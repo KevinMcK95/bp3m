@@ -34,12 +34,26 @@ fast_cross_match have been updated for JWST data.
 """
 
 import argparse
+import re
 import sys
 import os
 from pathlib import Path
 from multiprocessing import cpu_count
 
 import numpy as np
+
+
+def _config_lib_dir() -> str | None:
+    """Read lib_dir from ~/.bp3m/config.toml if it exists (written by bp3m-setup)."""
+    config = Path.home() / ".bp3m" / "config.toml"
+    if not config.exists():
+        return None
+    try:
+        text = config.read_text()
+        m = re.search(r'^lib_dir\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+        return m.group(1) if m else None
+    except Exception:
+        return None
 
 
 def _parse_args():
@@ -112,10 +126,12 @@ def _parse_args():
 
     # ── PSF fitting ───────────────────────────────────────────────────────────
     psf = p.add_argument_group('PSF fitting (py1pass)')
+    _lib_default = _config_lib_dir() or str(Path.home() / 'GaiaHub-master' / 'lib')
     psf.add_argument('--lib_dir', type=str,
-                     default=str(Path.home() / 'GaiaHub-master' / 'lib'),
+                     default=_lib_default,
                      help='Library directory containing STDPSFs/ and STDGDCs/ '
-                          'subdirectories (default: ~/GaiaHub-master/lib/)')
+                          'subdirectories. Defaults to the path set by bp3m-setup '
+                          f'(currently: {_lib_default})')
     psf.add_argument('--fmin_thresh', type=float, default=None,
                      help='Hard lower bound on the minimum source flux in electrons '
                           '(default 40). Acts as a floor: fmin will never go below '

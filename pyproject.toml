@@ -17,8 +17,8 @@ dependencies = [
     "tqdm",
     "pandas",
     "joblib",
-    "pypass @ git+https://github.com/kevinmckinnon/pypass",
-    "gaia_cross_match @ git+https://github.com/kevinmckinnon/gaia_cross_match",
+    "pypass @ git+https://github.com/KevinMcK95/pypass",
+    "gaia_cross_match @ git+https://github.com/KevinMcK95/gaia_cross_match",
 ]
 
 [project.optional-dependencies]
