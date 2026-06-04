@@ -11,9 +11,11 @@ BASE_URL = "https://www.stsci.edu/~jayander/HST1PASS/LIB"
 CONFIG_FILE = Path.home() / ".bp3m" / "config.toml"
 DEFAULT_LIB_DIR = Path.home() / ".bp3m" / "lib"
 
-# WFC3IR has PSFs but no GDCs
-PSF_INSTRUMENTS = ["ACSWFC", "ACSHRC", "WFC3UV", "WFC3IR"]
+PSF_INSTRUMENTS = ["ACSWFC", "ACSHRC", "WFC3UV"]
 GDC_INSTRUMENTS = ["ACSWFC", "ACSHRC", "WFC3UV"]
+# WFC3IR has PSFs on the server but no GDCs; not yet supported by pypass.
+# Users can request it explicitly with --instruments WFC3IR.
+_OPTIONAL_PSF_ONLY = {"WFC3IR"}
 
 
 def _list_fits(url: str) -> list:
@@ -94,7 +96,8 @@ def main():
 
     if args.instruments:
         requested = {i.upper() for i in args.instruments}
-        psf_insts = [i for i in PSF_INSTRUMENTS if i in requested]
+        all_psf = PSF_INSTRUMENTS + list(_OPTIONAL_PSF_ONLY)
+        psf_insts = [i for i in all_psf if i in requested]
         gdc_insts = [i for i in GDC_INSTRUMENTS if i in requested]
     else:
         psf_insts = PSF_INSTRUMENTS
