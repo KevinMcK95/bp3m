@@ -513,6 +513,12 @@ def main():
         except Exception:
             pass
 
+    # ── Check that we have images before continuing ───────────────────────────
+    if _selected_obsids is not None and len(_selected_obsids) == 0:
+        print("\nNo HST images available to process. Check your search "
+              "parameters (filters, instruments, search radius, dates).")
+        return
+
     # ── Resolve active image set for steps 3 onwards ─────────────────────────
     # --bp3m_images restricts ALL downstream steps (PSF, cross-match, BP3M),
     # not just the alignment step.  Resolve it now so every step uses the same

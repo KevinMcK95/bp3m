@@ -278,6 +278,9 @@ def search_mast(
             else:
                 raise
 
+    if len(obs_raw) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
     _delay2 = 10
     for _attempt in range(_mast_retries):
         try:
@@ -358,6 +361,14 @@ def search_mast(
 
         if 'instrument_name' in obs_df.columns and 'filters' in obs_df.columns:
             mask_obs = obs_df.apply(_combo_ok, axis=1)
+            dropped = obs_df[~mask_obs]
+            if not dropped.empty:
+                dropped_combos = sorted(set(
+                    f"{r['instrument_name']}/{r['filters']}"
+                    for _, r in dropped.iterrows()
+                ))
+                print(f"  WARNING: {len(dropped)} observation(s) dropped — no PSF+GDC "
+                      f"in lib_dir for: {', '.join(dropped_combos)}")
             obs_df  = obs_df[mask_obs]
             keep_ids = set(obs_df['obsid'].astype(str))
             prod_df = prod_df[prod_df['parent_obsid'].isin(keep_ids)]
