@@ -143,8 +143,10 @@ def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
         psf_filters: set[str] = set()
         for f in psf_sub.glob("STDPSF_*.fits"):
             parts = f.stem.split('_')
-            # STDPSF_ACSWFC_F814W or STDPSF_ACSWFC_F814W_SM4
-            if len(parts) >= 3 and not parts[-1].startswith('SM') and parts[-1] != 'vintage':
+            # STDPSF_ACSWFC_F814W, STDPSF_ACSWFC_F814W_SM4, STDPSF_ACSWFC_F850L_SM3
+            # SM-suffixed files are valid PSFs (e.g. F850L only exists as SM3).
+            # Using a set means multiple variants for the same filter don't double-count.
+            if len(parts) >= 3 and parts[-1] != 'vintage':
                 psf_filters.add(_normalise_filter(parts[2]))
 
         # Collect filters with a GDC file
