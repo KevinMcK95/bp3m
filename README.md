@@ -7,7 +7,7 @@ bp3m is a Python pipeline for measuring proper motions of stars using HST imagin
 ## Installation
 
 ```bash
-pip install git+https://github.com/KevinMcK95/bp3m
+pip install bp3m
 ```
 
 For the full environment including PyMC (required for the Bayesian solver):
@@ -15,7 +15,7 @@ For the full environment including PyMC (required for the Bayesian solver):
 ```bash
 conda env create -f environment.yml
 conda activate bp3m
-pip install -e .
+pip install bp3m
 ```
 
 bp3m bundles [pypass](pypass/README.md) (PSF-fitting photometry) and [gaia_cross_match](gaia_cross_match/README.md) (Gaia cross-matching) as internal packages — no separate installs are needed.
