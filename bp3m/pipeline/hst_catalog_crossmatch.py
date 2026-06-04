@@ -71,10 +71,7 @@ try:
     )
     from bp3m.coords import plane_project_inverse
 except ImportError as exc:
-    sys.exit(
-        f"Cannot import bp3m (looked in {_BP3M_DIR}): {exc}\n"
-        "Ensure bp3m_improved is on PYTHONPATH."
-    )
+    sys.exit(f"Cannot import bp3m: {exc}\nEnsure bp3m is installed (pip install bp3m).")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
