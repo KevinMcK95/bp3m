@@ -6,6 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "bp3m"
 version = "2.0.0"
 description = "Bayesian Pipeline for Proper Motion measurements using HST and Gaia"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Kevin McKinnon", email = "kevinmckinnon95@gmail.com"}]
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
@@ -17,9 +20,24 @@ dependencies = [
     "tqdm",
     "pandas",
     "joblib",
-    "pypass @ git+https://github.com/KevinMcK95/pypass",
-    "gaia_cross_match @ git+https://github.com/KevinMcK95/gaia_cross_match",
+    "pypass",
+    "gaia_cross_match",
 ]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/KevinMcK95/bp3m"
+Repository = "https://github.com/KevinMcK95/bp3m"
+Paper = "https://doi.org/10.3847/1538-4357/ad5ff6"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov"]
