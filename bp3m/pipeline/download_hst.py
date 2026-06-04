@@ -252,6 +252,7 @@ def search_mast(
     if obs_date_min is not None:
         t_min_bound = Time(obs_date_min).mjd
 
+    print(f"  Querying MAST (this can take a minute)...")
     import time as _time
     _mast_retries = 5
     _mast_delay   = 10  # seconds between retries
