@@ -392,6 +392,20 @@ def _resolve_target(args):
 def main():
     args = _parse_args()
 
+    # Wire --n_processes to BLAS and JAX thread limits so all parallelism
+    # is bounded by the same value. Env vars cover JAX (imported lazily)
+    # and subprocesses; threadpoolctl covers already-loaded BLAS pools.
+    if args.n_processes != -1:
+        _n = str(args.n_processes)
+        os.environ['OMP_NUM_THREADS']      = _n
+        os.environ['OPENBLAS_NUM_THREADS'] = _n
+        os.environ['MKL_NUM_THREADS']      = _n
+        try:
+            import threadpoolctl as _tpc
+            _tpc.threadpool_limits(limits=args.n_processes)
+        except ImportError:
+            pass
+
     print("=" * 55)
     print("GaiaHub Improved")
     print("=" * 55)
