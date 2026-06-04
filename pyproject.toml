@@ -20,6 +20,8 @@ dependencies = [
     "tqdm",
     "pandas",
     "joblib",
+    "jax",
+    "jaxlib",
 ]
 classifiers = [
     "License :: OSI Approved :: MIT License",
@@ -39,7 +41,6 @@ Paper = "https://doi.org/10.3847/1538-4357/ad5ff6"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov"]
-jax = ["jax", "jaxlib"]
 
 [project.scripts]
 bp3m = "bp3m_run:main"
