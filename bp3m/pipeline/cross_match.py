@@ -249,13 +249,13 @@ def run_cross_match(
                     if Path(f['root']).name == name
                 )) / "matched_gaia.csv")
 
-    # Run cross-image validation if available
+    # Run cross-image validation
     try:
-        from gaia_cross_match.cross_match_validator import validate_target
+        from gaia_cross_match.validator import validate_target
         print("\n  Running cross-image validation...")
         validate_target(field_name, str(Path(output_dir)))
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"  WARNING: cross-image validation failed — {_e}")
 
     # Include previously-skipped results in the return list
     for hst in folders:
