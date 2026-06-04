@@ -490,6 +490,9 @@ def download_hst_images(
 
     if obs_df.empty:
         print("  No observations found matching the criteria.")
+        # Write empty manifest so downstream steps know to exit gracefully.
+        manifest = hst_dir / f"{field_name}_selected_obsids.json"
+        manifest.write_text("[]")
         return obs_df, prod_df
 
     # Attach field_id (1-based sequential index shown to the user)
