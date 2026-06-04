@@ -152,7 +152,7 @@ def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
         for f in gdc_sub.glob("STDGDC_*.fits"):
             parts = f.stem.split('_')
             if len(parts) >= 3 and 'OFFICIAL' not in parts and 'JFRAME' not in parts:
-                gdc_filters.add(parts[2])
+                gdc_filters.add(_normalise_filter(parts[2]))
 
         common = psf_filters & gdc_filters
         if common:
