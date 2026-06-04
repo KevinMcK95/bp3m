@@ -41,8 +41,13 @@ import numpy as np
 
 
 def _config_lib_dir() -> str | None:
-    """Read lib_dir from ~/.bp3m/config.toml if it exists (written by bp3m-setup)."""
-    config = Path.home() / ".bp3m" / "config.toml"
+    """Read lib_dir from config.toml if it exists (written by bp3m-setup).
+
+    Config location: $BP3M_HOME/config.toml, or ~/.bp3m/config.toml by default.
+    """
+    import os
+    bp3m_home = Path(os.environ["BP3M_HOME"]) if "BP3M_HOME" in os.environ else Path.home() / ".bp3m"
+    config = bp3m_home / "config.toml"
     if not config.exists():
         return None
     try:

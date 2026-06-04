@@ -8,8 +8,14 @@ from urllib.request import urlopen, urlretrieve
 from urllib.error import URLError
 
 BASE_URL = "https://www.stsci.edu/~jayander/HST1PASS/LIB"
-CONFIG_FILE = Path.home() / ".bp3m" / "config.toml"
-DEFAULT_LIB_DIR = Path.home() / ".bp3m" / "lib"
+
+def _bp3m_home() -> Path:
+    """Base directory for bp3m config and default lib. Override with BP3M_HOME."""
+    import os
+    return Path(os.environ["BP3M_HOME"]) if "BP3M_HOME" in os.environ else Path.home() / ".bp3m"
+
+CONFIG_FILE = _bp3m_home() / "config.toml"
+DEFAULT_LIB_DIR = _bp3m_home() / "lib"
 
 PSF_INSTRUMENTS = ["ACSWFC", "ACSHRC", "WFC3UV"]
 GDC_INSTRUMENTS = ["ACSWFC", "ACSHRC", "WFC3UV"]
@@ -50,8 +56,9 @@ def main():
         description=(
             "Download HST PSF and geometric distortion correction (GDC) library "
             "files for bp3m from STScI (https://www.stsci.edu/~jayander/HST1PASS/LIB). "
-            "Saves the lib_dir path to ~/.bp3m/config.toml so --lib_dir is optional "
-            "when running bp3m."
+            "Saves the lib_dir path to config.toml so --lib_dir is optional "
+            "when running bp3m. Config location defaults to ~/.bp3m/ but can be "
+            "overridden by setting the BP3M_HOME environment variable."
         )
     )
     p.add_argument(
@@ -62,7 +69,7 @@ def main():
     p.add_argument(
         "--no-config",
         action="store_true",
-        help="Skip writing lib_dir to ~/.bp3m/config.toml",
+        help="Skip writing lib_dir to config.toml",
     )
     p.add_argument(
         "--instruments",
