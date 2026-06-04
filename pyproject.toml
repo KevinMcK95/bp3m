@@ -20,8 +20,6 @@ dependencies = [
     "tqdm",
     "pandas",
     "joblib",
-    "pypass",
-    "gaia_cross_match",
 ]
 classifiers = [
     "License :: OSI Approved :: MIT License",

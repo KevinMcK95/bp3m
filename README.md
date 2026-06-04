@@ -7,7 +7,7 @@ bp3m is a Python pipeline for measuring proper motions of stars using HST imagin
 ## Installation
 
 ```bash
-pip install git+https://github.com/kevinmckinnon/bp3m
+pip install git+https://github.com/KevinMcK95/bp3m
 ```
 
 For the full environment including PyMC (required for the Bayesian solver):
@@ -17,6 +17,8 @@ conda env create -f environment.yml
 conda activate bp3m
 pip install -e .
 ```
+
+bp3m bundles [pypass](pypass/README.md) (PSF-fitting photometry) and [gaia_cross_match](gaia_cross_match/README.md) (Gaia cross-matching) as internal packages — no separate installs are needed.
 
 ## Setup
 
@@ -57,8 +59,18 @@ bp3m has been tested on a range of stellar fields across multiple HST instrument
 
 Code optimization, the Python translation of supporting routines, and pipeline development were assisted by [Claude Code](https://claude.ai/code) (Anthropic).
 
-## References
+## Attribution
 
-- McKinnon et al. 2024, ApJ 972 150 — https://ui.adsabs.harvard.edu/abs/2024ApJ...972..150M/abstract
-- del Pino et al. 2022, ApJ 933 76 (GaiaHub) — https://ui.adsabs.harvard.edu/abs/2022ApJ...933...76D/abstract
-- Anderson 2022, WFC ISR 2022-05 (hst1pass) — https://ui.adsabs.harvard.edu/abs/2022wfc..rept....5A/abstract
+The bp3m pipeline builds on algorithms from two prior works that should be cited if you use this code:
+
+**PSF-fitting photometry** (pypass, bundled in bp3m) is a Python reimplementation of:
+> Anderson, J. 2022, "One-Pass HST Photometry with hst1pass", Space Telescope WFC Instrument Science Report 2022-05.
+> https://ui.adsabs.harvard.edu/abs/2022wfc..rept....5A/abstract
+
+**Gaia cross-matching** (gaia_cross_match, bundled in bp3m) is a Python reimplementation of the Fortran routine `xym2pm_GH.F` from:
+> del Pino, A., et al. 2022, "GaiaHub: A Method for Combining HST and Gaia to Obtain Improved Proper Motions for HST Observations", ApJ 933 76.
+> https://doi.org/10.3847/1538-4357/ac71ae
+
+**bp3m itself:**
+> McKinnon et al. 2024, ApJ 972 150.
+> https://ui.adsabs.harvard.edu/abs/2024ApJ...972..150M/abstract
