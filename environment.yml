@@ -1,0 +1,20 @@
+name: bp3m
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - numpy
+  - scipy
+  - astropy
+  - astroquery
+  - pymc
+  - matplotlib
+  - tqdm
+  - pandas
+  - joblib
+  - pip
+  - pip:
+    - pypass @ git+https://github.com/kevinmckinnon/pypass
+    - gaia_cross_match @ git+https://github.com/kevinmckinnon/gaia_cross_match
+    - -e .

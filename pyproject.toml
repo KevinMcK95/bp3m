@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bp3m"
+version = "2.0.0"
+description = "Bayesian Pipeline for Proper Motion measurements using HST and Gaia"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "astropy",
+    "astroquery",
+    "pymc",
+    "matplotlib",
+    "tqdm",
+    "pandas",
+    "joblib",
+    "pypass @ git+https://github.com/kevinmckinnon/pypass",
+    "gaia_cross_match @ git+https://github.com/kevinmckinnon/gaia_cross_match",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+jax = ["jax", "jaxlib"]
+
+[project.scripts]
+bp3m = "bp3m_run:main"
+bp3m-setup = "bp3m.setup:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

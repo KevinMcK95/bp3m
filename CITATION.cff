@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: bp3m
+version: 2.0.0
+authors:
+  - family-names: McKinnon
+    given-names: Kevin
+preferred-citation:
+  type: article
+  title: "BP3M: A Bayesian Pipeline for Proper Motion Measurements with HST and Gaia"
+  authors:
+    - family-names: McKinnon
+      given-names: Kevin
+  journal: "The Astrophysical Journal"
+  volume: 972
+  year: 2024
+  doi: 10.3847/1538-4357/ad5ff6
+  url: "https://ui.adsabs.harvard.edu/abs/2024ApJ...972..150M/abstract"
