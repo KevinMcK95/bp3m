@@ -101,8 +101,9 @@ def _parse_args():
     h.add_argument('--telescope', type=str, default='HST',
                    help='Telescope (default HST; JWST planned)')
     h.add_argument('--hst_filters', type=str, nargs='+', default=None,
-                   help='Required filters, e.g. F814W F606W '
-                        '(default: all filters with PSF+GDC in lib_dir)')
+                   help='Required filters, e.g. F814W F606W F850LP '
+                        '(default: all filters with PSF+GDC in lib_dir). '
+                        'Use MAST filter names (e.g. F850LP not F850L).')
     h.add_argument('--hst_im_type', type=str, default='_flc',
                    help='Image type: _flc (default) or _flt')
     h.add_argument('--hst_exptime_min', type=float, default=2.0,
