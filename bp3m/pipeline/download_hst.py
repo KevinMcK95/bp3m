@@ -47,6 +47,29 @@ _INST_TO_LIBDIR = {
 # Default Gaia DR3 reference epoch as MJD (2017-05-28)
 _GAIA_DR3_MJD = Time('2017-05-28').mjd
 
+# Normalise filter names from PSF/GDC filenames to MAST canonical names.
+# STScI PSF files occasionally use abbreviated names that differ from MAST.
+_PSF_FILTER_NORM = {
+    'F850L':  'F850LP',   # STDPSF_ACSWFC_F850L.fits → MAST F850LP
+}
+
+def _normalise_filter(name: str) -> str:
+    """Map a PSF/GDC filename filter token to the MAST canonical name."""
+    return _PSF_FILTER_NORM.get(name, name)
+
+
+def _clean_mast_filter(raw: str) -> str:
+    """Return the science filter from a MAST filter string, dropping CLEAR entries.
+
+    MAST returns paired-filter strings like 'F814W;CLEAR1L' or 'CLEAR2L;F606W'.
+    We split on ';', drop any token that is empty or starts with 'CLEAR', and
+    return the first remaining token.  Falls back to the raw string if nothing
+    survives the filter.
+    """
+    tokens = [t.strip() for t in raw.split(';')]
+    science = [t for t in tokens if t and not t.upper().startswith('CLEAR')]
+    return science[0] if science else raw.strip()
+
 
 def _query_params_sidecar(hst_dir: Path, field_name: str) -> Path:
     return hst_dir / f"{field_name}_obs_params.json"
@@ -122,7 +145,7 @@ def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
             parts = f.stem.split('_')
             # STDPSF_ACSWFC_F814W or STDPSF_ACSWFC_F814W_SM4
             if len(parts) >= 3 and not parts[-1].startswith('SM') and parts[-1] != 'vintage':
-                psf_filters.add(parts[2])
+                psf_filters.add(_normalise_filter(parts[2]))
 
         # Collect filters with a GDC file
         gdc_filters: set[str] = set()
@@ -294,7 +317,7 @@ def search_mast(
     obs_df['obs_time']   = obs_time.value
     obs_df['t_baseline'] = np.round(
         (date_second_epoch_mjd - obs_df['t_max'].values) / 365.2422, 2)
-    obs_df['filters'] = obs_df['filters'].str.strip('; CLEAR2L CLEAR1L')
+    obs_df['filters'] = obs_df['filters'].apply(_clean_mast_filter)
 
     # Merge exposure-time info into products table
     meta = obs_df[['obsid', 'i_exptime', 'filters', 't_baseline', 's_ra', 's_dec']]
