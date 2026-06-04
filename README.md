@@ -2,6 +2,8 @@
 
 bp3m is a Python pipeline for measuring proper motions of stars using HST imaging and Gaia astrometry. It implements and extends the Bayesian proper motion method of McKinnon et al. (2024, ApJ 972 150), replacing the original MCMC posterior with a closed-form Gaussian solution that is analytically exact and fast enough to simultaneously fit thousands of stars across >100 HST images. The pipeline follows the science workflow of GaiaHub (del Pino et al. 2022, ApJ 933 76) and uses pypass, a Python implementation of the hst1pass photometry algorithm (Anderson 2022, WFC ISR 2022-05).
 
+> **This is the actively developed version of bp3m and should be used in place of the original code.** The original MCMC-based implementation is archived at https://github.com/KevinMcK95/BayesianPMs. The closed-form Gaussian posterior in this version is not only faster but analytically superior — it does not suffer from MCMC convergence issues and scales to datasets that were impractical with the original code.
+
 ## Installation
 
 ```bash
