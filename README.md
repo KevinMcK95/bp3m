@@ -47,6 +47,14 @@ bp3m --name "Leo I" --search_radius 0.1 --output_dir ./outputs
 4. **Cross-match** — match each HST catalog to Gaia with an affine transformation (gaia_cross_match)
 5. **Bayesian alignment** — simultaneously solve for image transformations and stellar proper motions/parallaxes using the closed-form BP3M algorithm
 
+## Status and feedback
+
+bp3m has been tested on a range of stellar fields across multiple HST instruments and epochs, but as with any research software there may be edge cases and bugs that haven't been caught yet. If you run into unexpected behaviour or incorrect results, please open a GitHub issue — all feedback is welcome.
+
+## Development notes
+
+Code optimization, the Python translation of supporting routines, and pipeline development were assisted by [Claude Code](https://claude.ai/code) (Anthropic).
+
 ## References
 
 - McKinnon et al. 2024, ApJ 972 150 — https://ui.adsabs.harvard.edu/abs/2024ApJ...972..150M/abstract
