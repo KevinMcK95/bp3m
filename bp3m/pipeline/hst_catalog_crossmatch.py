@@ -2459,6 +2459,7 @@ def _measure_astrometry_proper(
     min_hst_epochs: int = 2,
     _det_lookup: Optional[dict] = None,
     _tele_xyz_cache: Optional[dict] = None,
+    _src_detections: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Measure proper astrometry for each source by solving the linearised
@@ -2516,9 +2517,14 @@ def _measure_astrometry_proper(
     print(f"  [phase4] gaia_lookup:      {time.perf_counter()-_t:.2f}s  "
           f"({len(gaia_lookup)} Gaia entries)")
 
-    _t = time.perf_counter()
-    src_detections = _parse_hst_indices_columns(combined_df)
-    print(f"  [phase4] src_detections:   {time.perf_counter()-_t:.2f}s")
+    if _src_detections is not None:
+        src_detections = _src_detections
+        print(f"  [phase4] src_detections:   reused ({len(src_detections)} entries)")
+    else:
+        _t = time.perf_counter()
+        src_detections = _parse_hst_indices_columns(combined_df)
+        print(f"  [phase4] src_detections:   {time.perf_counter()-_t:.2f}s  "
+              f"({len(src_detections)} entries)")
 
     # MAS_PER_DEG constant (3.6e6 mas / degree)
     _MAS_PER_DEG = 3.6e6
@@ -2863,14 +2869,21 @@ def _measure_astrometry_proper(
         for _iter in range(3):
             residuals = fit['deltas'] - fit['H_stack'] @ fit['u']
             N_fit = fit['N']
-            chi2_per = np.empty(N_fit)
-            for i in range(N_fit):
-                r_i = residuals[2*i:2*i+2]
-                try:
-                    C_i_inv = np.linalg.inv(fit['Big_C'][2*i:2*i+2, 2*i:2*i+2])
-                    chi2_per[i] = float(r_i @ C_i_inv @ r_i)
-                except np.linalg.LinAlgError:
-                    chi2_per[i] = 0.
+
+            # Vectorised chi² per detection: analytical batch 2×2 inverse
+            # avoids N_fit separate linalg.inv calls.
+            _ai = np.arange(N_fit)
+            _a  = fit['Big_C'][2*_ai,   2*_ai  ]
+            _b  = fit['Big_C'][2*_ai,   2*_ai+1]
+            _c  = fit['Big_C'][2*_ai+1, 2*_ai  ]
+            _d  = fit['Big_C'][2*_ai+1, 2*_ai+1]
+            _det = _a * _d - _b * _c
+            _safe = np.abs(_det) > 0
+            _inv_det = np.where(_safe, 1.0 / np.where(_safe, _det, 1.0), 0.0)
+            _r0 = residuals[2*_ai]
+            _r1 = residuals[2*_ai + 1]
+            chi2_per = ((_d*_r0 - _b*_r1)*_r0 + (-_c*_r0 + _a*_r1)*_r1) * _inv_det
+
             outlier_mask = chi2_per > outlier_sigma**2
             if not outlier_mask.any():
                 break
@@ -2992,9 +3005,12 @@ def _measure_astrometry_proper(
                       f"ETA {eta:.0f}s", flush=True)
 
     if n_workers > 1 and n_total >= 200:
-        chunk_size = max(1, n_total // n_workers)
-        chunks = [all_indices[i:i + chunk_size]
-                  for i in range(0, n_total, chunk_size)]
+        # Sort by detection count descending (heaviest first), then round-robin
+        # assign to chunks — LPT heuristic for near-optimal load balance.
+        all_indices.sort(key=lambda ri: len(src_detections.get(ri, [])), reverse=True)
+        chunks = [[] for _ in range(n_workers)]
+        for i, row_i in enumerate(all_indices):
+            chunks[i % n_workers].append(row_i)
 
         def _process_chunk(chunk_indices: list) -> list[dict]:
             _t_chunk = time.perf_counter()
@@ -3759,6 +3775,11 @@ def run_hst_crossmatch(
             print(f"  [phase4]   tele_xyz built:   {time.perf_counter()-_t_pre:.2f}s  "
                   f"({len(_shared_tele_xyz)} images)")
 
+            _t_pre = time.perf_counter()
+            _shared_src_detections = _parse_hst_indices_columns(combined_df)
+            print(f"  [phase4]   src_detections:   {time.perf_counter()-_t_pre:.2f}s  "
+                  f"({len(_shared_src_detections)} entries)")
+
             astrom_df = _measure_astrometry_proper(
                 combined_df      = combined_df,
                 det_df           = det_df,
@@ -3775,6 +3796,7 @@ def run_hst_crossmatch(
                 outlier_sigma    = phase4_outlier_sigma,
                 _det_lookup      = _shared_det_lookup,
                 _tele_xyz_cache  = _shared_tele_xyz,
+                _src_detections  = _shared_src_detections,
             )
 
             n_good = int(np.isfinite(astrom_df['ra_xmatch']).sum())
@@ -3786,17 +3808,18 @@ def run_hst_crossmatch(
 
             # Stash all Phase 4 ingredients so Phase 5 can re-use them
             _p4 = dict(
-                r_hat          = r_hat4,
-                C_r            = C_r_full,
-                image_names    = image_names4,
-                n_r            = n_r4,
-                poly_order     = poly_order4,
-                sub_img_meta   = sub_img_meta4,
-                ra0_field      = ra0_field,
-                dec0_field     = dec0_field,
-                pscale         = pscale4,
-                det_lookup     = _shared_det_lookup,
-                tele_xyz_cache = _shared_tele_xyz,
+                r_hat           = r_hat4,
+                C_r             = C_r_full,
+                image_names     = image_names4,
+                n_r             = n_r4,
+                poly_order      = poly_order4,
+                sub_img_meta    = sub_img_meta4,
+                ra0_field       = ra0_field,
+                dec0_field      = dec0_field,
+                pscale          = pscale4,
+                det_lookup      = _shared_det_lookup,
+                tele_xyz_cache  = _shared_tele_xyz,
+                src_detections  = _shared_src_detections,
             )
 
             # ── Phase 4b: post-astrometry deduplication (ra_xmatch positions) ────
@@ -3847,6 +3870,7 @@ def run_hst_crossmatch(
                             outlier_sigma=phase4_outlier_sigma,
                             _det_lookup=_p4.get('det_lookup'),
                             _tele_xyz_cache=_p4.get('tele_xyz_cache'),
+                            _src_detections=_p4.get('src_detections'),
                         )
                         for _col in _astrom_4b.columns:
                             combined_dedup4b.loc[_cdf_4b.index, _col] = _astrom_4b[_col].values
@@ -3942,6 +3966,7 @@ def run_hst_crossmatch(
                         sub_img_meta    = _p4['sub_img_meta'],
                         _det_lookup     = _p4.get('det_lookup'),
                         _tele_xyz_cache = _p4.get('tele_xyz_cache'),
+                        _src_detections = None,  # different column structure for pass2
                         gaia_df      = gaia_df,
                         outlier_sigma = phase4_outlier_sigma,
                     )
