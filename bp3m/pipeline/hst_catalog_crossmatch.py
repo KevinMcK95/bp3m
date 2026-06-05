@@ -260,13 +260,25 @@ def _load_all_detections(field_dir: Path,
 
     print(f"  {n_sub} sub-images, N_R={n_r} (poly_order={poly_order})")
 
-    # Legacy relative ZP (rarely populated; kept as additive correction on top of mag_ab)
+    # Pre-normalise mag_zp using cross_image_zp from magnitude_zp_offsets.csv.
+    # These ZPs are computed from Gaia-matched bright sources (reliable) and put
+    # all images on the same photometric scale before Phase 3.  Phase 3 then
+    # measures only small residual ZPs rather than large spurious offsets that
+    # arise when matching across long time baselines using all faint sources.
+    # Convention: mag_norm = mag_st_gdc + cross_image_zp  →  add (not subtract).
     zp_df = _load_zp_offsets(field_dir)
     zp_legacy: dict[str, float] = {}
-    if zp_df is not None:
+    _apply_pre_zp = False
+    if zp_df is not None and 'cross_image_zp' in zp_df.columns:
         for _, row in zp_df.iterrows():
-            col = 'cross_image_zp' if 'cross_image_zp' in row.index else 'cross_image_zp_offset'
-            zp_legacy[row['image']] = float(row[col])
+            img_name = str(row['image'])
+            zp_val   = float(row['cross_image_zp'])
+            zp_legacy[img_name] = zp_val
+        if zp_legacy:
+            _apply_pre_zp = True
+            n_zp = sum(1 for v in zp_legacy.values() if abs(v) > 0.005)
+            print(f"  Pre-ZP from magnitude_zp_offsets.csv: {len(zp_legacy)} images, "
+                  f"{n_zp} with |ZP| > 0.005 mag")
 
     # Load alpha (chi2 inflation) factors per sub-image from image_transformations.csv
     # alpha^2 inflates HST position covariances to account for systematic residuals
@@ -372,8 +384,7 @@ def _load_all_detections(field_dir: Path,
             except Exception as _del_exc:
                 print(f"    (deletion failed: {_del_exc})")
             return None
-        cat_mag_cal      = np.asarray(tbl['mag_st_gdc'], float)
-        _apply_legacy_zp = False
+        cat_mag_cal = np.asarray(tbl['mag_st_gdc'], float)
         cat_qfit = np.asarray(tbl['qfit'],  float)
         cat_chi2 = np.asarray(tbl['chi2'],  float)
         cat_nsat = np.asarray(tbl['n_sat'], int)
@@ -418,7 +429,9 @@ def _load_all_detections(field_dir: Path,
             print(f"  Warning: projection failed for {sub_name}: {exc}")
             return None
 
-        legacy_zp_corr = zp_legacy.get(base, 0.0) if _apply_legacy_zp else 0.0
+        # Add cross_image_zp (from magnitude_zp_offsets.csv) to normalise to the
+        # common reference scale before Phase 3 within-filter matching.
+        pre_zp_corr = zp_legacy.get(base, 0.0) if _apply_pre_zp else 0.0
 
         # Hard cap: drop sources with degenerate covariances (failed PSF fits)
         _good = (sigma_ra < 50.) & (sigma_dec < 50.)   # 50 mas ≈ 1 px
@@ -450,7 +463,7 @@ def _load_all_detections(field_dir: Path,
             'cov_ra_dec':        cov_rd,
             'mag_gdc':           cat_mag[idx],
             'mag_err_gdc':       cat_magerr[idx],
-            'mag_zp':            cat_mag_cal[idx] - legacy_zp_corr,
+            'mag_zp':            cat_mag_cal[idx] + pre_zp_corr,
             'alpha':             float(alpha),
             'is_star_candidate': cat_star[idx],
             'qfit':              cat_qfit[idx],
