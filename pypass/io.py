@@ -1076,9 +1076,22 @@ def run_photometry_fits(
             r._zp_ab     = _zp_ab
             r._exptime   = _exptime
 
+        n_conv = sum(r.converged for r in records)
         all_records.extend(records)
         if verbose:
-            print(f"  -> {len(records)} stars on chip ext={sci_ext}")
+            n_chip = len(records)
+            nc_str = (f" ({n_chip - n_conv} non-converged excluded)"
+                      if n_chip > n_conv else "")
+            print(f"  -> {n_conv} converged stars on chip ext={sci_ext}{nc_str}")
+
+    # Drop non-converged stars before classification and chi² scaling so that
+    # bad fits do not pollute the concentration locus or the chi² magnitude bins.
+    n_before = len(all_records)
+    all_records = [r for r in all_records if r.converged]
+    n_removed = n_before - len(all_records)
+    if verbose and n_removed:
+        print(f"  Removed {n_removed} non-converged star(s) before classification "
+              f"(hit max_iter without convergence)")
 
     # Classify stars once on the full multi-chip catalogue so the concentration
     # locus is built from both detectors together, giving a better-sampled
@@ -1094,14 +1107,6 @@ def run_photometry_fits(
     # Apply chi²-inflation once across the combined catalogue
     from .core import inflate_chi2
     inflate_chi2(all_records, zero_point, verbose=verbose)
-
-    # Drop non-converged stars
-    n_before = len(all_records)
-    all_records = [r for r in all_records if r.converged]
-    n_removed = n_before - len(all_records)
-    if verbose and n_removed:
-        print(f"  Removed {n_removed} non-converged star(s) from catalogue "
-              f"(hit max_iter without convergence)")
 
     # Compute per-star DQ flag summaries (1×1, 2×2, 3×3 windows).
     # Uses the raw DQ integer array so all flag bits are preserved.
