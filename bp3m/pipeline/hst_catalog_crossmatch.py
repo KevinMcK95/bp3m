@@ -2523,6 +2523,17 @@ def _measure_astrometry_proper(
         except Exception:
             _tele_xyz_cache[sname_d] = np.array([0., 0., 0.])
 
+    # Fix 1: pre-extract gaia_source_id to avoid 176k combined_df.loc[] calls
+    _src_gaia_ids: dict = {}
+    if 'gaia_source_id' in combined_df.columns:
+        for _row_i, _val in combined_df['gaia_source_id'].items():
+            try:
+                _src_gaia_ids[_row_i] = int(np.int64(_val))
+            except (ValueError, TypeError, OverflowError):
+                _src_gaia_ids[_row_i] = 0
+
+    _ZERO3 = np.zeros(3)   # fallback telescope position
+
     # ── Per-source fit (called in parallel from thread pool) ──────────────────
     # Closures over the pre-built lookup dicts and arrays above.
     # Each call is fully independent: no shared mutable state.
@@ -2556,16 +2567,10 @@ def _measure_astrometry_proper(
             return base_row
 
         # ── Gaia prior for this source ────────────────────────────────────────
-        src_row = combined_df.loc[row_i]
         gaia_row: Optional[pd.Series] = None
-        try:
-            sid_val = src_row.get('gaia_source_id', 0)
-            # Use np.int64 to avoid float precision loss on large Gaia source IDs
-            sid_int = int(np.int64(sid_val))
-            if sid_int > 0:
-                gaia_row = gaia_lookup.get(sid_int)
-        except (ValueError, TypeError, OverflowError):
-            pass
+        sid_int = _src_gaia_ids.get(row_i, 0)
+        if sid_int > 0:
+            gaia_row = gaia_lookup.get(sid_int)
 
         has_gaia = gaia_row is not None
         if has_gaia:
@@ -2588,7 +2593,11 @@ def _measure_astrometry_proper(
             gaia_g_mag = 20.0  # cap — HST-only sources are always faint
 
         # ── Collect per-detection data ────────────────────────────────────────
+        # For poly_order=1 (the common case) we skip build_X_matrix entirely:
+        # X_mat is reconstructed vectorised inside _build_system, and y_obs is
+        # computed inline.  For higher orders we fall back to the full call.
         det_data: list[dict] = []
+        _poly1 = (poly_order == 1)
         for (sname, cidx) in valid_pairs:
             j_idx = img_idx_lookup.get(sname, -1)
             if j_idx < 0:
@@ -2597,9 +2606,15 @@ def _measure_astrometry_proper(
             x_c = float(d['x_gdc']) - _SOLVER_XO
             y_c = float(d['y_gdc']) - _SOLVER_YO
             cs  = j_idx * n_r
-            X_mat = build_X_matrix(x_c, y_c, 0., 0., 0., 0., poly_order=poly_order)
             r_blk = r_hat_arr[cs:cs + n_r]
-            y_obs = X_mat @ r_blk   # tangent-plane sky pixels (2-vector)
+            if _poly1:
+                # y_obs = X_mat @ r_blk for poly_order=1 without allocating X_mat
+                y_obs = np.array([r_blk[0]*x_c + r_blk[1]*y_c + r_blk[4],
+                                  r_blk[2]*x_c + r_blk[3]*y_c + r_blk[5]])
+                X_mat = None   # reconstructed in _build_system
+            else:
+                X_mat = build_X_matrix(x_c, y_c, 0., 0., 0., 0., poly_order=poly_order)
+                y_obs = X_mat @ r_blk
             det_data.append({
                 'sname':      sname,
                 'j_idx':      j_idx,
@@ -2653,88 +2668,120 @@ def _measure_astrometry_proper(
             if N < 1:
                 return None
 
-            Big_C   = np.zeros((2 * N, 2 * N))
-            deltas  = np.empty(2 * N)
-            H_stack = np.zeros((2 * N, 5))   # H_j = J_j @ M_j, stacked
+            # Fix 3: vectorise all per-detection work — replaces the O(N) Python
+            # loop with a handful of numpy calls on (N,) arrays.
 
-            for a, da in enumerate(ddata):
-                dt_a = da['epoch_yr'] - _GAIA_T_REF_YR  # years since J2016.0
+            snames    = [da['sname']     for da in ddata]
+            cs_arr    = np.array([da['cs']         for da in ddata], dtype=np.intp)
+            x_c_arr   = np.array([da['x_c']        for da in ddata])
+            y_c_arr   = np.array([da['y_c']        for da in ddata])
+            y_obs_all = np.array([da['y_obs']      for da in ddata])   # (N, 2)
+            dt_arr    = np.array([da['epoch_yr'] - _GAIA_T_REF_YR for da in ddata])
+            cov_xx    = np.array([da['cov_xx_raw'] for da in ddata])
+            cov_yy    = np.array([da['cov_yy_raw'] for da in ddata])
+            cov_xy    = np.array([da['cov_xy_raw'] for da in ddata])
+            alpha_arr = np.array([da['alpha']      for da in ddata])
 
-                # Per-image tangent-plane reference (matches BP3M's per-image ra0/dec0)
-                ra0_j, dec0_j, ps_j = _img_meta(da['sname'])
+            ra0_arr  = np.array([_img_meta(s)[0]  for s in snames])
+            dec0_arr = np.array([_img_meta(s)[1]  for s in snames])
+            ps_arr   = np.array([_img_meta(s)[2]  for s in snames])
 
-                # Reference sky-pixel position at this epoch
-                if has_gaia:
-                    ra_ref_a  = (ra_g
-                                 + pmra_g * dt_a
-                                 / (np.cos(dec_g * DEG2RAD) * _MAS_PER_DEG))
-                    dec_ref_a = dec_g + pmdec_g * dt_a / _MAS_PER_DEG
-                    try:
-                        xr, yr = plane_project(ra_ref_a, dec_ref_a,
-                                               ra0_j, dec0_j, ps_j)
-                        y_ref_a = np.array([float(xr), float(yr)])
-                    except Exception:
-                        y_ref_a = da['y_obs'].copy()
-                else:
-                    # Project constant sky reference into this image's tangent plane
-                    try:
-                        xr, yr = plane_project(ref_ra, ref_dec, ra0_j, dec0_j, ps_j)
-                        y_ref_a = np.array([float(xr), float(yr)])
-                    except Exception:
-                        y_ref_a = da['y_obs'].copy()
+            # Reference sky positions (epoch-propagated for Gaia stars)
+            if has_gaia:
+                cos_dec_g   = np.cos(dec_g * DEG2RAD)
+                ra_ref_arr  = ra_g  + pmra_g  * dt_arr / (cos_dec_g * _MAS_PER_DEG)
+                dec_ref_arr = dec_g + pmdec_g * dt_arr / _MAS_PER_DEG
+            else:
+                ra_ref_arr  = np.full(N, ref_ra)
+                dec_ref_arr = np.full(N, ref_dec)
 
-                deltas[2*a:2*a+2] = da['y_obs'] - y_ref_a
+            # Deltas: one plane_project call for all N detections
+            xr_all, yr_all = plane_project(ra_ref_arr, dec_ref_arr,
+                                            ra0_arr, dec0_arr, ps_arr)
+            # Fall back to y_obs where projection is non-finite
+            xr_all = np.where(np.isfinite(xr_all), xr_all, y_obs_all[:, 0])
+            yr_all = np.where(np.isfinite(yr_all), yr_all, y_obs_all[:, 1])
+            deltas = (y_obs_all - np.stack([xr_all, yr_all], axis=1)).ravel()  # (2N,)
 
-                # Per-image Jacobian J_j: ∂(x_tangent, y_tangent)/∂(α*, δ) in pix/mas
-                ref_ra_j  = ra_ref_a  if has_gaia else ref_ra
-                ref_dec_j = dec_ref_a if has_gaia else ref_dec
-                try:
-                    J_j = plane_project_jacobian(
-                        np.array([ref_ra_j]), np.array([ref_dec_j]),
-                        ra0_j, dec0_j, ps_j)[0]  # (2,2) pix/mas
-                except Exception:
-                    J_j = plane_project_jacobian(
-                        np.array([ref_ra]), np.array([ref_dec]),
-                        ra0_field, dec0_field, pscale)[0]
+            # H_stack: J_j @ U_j vectorised across all N detections
+            J_all = plane_project_jacobian(ra_ref_arr, dec_ref_arr,
+                                           ra0_arr, dec0_arr, ps_arr)  # (N, 2, 2)
+            # Replace non-finite rows with field-centre fallback
+            bad_J = ~np.all(np.isfinite(J_all), axis=(-2, -1))
+            if bad_J.any():
+                J_fb = plane_project_jacobian(
+                    np.full(bad_J.sum(), ref_ra), np.full(bad_J.sum(), ref_dec),
+                    np.full(bad_J.sum(), ra0_field), np.full(bad_J.sum(), dec0_field),
+                    np.full(bad_J.sum(), pscale))
+                J_all[bad_J] = J_fb
 
-                # Parallax factors at this image epoch (same formula as BP3M solver.py)
-                tele_xyz_a = _tele_xyz_cache.get(da['sname'], np.array([0., 0., 0.]))
-                plx_ra_a, plx_dec_a = get_parallax_factors(ref_ra, ref_dec, tele_xyz_a)
+            tele_xyz_T = np.array([_tele_xyz_cache.get(s, _ZERO3)
+                                    for s in snames]).T            # (3, N)
+            plx_ra_all, plx_dec_all = get_parallax_factors(ref_ra, ref_dec, tele_xyz_T)
 
-                # Design matrix row: H_j = J_j @ U_j  (U_j from bp3m.astro_utils)
-                M_a = build_U_matrix(dt_a, float(plx_ra_a), float(plx_dec_a))
-                H_stack[2*a:2*a+2] = J_j @ M_a   # (2, 5) pix/mas
+            U_all = np.zeros((N, 2, 5))
+            U_all[:, 0, 0] = 1.;  U_all[:, 1, 1] = 1.
+            U_all[:, 0, 2] = dt_arr;  U_all[:, 1, 3] = dt_arr
+            U_all[:, 0, 4] = plx_ra_all;  U_all[:, 1, 4] = plx_dec_all
+            H_stack = np.einsum('nij,njk->nik', J_all, U_all).reshape(2*N, 5)
 
-                cs_a = da['cs']   # stored for vectorised C_r block below
+            # Diagonal C_hst blocks: J_trans @ (alpha² C_hst) @ J_trans.T  (N, 2, 2)
+            sig_x   = np.sqrt(np.maximum(cov_xx, 0.))
+            sig_y   = np.sqrt(np.maximum(cov_yy, 0.))
+            denom   = sig_x * sig_y
+            corr    = np.where(denom > 0,
+                               np.clip(cov_xy / denom, -0.9999, 0.9999), 0.)
+            sxsy    = sig_x * sig_y * corr
+            C_hst_all        = np.zeros((N, 2, 2))
+            C_hst_all[:, 0, 0] = sig_x**2
+            C_hst_all[:, 1, 1] = sig_y**2
+            C_hst_all[:, 0, 1] = sxsy
+            C_hst_all[:, 1, 0] = sxsy
 
-                # Diagonal: HST photon noise (pix²) propagated through J_trans
-                cov_xx, cov_yy, cov_xy = da['cov_xx_raw'], da['cov_yy_raw'], da['cov_xy_raw']
-                alpha_a = da['alpha']
-                sig_x = np.sqrt(max(cov_xx, 0.))
-                sig_y = np.sqrt(max(cov_yy, 0.))
-                denom = sig_x * sig_y
-                corr  = float(np.clip(cov_xy / denom if denom > 0 else 0.,
-                                      -0.9999, 0.9999))
-                C_hst  = hst_position_cov(sig_x, sig_y, corr)
-                r_blk_a = r_hat_arr[da['cs']:da['cs'] + n_r]
-                J_trans_a = compute_poly_jacobian(
-                    r_blk_a,
-                    np.array([da['x_c']]),
-                    np.array([da['y_c']]),
-                    poly_order,
-                )[0]   # (2, 2) sky pix / GDC pix
-                Big_C[2*a:2*a+2, 2*a:2*a+2] += J_trans_a @ (alpha_a**2 * C_hst) @ J_trans_a.T
+            r_blk_all = r_hat_arr[cs_arr[:, None] + np.arange(n_r)]  # (N, n_r)
+            if poly_order == 1:
+                J_trans_all = np.zeros((N, 2, 2))
+                J_trans_all[:, 0, 0] = r_blk_all[:, 0]   # a
+                J_trans_all[:, 0, 1] = r_blk_all[:, 1]   # b
+                J_trans_all[:, 1, 0] = r_blk_all[:, 2]   # c
+                J_trans_all[:, 1, 1] = r_blk_all[:, 3]   # d
+            else:
+                J_trans_all = np.array([
+                    compute_poly_jacobian(r_blk_all[a],
+                                          np.array([x_c_arr[a]]),
+                                          np.array([y_c_arr[a]]), poly_order)[0]
+                    for a in range(N)
+                ])
 
-            # ── Vectorised C_r contribution: X_flat @ C_r_sub @ X_flat.T ──────
-            # Replaces the O(N²) inner Python loop with one BLAS DGEMM call.
-            cs_arr  = np.array([da['cs']    for da in ddata])       # (N,)
-            X_arr   = np.array([da['X_mat'] for da in ddata])       # (N, 2, n_r)
-            row_idx = np.concatenate([np.arange(cs, cs + n_r) for cs in cs_arr])
-            C_r_sub = C_r[np.ix_(row_idx, row_idx)]                 # (N*n_r, N*n_r)
-            X_flat  = np.zeros((2 * N, N * n_r))
+            alpha2       = (alpha_arr ** 2)[:, None, None]
+            diag_blocks  = np.einsum('nij,njk,nlk->nil',
+                                     J_trans_all, alpha2 * C_hst_all, J_trans_all)
+
+            # X_mat array: for poly_order=1 reconstruct from x_c/y_c (no alloc in loop)
+            if poly_order == 1:
+                X_arr = np.zeros((N, 2, n_r))
+                X_arr[:, 0, 0] = x_c_arr;  X_arr[:, 0, 1] = y_c_arr;  X_arr[:, 0, 4] = 1.
+                X_arr[:, 1, 2] = x_c_arr;  X_arr[:, 1, 3] = y_c_arr;  X_arr[:, 1, 5] = 1.
+            else:
+                X_arr = np.array([da['X_mat'] for da in ddata])  # (N, 2, n_r)
+
+            # ── Assemble Big_C ────────────────────────────────────────────────
+            Big_C = np.zeros((2 * N, 2 * N))
+
+            # Diagonal C_hst blocks via advanced indexing (no Python loop)
+            a_idx = np.arange(N)
+            for i in range(2):
+                for j in range(2):
+                    Big_C[2*a_idx + i, 2*a_idx + j] += diag_blocks[:, i, j]
+
+            # C_r contribution: X_flat @ C_r_sub @ X_flat.T  (one BLAS call)
+            row_idx      = cs_arr[:, None] + np.arange(n_r)        # (N, n_r)
+            row_idx_flat = row_idx.ravel()
+            C_r_sub      = C_r[np.ix_(row_idx_flat, row_idx_flat)] # (N*n_r, N*n_r)
+            X_flat       = np.zeros((2 * N, N * n_r))
             for a in range(N):
                 X_flat[2*a:2*a+2, a*n_r:(a+1)*n_r] = X_arr[a]
-            Big_C  += X_flat @ C_r_sub @ X_flat.T
+            Big_C += X_flat @ C_r_sub @ X_flat.T
 
             # Prior information matrix in mas⁻²
             # Gaia 5p/6p: no diffuse prior — use Gaia covariance only.
