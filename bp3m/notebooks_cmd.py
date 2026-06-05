@@ -40,6 +40,29 @@ def _configure_notebook(nb: dict, output_dir: Path, field: str) -> dict:
     return nb
 
 
+def _current_kernel_name() -> str:
+    """Return the Jupyter kernel name for the running Python, registering it if needed."""
+    import subprocess
+    kernel_name = Path(sys.executable).parent.parent.name  # e.g. 'bp3m_env'
+    # Check if already registered
+    result = subprocess.run(
+        [sys.executable, '-m', 'jupyter', 'kernelspec', 'list', '--json'],
+        capture_output=True, text=True)
+    try:
+        import json as _json
+        specs = _json.loads(result.stdout).get('kernelspecs', {})
+    except Exception:
+        specs = {}
+    if kernel_name not in specs:
+        # Register the current environment as a kernel
+        subprocess.run(
+            [sys.executable, '-m', 'ipykernel', 'install',
+             '--user', '--name', kernel_name, '--display-name', kernel_name],
+            check=True, capture_output=True)
+        print(f"    Registered kernel '{kernel_name}' for this environment.")
+    return kernel_name
+
+
 def _execute_notebook(nb_path: Path) -> bool:
     """Execute a notebook in-place. Returns True on success."""
     try:
@@ -51,8 +74,9 @@ def _execute_notebook(nb_path: Path) -> bool:
         return False
 
     try:
+        kernel_name = _current_kernel_name()
         nb = nbformat.read(nb_path, as_version=4)
-        ep = ExecutePreprocessor(timeout=1800, kernel_name='python3')
+        ep = ExecutePreprocessor(timeout=1800, kernel_name=kernel_name)
         ep.preprocess(nb, {'metadata': {'path': str(nb_path.parent)}})
         nbformat.write(nb, nb_path)
         return True
