@@ -1419,11 +1419,12 @@ def _within_filter_match(
         _ZP_MIN_MASTER = 500   # master sources required
         _ZP_MIN_IMG    = 50    # star candidates required in current image
         _ZP_MIN_INLIER = 30    # mode-inliers required
-        # When pre-ZP from magnitude_zp_offsets.csv was applied, mag_zp values
-        # are already on a common scale from reliable Gaia-matched sources.
-        # Cap residual Phase 3 corrections to ±0.15 mag to suppress spurious
-        # large ZPs from false positional matches across long time baselines.
-        _ZP_MAX_CORR   = 0.15 if pre_zp_applied else 1.0
+        # Phase 3 ZP estimation is kept for diagnostics but never applied.
+        # The pre-ZP from magnitude_zp_offsets.csv (computed from reliable
+        # Gaia-matched sources) is the authoritative inter-image calibration.
+        # Positional matching over long time baselines in dense fields produces
+        # spurious large ZPs from false matches that corrupt the master catalog.
+        _ZP_MAX_CORR   = 0.0
 
         for sub_name in remaining:
             cur_mask = fdf['sub_name'].values == sub_name
