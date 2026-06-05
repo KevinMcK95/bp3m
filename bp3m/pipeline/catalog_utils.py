@@ -123,6 +123,10 @@ def build_gaia_cov(df):
     pmdec_e = _get('pmdec_error',     1e3)
     plx_e   = _get('parallax_error',  1e3)
 
+    # Stars with formal PM error > 100 mas/yr have unreliable Gaia astrometry
+    pmra_e  = np.where(pmra_e  > 100, np.nan, pmra_e)
+    pmdec_e = np.where(pmdec_e > 100, np.nan, pmdec_e)
+
     sigmas = np.stack([ra_e, dec_e, pmra_e, pmdec_e, plx_e], axis=1)  # (N, 5)
 
     corr = np.zeros((n, 5, 5))
