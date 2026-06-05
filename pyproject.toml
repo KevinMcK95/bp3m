@@ -23,6 +23,7 @@ dependencies = [
     "jaxlib",
     "nbconvert",
     "ipykernel",
+    "jupyter",
 ]
 classifiers = [
     "License :: OSI Approved :: MIT License",
