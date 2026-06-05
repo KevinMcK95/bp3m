@@ -43,7 +43,7 @@ def _ensure_py1pass():
 
 # ── Default PSF-fitting parameters (user-confirmed for HST FLC images) ──────
 _HST_DEFAULTS = dict(
-    fmin_thresh=70.0,
+    fmin_thresh=40.0,
     hmin=4,
     n_passes=2,
     n_discovery_passes=1,
