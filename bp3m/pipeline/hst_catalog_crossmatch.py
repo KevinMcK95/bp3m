@@ -490,7 +490,9 @@ def _load_all_detections(field_dir: Path,
     per_image_dfs = [df for df in img_dfs if df is not None]
     if not per_image_dfs:
         return None
-    return pd.concat(per_image_dfs, ignore_index=True)
+    result = pd.concat(per_image_dfs, ignore_index=True)
+    result.attrs['pre_zp_applied'] = _apply_pre_zp
+    return result
 
 
 def _infer_poly_order(n_r: int) -> int:
@@ -1255,6 +1257,7 @@ def _within_filter_match(
     mag_outlier_sigma: float = 5.0,
     mag_outlier_floor: float = 0.5,
     nonstar_mag_relax: float = 1.5,
+    pre_zp_applied: bool  = False,
 ) -> dict[str, pd.DataFrame]:
     """
     Build a per-filter master catalog by iteratively matching sources across
@@ -1416,7 +1419,11 @@ def _within_filter_match(
         _ZP_MIN_MASTER = 500   # master sources required
         _ZP_MIN_IMG    = 50    # star candidates required in current image
         _ZP_MIN_INLIER = 30    # mode-inliers required
-        _ZP_MAX_CORR   = 1.0
+        # When pre-ZP from magnitude_zp_offsets.csv was applied, mag_zp values
+        # are already on a common scale from reliable Gaia-matched sources.
+        # Cap residual Phase 3 corrections to ±0.15 mag to suppress spurious
+        # large ZPs from false positional matches across long time baselines.
+        _ZP_MAX_CORR   = 0.15 if pre_zp_applied else 1.0
 
         for sub_name in remaining:
             cur_mask = fdf['sub_name'].values == sub_name
@@ -3474,6 +3481,7 @@ def run_hst_crossmatch(
         mag_n_sigma=mag_n_sigma,
         mag_floor=mag_floor,
         min_detections=min_detections,
+        pre_zp_applied=det_df.attrs.get('pre_zp_applied', False),
     )
     for filt, master_df in filter_masters.items():
         out_path = output_dir / f'master_{filt}.csv'
