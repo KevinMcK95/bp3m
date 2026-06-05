@@ -108,7 +108,20 @@ bp3m-v2 --name "Leo I" --output_dir ./outputs
 - `hst_xmatch/master_combined_v2.csv` — the master HST cross-match catalogue used as input to v2 BP3M
 - `hst_xmatch/master_combined.csv` — cross-filter merged HST source catalogue
 
-## A note on systematics
+## Important caveats
+
+### PM correlations between stars
+
+The marginalised proper motion columns (`pmra_bp3m`, `pmdec_bp3m` etc.) account for uncertainty in the HST-Gaia image alignment, but this comes at a cost: because all stars share the same alignment solution, their proper motions are **correlated with each other**. The magnitude of this correlation depends on how many stars constrain each image transformation and how many images a star appears in.
+
+There are two sets of PM columns in `stellar_astrometry.csv`:
+
+- **`pmra_bp3m_cond` / `sigma_pmra_bp3m_cond`** — conditional (MAP alignment fixed). Stars are **uncorrelated** at fixed alignment. Use these for per-star analyses where each star is treated independently (e.g. membership probabilities).
+- **`pmra_bp3m` / `sigma_pmra_bp3m`** — marginalised over the alignment posterior. These are conservative single-star uncertainties but stars are **correlated**. Use these for comparisons with Gaia or literature.
+
+For population statistics (mean PM, velocity dispersion), neither set is strictly correct on its own. The most rigorous approach is to draw joint samples from the alignment posterior and propagate to your science quantity — see `notebooks/06_alignment_posterior.ipynb` for a worked example.
+
+### Cross-telescope systematics
 
 Combining astrometry between two telescopes (HST and Gaia) with different passbands, pixel scales, and epochs can introduce complicated systematic errors that affect the final proper motion catalogue. Common sources of systematics include:
 
