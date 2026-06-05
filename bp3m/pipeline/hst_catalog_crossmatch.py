@@ -2503,18 +2503,16 @@ def _measure_astrometry_proper(
     img_idx_lookup: dict[str, int] = {name: i for i, name in enumerate(image_names)}
 
     _t = time.perf_counter()
-    # Gaia lookup: source_id (int) → Series
-    # Use int() directly on int64 values — never via float() to avoid precision loss
-    # on large 64-bit Gaia source IDs.
-    gaia_lookup: dict[int, pd.Series] = {}
+    # Gaia lookup: source_id (int64) → row dict.
+    # iterrows() recasts int64 source IDs to float64, silently rounding large IDs.
+    # Use to_numpy(np.int64) for IDs and to_dict('records') for row data instead.
+    gaia_lookup: dict[int, dict] = {}
     if gaia_df is not None and 'source_id' in gaia_df.columns:
-        for _, gr in gaia_df.iterrows():
-            try:
-                sid = gr['source_id']
-                # Avoid float() conversion which loses int64 precision
-                gaia_lookup[int(np.int64(sid))] = gr
-            except (ValueError, TypeError, OverflowError):
-                pass
+        _gaia_ids  = gaia_df['source_id'].to_numpy(dtype=np.int64, na_value=0)
+        _gaia_rows = gaia_df.to_dict('records')
+        for sid, row in zip(_gaia_ids, _gaia_rows):
+            if sid != 0:
+                gaia_lookup[int(sid)] = row
     print(f"  [phase4] gaia_lookup:      {time.perf_counter()-_t:.2f}s  "
           f"({len(gaia_lookup)} Gaia entries)")
 
@@ -2556,15 +2554,15 @@ def _measure_astrometry_proper(
     # rename to match closure usage below
     _tele_xyz_cache = tele_xyz_cache
 
-    # Pre-extract gaia_source_id to avoid N combined_df.loc[] calls
+    # Pre-extract gaia_source_id to avoid N combined_df.loc[] calls.
+    # Use to_numpy(int64) — Series.items() may yield float64 for nullable columns,
+    # silently rounding large Gaia source IDs.
     _t = time.perf_counter()
     _src_gaia_ids: dict = {}
     if 'gaia_source_id' in combined_df.columns:
-        for _row_i, _val in combined_df['gaia_source_id'].items():
-            try:
-                _src_gaia_ids[_row_i] = int(np.int64(_val))
-            except (ValueError, TypeError, OverflowError):
-                _src_gaia_ids[_row_i] = 0
+        _ids = combined_df['gaia_source_id'].to_numpy(dtype=np.int64, na_value=0)
+        for _row_i, _sid in zip(combined_df.index, _ids):
+            _src_gaia_ids[_row_i] = int(_sid)
     print(f"  [phase4] src_gaia_ids:     {time.perf_counter()-_t:.2f}s")
 
     _ZERO3 = np.zeros(3)   # fallback telescope position
