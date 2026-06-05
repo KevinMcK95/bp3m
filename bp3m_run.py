@@ -135,14 +135,19 @@ def _parse_args():
                      help='Library directory containing STDPSFs/ and STDGDCs/ '
                           'subdirectories. Defaults to the path set by bp3m-setup '
                           f'(currently: {_lib_default})')
+    psf.add_argument('--fmin', type=float, default=None,
+                     help='Directly set the pypass flux detection threshold in electrons. '
+                          'Overrides both --mag_st_max and --fmin_thresh when given.')
     psf.add_argument('--fmin_thresh', type=float, default=None,
                      help='Hard lower bound on the minimum source flux in electrons '
                           '(default 40). Acts as a floor: fmin will never go below '
-                          'this value even when mag_st_max would imply a lower threshold.')
+                          'this value even when mag_st_max would imply a lower threshold. '
+                          'Ignored if --fmin is given.')
     psf.add_argument('--mag_st_max', type=float, default=None,
                      help='Faint ST-magnitude limit used to set the detection threshold '
                           '(default 28). Converted to a flux threshold per image using '
-                          'PHOTFLAM and EXPTIME; floored at fmin_thresh.')
+                          'PHOTFLAM and EXPTIME; floored at fmin_thresh. '
+                          'Ignored if --fmin is given.')
     psf.add_argument('--hmin', type=int, default=None,
                      help='NMS radius in pixels (default 4)')
     psf.add_argument('--n_passes', type=int, default=None,
@@ -601,7 +606,7 @@ def main():
             force_refit=args.force_refit_psf,
             clean_psf=args.clean_psf,
             n_psf_iter=args.n_psf_iter,
-            fmin_thresh=args.fmin_thresh, mag_st_max=args.mag_st_max, hmin=args.hmin,
+            fmin=args.fmin, fmin_thresh=args.fmin_thresh, mag_st_max=args.mag_st_max, hmin=args.hmin,
             n_passes=args.n_passes, n_discovery_passes=args.n_discovery_passes,
             max_iter_fit=args.psf_max_iter,
             sat_threshold=args.sat_threshold, conc_limit=args.conc_limit,

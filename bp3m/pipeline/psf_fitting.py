@@ -1206,6 +1206,7 @@ def run_psf_fitting(
     restrict_to_obsids: list[str] | None = None,
     psf_dir: Path | None = None,
     # py1pass parameter overrides
+    fmin: float | None = None,
     fmin_thresh: float | None = None,
     mag_st_max: float | None = None,
     hmin: int | None = None,
@@ -1291,10 +1292,16 @@ def run_psf_fitting(
 
     # Build parameter dict from defaults + any overrides.
     params = dict(_HST_DEFAULTS)
-    if fmin_thresh is not None:
-        params['fmin_thresh'] = fmin_thresh
-    if mag_st_max is not None:
-        params['mag_st_max'] = mag_st_max
+    if fmin is not None:
+        # fmin directly sets the pypass flux threshold, overriding both
+        # mag_st_max (set to 99 so fmin_from_mag ≈ 0) and fmin_thresh.
+        params['fmin_thresh'] = fmin
+        params['mag_st_max']  = 99.0
+    else:
+        if fmin_thresh is not None:
+            params['fmin_thresh'] = fmin_thresh
+        if mag_st_max is not None:
+            params['mag_st_max'] = mag_st_max
 
     for key, val in [('hmin', hmin), ('n_passes', n_passes),
                       ('n_discovery_passes', n_discovery_passes),
@@ -1367,9 +1374,13 @@ def run_psf_fitting(
         print("  All catalogs up to date.")
         return [img.parent / f"{img.stem}_catalog.fits" for img in images]
 
-    _mag_str   = f"--mag_st_max {params['mag_st_max']}" if 'mag_st_max' in params \
-                 else "--mag_st_max 28.0  (default)"
-    _thresh_str = f"--fmin_thresh {params['fmin_thresh']}"
+    if fmin is not None:
+        _mag_str    = f"--fmin {fmin}  (overrides mag_st_max and fmin_thresh)"
+        _thresh_str = ""
+    else:
+        _mag_str    = f"--mag_st_max {params['mag_st_max']}" if 'mag_st_max' in params \
+                      else "--mag_st_max 28.0  (default)"
+        _thresh_str = f"--fmin_thresh {params['fmin_thresh']}"
     _cmd = (
         f"pypass --image <img> --lib_dir {lib_dir}"
         f" --n_passes {params['n_passes']}"
