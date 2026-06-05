@@ -276,9 +276,9 @@ def _load_all_detections(field_dir: Path,
             zp_legacy[img_name] = zp_val
         if zp_legacy:
             _apply_pre_zp = True
-            n_zp = sum(1 for v in zp_legacy.values() if abs(v) > 0.005)
+            n_zp = sum(1 for v in zp_legacy.values() if abs(v) > 0.2)
             print(f"  Pre-ZP from magnitude_zp_offsets.csv: {len(zp_legacy)} images, "
-                  f"{n_zp} with |ZP| > 0.005 mag")
+                  f"{n_zp} with |ZP| > 0.2 mag")
 
     # Load alpha (chi2 inflation) factors per sub-image from image_transformations.csv
     # alpha^2 inflates HST position covariances to account for systematic residuals
