@@ -14,14 +14,13 @@ For each refinement cycle (default 1):
 
 Usage
 -----
-    bp3m-v2 --output_dir ./outputs --field Leo_I
+    bp3m-v2 --name "Leo I"
 
     # Skip the initial crossmatch (already done):
-    bp3m-v2 --output_dir ./outputs --field Leo_I --skip_initial_crossmatch
+    bp3m-v2 --name "Leo I" --skip_initial_crossmatch
 
     # Skip both the initial crossmatch and the first v2 BP3M (already done):
-    bp3m-v2 --output_dir ./outputs --field Leo_I \\
-        --skip_initial_crossmatch --start_cycle 2
+    bp3m-v2 --name "Leo I" --skip_initial_crossmatch --start_cycle 2
 """
 
 from __future__ import annotations
@@ -39,10 +38,11 @@ def main():
     )
 
     # ── Field ──────────────────────────────────────────────────────────────────
-    parser.add_argument('--output_dir', required=True,
-                        help='Root directory containing the field subdirectory')
-    parser.add_argument('--field', required=True,
-                        help='Field name (subdirectory of output_dir)')
+    parser.add_argument('--name', required=True,
+                        help='Target name — must match the field directory created by bp3m '
+                             '(spaces are replaced with underscores, e.g. "Leo I" → Leo_I)')
+    parser.add_argument('--output_dir', type=str, default='.',
+                        help='Root output directory (default: current directory)')
 
     # ── Iteration control ──────────────────────────────────────────────────────
     parser.add_argument('--n_refine', type=int, default=1,
@@ -110,10 +110,12 @@ def main():
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser()
-    field_dir  = output_dir / args.field
+    field      = args.name.replace(' ', '_')
+    field_dir  = output_dir / field
 
     if not field_dir.exists():
         print(f"Error: field directory not found: {field_dir}")
+        print(f"  (looked for '{field}' — make sure --name matches what bp3m used)")
         sys.exit(1)
 
     from bp3m.pipeline.hst_catalog_crossmatch import run_hst_crossmatch
@@ -139,7 +141,7 @@ def main():
 
     bp3m_kwargs = dict(
         output_dir           = output_dir,
-        field_name           = args.field,
+        field_name           = field,
         n_iter               = args.n_iter,
         n_samples            = args.n_samples,
         clip_sigma           = args.clip_sigma,
@@ -194,8 +196,9 @@ def main():
                            cycle_id=cycle)
 
     print(f"\n{'#'*60}")
-    print(f"# Done.  Results in {bp3m_v2_dir}")
-    print(f"#        Catalog  in {xmatch_dir / 'master_combined_v2.csv'}")
+    print(f"# Done.")
+    print(f"#   Results: {bp3m_v2_dir}")
+    print(f"#   Catalog: {xmatch_dir / 'master_combined_v2.csv'}")
     print(f"{'#'*60}")
 
 
