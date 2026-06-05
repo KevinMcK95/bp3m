@@ -40,6 +40,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -2480,13 +2482,21 @@ def _measure_astrometry_proper(
 
     Returns a DataFrame indexed like combined_df.
     """
+    _t0_phase = time.perf_counter()
+    print(f"  [phase4] setup: {len(combined_df)} sources, "
+          f"{len(det_df)} detections, {len(image_names)} sub-images")
+
     # ── Pre-build lookups ─────────────────────────────────────────────────────
+    _t = time.perf_counter()
     det_lookup: dict[tuple[str, int], dict] = {}
     for _, drow in det_df.iterrows():
         det_lookup[(str(drow['sub_name']), int(drow['catalog_index']))] = drow.to_dict()
+    print(f"  [phase4] det_lookup:       {time.perf_counter()-_t:.2f}s  "
+          f"({len(det_lookup)} entries)")
 
     img_idx_lookup: dict[str, int] = {name: i for i, name in enumerate(image_names)}
 
+    _t = time.perf_counter()
     # Gaia lookup: source_id (int) → Series
     # Use int() directly on int64 values — never via float() to avoid precision loss
     # on large 64-bit Gaia source IDs.
@@ -2499,8 +2509,12 @@ def _measure_astrometry_proper(
                 gaia_lookup[int(np.int64(sid))] = gr
             except (ValueError, TypeError, OverflowError):
                 pass
+    print(f"  [phase4] gaia_lookup:      {time.perf_counter()-_t:.2f}s  "
+          f"({len(gaia_lookup)} Gaia entries)")
 
+    _t = time.perf_counter()
     src_detections = _parse_hst_indices_columns(combined_df)
+    print(f"  [phase4] src_detections:   {time.perf_counter()-_t:.2f}s")
 
     # MAS_PER_DEG constant (3.6e6 mas / degree)
     _MAS_PER_DEG = 3.6e6
@@ -2509,6 +2523,7 @@ def _measure_astrometry_proper(
     # get_tele_position is an astropy ephemeris call — expensive per invocation,
     # so we cache tele_xyz keyed by sub_name.  Many sources share the same image,
     # so this reduces N_images ephemeris calls instead of N_sources × N_detections.
+    _t = time.perf_counter()
     _img_mjd: dict[str, float] = {}
     for _, drow in det_df.iterrows():
         sname_d = str(drow['sub_name'])
@@ -2522,8 +2537,11 @@ def _measure_astrometry_proper(
                 AstropyTime(mjd_d, format='mjd'), curr_id='earth')
         except Exception:
             _tele_xyz_cache[sname_d] = np.array([0., 0., 0.])
+    print(f"  [phase4] tele_xyz_cache:   {time.perf_counter()-_t:.2f}s  "
+          f"({len(_tele_xyz_cache)} images)")
 
-    # Fix 1: pre-extract gaia_source_id to avoid 176k combined_df.loc[] calls
+    # Fix 1: pre-extract gaia_source_id to avoid N combined_df.loc[] calls
+    _t = time.perf_counter()
     _src_gaia_ids: dict = {}
     if 'gaia_source_id' in combined_df.columns:
         for _row_i, _val in combined_df['gaia_source_id'].items():
@@ -2531,6 +2549,7 @@ def _measure_astrometry_proper(
                 _src_gaia_ids[_row_i] = int(np.int64(_val))
             except (ValueError, TypeError, OverflowError):
                 _src_gaia_ids[_row_i] = 0
+    print(f"  [phase4] src_gaia_ids:     {time.perf_counter()-_t:.2f}s")
 
     _ZERO3 = np.zeros(3)   # fallback telescope position
 
@@ -2934,20 +2953,56 @@ def _measure_astrometry_proper(
 
     # ── Parallel dispatch (threads release GIL during LAPACK calls) ──────────
     all_indices = list(combined_df.index)
-    n_workers = min(8, os.cpu_count() or 1)
-    if n_workers > 1 and len(all_indices) >= 200:
-        chunk_size = max(1, len(all_indices) // n_workers)
+    n_total     = len(all_indices)
+    n_workers   = min(8, os.cpu_count() or 1)
+
+    print(f"  [phase4] dispatching {n_total} sources across {n_workers} threads ...")
+    _t_dispatch = time.perf_counter()
+
+    # Thread-safe progress counter
+    _progress_lock   = threading.Lock()
+    _progress_done   = [0]
+    _report_interval = max(1, n_total // 20)   # report every ~5%
+
+    def _report_progress(n_just_done: int) -> None:
+        with _progress_lock:
+            _progress_done[0] += n_just_done
+            done = _progress_done[0]
+            if done % _report_interval < n_just_done or done == n_total:
+                elapsed = time.perf_counter() - _t_dispatch
+                rate    = done / elapsed if elapsed > 0 else 0.0
+                eta     = (n_total - done) / rate if rate > 0 else float('inf')
+                print(f"  [phase4]   {done:>7}/{n_total}  "
+                      f"({100*done/n_total:.0f}%)  "
+                      f"{rate:.0f} src/s  "
+                      f"ETA {eta:.0f}s", flush=True)
+
+    if n_workers > 1 and n_total >= 200:
+        chunk_size = max(1, n_total // n_workers)
         chunks = [all_indices[i:i + chunk_size]
-                  for i in range(0, len(all_indices), chunk_size)]
+                  for i in range(0, n_total, chunk_size)]
 
         def _process_chunk(chunk_indices: list) -> list[dict]:
-            return [_fit_one_source(row_i) for row_i in chunk_indices]
+            _t_chunk = time.perf_counter()
+            results  = [_fit_one_source(row_i) for row_i in chunk_indices]
+            _report_progress(len(chunk_indices))
+            return results
 
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             results = list(executor.map(_process_chunk, chunks))
         out_rows = [r for chunk in results for r in chunk]
     else:
-        out_rows = [_fit_one_source(row_i) for row_i in all_indices]
+        out_rows = []
+        for row_i in all_indices:
+            out_rows.append(_fit_one_source(row_i))
+            _report_progress(1)
+
+    elapsed_total = time.perf_counter() - _t_dispatch
+    rate_total    = n_total / elapsed_total if elapsed_total > 0 else 0.0
+    print(f"  [phase4] fit done: {elapsed_total:.1f}s total  "
+          f"({rate_total:.0f} src/s avg)")
+    print(f"  [phase4] total phase time: "
+          f"{time.perf_counter() - _t0_phase:.1f}s")
 
     return pd.DataFrame(out_rows, index=combined_df.index)
 
