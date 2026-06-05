@@ -2352,7 +2352,7 @@ def _build_gaia_cov5(row: pd.Series) -> tuple:
     and is_full_astrometry is True for 5p/6p sources (False for 2p).
     """
     for c in ['ra_error', 'dec_error']:
-        if c not in row.index or not np.isfinite(float(row[c])):
+        if c not in row or not np.isfinite(float(row[c])):
             return None, False
 
     ra_e   = float(row.get('ra_error',  np.nan))   # mas
