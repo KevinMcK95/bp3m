@@ -2705,12 +2705,7 @@ def _measure_astrometry_proper(
                 M_a = build_U_matrix(dt_a, float(plx_ra_a), float(plx_dec_a))
                 H_stack[2*a:2*a+2] = J_j @ M_a   # (2, 5) pix/mas
 
-                # C_r contribution (all pairs a, b)
-                cs_a, Xa = da['cs'], da['X_mat']
-                for b_idx, db in enumerate(ddata):
-                    cs_b, Xb    = db['cs'], db['X_mat']
-                    C_r_blk     = C_r[cs_a:cs_a + n_r, cs_b:cs_b + n_r]
-                    Big_C[2*a:2*a+2, 2*b_idx:2*b_idx+2] += Xa @ C_r_blk @ Xb.T
+                cs_a = da['cs']   # stored for vectorised C_r block below
 
                 # Diagonal: HST photon noise (pix²) propagated through J_trans
                 cov_xx, cov_yy, cov_xy = da['cov_xx_raw'], da['cov_yy_raw'], da['cov_xy_raw']
@@ -2729,6 +2724,17 @@ def _measure_astrometry_proper(
                     poly_order,
                 )[0]   # (2, 2) sky pix / GDC pix
                 Big_C[2*a:2*a+2, 2*a:2*a+2] += J_trans_a @ (alpha_a**2 * C_hst) @ J_trans_a.T
+
+            # ── Vectorised C_r contribution: X_flat @ C_r_sub @ X_flat.T ──────
+            # Replaces the O(N²) inner Python loop with one BLAS DGEMM call.
+            cs_arr  = np.array([da['cs']    for da in ddata])       # (N,)
+            X_arr   = np.array([da['X_mat'] for da in ddata])       # (N, 2, n_r)
+            row_idx = np.concatenate([np.arange(cs, cs + n_r) for cs in cs_arr])
+            C_r_sub = C_r[np.ix_(row_idx, row_idx)]                 # (N*n_r, N*n_r)
+            X_flat  = np.zeros((2 * N, N * n_r))
+            for a in range(N):
+                X_flat[2*a:2*a+2, a*n_r:(a+1)*n_r] = X_arr[a]
+            Big_C  += X_flat @ C_r_sub @ X_flat.T
 
             # Prior information matrix in mas⁻²
             # Gaia 5p/6p: no diffuse prior — use Gaia covariance only.
