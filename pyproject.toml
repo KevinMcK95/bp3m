@@ -21,6 +21,7 @@ dependencies = [
     "joblib",
     "jax",
     "jaxlib",
+    "nbconvert",
 ]
 classifiers = [
     "License :: OSI Approved :: MIT License",
