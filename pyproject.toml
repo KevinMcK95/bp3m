@@ -15,7 +15,6 @@ dependencies = [
     "scipy",
     "astropy",
     "astroquery",
-    "pymc",
     "matplotlib",
     "tqdm",
     "pandas",
@@ -45,6 +44,7 @@ dev = ["pytest", "pytest-cov"]
 [project.scripts]
 bp3m = "bp3m_run:main"
 bp3m-v2 = "bp3m.pipeline.run_iterate_v2:main"
+bp3m-notebooks = "bp3m.notebooks_cmd:main"
 bp3m-setup = "bp3m.setup:main"
 
 [tool.setuptools]
@@ -52,6 +52,9 @@ py-modules = ["bp3m_run"]
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools.package-data]
+"bp3m.notebooks" = ["*.ipynb"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

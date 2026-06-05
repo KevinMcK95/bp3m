@@ -8,13 +8,12 @@ dependencies:
   - scipy
   - astropy
   - astroquery
-  - pymc
   - matplotlib
   - tqdm
   - pandas
   - joblib
+  - jax
+  - jaxlib
   - pip
   - pip:
-    - pypass @ git+https://github.com/kevinmckinnon/pypass
-    - gaia_cross_match @ git+https://github.com/kevinmckinnon/gaia_cross_match
-    - -e .
+    - bp3m

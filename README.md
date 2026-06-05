@@ -12,12 +12,11 @@ bp3m implements and extends the Bayesian proper motion method of McKinnon et al.
 pip install bp3m
 ```
 
-For the full environment including PyMC (required for the Bayesian solver):
+For a full conda environment:
 
 ```bash
 conda env create -f environment.yml
 conda activate bp3m
-pip install bp3m
 ```
 
 bp3m bundles [pypass](pypass/README.md) (PSF-fitting photometry) and [gaia_cross_match](gaia_cross_match/README.md) (Gaia cross-matching) as internal packages — no separate installs are needed.
