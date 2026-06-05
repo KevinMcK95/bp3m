@@ -2457,6 +2457,8 @@ def _measure_astrometry_proper(
     gaia_df: Optional[pd.DataFrame] = None,
     outlier_sigma: float = 5.0,
     min_hst_epochs: int = 2,
+    _det_lookup: Optional[dict] = None,
+    _tele_xyz_cache: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Measure proper astrometry for each source by solving the linearised
@@ -2487,12 +2489,16 @@ def _measure_astrometry_proper(
           f"{len(det_df)} detections, {len(image_names)} sub-images")
 
     # ── Pre-build lookups ─────────────────────────────────────────────────────
-    _t = time.perf_counter()
-    det_lookup: dict[tuple[str, int], dict] = {}
-    for _, drow in det_df.iterrows():
-        det_lookup[(str(drow['sub_name']), int(drow['catalog_index']))] = drow.to_dict()
-    print(f"  [phase4] det_lookup:       {time.perf_counter()-_t:.2f}s  "
-          f"({len(det_lookup)} entries)")
+    if _det_lookup is not None:
+        det_lookup = _det_lookup
+        print(f"  [phase4] det_lookup:       reused ({len(det_lookup)} entries)")
+    else:
+        _t = time.perf_counter()
+        det_lookup = {}
+        for row in det_df.to_dict('records'):
+            det_lookup[(str(row['sub_name']), int(row['catalog_index']))] = row
+        print(f"  [phase4] det_lookup:       {time.perf_counter()-_t:.2f}s  "
+              f"({len(det_lookup)} entries)")
 
     img_idx_lookup: dict[str, int] = {name: i for i, name in enumerate(image_names)}
 
@@ -2523,24 +2529,34 @@ def _measure_astrometry_proper(
     # get_tele_position is an astropy ephemeris call — expensive per invocation,
     # so we cache tele_xyz keyed by sub_name.  Many sources share the same image,
     # so this reduces N_images ephemeris calls instead of N_sources × N_detections.
-    _t = time.perf_counter()
-    _img_mjd: dict[str, float] = {}
-    for _, drow in det_df.iterrows():
-        sname_d = str(drow['sub_name'])
-        if sname_d not in _img_mjd:
-            _img_mjd[sname_d] = float(drow['epoch_mjd'])
+    if _tele_xyz_cache is not None:
+        tele_xyz_cache = _tele_xyz_cache
+        print(f"  [phase4] tele_xyz_cache:   reused ({len(tele_xyz_cache)} images)")
+    else:
+        _t = time.perf_counter()
+        _img_mjd: dict[str, float] = {}
+        for row in det_df[['sub_name', 'epoch_mjd']].drop_duplicates('sub_name').to_dict('records'):
+            _img_mjd[str(row['sub_name'])] = float(row['epoch_mjd'])
 
-    _tele_xyz_cache: dict[str, np.ndarray] = {}
-    for sname_d, mjd_d in _img_mjd.items():
-        try:
-            _tele_xyz_cache[sname_d] = get_tele_position(
-                AstropyTime(mjd_d, format='mjd'), curr_id='earth')
-        except Exception:
-            _tele_xyz_cache[sname_d] = np.array([0., 0., 0.])
-    print(f"  [phase4] tele_xyz_cache:   {time.perf_counter()-_t:.2f}s  "
-          f"({len(_tele_xyz_cache)} images)")
+        tele_xyz_cache: dict[str, np.ndarray] = {}
 
-    # Fix 1: pre-extract gaia_source_id to avoid N combined_df.loc[] calls
+        def _fetch_xyz(sname_mjd):
+            sname, mjd = sname_mjd
+            try:
+                return sname, get_tele_position(AstropyTime(mjd, format='mjd'), curr_id='earth')
+            except Exception:
+                return sname, np.zeros(3)
+
+        with ThreadPoolExecutor(max_workers=min(8, len(_img_mjd))) as _pool:
+            for sname, xyz in _pool.map(_fetch_xyz, _img_mjd.items()):
+                tele_xyz_cache[sname] = xyz
+        print(f"  [phase4] tele_xyz_cache:   {time.perf_counter()-_t:.2f}s  "
+              f"({len(tele_xyz_cache)} images)")
+
+    # rename to match closure usage below
+    _tele_xyz_cache = tele_xyz_cache
+
+    # Pre-extract gaia_source_id to avoid N combined_df.loc[] calls
     _t = time.perf_counter()
     _src_gaia_ids: dict = {}
     if 'gaia_source_id' in combined_df.columns:
@@ -3717,20 +3733,50 @@ def run_hst_crossmatch(
             print(f"  {len(combined_df)} sources, {len(image_names4)} sub-images, "
                   f"{n_meta} with per-image transform metadata, poly_order={poly_order4}")
 
+            # Pre-build the expensive lookups once; all subsequent calls reuse them
+            print("  [phase4] pre-building shared lookups ...")
+            _t_pre = time.perf_counter()
+            _shared_det_lookup = {}
+            for _row in det_df.to_dict('records'):
+                _shared_det_lookup[(str(_row['sub_name']), int(_row['catalog_index']))] = _row
+            print(f"  [phase4]   det_lookup built: {time.perf_counter()-_t_pre:.2f}s  "
+                  f"({len(_shared_det_lookup)} entries)")
+
+            _t_pre = time.perf_counter()
+            _img_mjd_pre: dict[str, float] = {}
+            for _row in det_df[['sub_name', 'epoch_mjd']].drop_duplicates('sub_name').to_dict('records'):
+                _img_mjd_pre[str(_row['sub_name'])] = float(_row['epoch_mjd'])
+
+            def _fetch_xyz_pre(sname_mjd):
+                sname, mjd = sname_mjd
+                try:
+                    return sname, get_tele_position(AstropyTime(mjd, format='mjd'), curr_id='earth')
+                except Exception:
+                    return sname, np.zeros(3)
+
+            _shared_tele_xyz: dict[str, np.ndarray] = {}
+            with ThreadPoolExecutor(max_workers=min(8, len(_img_mjd_pre))) as _pool:
+                for _sname, _xyz in _pool.map(_fetch_xyz_pre, _img_mjd_pre.items()):
+                    _shared_tele_xyz[_sname] = _xyz
+            print(f"  [phase4]   tele_xyz built:   {time.perf_counter()-_t_pre:.2f}s  "
+                  f"({len(_shared_tele_xyz)} images)")
+
             astrom_df = _measure_astrometry_proper(
-                combined_df   = combined_df,
-                det_df        = det_df,
-                r_hat_arr     = r_hat4,
-                C_r           = C_r_full,
-                image_names   = image_names4,
-                n_r           = n_r4,
-                poly_order    = poly_order4,
-                ra0_field     = ra0_field,
-                dec0_field    = dec0_field,
-                pscale        = pscale4,
-                sub_img_meta  = sub_img_meta4,
-                gaia_df       = gaia_df,
-                outlier_sigma = phase4_outlier_sigma,
+                combined_df      = combined_df,
+                det_df           = det_df,
+                r_hat_arr        = r_hat4,
+                C_r              = C_r_full,
+                image_names      = image_names4,
+                n_r              = n_r4,
+                poly_order       = poly_order4,
+                ra0_field        = ra0_field,
+                dec0_field       = dec0_field,
+                pscale           = pscale4,
+                sub_img_meta     = sub_img_meta4,
+                gaia_df          = gaia_df,
+                outlier_sigma    = phase4_outlier_sigma,
+                _det_lookup      = _shared_det_lookup,
+                _tele_xyz_cache  = _shared_tele_xyz,
             )
 
             n_good = int(np.isfinite(astrom_df['ra_xmatch']).sum())
@@ -3742,15 +3788,17 @@ def run_hst_crossmatch(
 
             # Stash all Phase 4 ingredients so Phase 5 can re-use them
             _p4 = dict(
-                r_hat      = r_hat4,
-                C_r        = C_r_full,
-                image_names = image_names4,
-                n_r        = n_r4,
-                poly_order = poly_order4,
-                sub_img_meta = sub_img_meta4,
-                ra0_field  = ra0_field,
-                dec0_field = dec0_field,
-                pscale     = pscale4,
+                r_hat          = r_hat4,
+                C_r            = C_r_full,
+                image_names    = image_names4,
+                n_r            = n_r4,
+                poly_order     = poly_order4,
+                sub_img_meta   = sub_img_meta4,
+                ra0_field      = ra0_field,
+                dec0_field     = dec0_field,
+                pscale         = pscale4,
+                det_lookup     = _shared_det_lookup,
+                tele_xyz_cache = _shared_tele_xyz,
             )
 
             # ── Phase 4b: post-astrometry deduplication (ra_xmatch positions) ────
@@ -3799,6 +3847,8 @@ def run_hst_crossmatch(
                             dec0_field=_p4['dec0_field'], pscale=_p4['pscale'],
                             sub_img_meta=_p4['sub_img_meta'], gaia_df=gaia_df,
                             outlier_sigma=phase4_outlier_sigma,
+                            _det_lookup=_p4.get('det_lookup'),
+                            _tele_xyz_cache=_p4.get('tele_xyz_cache'),
                         )
                         for _col in _astrom_4b.columns:
                             combined_dedup4b.loc[_cdf_4b.index, _col] = _astrom_4b[_col].values
@@ -3881,17 +3931,19 @@ def run_hst_crossmatch(
                     _cdf_changed['hst_indices_pass2'] = _cdf_changed['pass2_hst_indices']
 
                     _astrom_v2 = _measure_astrometry_proper(
-                        combined_df  = _cdf_changed,
-                        det_df       = det_df,
-                        r_hat_arr    = _p4['r_hat'],
-                        C_r          = _p4['C_r'],
-                        image_names  = _p4['image_names'],
-                        n_r          = _p4['n_r'],
-                        poly_order   = _p4['poly_order'],
-                        ra0_field    = _p4['ra0_field'],
-                        dec0_field   = _p4['dec0_field'],
-                        pscale       = _p4['pscale'],
-                        sub_img_meta = _p4['sub_img_meta'],
+                        combined_df     = _cdf_changed,
+                        det_df          = det_df,
+                        r_hat_arr       = _p4['r_hat'],
+                        C_r             = _p4['C_r'],
+                        image_names     = _p4['image_names'],
+                        n_r             = _p4['n_r'],
+                        poly_order      = _p4['poly_order'],
+                        ra0_field       = _p4['ra0_field'],
+                        dec0_field      = _p4['dec0_field'],
+                        pscale          = _p4['pscale'],
+                        sub_img_meta    = _p4['sub_img_meta'],
+                        _det_lookup     = _p4.get('det_lookup'),
+                        _tele_xyz_cache = _p4.get('tele_xyz_cache'),
                         gaia_df      = gaia_df,
                         outlier_sigma = phase4_outlier_sigma,
                     )
