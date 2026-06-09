@@ -4627,8 +4627,8 @@ def _plot_gaia_comparison(combined_df: pd.DataFrame, gaia_df: pd.DataFrame,
         print("  Warning: gaia_df missing required columns for comparison plot")
         return
 
-    sids = combined_df['gaia_source_id'].values
-    has_match = (sids != 0) & np.isfinite(sids.astype(float))
+    sids = combined_df['gaia_source_id'].to_numpy(dtype=np.int64, na_value=0)
+    has_match = sids != 0
     if has_match.sum() < 5:
         return
 
