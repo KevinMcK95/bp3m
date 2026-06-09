@@ -1267,6 +1267,7 @@ def _within_filter_match(
     mag_outlier_floor: float = 0.5,
     nonstar_mag_relax: float = 1.5,
     pre_zp_applied: bool  = False,
+    zp_max_corr: Optional[float] = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Build a per-filter master catalog by iteratively matching sources across
@@ -1428,7 +1429,7 @@ def _within_filter_match(
         _ZP_MIN_MASTER = 500   # master sources required
         _ZP_MIN_IMG    = 50    # star candidates required in current image
         _ZP_MIN_INLIER = 30    # mode-inliers required
-        _ZP_MAX_CORR   = 0.0 if pre_zp_applied else 1.0
+        _ZP_MAX_CORR   = zp_max_corr if zp_max_corr is not None else (0.0 if pre_zp_applied else 3.0)
 
         for sub_name in remaining:
             cur_mask = fdf['sub_name'].values == sub_name
@@ -3518,6 +3519,7 @@ def run_hst_crossmatch(
     anchor_bp3m_dir: Optional[Path] = None,
     phase4_outlier_sigma: float = 3.5,
     cycle_id: int = 0,
+    zp_max_corr: Optional[float] = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Run the full HST cross-match pipeline for a field.
@@ -3662,6 +3664,7 @@ def run_hst_crossmatch(
         mag_floor=mag_floor,
         min_detections=min_detections,
         pre_zp_applied=det_df.attrs.get('pre_zp_applied', False),
+        zp_max_corr=zp_max_corr,
     )
     for filt, master_df in filter_masters.items():
         out_path = output_dir / f'master_{filt}.csv'

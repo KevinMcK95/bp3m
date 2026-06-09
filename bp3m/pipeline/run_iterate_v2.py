@@ -106,6 +106,8 @@ def main():
                         help='Skip saving per-filter detection catalogs')
     parser.add_argument('--phase4_outlier_sigma', type=float, default=3.5,
                         help='Per-detection chi2 sigma threshold for Phase 4 outlier rejection')
+    parser.add_argument('--zp_max_corr', type=float, default=None,
+                        help='Max ZP correction to apply (mag). Default: 0.0 when pre-measured ZP exists, 3.0 otherwise')
 
     args = parser.parse_args()
 
@@ -137,6 +139,7 @@ def main():
         save_detections          = not args.no_save_detections,
         phase4_outlier_sigma     = args.phase4_outlier_sigma,
         anchor_bp3m_dir          = bp3m_v1_dir if bp3m_v1_dir.exists() else None,
+        zp_max_corr              = args.zp_max_corr,
     )
 
     bp3m_kwargs = dict(
