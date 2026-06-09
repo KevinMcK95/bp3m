@@ -1474,12 +1474,19 @@ def _within_filter_match(
                             _w68       = float(np.percentile(_dmag_cut, 84) -
                                                np.percentile(_dmag_cut, 16))
                             _zp_offset = float(np.clip(_zp_raw, -_ZP_MAX_CORR, _ZP_MAX_CORR))
-                            if abs(_zp_raw) > 0.01:
-                                _cap_note = (f" [capped from {_zp_raw:+.3f}]"
-                                             if abs(_zp_raw) > _ZP_MAX_CORR else "")
-                                print(f"      ZP [{sub_name}]: {_zp_offset:+.3f} mag "
-                                      f"({len(_im_q)} pairs, {len(_dmag_cut)} inliers, "
-                                      f"68%w={_w68:.3f}{_cap_note})")
+                            _cap_note = (f" [capped from {_zp_raw:+.3f}]"
+                                         if abs(_zp_raw) > _ZP_MAX_CORR else "")
+                            print(f"      ZP [{sub_name}]: {_zp_offset:+.3f} mag "
+                                  f"({len(_im_q)} pairs, {len(_dmag_cut)} inliers, "
+                                  f"68%w={_w68:.3f}{_cap_note})")
+                        else:
+                            print(f"      ZP [{sub_name}]: skipped "
+                                  f"(only {len(_dmag_cut)} inliers after mode cut, "
+                                  f"need {_ZP_MIN_INLIER})")
+            else:
+                _reason = (f"only {len(_sl_zp)} stars" if len(_sl_zp) < _ZP_MIN_IMG
+                           else f"only {len(master_ra)} master sources")
+                print(f"      ZP [{sub_name}]: skipped ({_reason})")
 
             # Apply ZP correction in-place so _extend_master also sees corrected values.
             if _zp_offset != 0.0:
