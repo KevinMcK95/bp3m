@@ -2636,6 +2636,15 @@ def _measure_astrometry_proper(
             gaia_row = gaia_lookup.get(sid_int)
 
         has_gaia = gaia_row is not None
+        # DEBUG: trace Gaia lookup for a specific set of known-problematic IDs
+        _DEBUG_IDS = {5203318729822733184, 5203318729819474432, 5203318661103254656,
+                      5203318661103259264, 5203318489304573696}
+        if sid_int in _DEBUG_IDS:
+            print(f"  [DEBUG] row_i={row_i} sid={sid_int} "
+                  f"in_lookup={gaia_lookup.get(sid_int) is not None} "
+                  f"has_gaia={has_gaia} "
+                  f"gaia_lookup_len={len(gaia_lookup)} "
+                  f"n_valid_pairs={len(valid_pairs)}", flush=True)
         if has_gaia:
             ra_g    = float(gaia_row['ra'])   # degrees, J2016.0
             dec_g   = float(gaia_row['dec'])  # degrees, J2016.0
@@ -2695,6 +2704,17 @@ def _measure_astrometry_proper(
             })
 
         if not det_data:
+            return base_row
+
+        # ── Epoch-count gate ──────────────────────────────────────────────────
+        # A Gaia cross-match provides an independent position at J2016.0, so it
+        # counts as one additional epoch for the purpose of PM determination.
+        # HST-only single-visit stars (n_hst=1, no Gaia) cannot constrain PM and
+        # are skipped.  Gaia-matched single-visit stars (1+1=2) proceed: the
+        # ~10-year HST-Gaia baseline fully constrains the fit.
+        n_hst_visits = len({dd['sname'] for dd in det_data})
+        n_effective_epochs = n_hst_visits + int(has_gaia)
+        if n_effective_epochs < min_hst_epochs:
             return base_row
 
         # ── Reference sky position ────────────────────────────────────────────
