@@ -785,11 +785,14 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         mag_hst_gdc = hst_cat['mag_gdc'].astype(float)
         is_star    = hst_cat['is_star_candidate'].astype(bool)
         mag_err_hst = hst_cat['mag_err_gdc'].astype(float) if 'mag_err_gdc' in hst_cat.dtype.names else None
-        mag_st_hst  = hst_cat['mag_st_gdc'].astype(float) if 'mag_st_gdc'  in hst_cat.dtype.names else None
+        if 'mag_st_gdc' not in hst_cat.dtype.names:
+            raise ValueError(
+                f"Catalog missing 'mag_st_gdc' column — stale py1pass output. "
+                f"Delete the catalog so py1pass will re-run."
+            )
+        mag_hst = hst_cat['mag_st_gdc'].astype(float)
+        mag_st_hst  = mag_hst   # kept for output saving below
         mag_ab_hst  = hst_cat['mag_ab'].astype(float)     if 'mag_ab'      in hst_cat.dtype.names else None
-        # Use mag_st_gdc (EXPTIME-corrected STMAG) for all magnitude comparisons;
-        # fall back to mag_gdc only when mag_st_gdc is unavailable.
-        mag_hst = mag_st_hst if mag_st_hst is not None else mag_hst_gdc
         C_pix_hst = np.zeros((len(x_hst), 2, 2))
         C_pix_hst[:, 0, 0] = hst_cat['cov_xx_gdc'].astype(float) + hst_pix_floor**2
         C_pix_hst[:, 1, 1] = hst_cat['cov_yy_gdc'].astype(float) + hst_pix_floor**2
