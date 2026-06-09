@@ -219,7 +219,7 @@ def _load_all_detections(field_dir: Path,
     sigma_ra, sigma_dec : mas
     cov_ra_dec     : mas²
     mag_gdc, mag_err_gdc
-    mag_zp         : ZP-corrected magnitude (mag_gdc – zp_offset)
+    mag_zp         : calibrated magnitude = mag_st_gdc + cross_image_zp (or just mag_st_gdc if no pre-ZP file)
     is_star_candidate : bool
     qfit, chi2
     x_gdc, y_gdc  : GDC pixel positions
@@ -777,9 +777,9 @@ def _phase0b_anchor_gaia_stars(
         gaia_g_ser = (gaia_stars.set_index('Gaia_id')['gmag']
                       if 'gmag' in gaia_stars.columns else pd.Series(dtype=float))
         matched_det['_gmag'] = matched_det['_gid'].map(gaia_g_ser)
-        valid = matched_det.dropna(subset=['_gmag', 'mag_gdc'])
+        valid = matched_det.dropna(subset=['_gmag', 'mag_zp'])
         for sub, grp in valid.groupby('sub_name'):
-            diffs = grp['_gmag'].values - grp['mag_gdc'].values
+            diffs = grp['_gmag'].values - grp['mag_zp'].values
             if len(diffs) >= 5:
                 med   = float(np.median(diffs))
                 sigma = float(np.median(np.abs(diffs - med)) / 0.6745)
@@ -795,7 +795,7 @@ def _phase0b_anchor_gaia_stars(
         ra_s  = grp['ra'].values
         dec_s = grp['dec'].values
         tree  = cKDTree(np.column_stack([ra_s * cos_dec_global, dec_s]))
-        sub_trees[sub] = (tree, ra_s, dec_s, grp['mag_gdc'].values,
+        sub_trees[sub] = (tree, ra_s, dec_s, grp['mag_zp'].values,
                           grp.index.values)
 
     epoch_lookup = (det_df.groupby('sub_name')['epoch_mjd'].first() / MJD_YR
@@ -944,9 +944,9 @@ def _phase2_gaia_catalog_anchor(
         matched_det['_gid'] = matched_det['gaia_source_id'].astype(np.int64)
         gaia_g_ser = gaia_df.set_index(id_col)['gmag'] if 'gmag' in gaia_df.columns else pd.Series(dtype=float)
         matched_det['_gmag'] = matched_det['_gid'].map(gaia_g_ser)
-        valid = matched_det.dropna(subset=['_gmag', 'mag_gdc'])
+        valid = matched_det.dropna(subset=['_gmag', 'mag_zp'])
         for sub, grp in valid.groupby('sub_name'):
-            diffs = grp['_gmag'].values - grp['mag_gdc'].values
+            diffs = grp['_gmag'].values - grp['mag_zp'].values
             if len(diffs) >= 5:
                 med = float(np.median(diffs))
                 sigma = float(np.median(np.abs(diffs - med)) / 0.6745)
@@ -959,7 +959,7 @@ def _phase2_gaia_catalog_anchor(
             continue
         ra_s = grp['ra'].values; dec_s = grp['dec'].values
         tree = cKDTree(np.column_stack([ra_s * cos_dec_global, dec_s]))
-        sub_trees[sub] = (tree, ra_s, dec_s, grp['mag_gdc'].values, grp.index.values)
+        sub_trees[sub] = (tree, ra_s, dec_s, grp['mag_zp'].values, grp.index.values)
 
     epoch_lookup = (det_df.groupby('sub_name')['epoch_mjd'].first() / MJD_YR + _MJD0_YR).to_dict()
     already_labelled: set[tuple[int, str]] = set()
@@ -1421,12 +1421,11 @@ def _within_filter_match(
         _ZP_MIN_MASTER = 500   # master sources required
         _ZP_MIN_IMG    = 50    # star candidates required in current image
         _ZP_MIN_INLIER = 30    # mode-inliers required
-        # Phase 3 ZP estimation is kept for diagnostics but never applied.
-        # The pre-ZP from magnitude_zp_offsets.csv (computed from reliable
-        # Gaia-matched sources) is the authoritative inter-image calibration.
-        # Positional matching over long time baselines in dense fields produces
-        # spurious large ZPs from false matches that corrupt the master catalog.
-        _ZP_MAX_CORR   = 0.0
+        # When pre-ZP from magnitude_zp_offsets.csv was applied, images are
+        # already on a common scale; cap Phase 3 residual corrections to ±0.15 mag
+        # to suppress spurious large ZPs from false matches across long time baselines.
+        # Without pre-ZP (first run or missing file), allow up to ±1.0 mag.
+        _ZP_MAX_CORR   = 0.15 if pre_zp_applied else 1.0
 
         for sub_name in remaining:
             cur_mask = fdf['sub_name'].values == sub_name

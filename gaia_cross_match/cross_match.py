@@ -782,11 +782,14 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             _orig_row_idx = _orig_row_idx[_valid]
         x_hst      = hst_cat['x_gdc'].astype(float)
         y_hst      = hst_cat['y_gdc'].astype(float)
-        mag_hst    = hst_cat['mag_gdc'].astype(float)
+        mag_hst_gdc = hst_cat['mag_gdc'].astype(float)
         is_star    = hst_cat['is_star_candidate'].astype(bool)
         mag_err_hst = hst_cat['mag_err_gdc'].astype(float) if 'mag_err_gdc' in hst_cat.dtype.names else None
         mag_st_hst  = hst_cat['mag_st_gdc'].astype(float) if 'mag_st_gdc'  in hst_cat.dtype.names else None
         mag_ab_hst  = hst_cat['mag_ab'].astype(float)     if 'mag_ab'      in hst_cat.dtype.names else None
+        # Use mag_st_gdc (EXPTIME-corrected STMAG) for all magnitude comparisons;
+        # fall back to mag_gdc only when mag_st_gdc is unavailable.
+        mag_hst = mag_st_hst if mag_st_hst is not None else mag_hst_gdc
         C_pix_hst = np.zeros((len(x_hst), 2, 2))
         C_pix_hst[:, 0, 0] = hst_cat['cov_xx_gdc'].astype(float) + hst_pix_floor**2
         C_pix_hst[:, 1, 1] = hst_cat['cov_yy_gdc'].astype(float) + hst_pix_floor**2
@@ -913,7 +916,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         output['hst_index']      = _orig_row_idx[final_matches['h_idx'].values]
         output['hst_x_gdc']      = x_hst[final_matches['h_idx'].values]
         output['hst_y_gdc']      = y_hst[final_matches['h_idx'].values]
-        output['hst_mag_gdc']    = mag_hst[final_matches['h_idx'].values]
+        output['hst_mag_gdc']    = mag_hst_gdc[final_matches['h_idx'].values]
         if mag_err_hst is not None:
             output['hst_mag_err_gdc']= mag_err_hst[final_matches['h_idx'].values]
         if mag_st_hst is not None:
@@ -925,7 +928,10 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         output['gaia_ra_prop']   = ra_in[final_matches['g_idx'].values]
         output['gaia_dec_prop']  = dec_in[final_matches['g_idx'].values]
         output['gaia_gmag']      = g_mag_in[final_matches['g_idx'].values]
-        output['residual_mag']   = output['gaia_gmag'] - (output['hst_mag_gdc'] + zp)
+        # residual_mag uses the same calibrated magnitude that was used for ZP
+        # estimation (mag_hst = mag_st_gdc when available, else mag_gdc).
+        mag_hst_for_resid = mag_hst[final_matches['h_idx'].values]
+        output['residual_mag']   = output['gaia_gmag'] - (mag_hst_for_resid + zp)
         output['residual_x']     = final_matches['dx'].values
         output['residual_y']     = final_matches['dy'].values
         output['residual_sigma'] = final_matches['sigma'].values
