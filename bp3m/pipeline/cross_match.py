@@ -71,6 +71,7 @@ def _match_one(args):
             max_mag_diff=kwargs.get('max_mag_diff', 3.0),
             scale_sweep=kwargs.get('scale_sweep', False),
             discovery_max_offset=kwargs.get('discovery_max_offset', 50),
+            use_resid_floor=kwargs.get('use_resid_floor', True),
         )
         out = Path(hst_dict['root']) / "matched_gaia.csv"
         n = len(pd.read_csv(out)) if out.exists() else 0
@@ -109,6 +110,7 @@ def run_cross_match(
     max_mag_diff: float = 3.0,
     scale_sweep: bool = False,
     discovery_max_offset: int = 50,
+    use_resid_floor: bool = True,
     force_rematch: bool = False,
     image_id: str | None = None,
     restrict_to_obsids: list[str] | None = None,
@@ -132,6 +134,8 @@ def run_cross_match(
     scale_sweep          : sweep over pixel scale during 4P discovery (slower)
     discovery_max_offset : half-width of the offset histogram search during 4P
                            discovery (pixels); default 50
+    use_resid_floor      : if False, zero out the per-iteration empirical residual
+                           covariance added to C_total during affine refinement
     force_rematch        : re-match even if matched_gaia.csv and matching params exist
     image_id             : process only this single observation ID
 
@@ -179,6 +183,7 @@ def run_cross_match(
         'max_mag_diff':         max_mag_diff,
         'scale_sweep':          scale_sweep,
         'discovery_max_offset': discovery_max_offset,
+        'use_resid_floor':      use_resid_floor,
     }
 
     work = []
@@ -207,6 +212,7 @@ def run_cross_match(
             'max_mag_diff':         max_mag_diff,
             'scale_sweep':          scale_sweep,
             'discovery_max_offset': discovery_max_offset,
+            'use_resid_floor':      use_resid_floor,
             'params_meta':          params_meta,
         }))
 

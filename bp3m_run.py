@@ -175,6 +175,8 @@ def _parse_args():
                     help='Enable pixel-scale sweep during 4P discovery (slower)')
     xm.add_argument('--discovery_max_offset', type=int, default=50,
                     help='Half-width of the offset histogram search during 4P discovery in pixels (default 50)')
+    xm.add_argument('--no_resid_floor', action='store_true',
+                    help='Disable the per-iteration empirical residual covariance floor during affine refinement')
 
     # ── Alignment (BP3M) ──────────────────────────────────────────────────────
     bp = p.add_argument_group('Bayesian alignment (BP3M)')
@@ -655,6 +657,7 @@ def main():
             max_mag_diff=args.max_mag_diff,
             scale_sweep=args.scale_sweep,
             discovery_max_offset=args.discovery_max_offset,
+            use_resid_floor=not args.no_resid_floor,
             force_rematch=args.force_rematch,
             restrict_to_obsids=_restrict,
         )

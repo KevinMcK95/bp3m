@@ -603,7 +603,7 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
     return min(discovered, key=lambda x: x['red_cost'])
 
 
-def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff):
+def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_resid_floor=True):
     """
     Upgrades 4P seeds to a 6P affine transform and iterates until convergence.
 
@@ -631,7 +631,7 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff):
     dx_v, dy_v = xg_b - xh_in_g, yg_b - yh_in_g
     resid_sigma_x = 0.5 * np.diff(np.nanpercentile(dx_v, [16, 84]))[0]
     resid_sigma_y = 0.5 * np.diff(np.nanpercentile(dy_v, [16, 84]))[0]
-    resid_cov = np.diag(np.array([resid_sigma_x, resid_sigma_y])**2)
+    resid_cov = np.diag(np.array([resid_sigma_x, resid_sigma_y])**2) if use_resid_floor else np.zeros((2, 2))
 
     ratio, rot = np.sqrt(A*D-B*C), np.degrees(np.arctan2(B-C, A+D))
     print(f"  Init 6P: {len(xh_b)} seeds, scale={ratio:.6f}, rot={rot:.4f}deg, "
@@ -683,7 +683,7 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff):
 
         resid_sigma_x = 0.5 * np.diff(np.nanpercentile(good['dx'], [16, 84]))[0]
         resid_sigma_y = 0.5 * np.diff(np.nanpercentile(good['dy'], [16, 84]))[0]
-        resid_cov = np.diag(np.array([resid_sigma_x, resid_sigma_y])**2)
+        resid_cov = np.diag(np.array([resid_sigma_x, resid_sigma_y])**2) if use_resid_floor else np.zeros((2, 2))
         zp = np.median(good['mag_diff'])
 
         ratio, rot = np.sqrt(A*D-B*C), np.degrees(np.arctan2(B-C, A+D))
@@ -699,7 +699,7 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff):
 # Main per-image processor
 # ---------------------------------------------------------------------------
 
-def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50):
+def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True):
     start_time = time.time()
     image_name = os.path.basename(hst['flc']).replace("_flc.fits", "")
     log_file, original_stdout = os.path.join(hst['root'], "processing_log.txt"), sys.stdout
@@ -843,7 +843,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         # hst_data_all which contains every source.
         best_all = {**best, 'h_v': star_indices[best['h_v']]}
         A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f = \
-            _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff)
+            _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor)
         M = np.array([[A, B], [C, D]])
 
         # --- Final pass: gather all candidates with the converged transform ---
