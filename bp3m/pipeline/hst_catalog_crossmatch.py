@@ -2636,15 +2636,6 @@ def _measure_astrometry_proper(
             gaia_row = gaia_lookup.get(sid_int)
 
         has_gaia = gaia_row is not None
-        # DEBUG: trace Gaia lookup for a specific set of known-problematic IDs
-        _DEBUG_IDS = {5203318729822733184, 5203318729819474432, 5203318661103254656,
-                      5203318661103259264, 5203318489304573696}
-        if sid_int in _DEBUG_IDS:
-            print(f"  [DEBUG] row_i={row_i} sid={sid_int} "
-                  f"in_lookup={gaia_lookup.get(sid_int) is not None} "
-                  f"has_gaia={has_gaia} "
-                  f"gaia_lookup_len={len(gaia_lookup)} "
-                  f"n_valid_pairs={len(valid_pairs)}", flush=True)
         if has_gaia:
             ra_g    = float(gaia_row['ra'])   # degrees, J2016.0
             dec_g   = float(gaia_row['dec'])  # degrees, J2016.0
@@ -2658,11 +2649,6 @@ def _measure_astrometry_proper(
             gaia_g_mag = float(gaia_row.get('gmag', 20.0))
             if not np.isfinite(gaia_g_mag):
                 gaia_g_mag = 20.0
-            if sid_int in _DEBUG_IDS:
-                print(f"  [DEBUG2] sid={sid_int} has_full_gaia_astrometry={has_full_gaia_astrometry} "
-                      f"pmra_g={pmra_g:.4f} C_gaia_is_None={C_gaia is None} "
-                      f"pmra_err={gaia_row.get('pmra_error', 'MISSING')} "
-                      f"ra_err={gaia_row.get('ra_error', 'MISSING')}", flush=True)
         else:
             ra_g = dec_g = pmra_g = pmdec_g = plx_g = 0.0
             C_gaia = None
@@ -2984,11 +2970,6 @@ def _measure_astrometry_proper(
         # Null out PM if its uncertainty exceeds _SIGMA_PM_DIFFUSE/10 (10 mas/yr) —
         # below this threshold the measurement is not useful for most science.
         _pm_null = sigma_pmra >= _SIGMA_PM_DIFFUSE / 10.0 or sigma_pmdec >= _SIGMA_PM_DIFFUSE / 10.0
-        if sid_int in _DEBUG_IDS:
-            print(f"  [DEBUG3] sid={sid_int} N_fit={fit['N']} "
-                  f"sigma_pmra={sigma_pmra:.4f} sigma_ra={float(np.sqrt(max(C_u[0,0],0.))):.4f} "
-                  f"pmra_out={pmra_out:.4f} pm_null={_pm_null} "
-                  f"has_full_gaia={has_full_gaia_astrometry}", flush=True)
         if _pm_null:
             pmra_out = pmdec_out = np.nan
             sigma_pmra = sigma_pmdec = corr_pm = np.nan
@@ -3058,6 +3039,10 @@ def _measure_astrometry_proper(
                       f"{rate:.0f} src/s  "
                       f"ETA {eta:.0f}s", flush=True)
 
+    # Collect results keyed by row_i so that sorting for load balance
+    # does not scramble the output order (results must align with combined_df.index).
+    row_results: dict[int, dict] = {}
+
     if n_workers > 1 and n_total >= 200:
         # Sort by detection count descending (heaviest first), then round-robin
         # assign to chunks — LPT heuristic for near-optimal load balance.
@@ -3066,20 +3051,22 @@ def _measure_astrometry_proper(
         for i, row_i in enumerate(all_indices):
             chunks[i % n_workers].append(row_i)
 
-        def _process_chunk(chunk_indices: list) -> list[dict]:
-            _t_chunk = time.perf_counter()
-            results  = [_fit_one_source(row_i) for row_i in chunk_indices]
+        def _process_chunk(chunk_indices: list) -> list[tuple[int, dict]]:
+            results  = [(ri, _fit_one_source(ri)) for ri in chunk_indices]
             _report_progress(len(chunk_indices))
             return results
 
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            results = list(executor.map(_process_chunk, chunks))
-        out_rows = [r for chunk in results for r in chunk]
+            for chunk_results in executor.map(_process_chunk, chunks):
+                for ri, res in chunk_results:
+                    row_results[ri] = res
     else:
-        out_rows = []
         for row_i in all_indices:
-            out_rows.append(_fit_one_source(row_i))
+            row_results[row_i] = _fit_one_source(row_i)
             _report_progress(1)
+
+    # Reconstruct in combined_df.index order
+    out_rows = [row_results[ri] for ri in combined_df.index]
 
     elapsed_total = time.perf_counter() - _t_dispatch
     rate_total    = n_total / elapsed_total if elapsed_total > 0 else 0.0
