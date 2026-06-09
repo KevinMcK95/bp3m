@@ -39,7 +39,7 @@ records, psf_path, gdc_path = run_photometry_fits(
     lib_dir='./lib',        # contains STDPSFs/ and STDGDCs/
     n_passes=2,
     half_width=3,
-    fmin_thresh=70.0,
+    fmin_thresh=100.0,
     mag_st_max=28.0,
     verbose=True,
 )

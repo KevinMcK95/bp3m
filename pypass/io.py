@@ -820,7 +820,7 @@ def run_photometry_fits(
     sky_inner=4,
     sky_outer=8,
     hmin=4,
-    fmin_thresh=70.0,
+    fmin_thresh=100.0,
     max_iter_fit=5,
     tol=1e-4,
     n_passes=1,
