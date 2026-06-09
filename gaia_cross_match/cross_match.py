@@ -434,7 +434,7 @@ def _save_offset_histogram(best, image_name, out_dir):
                            os.path.join(out_dir, 'offset_histogram.png'))
 
 
-def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False):
+def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, discovery_max_offset=50):
     """
     Tier-walks qfit x mag limits to find a physically plausible 4P similarity seed.
 
@@ -489,7 +489,7 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False):
                 hst_d['x'][h_idx_tier], hst_d['y'][h_idx_tier], hst_d['mag'][h_idx_tier],
                 cov1=Cg_s[curr_keep], cov2=hst_d['C'][h_idx_tier],
                 x_cen=params['x_cen'], y_cen=params['y_cen'],
-                max_offset=50, bin_size=1, top_n=3,
+                max_offset=discovery_max_offset, bin_size=1, top_n=3,
                 ds_range=(-0.02, 0.02) if scale_sweep else (0.0, 0.0), n_scales=41 if scale_sweep else 1,
                 return_histogram=True
             )
@@ -699,7 +699,7 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff):
 # Main per-image processor
 # ---------------------------------------------------------------------------
 
-def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False):
+def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50):
     start_time = time.time()
     image_name = os.path.basename(hst['flc']).replace("_flc.fits", "")
     log_file, original_stdout = os.path.join(hst['root'], "processing_log.txt"), sys.stdout
@@ -827,7 +827,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         tree_gaia_all = KDTree(np.column_stack([x_g_in, y_g_in]))
 
         # --- 4P Discovery ---
-        best = _run_4p_discovery(hst_data, gaia_field, params, max_mag_diff, scale_sweep=scale_sweep)
+        best = _run_4p_discovery(hst_data, gaia_field, params, max_mag_diff, scale_sweep=scale_sweep, discovery_max_offset=discovery_max_offset)
         if best is None:
             print(f"Finished {image_name}: 4P Discovery failed to find physically plausible matches.", file=original_stdout)
             return

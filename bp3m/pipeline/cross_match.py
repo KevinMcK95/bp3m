@@ -70,6 +70,7 @@ def _match_one(args):
             zero_pm=kwargs.get('zero_pm', False),
             max_mag_diff=kwargs.get('max_mag_diff', 3.0),
             scale_sweep=kwargs.get('scale_sweep', False),
+            discovery_max_offset=kwargs.get('discovery_max_offset', 50),
         )
         out = Path(hst_dict['root']) / "matched_gaia.csv"
         n = len(pd.read_csv(out)) if out.exists() else 0
@@ -107,6 +108,7 @@ def run_cross_match(
     zero_pm: bool = False,
     max_mag_diff: float = 3.0,
     scale_sweep: bool = False,
+    discovery_max_offset: int = 50,
     force_rematch: bool = False,
     image_id: str | None = None,
     restrict_to_obsids: list[str] | None = None,
@@ -119,17 +121,19 @@ def run_cross_match(
 
     Parameters
     ----------
-    output_dir    : pipeline root directory
-    field_name    : field subdirectory name
-    telescope     : 'HST' (JWST planned)
-    n_processes   : parallel workers
-    hst_pix_floor : minimum positional uncertainty floor (pixels)
-    min_matches   : minimum seed matches required for 4P discovery
-    zero_pm       : set all Gaia PMs to 0 (debugging)
-    max_mag_diff  : maximum allowed magnitude difference for matching
-    scale_sweep   : sweep over pixel scale during 4P discovery (slower)
-    force_rematch : re-match even if matched_gaia.csv and matching params exist
-    image_id      : process only this single observation ID
+    output_dir           : pipeline root directory
+    field_name           : field subdirectory name
+    telescope            : 'HST' (JWST planned)
+    n_processes          : parallel workers
+    hst_pix_floor        : minimum positional uncertainty floor (pixels)
+    min_matches          : minimum seed matches required for 4P discovery
+    zero_pm              : set all Gaia PMs to 0 (debugging)
+    max_mag_diff         : maximum allowed magnitude difference for matching
+    scale_sweep          : sweep over pixel scale during 4P discovery (slower)
+    discovery_max_offset : half-width of the offset histogram search during 4P
+                           discovery (pixels); default 50
+    force_rematch        : re-match even if matched_gaia.csv and matching params exist
+    image_id             : process only this single observation ID
 
     Returns
     -------
@@ -169,11 +173,12 @@ def run_cross_match(
         return []
 
     params_meta = {
-        'hst_pix_floor': hst_pix_floor,
-        'min_matches':   min_matches,
-        'zero_pm':       zero_pm,
-        'max_mag_diff':  max_mag_diff,
-        'scale_sweep':   scale_sweep,
+        'hst_pix_floor':        hst_pix_floor,
+        'min_matches':          min_matches,
+        'zero_pm':              zero_pm,
+        'max_mag_diff':         max_mag_diff,
+        'scale_sweep':          scale_sweep,
+        'discovery_max_offset': discovery_max_offset,
     }
 
     work = []
@@ -196,12 +201,13 @@ def run_cross_match(
                         print(d)
 
         work.append((hst, gaia_df, {
-            'hst_pix_floor': hst_pix_floor,
-            'min_matches':   min_matches,
-            'zero_pm':       zero_pm,
-            'max_mag_diff':  max_mag_diff,
-            'scale_sweep':   scale_sweep,
-            'params_meta':   params_meta,
+            'hst_pix_floor':        hst_pix_floor,
+            'min_matches':          min_matches,
+            'zero_pm':              zero_pm,
+            'max_mag_diff':         max_mag_diff,
+            'scale_sweep':          scale_sweep,
+            'discovery_max_offset': discovery_max_offset,
+            'params_meta':          params_meta,
         }))
 
     if skipped:
