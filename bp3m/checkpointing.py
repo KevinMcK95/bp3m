@@ -257,7 +257,7 @@ def load_inputs(path: str | Path):
     }
 
     # ── Gaia catalog ──────────────────────────────────────────────────────────
-    gaia_catalog = pd.read_csv(path / "gaia_catalog.csv")
+    gaia_catalog = pd.read_csv(path / "gaia_catalog.csv", dtype={'Gaia_id': np.int64})
 
     # Rebuild star_id_to_idx in the same order as the saved catalog
     star_id_to_idx: dict = {

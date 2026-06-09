@@ -49,7 +49,7 @@ def load_image_data(data_root, field_name="Fornax_dSph"):
         return None
     
     print(f"Concatenating {len(gaia_files)} Gaia file(s)...")
-    all_gaia_list = [pd.read_csv(f).rename(columns={'SOURCE_ID': 'source_id'}, inplace=False) for f in gaia_files]
+    all_gaia_list = [pd.read_csv(f, dtype={'source_id': np.int64, 'SOURCE_ID': np.int64}).rename(columns={'SOURCE_ID': 'source_id'}, inplace=False) for f in gaia_files]
     gaia_catalog = pd.concat(all_gaia_list, ignore_index=True).drop_duplicates(subset=['source_id'])
     gaia_cols = [
         "source_id", "ra", "dec", "ra_error", "dec_error", "ra_dec_corr",

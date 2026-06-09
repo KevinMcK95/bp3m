@@ -28,7 +28,7 @@ def load_gaia_data(target, data_dir):
     # and silently corrupt Gaia source IDs through floating-point rounding).
     df_list = []
     for f in gaia_files:
-        dfi = pd.read_csv(f)
+        dfi = pd.read_csv(f, dtype={'source_id': np.int64, 'SOURCE_ID': np.int64})
         if 'SOURCE_ID' in dfi.columns and 'source_id' not in dfi.columns:
             dfi = dfi.rename(columns={'SOURCE_ID': 'source_id'})
         df_list.append(dfi)
@@ -926,7 +926,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             output['hst_mag_st_gdc'] = mag_st_hst[final_matches['h_idx'].values]
         if mag_ab_hst is not None:
             output['hst_mag_ab']     = mag_ab_hst[final_matches['h_idx'].values]
-        output['gaia_source_id'] = gaia_df.iloc[in_field]['source_id'].values[final_matches['g_idx'].values]
+        output['gaia_source_id'] = gaia_df.iloc[in_field]['source_id'].to_numpy(dtype=np.int64)[final_matches['g_idx'].values]
         output['has_gaia_pms']   = has_gaia_pms[in_field][final_matches['g_idx'].values]
         output['gaia_ra_prop']   = ra_in[final_matches['g_idx'].values]
         output['gaia_dec_prop']  = dec_in[final_matches['g_idx'].values]

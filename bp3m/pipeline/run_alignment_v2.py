@@ -705,11 +705,11 @@ def run_alignment_v2(
                     usecols=lambda c: c in ('gaia_source_id', 'pmra_xmatch',
                                              'pmdec_xmatch', 'sigma_pmra_xmatch',
                                              'sigma_pmdec_xmatch'),
+                    dtype={'gaia_source_id': np.int64},
                     low_memory=False,
                 )
-                _gaia_rows = _mv2.dropna(subset=['gaia_source_id']).copy()
-                _gaia_rows['_gid'] = pd.to_numeric(
-                    _gaia_rows['gaia_source_id'], errors='coerce').fillna(0).astype(np.int64)
+                _gaia_rows = _mv2[_mv2['gaia_source_id'] > 0].copy()
+                _gaia_rows['_gid'] = _gaia_rows['gaia_source_id'].astype(np.int64)
                 _gaia_rows = _gaia_rows[_gaia_rows['_gid'] > 0].set_index('_gid')
 
                 # Accumulate per-star MAP normal equations in pixel space.

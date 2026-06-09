@@ -843,14 +843,17 @@ def _phase0b_anchor_gaia_stars(
                 hst_mag = float(mag_s[ki]) if np.isfinite(mag_s[ki]) else np.nan
                 if np.isfinite(hst_mag):
                     resid = abs(hst_mag - (g_mag - zp_med))
-                    if resid > max(mag_n_sigma * zp_sig, mag_floor):
+                    if resid > mag_n_sigma * np.sqrt(zp_sig**2 + mag_floor**2):
                         continue
             if dist_i < best_sep:
                 best_sep = dist_i; best_row = row_idx
         return best_row
 
-    for _, star in gaia_stars.iterrows():
-        gid    = int(star['Gaia_id'])
+    # Pre-extract Gaia_id as int64 before iterrows loop to prevent float64
+    # precision loss (iterrows promotes int64→float64 in mixed-dtype DataFrames).
+    _gaia_star_ids = gaia_stars['Gaia_id'].to_numpy(dtype=np.int64)
+    for _gs_i, (_, star) in enumerate(gaia_stars.iterrows()):
+        gid    = int(_gaia_star_ids[_gs_i])
         ra0_g  = float(star['ra'])
         dec0_g = float(star['dec'])
         pmra   = float(star.get('pmra_bp3m_cond',  star.get('pmra',  0) or 0) or 0)
@@ -912,7 +915,8 @@ def _phase2_gaia_catalog_anchor(
         return det_df
 
     try:
-        gaia_df = pd.read_csv(gaia_csv)
+        gaia_df = pd.read_csv(gaia_csv,
+                              dtype={'source_id': np.int64, 'SOURCE_ID': np.int64})
         gaia_df.columns = [c.lower() for c in gaia_df.columns]
     except Exception:
         return det_df
@@ -920,7 +924,7 @@ def _phase2_gaia_catalog_anchor(
     id_col = 'source_id' if 'source_id' in gaia_df.columns else 'SOURCE_ID'.lower()
     if id_col not in gaia_df.columns:
         return det_df
-    gaia_df[id_col] = pd.to_numeric(gaia_df[id_col], errors='coerce').astype(np.int64)
+    gaia_df[id_col] = gaia_df[id_col].astype(np.int64)
 
     # Restrict to Gaia stars not already anchored by Phase 1
     already_in_det = set(
@@ -966,9 +970,11 @@ def _phase2_gaia_catalog_anchor(
     for row in det_df[det_df['has_gaia_match']].itertuples():
         already_labelled.add((int(row.gaia_source_id), row.sub_name))
 
+    # Pre-extract source_id as int64 to prevent float64 precision loss via iterrows.
+    _target_ids = targets[id_col].to_numpy(dtype=np.int64)
     n_anchored = 0; n_stars_improved = 0
-    for _, star in targets.iterrows():
-        gid = int(star[id_col])
+    for _tgt_i, (_, star) in enumerate(targets.iterrows()):
+        gid = int(_target_ids[_tgt_i])
         ra0_g = float(star.get('ra', np.nan))
         dec0_g = float(star.get('dec', np.nan))
         if not (np.isfinite(ra0_g) and np.isfinite(dec0_g)):
@@ -1000,7 +1006,7 @@ def _phase2_gaia_catalog_anchor(
                     hst_mag = float(mag_s[ki]) if np.isfinite(mag_s[ki]) else np.nan
                     if np.isfinite(hst_mag):
                         resid = abs(hst_mag - (g_mag - zp_med))
-                        if resid > max(mag_n_sigma * zp_sig, mag_floor):
+                        if resid > mag_n_sigma * np.sqrt(zp_sig**2 + mag_floor**2):
                             continue
                 if dist_i < best_sep:
                     best_sep = dist_i; best_row = row_idx
@@ -1050,7 +1056,7 @@ def _match_two_sets(
     source's running mean epoch and the current image epoch.  The PM
     contribution to the match radius is max_pm_masyr * dt_yr per source.
 
-    Magnitude cut: |Δmag| < max(mag_n_sigma × √(σ_a² + σ_b²), mag_floor).
+    Magnitude cut: |Δmag| < mag_n_sigma × √(σ_a² + σ_b² + mag_floor²).
     With mag_st_gdc the ZP is identical across images in the same filter, so
     the combined photometric uncertainty is the only relevant scale.  The floor
     prevents rejection of perfectly calibrated bright-star pairs due to
@@ -1115,10 +1121,11 @@ def _match_two_sets(
     r_pair       = match_n_sigma * np.sqrt(sigma_a_eff[ca]**2 + sigma_b_eff**2 + pm_contrib_pair**2)
     pos_ok       = seps < r_pair
 
-    # Magnitude cut: N-sigma using per-source photometric errors, with a floor
+    # Magnitude cut: N-sigma using per-source photometric errors in quadrature with
+    # the floor, so bright stars with tiny formal errors still get floor protection.
     dmag      = np.abs(mag_zp_b[cb] - mag_zp_a[ca])
     _comb_sig = np.sqrt(mag_err_a[ca]**2 + mag_err_b[cb]**2)
-    mag_ok    = dmag < np.maximum(mag_n_sigma * _comb_sig, mag_floor)
+    mag_ok    = dmag < mag_n_sigma * np.sqrt(_comb_sig**2 + mag_floor**2)
 
     keep = pos_ok & mag_ok
     ca   = ca[keep]
@@ -2049,10 +2056,23 @@ def _cross_filter_match(
         d[f'hst_indices_{filt}'] = row.get('hst_indices', '')
         return d
 
+    # Pre-extract gaia_source_id as int64 for all filters.
+    # iterrows() recasts int64 columns to float64 in mixed-dtype DataFrames,
+    # silently rounding large Gaia source IDs (19-digit integers exceed float64
+    # precision). Extracting via to_numpy(int64) avoids this.
+    _gaia_ids_by_filt: dict[str, np.ndarray] = {}
+    for _f, _df in filter_masters.items():
+        if 'gaia_source_id' in _df.columns:
+            _gaia_ids_by_filt[_f] = _df['gaia_source_id'].to_numpy(dtype=np.int64, na_value=0)
+        else:
+            _gaia_ids_by_filt[_f] = np.zeros(len(_df), dtype=np.int64)
+
     # Start with the first filter
     ref_filt = filters[0]
-    for _, row in filter_masters[ref_filt].iterrows():
-        merged_rows.append(_make_base_row(row, ref_filt))
+    for _row_pos, (_, row) in enumerate(filter_masters[ref_filt].iterrows()):
+        d = _make_base_row(row, ref_filt)
+        d['gaia_source_id'] = int(_gaia_ids_by_filt[ref_filt][_row_pos])
+        merged_rows.append(d)
     mx = masters_tp[ref_filt][0].tolist()
     my = masters_tp[ref_filt][1].tolist()
     merged_x_list.extend(mx)
@@ -2109,12 +2129,13 @@ def _cross_filter_match(
             # Update Gaia match from whichever filter has it
             if not mrow.get('has_gaia_match', False) and row.get('has_gaia_match', False):
                 mrow['has_gaia_match'] = True
-                mrow['gaia_source_id'] = row.get('gaia_source_id', 0)
+                mrow['gaia_source_id'] = int(_gaia_ids_by_filt[filt][ci])
 
         # Add unmatched sources from current filter as new rows
         for ci in np.where(~matched_cur)[0]:
             row = cur_df.iloc[ci]
             new_row = _make_base_row(row, filt)
+            new_row['gaia_source_id'] = int(_gaia_ids_by_filt[filt][ci])
             merged_rows.append(new_row)
             merged_x_list.append(float(cur_x[ci]))
             merged_y_list.append(float(cur_y[ci]))
@@ -2174,7 +2195,8 @@ def _recover_gaia_matches(
           f"(k={n_candidates} candidates, ±{color_tolerance:.1f} mag colour cut)")
 
     try:
-        gaia_df = pd.read_csv(gaia_csv)
+        gaia_df = pd.read_csv(gaia_csv,
+                              dtype={'source_id': np.int64, 'SOURCE_ID': np.int64})
         gaia_df.columns = [c.lower() for c in gaia_df.columns]
     except Exception as exc:
         print(f"  Warning: cannot load Gaia CSV: {exc}")
@@ -3569,9 +3591,9 @@ def run_hst_crossmatch(
                 # Try uppercase column name
                 _gcat_ids = pd.read_csv(gaia_csv,
                                         usecols=lambda c: c.upper() == 'SOURCE_ID',
+                                        dtype={'SOURCE_ID': np.int64},
                                         low_memory=False)
                 _gcat_ids.columns = ['source_id']
-                _gcat_ids['source_id'] = _gcat_ids['source_id'].astype(np.int64)
             _local_gids = set(_gcat_ids['source_id'].values)
             _has_match  = det_df['has_gaia_match'].values.astype(bool)
             _gids       = det_df['gaia_source_id'].astype(np.int64).values
@@ -3655,7 +3677,8 @@ def run_hst_crossmatch(
     gaia_df: Optional[pd.DataFrame] = None
     if gaia_csv is not None and Path(gaia_csv).exists():
         try:
-            gaia_df = pd.read_csv(gaia_csv)
+            gaia_df = pd.read_csv(gaia_csv,
+                                  dtype={'source_id': np.int64, 'SOURCE_ID': np.int64})
             gaia_df.columns = [c.lower() for c in gaia_df.columns]
         except Exception:
             pass
@@ -4790,7 +4813,8 @@ def _regen_plots(field_dir: Path,
         raise FileNotFoundError(f"No master_combined.csv found at {combined_path}. "
                                 "Run without --plots_only first.")
 
-    combined_df = pd.read_csv(combined_path, low_memory=False)
+    combined_df = pd.read_csv(combined_path, low_memory=False,
+                              dtype={'gaia_source_id': np.int64})
     print(f"Loaded {len(combined_df)} sources from {combined_path}")
 
     # Auto-detect Gaia CSV
@@ -4801,7 +4825,8 @@ def _regen_plots(field_dir: Path,
         if gaia_candidates:
             gaia_csv = sorted(gaia_candidates)[-1]
     if gaia_csv is not None and Path(gaia_csv).exists():
-        gaia_df = pd.read_csv(gaia_csv, low_memory=False)
+        gaia_df = pd.read_csv(gaia_csv, low_memory=False,
+                              dtype={'source_id': np.int64, 'SOURCE_ID': np.int64})
         print(f"Loaded {len(gaia_df)} Gaia sources from {gaia_csv}")
 
     field_name = field_dir.name

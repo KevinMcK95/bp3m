@@ -316,7 +316,8 @@ def generate_synthetic_data(
     gaia_files = sorted(_glob.glob(str(gaia_dir / "*_gaia.csv")))
     if not gaia_files:
         raise FileNotFoundError(f"No Gaia catalog in {gaia_dir}")
-    gaia_frames = [pd.read_csv(f).rename(columns={"SOURCE_ID": "source_id"})
+    gaia_frames = [pd.read_csv(f, dtype={'source_id': np.int64, 'SOURCE_ID': np.int64})
+                   .rename(columns={"SOURCE_ID": "source_id"})
                    for f in gaia_files]
     gaia_raw = (pd.concat(gaia_frames, ignore_index=True)
                   .drop_duplicates("source_id")
