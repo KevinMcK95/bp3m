@@ -120,7 +120,7 @@ def make_plots(solver, images, gaia_catalog,
 
     gm = gmag[has_gaia]
     ax_unc.scatter(gm, sig_pm_gaia[has_gaia],
-                   s=6, alpha=0.5, color='#aaaaaa', label='Gaia 5p', zorder=2)
+                   s=6, alpha=0.7, color='#444444', label='Gaia 5p', zorder=2)
     _bp3m_gaia_conv = bp3m_converged & has_gaia
     _bp3m_hst_conv  = bp3m_converged & hst_only
     ax_unc.scatter(gmag[_bp3m_gaia_conv], sig_pm_bp3m[_bp3m_gaia_conv],
