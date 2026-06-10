@@ -2625,6 +2625,9 @@ def _measure_astrometry_proper(
             'det_chi2':                '',
             'epoch_ref_xmatch':        _GAIA_T_REF_YR,
             'chi2_xmatch':             np.nan,
+            # Full 5×5 posterior covariance C_u (includes C_r propagation).
+            # Stored flat as _Cu_{i}{j}; extracted to (N,5,5) npy at save time.
+            **{f'_Cu_{i}{j}': np.nan for i in range(5) for j in range(5)},
         }
 
         if not valid_pairs:
@@ -3011,6 +3014,7 @@ def _measure_astrometry_proper(
             'det_chi2':                det_chi2_str,
             'epoch_ref_xmatch':        _GAIA_T_REF_YR,
             'chi2_xmatch':             chi2_dof,
+            **{f'_Cu_{i}{j}': float(C_u[i, j]) for i in range(5) for j in range(5)},
         })
         return base_row
 
@@ -3942,10 +3946,14 @@ def run_hst_crossmatch(
                     pass  # non-critical: chi2 columns simply absent
 
             # Re-save combined catalog with Phase 4 columns
+            # (drop the internal _Cu_{ij} columns before writing — they are
+            #  extracted to C_u_xmatch.npy by the Phase 7 save path)
+            _cu_cols_v1 = [c for c in combined_df.columns if c.startswith('_Cu_')]
+            _df_save = combined_df.drop(columns=_cu_cols_v1) if _cu_cols_v1 else combined_df
             out_path = output_dir / 'master_combined.csv'
-            if 'gaia_source_id' in combined_df.columns:
-                combined_df['gaia_source_id'] = combined_df['gaia_source_id'].fillna(0).astype(np.int64)
-            combined_df.to_csv(out_path, index=False)
+            if 'gaia_source_id' in _df_save.columns:
+                _df_save['gaia_source_id'] = _df_save['gaia_source_id'].fillna(0).astype(np.int64)
+            _df_save.to_csv(out_path, index=False)
             print(f"  Updated master_combined.csv with Phase 4 astrometry columns")
 
     except Exception as exc:
@@ -4023,6 +4031,16 @@ def run_hst_crossmatch(
                         combined_v2_df.loc[_changed_idx, 'pmra_xmatch']).sum())
                     print(f"  Phase 5: {_n_pm_v2}/{n_changed} re-fitted sources "
                           f"have full PM constraints")
+
+            # ── Save per-star C_u (5×5) covariance array ─────────────────────
+            # Rows align 1:1 with master_combined_v2.csv.  Includes full C_r
+            # propagation from Phase 6/7; NaN rows are failed / insufficient fits.
+            _cu_cols = [f'_Cu_{i}{j}' for i in range(5) for j in range(5)]
+            if all(c in combined_v2_df.columns for c in _cu_cols):
+                _C_u_arr = combined_v2_df[_cu_cols].to_numpy(dtype=np.float64).reshape(-1, 5, 5)
+                np.save(output_dir / 'C_u_xmatch.npy', _C_u_arr)
+                print(f"  Saved → C_u_xmatch.npy  shape={_C_u_arr.shape}")
+                combined_v2_df = combined_v2_df.drop(columns=_cu_cols)
 
             _out_v2 = output_dir / 'master_combined_v2.csv'
             if 'gaia_source_id' in combined_v2_df.columns:
