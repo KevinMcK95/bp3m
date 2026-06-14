@@ -486,7 +486,8 @@ def _save_full_catalog_residuals(output_bp3m, solver, image_names, r_hat,
         pscale = float(meta['orig_pixel_scale'])   # mas/pixel
         hst_time = Time(float(meta['hst_time_mjd']), format='mjd')
         hst_yr   = float(hst_time.jyear)
-        tele_xyz = meta.get('tele_XYZ') or get_tele_position(hst_time, curr_id='earth')
+        _tele = meta.get('tele_XYZ')
+        tele_xyz = _tele if _tele is not None else get_tele_position(hst_time, curr_id='earth')
 
         # r_j for this image
         cs  = j_idx * n_r
