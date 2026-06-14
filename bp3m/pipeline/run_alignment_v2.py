@@ -376,6 +376,209 @@ def _plot_soft_weights(z_weights_out, solver, plot_dir):
 
 # ── Full-catalog residuals ─────────────────────────────────────────────────────
 
+def _load_full_catalog_df(data_root: Path, field_name: str):
+    """
+    Load and merge detections_F814W.csv + master_combined_v2.csv.
+
+    Expensive (reads and merges large CSVs) but only needs to be called once.
+    Returns a dict {sub_name: DataFrame} with columns:
+        x_gdc, y_gdc, mag_gdc, ra_xmatch, dec_xmatch, pmra_xmatch,
+        pmdec_xmatch, parallax_xmatch, epoch_ref_xmatch, gaia_source_id
+
+    Returns None if required files are missing.
+    """
+    import pandas as pd
+
+    xmatch_dir = data_root / field_name / "hst_xmatch"
+    det_path   = xmatch_dir / "detections_F814W.csv"
+    mcat_path  = xmatch_dir / "master_combined_v2.csv"
+
+    if not det_path.exists() or not mcat_path.exists():
+        return None
+
+    det  = pd.read_csv(det_path,  dtype={'gaia_source_id': np.int64})
+    mcat = pd.read_csv(mcat_path, dtype={'gaia_source_id': np.int64}, low_memory=False)
+
+    star_cols = ['ra_xmatch', 'dec_xmatch', 'pmra_xmatch', 'pmdec_xmatch',
+                 'parallax_xmatch', 'epoch_ref_xmatch']
+
+    # Part 1: Gaia-matched detections (gaia_source_id != 0)
+    mcat_gaia  = (mcat[mcat['gaia_source_id'] != 0]
+                  [['gaia_source_id'] + star_cols].copy())
+    det_gaia   = det[det['gaia_source_id'].to_numpy(np.int64) != 0][
+                     ['sub_name', 'gaia_source_id', 'catalog_index',
+                      'x_gdc', 'y_gdc', 'mag_gdc']].copy()
+    det_gaia_m = det_gaia.merge(mcat_gaia, on='gaia_source_id', how='inner')
+
+    # Part 2: HST-only detections (gaia_source_id == 0)
+    print("    Parsing hst_indices_F814W for HST-only lookup...")
+    mcat_hst_src = mcat[mcat['hst_indices_F814W'].notna()][
+                       ['hst_indices_F814W'] + star_cols].copy()
+    mcat_hst_src = mcat_hst_src.reset_index(drop=True)
+    mcat_hst_src['_entries'] = (mcat_hst_src['hst_indices_F814W']
+                                .str.replace(';', ',', regex=False)
+                                .str.split(','))
+    mcat_exploded = mcat_hst_src.explode('_entries')
+    mcat_exploded = mcat_exploded[
+        mcat_exploded['_entries'].str.contains(':', na=False)]
+    entry_parts = mcat_exploded['_entries'].str.split(':', expand=True)
+    mcat_exploded = mcat_exploded.copy()
+    mcat_exploded['sub_name']      = entry_parts[0]
+    mcat_exploded['catalog_index'] = entry_parts[1].astype(np.int64)
+    rev_idx = (mcat_exploded[['sub_name', 'catalog_index'] + star_cols]
+               .reset_index(drop=True))
+
+    det_hst = det[det['gaia_source_id'].to_numpy(np.int64) == 0][
+                  ['sub_name', 'gaia_source_id', 'catalog_index',
+                   'x_gdc', 'y_gdc', 'mag_gdc']].copy()
+    det_hst['catalog_index'] = det_hst['catalog_index'].astype(np.int64)
+    det_hst_m = det_hst.merge(rev_idx, on=['sub_name', 'catalog_index'], how='inner')
+
+    det_all = pd.concat([det_gaia_m, det_hst_m], ignore_index=True)
+    del det_gaia_m, det_hst_m, mcat_exploded, rev_idx
+
+    n_matched = len(det_all)
+    n_gaia_m  = (det_all['gaia_source_id'].to_numpy(np.int64) != 0).sum()
+    print(f"    Loaded {n_matched:,} detections "
+          f"({n_gaia_m:,} Gaia-matched + {n_matched - n_gaia_m:,} HST-only)")
+
+    # Convert to dict keyed by sub_name for fast per-image access
+    return {img: grp.reset_index(drop=True)
+            for img, grp in det_all.groupby('sub_name', sort=False)}
+
+
+def _compute_full_catalog_residuals_from_df(
+        img_to_df: dict,
+        bp3m_gaia_ids: set,
+        solver,
+        image_names: list,
+        r_hat: np.ndarray) -> dict:
+    """
+    Compute per-image GDC residuals for all catalog stars given current r_hat.
+
+    Parameters
+    ----------
+    img_to_df      : {sub_name: DataFrame} from _load_full_catalog_df
+    bp3m_gaia_ids  : set of Gaia IDs in the BP3M solver (for in_bp3m flag)
+    solver         : BP3MSolver (provides .images, .N_R, .poly_order, .R)
+    image_names    : ordered list of sub_names
+    r_hat          : (N_R * n_images,) current transformation vector
+
+    Returns
+    -------
+    out_arrays : dict with keys {img}_{X_c,Y_c,dx_gdc,dy_gdc,mag_inst,in_bp3m}
+    """
+    from astropy.time import Time
+    from bp3m.astro_utils import (
+        plane_project, plane_project_jacobian, plane_project_tangent_derivs,
+        get_tele_position, get_parallax_factors, compute_poly_jacobian,
+    )
+
+    out_arrays = {}
+    n_r        = solver.N_R
+    poly_order = solver.poly_order
+
+    for j_idx, img in enumerate(image_names):
+        if img not in img_to_df:
+            continue
+        meta = solver.images.get(img)
+        if meta is None:
+            continue
+
+        img_df = img_to_df[img]
+
+        ra0    = float(meta['ra0'])
+        dec0   = float(meta['dec0'])
+        pscale = float(meta['orig_pixel_scale'])
+        hst_time = Time(float(meta['hst_time_mjd']), format='mjd')
+        hst_yr   = float(hst_time.jyear)
+        _tele    = meta.get('tele_XYZ')
+        tele_xyz = (_tele if _tele is not None
+                    else get_tele_position(hst_time, curr_id='earth'))
+
+        cs  = j_idx * n_r
+        r_j = r_hat[cs : cs + n_r]
+
+        x_gdc     = img_df['x_gdc'].to_numpy(float)
+        y_gdc     = img_df['y_gdc'].to_numpy(float)
+        mag_arr   = img_df['mag_gdc'].to_numpy(float)
+        ra_arr    = img_df['ra_xmatch'].to_numpy(float)
+        dec_arr   = img_df['dec_xmatch'].to_numpy(float)
+        pmra_arr  = img_df['pmra_xmatch'].to_numpy(float)
+        pmdec_arr = img_df['pmdec_xmatch'].to_numpy(float)
+        plx_arr   = img_df['parallax_xmatch'].to_numpy(float)
+        epoch_arr = img_df['epoch_ref_xmatch'].to_numpy(float)
+        gids_arr  = img_df['gaia_source_id'].to_numpy(np.int64)
+
+        n   = len(img_df)
+        X_c = x_gdc - 2048.0
+        Y_c = y_gdc - 2048.0
+
+        xs, ys = plane_project(ra_arr, dec_arr, ra0, dec0, pscale)
+        xys    = np.stack([xs, ys], axis=1)
+
+        J_arr = plane_project_jacobian(ra_arr, dec_arr, ra0, dec0, pscale)
+
+        dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = plane_project_tangent_derivs(
+            ra_arr, dec_arr, ra0, dec0, pscale / 1000.0)
+
+        plx_ra_arr, plx_dec_arr = get_parallax_factors(ra_arr, dec_arr, tele_xyz)
+
+        dt_arr = hst_yr - epoch_arr
+
+        if poly_order == 1:
+            X_mat = np.zeros((n, 2, n_r))
+            X_mat[:, 0, 0] = X_c;         X_mat[:, 0, 1] = Y_c
+            X_mat[:, 0, 4] = 1.0
+            X_mat[:, 0, 6] = dxs_dra0;    X_mat[:, 0, 7] = dxs_ddec0
+            X_mat[:, 1, 2] = X_c;         X_mat[:, 1, 3] = Y_c
+            X_mat[:, 1, 5] = 1.0
+            X_mat[:, 1, 6] = dys_dra0;    X_mat[:, 1, 7] = dys_ddec0
+        else:
+            from bp3m.astro_utils import build_X_matrix
+            X_mat = np.array([
+                build_X_matrix(X_c[k], Y_c[k],
+                               dxs_dra0[k], dxs_ddec0[k],
+                               dys_dra0[k], dys_ddec0[k], poly_order)
+                for k in range(n)])
+
+        U_arr = np.zeros((n, 2, 5))
+        U_arr[:, 0, 0] = 1.0;          U_arr[:, 1, 1] = 1.0
+        U_arr[:, 0, 2] = dt_arr;       U_arr[:, 1, 3] = dt_arr
+        U_arr[:, 0, 4] = plx_ra_arr;   U_arr[:, 1, 4] = plx_dec_arr
+
+        JU = np.einsum('nij,njk->nik', J_arr, U_arr)
+
+        v_approx = np.zeros((n, 5))
+        v_approx[:, 2] = pmra_arr
+        v_approx[:, 3] = pmdec_arr
+        v_approx[:, 4] = plx_arr
+
+        pred         = (np.einsum('nij,j->ni', X_mat, r_j)
+                        - np.einsum('nij,nj->ni', JU, v_approx))
+        resid_pseudo = xys - pred
+
+        if poly_order == 1:
+            J_inv = np.linalg.inv(solver.R[img])
+            dxy   = resid_pseudo @ J_inv.T
+        else:
+            J_loc = compute_poly_jacobian(r_j, X_c, Y_c, poly_order)
+            J_inv = np.linalg.inv(J_loc)
+            dxy   = np.einsum('nij,nj->ni', J_inv, resid_pseudo)
+
+        in_bp3m = np.array([int(g) in bp3m_gaia_ids for g in gids_arr.tolist()],
+                           dtype=bool)
+
+        out_arrays[f'{img}_X_c']      = X_c.astype(np.float32)
+        out_arrays[f'{img}_Y_c']      = Y_c.astype(np.float32)
+        out_arrays[f'{img}_dx_gdc']   = dxy[:, 0].astype(np.float32)
+        out_arrays[f'{img}_dy_gdc']   = dxy[:, 1].astype(np.float32)
+        out_arrays[f'{img}_mag_inst'] = mag_arr.astype(np.float32)
+        out_arrays[f'{img}_in_bp3m']  = in_bp3m
+
+    return out_arrays
+
+
 def _save_full_catalog_residuals(output_bp3m, solver, image_names, r_hat,
                                   data_root, field_name):
     """
@@ -393,198 +596,15 @@ def _save_full_catalog_residuals(output_bp3m, solver, image_names, r_hat,
         {img}_mag_inst  : (n,) instrumental mag (mag_gdc from detections_F814W.csv)
         {img}_in_bp3m   : (n,) bool — star in BP3M solver (Gaia-matched alignment star)
     """
-    import pandas as pd
-    from astropy.time import Time
-    from bp3m.astro_utils import (
-        plane_project, plane_project_jacobian, plane_project_tangent_derivs,
-        get_tele_position, get_parallax_factors, compute_poly_jacobian,
-    )
-
-    xmatch_dir = data_root / field_name / "hst_xmatch"
-    det_path   = xmatch_dir / "detections_F814W.csv"
-    mcat_path  = xmatch_dir / "master_combined_v2.csv"
-
-    if not det_path.exists() or not mcat_path.exists():
+    print("\n  Computing full-catalog GDC residuals (all master_combined_v2 stars)...")
+    img_to_df = _load_full_catalog_df(data_root, field_name)
+    if img_to_df is None:
         print("  _save_full_catalog_residuals: required files not found — skipping")
         return
 
-    print("\n  Computing full-catalog GDC residuals (all master_combined_v2 stars)...")
-
-    # ── Load ────────────────────────────────────────────────────────────────────
-    det  = pd.read_csv(det_path,  dtype={'gaia_source_id': np.int64})
-    mcat = pd.read_csv(mcat_path, dtype={'gaia_source_id': np.int64}, low_memory=False)
-
-    star_cols = ['ra_xmatch', 'dec_xmatch', 'pmra_xmatch', 'pmdec_xmatch',
-                 'parallax_xmatch', 'epoch_ref_xmatch']
-
-    # ── Merge detections with master catalog ────────────────────────────────────
-    # Part 1: Gaia-matched detections (gaia_source_id != 0)
-    mcat_gaia = (mcat[mcat['gaia_source_id'] != 0]
-                 [['gaia_source_id'] + star_cols].copy())
-    det_gaia  = det[det['gaia_source_id'].to_numpy(np.int64) != 0][
-                    ['sub_name', 'gaia_source_id', 'catalog_index',
-                     'x_gdc', 'y_gdc', 'mag_gdc']].copy()
-    det_gaia_m = det_gaia.merge(mcat_gaia, on='gaia_source_id', how='inner')
-
-    # Part 2: HST-only detections (gaia_source_id == 0)
-    # Build reverse index: (sub_name, catalog_index) → master catalog row
-    # Parse hst_indices_F814W column
-    print("    Parsing hst_indices_F814W for HST-only lookup...")
-    mcat_hst_src = mcat[mcat['hst_indices_F814W'].notna()][
-                       ['hst_indices_F814W'] + star_cols].copy()
-    mcat_hst_src = mcat_hst_src.reset_index(drop=True)
-
-    # Explode "sub_name:catalog_index" entries — separator may be ',' or ';'
-    mcat_hst_src['_entries'] = (mcat_hst_src['hst_indices_F814W']
-                                .str.replace(';', ',', regex=False)
-                                .str.split(','))
-    mcat_exploded = mcat_hst_src.explode('_entries')
-    mcat_exploded = mcat_exploded[mcat_exploded['_entries'].str.contains(':', na=False)]
-    entry_parts = mcat_exploded['_entries'].str.split(':', expand=True)
-    mcat_exploded = mcat_exploded.copy()
-    mcat_exploded['sub_name']       = entry_parts[0]
-    mcat_exploded['catalog_index']  = entry_parts[1].astype(np.int64)
-    rev_idx = mcat_exploded[['sub_name', 'catalog_index'] + star_cols].reset_index(drop=True)
-
-    det_hst = det[det['gaia_source_id'].to_numpy(np.int64) == 0][
-                  ['sub_name', 'gaia_source_id', 'catalog_index',
-                   'x_gdc', 'y_gdc', 'mag_gdc']].copy()
-    det_hst['catalog_index'] = det_hst['catalog_index'].astype(np.int64)
-    det_hst_m = det_hst.merge(rev_idx, on=['sub_name', 'catalog_index'], how='inner')
-
-    # Combine and sort by sub_name for per-image grouping
-    det_all = pd.concat([det_gaia_m, det_hst_m], ignore_index=True)
-    del det_gaia_m, det_hst_m, mcat_exploded, rev_idx  # free memory
-
-    n_matched = len(det_all)
-    n_gaia_m  = (det_all['gaia_source_id'].to_numpy(np.int64) != 0).sum()
-    print(f"    Matched {n_matched:,} detections "
-          f"({n_gaia_m:,} Gaia-matched + {n_matched - n_gaia_m:,} HST-only)")
-
-    # BP3M solver Gaia IDs (for in_bp3m flag on Gaia-matched detections)
     bp3m_gaia_ids = set(int(g) for g in solver.star_id_to_idx.keys() if int(g) > 0)
-
-    # ── Per-image residual computation ─────────────────────────────────────────
-    out_arrays = {}
-    n_r = solver.N_R
-    poly_order = solver.poly_order
-
-    det_by_img = det_all.groupby('sub_name', sort=False)
-
-    for j_idx, img in enumerate(image_names):
-        if img not in det_by_img.groups:
-            continue
-        meta = solver.images.get(img)
-        if meta is None:
-            continue
-
-        img_df = det_by_img.get_group(img)
-
-        # Image geometry
-        ra0    = float(meta['ra0'])
-        dec0   = float(meta['dec0'])
-        pscale = float(meta['orig_pixel_scale'])   # mas/pixel
-        hst_time = Time(float(meta['hst_time_mjd']), format='mjd')
-        hst_yr   = float(hst_time.jyear)
-        _tele = meta.get('tele_XYZ')
-        tele_xyz = _tele if _tele is not None else get_tele_position(hst_time, curr_id='earth')
-
-        # r_j for this image
-        cs  = j_idx * n_r
-        r_j = r_hat[cs : cs + n_r]
-
-        # Per-detection arrays
-        x_gdc    = img_df['x_gdc'].to_numpy(float)
-        y_gdc    = img_df['y_gdc'].to_numpy(float)
-        mag_arr  = img_df['mag_gdc'].to_numpy(float)
-        ra_arr   = img_df['ra_xmatch'].to_numpy(float)
-        dec_arr  = img_df['dec_xmatch'].to_numpy(float)
-        pmra_arr = img_df['pmra_xmatch'].to_numpy(float)
-        pmdec_arr= img_df['pmdec_xmatch'].to_numpy(float)
-        plx_arr  = img_df['parallax_xmatch'].to_numpy(float)
-        epoch_arr= img_df['epoch_ref_xmatch'].to_numpy(float)  # Julian year
-        gids_arr = img_df['gaia_source_id'].to_numpy(np.int64)
-
-        n = len(img_df)
-
-        # Centered GDC pixel positions
-        X_c = x_gdc - 2048.0
-        Y_c = y_gdc - 2048.0
-
-        # Gaia reference position in pseudo-image frame (pix)
-        xs, ys = plane_project(ra_arr, dec_arr, ra0, dec0, pscale)
-        xys = np.stack([xs, ys], axis=1)   # (n, 2)
-
-        # Jacobian J: (n, 2, 2) in pix/mas
-        J_arr = plane_project_jacobian(ra_arr, dec_arr, ra0, dec0, pscale)
-
-        # Tangent-point derivatives (pscale/1000 → arcsec units, matching solver)
-        dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = plane_project_tangent_derivs(
-            ra_arr, dec_arr, ra0, dec0, pscale / 1000.0)
-
-        # Parallax factors
-        plx_ra_arr, plx_dec_arr = get_parallax_factors(ra_arr, dec_arr, tele_xyz)
-
-        # Time baseline: HST epoch minus star reference epoch (Julian years)
-        dt_arr = hst_yr - epoch_arr
-
-        # X_mat: (n, 2, n_r) design matrix — vectorized for poly_order=1
-        if poly_order == 1:
-            X_mat = np.zeros((n, 2, n_r))
-            X_mat[:, 0, 0] = X_c;         X_mat[:, 0, 1] = Y_c
-            X_mat[:, 0, 4] = 1.0
-            X_mat[:, 0, 6] = dxs_dra0;    X_mat[:, 0, 7] = dxs_ddec0
-            X_mat[:, 1, 2] = X_c;         X_mat[:, 1, 3] = Y_c
-            X_mat[:, 1, 5] = 1.0
-            X_mat[:, 1, 6] = dys_dra0;    X_mat[:, 1, 7] = dys_ddec0
-        else:
-            from bp3m.astro_utils import build_X_matrix
-            X_mat = np.array([
-                build_X_matrix(X_c[k], Y_c[k],
-                               dxs_dra0[k], dxs_ddec0[k],
-                               dys_dra0[k], dys_ddec0[k], poly_order)
-                for k in range(n)])
-
-        # U matrix: (n, 2, 5) — stellar motion time-evolution
-        U_arr = np.zeros((n, 2, 5))
-        U_arr[:, 0, 0] = 1.0;          U_arr[:, 1, 1] = 1.0
-        U_arr[:, 0, 2] = dt_arr;       U_arr[:, 1, 3] = dt_arr
-        U_arr[:, 0, 4] = plx_ra_arr;   U_arr[:, 1, 4] = plx_dec_arr
-
-        # JU = J @ U: (n, 2, 5)
-        JU = np.einsum('nij,njk->nik', J_arr, U_arr)
-
-        # Approximate stellar motion vector: Δα*=0, Δδ=0 since ra/dec_xmatch
-        # is the MAP position; only PM and parallax contribute.
-        v_approx = np.zeros((n, 5))
-        v_approx[:, 2] = pmra_arr
-        v_approx[:, 3] = pmdec_arr
-        v_approx[:, 4] = plx_arr
-
-        # Predicted pseudo-image position and residual
-        pred = (np.einsum('nij,j->ni', X_mat, r_j)
-                - np.einsum('nij,nj->ni', JU, v_approx))
-        resid_pseudo = xys - pred   # (n, 2)
-
-        # Back-project residual to GDC frame
-        if poly_order == 1:
-            J_inv = np.linalg.inv(solver.R[img])   # (2, 2)
-            dxy   = resid_pseudo @ J_inv.T          # (n, 2)
-        else:
-            J_loc = compute_poly_jacobian(r_j, X_c, Y_c, poly_order)
-            J_inv = np.linalg.inv(J_loc)            # (n, 2, 2)
-            dxy   = np.einsum('nij,nj->ni', J_inv, resid_pseudo)
-
-        # In-BP3M flag: True for Gaia-matched stars used in BP3M alignment
-        in_bp3m = np.array([int(g) in bp3m_gaia_ids for g in gids_arr.tolist()],
-                           dtype=bool)
-
-        out_arrays[f'{img}_X_c']      = X_c.astype(np.float32)
-        out_arrays[f'{img}_Y_c']      = Y_c.astype(np.float32)
-        out_arrays[f'{img}_dx_gdc']   = dxy[:, 0].astype(np.float32)
-        out_arrays[f'{img}_dy_gdc']   = dxy[:, 1].astype(np.float32)
-        out_arrays[f'{img}_mag_inst'] = mag_arr.astype(np.float32)
-        out_arrays[f'{img}_in_bp3m']  = in_bp3m
+    out_arrays = _compute_full_catalog_residuals_from_df(
+        img_to_df, bp3m_gaia_ids, solver, image_names, r_hat)
 
     if not out_arrays:
         print("  WARNING: no detections matched — detections_catalog.npz not saved")

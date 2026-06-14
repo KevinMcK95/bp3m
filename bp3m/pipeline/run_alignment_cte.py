@@ -4,21 +4,20 @@ run_alignment_cte.py  —  Joint CTE + astrometry model for HST ACS/WFC.
 Extends BP3M v2 alignment to simultaneously fit per-image transformations (r_j),
 stellar astrometry (v_i), and a parametric CTE model θ_CTE.
 
-See docs/cte_joint_model.md for the full mathematical derivation and design decisions.
+See docs/cte_joint_model.md for full mathematical derivation and design decisions.
 
 CTE model summary
 -----------------
-For chip c, detection k in image j (epoch t_j):
+For chip c (hi/lo), detection k in image j (epoch t_j):
 
   δCTE_x_k = (t_j − t_0) · φ(mag_k; δ_c) · b_x(X_k, Y_k) · γ_x_c
   δCTE_y_k = (t_j − t_0) · φ(mag_k; δ_c) · b_y(X_k, Y_k) · γ_y_c
 
-  φ(mag; δ) = 10^{0.4·δ·(mag − mag_ref)} − 1   (flux power-law; mag_ref = 20)
-  b_y = [Y', X·Y', Y'²]   where Y' = Y_c − Y_readout_c   (boundary: CTE_y = 0 at Y')
-  b_x = [X_c, X_c·Y_c, X_c²]                              (boundary: CTE_x = 0 at X=0)
-
-  γ_x_c, γ_y_c: (3,) composite polynomial coefficients (absorb temporal α)
-  δ_c: flux power-law exponent (shared between CTE_x and CTE_y for chip c)
+  φ(mag; δ) = 10^{0.4·δ·(mag − mag_ref)} − 1
+  b_y = [Y', X·Y', Y'²]  where Y' = Y_c − Y_readout_c  (CTE_y=0 at readout)
+  b_x = [X_c, X_c·Y_c, X_c²]                           (CTE_x=0 at X_c=0)
+  γ_x_c, γ_y_c: (3,) composite coefficients (absorb temporal α)
+  δ_c: shared flux exponent for chip c
 
 Parameters: 14 total (7 per chip: δ, γ_x(3), γ_y(3)).
 """
@@ -26,151 +25,133 @@ Parameters: 14 total (7 per chip: δ, γ_x(3), γ_y(3)).
 from __future__ import annotations
 
 import time
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 # ── ACS/WFC chip geometry constants ──────────────────────────────────────────
-# Centered GDC pixel coordinates: X_c = x_gdc − 2048, Y_c = y_gdc − 2048.
-# _hi chip: readout register at top of chip (+Y side).
-# _lo chip: readout register at bottom of chip (−Y side).
-_HI_Y_READOUT = +2047.0   # Y_c at readout register for _hi chip
-_LO_Y_READOUT = -2048.0   # Y_c at readout register for _lo chip
-_MAG_REF      = 20.0      # reference magnitude for flux power-law normalization
+_HI_Y_READOUT = +2047.0
+_LO_Y_READOUT = -2048.0
+_MAG_REF      = 20.0
 
 
 # ── CTE parameter dataclass ───────────────────────────────────────────────────
 
 @dataclass
 class CTEChipParams:
-    """CTE model parameters for one ACS/WFC chip."""
-    chip: str                                              # 'hi' or 'lo'
-    y_readout: float                                       # Y_c at readout register
-    delta: float = 1.0                                     # flux power-law exponent
-    gamma_x: np.ndarray = field(default_factory=lambda: np.zeros(3))  # serial CTE
-    gamma_y: np.ndarray = field(default_factory=lambda: np.zeros(3))  # parallel CTE
+    chip: str
+    y_readout: float
+    delta: float = 1.0
+    gamma_x: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    gamma_y: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
     def copy(self) -> 'CTEChipParams':
-        return CTEChipParams(
-            chip=self.chip,
-            y_readout=self.y_readout,
-            delta=float(self.delta),
-            gamma_x=self.gamma_x.copy(),
-            gamma_y=self.gamma_y.copy(),
-        )
-
-    def as_dict(self) -> dict:
-        return {
-            'chip': self.chip,
-            'y_readout': self.y_readout,
-            'delta': float(self.delta),
-            'gamma_x': self.gamma_x.tolist(),
-            'gamma_y': self.gamma_y.tolist(),
-        }
+        return CTEChipParams(chip=self.chip, y_readout=self.y_readout,
+                             delta=float(self.delta),
+                             gamma_x=self.gamma_x.copy(),
+                             gamma_y=self.gamma_y.copy())
 
 
 def default_cte_params() -> dict[str, CTEChipParams]:
-    """Return default (zero) CTE parameters for both chips."""
     return {
         'hi': CTEChipParams(chip='hi', y_readout=_HI_Y_READOUT),
         'lo': CTEChipParams(chip='lo', y_readout=_LO_Y_READOUT),
     }
 
 
+# ── Chip classification ────────────────────────────────────────────────────────
+
+def _chip_from_image(img: str) -> str | None:
+    """Return 'hi', 'lo', or None for merged (unsplit) images."""
+    if img.endswith('_hi'):
+        return 'hi'
+    if img.endswith('_lo'):
+        return 'lo'
+    return None   # merged image — no CTE model applies
+
+
 # ── Flux power-law model ──────────────────────────────────────────────────────
 
-def phi_flux(mag: np.ndarray, delta: float, mag_ref: float = _MAG_REF) -> np.ndarray:
-    """
-    φ(mag; δ) = 10^{0.4·δ·(mag − mag_ref)} − 1.
-
-    Physical interpretation: CTE trailing ∝ (flux/flux_ref)^δ − 1.
-    At mag = mag_ref: φ = 0.
-    For faint stars (mag > mag_ref), δ > 0 → φ < 0 (less flux → less trailing).
-    """
+def phi_flux(mag: np.ndarray, delta: float,
+             mag_ref: float = _MAG_REF) -> np.ndarray:
+    """φ(mag; δ) = 10^{0.4·δ·(mag − mag_ref)} − 1."""
     return np.power(10.0, 0.4 * delta * (np.asarray(mag, dtype=float) - mag_ref)) - 1.0
 
 
-def dphi_ddelta(mag: np.ndarray, delta: float, mag_ref: float = _MAG_REF) -> np.ndarray:
-    """
-    dφ/dδ = 0.4·ln(10)·(mag − mag_ref)·10^{0.4·δ·(mag − mag_ref)}.
-
-    Analytic gradient of φ w.r.t. δ for Gauss-Newton δ update.
-    """
+def dphi_ddelta(mag: np.ndarray, delta: float,
+                mag_ref: float = _MAG_REF) -> np.ndarray:
+    """dφ/dδ = 0.4·ln(10)·(mag − mag_ref)·10^{0.4·δ·(mag − mag_ref)}."""
     dm = np.asarray(mag, dtype=float) - mag_ref
     return 0.4 * np.log(10.0) * dm * np.power(10.0, 0.4 * delta * dm)
 
 
 # ── CTE basis functions ───────────────────────────────────────────────────────
 
-def cte_y_basis(X_c: np.ndarray, Y_c: np.ndarray, y_readout: float) -> np.ndarray:
-    """
-    Parallel (Y-direction) CTE basis: (n, 3).
-
-    b_y = [Y', X_c·Y', Y'²]  where Y' = Y_c − y_readout.
-    Boundary condition: CTE_y = 0 at Y' = 0 (readout register).
-    """
+def cte_y_basis(X_c: np.ndarray, Y_c: np.ndarray,
+                y_readout: float) -> np.ndarray:
+    """b_y = [Y', X_c·Y', Y'²]  (boundary: CTE_y = 0 at Y' = 0)."""
     Yp = Y_c - y_readout
     return np.stack([Yp, X_c * Yp, Yp ** 2], axis=1)
 
 
 def cte_x_basis(X_c: np.ndarray, Y_c: np.ndarray) -> np.ndarray:
-    """
-    Serial (X-direction) CTE basis: (n, 3).
-
-    b_x = [X_c, X_c·Y_c, X_c²].
-    Boundary condition: CTE_x = 0 at X_c = 0 (chip center / amplifier line).
-    """
+    """b_x = [X_c, X_c·Y_c, X_c²]  (boundary: CTE_x = 0 at X_c = 0)."""
     return np.stack([X_c, X_c * Y_c, X_c ** 2], axis=1)
 
 
 # ── CTE displacement computation ──────────────────────────────────────────────
 
 def compute_cte_displacement(
-    X_c: np.ndarray,
-    Y_c: np.ndarray,
-    mag: np.ndarray,
-    dt: np.ndarray,
+    X_c: np.ndarray, Y_c: np.ndarray,
+    mag: np.ndarray, dt: np.ndarray,
     chip_params: CTEChipParams,
 ) -> np.ndarray:
     """
-    Compute CTE displacement in raw chip-centered pixel frame.
+    CTE displacement in raw chip-centered pixel frame.
 
-    Parameters
-    ----------
-    X_c, Y_c : (n,) centered GDC pixel positions
-    mag       : (n,) instrumental magnitudes
-    dt        : (n,) time since t_epoch0 in years (t_j − t_0)
-    chip_params : CTEChipParams for this chip
-
-    Returns
-    -------
-    delta_cte : (n, 2) array of (δCTE_x, δCTE_y) in pixels
+    Returns (n, 2) array of (δCTE_x, δCTE_y) in pixels.
     """
-    phi  = phi_flux(mag, chip_params.delta)           # (n,)
-    Phi  = dt * phi                                    # (n,) temporal amplitude × flux
-
-    Bx = cte_x_basis(X_c, Y_c)                        # (n, 3)
-    By = cte_y_basis(X_c, Y_c, chip_params.y_readout) # (n, 3)
-
-    dcte_x = Phi * (Bx @ chip_params.gamma_x)         # (n,)
-    dcte_y = Phi * (By @ chip_params.gamma_y)         # (n,)
-
-    return np.stack([dcte_x, dcte_y], axis=1)          # (n, 2)
+    phi  = phi_flux(mag, chip_params.delta)
+    Phi  = dt * phi
+    Bx   = cte_x_basis(X_c, Y_c)
+    By   = cte_y_basis(X_c, Y_c, chip_params.y_readout)
+    return np.stack([Phi * (Bx @ chip_params.gamma_x),
+                     Phi * (By @ chip_params.gamma_y)], axis=1)
 
 
-# ── Solver integration ────────────────────────────────────────────────────────
+# ── mag_inst injection ────────────────────────────────────────────────────────
 
-def _chip_from_image(img: str) -> str:
-    """Return 'hi' or 'lo' from image name suffix."""
-    return 'hi' if img.endswith('_hi') else 'lo'
+def _inject_mag_inst(solver, image_names: list, filtered_spi: dict,
+                     gaia_catalog) -> None:
+    """
+    Inject per-detection instrumental mag into solver._img_data[img]['mag_inst'].
+
+    Uses filtered_spi[img]['mag'] (from FITS catalog, already loaded by
+    data_loader_master).  Maps via Gaia_id lookup — works for both positive
+    Gaia-matched stars and negative HST-only stars.
+    """
+    gc_ids = gaia_catalog['Gaia_id'].to_numpy(dtype=np.int64)
+
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        spi_df = filtered_spi.get(img)
+        if spi_df is None or 'mag' not in spi_df.columns:
+            continue
+
+        # Build Gaia_id → mag lookup (vectorized, no iterrows)
+        _gids = spi_df['Gaia_id'].to_numpy(dtype=np.int64)
+        _mags = spi_df['mag'].to_numpy(dtype=float)
+        gid_to_mag = {int(_gids[k]): float(_mags[k]) for k in range(len(spi_df))}
+
+        sidx = d['sidx']
+        mag_arr = np.array([gid_to_mag.get(int(gc_ids[s]), np.nan) for s in sidx])
+        d['mag_inst'] = mag_arr
 
 
-def _epoch_from_image(img: str) -> int:
-    """Return approximate epoch year from rootname prefix."""
-    return 2006 if img.startswith('j9gz') else 2011
-
+# ── Solver CTE correction ─────────────────────────────────────────────────────
 
 def apply_cte_to_solver(
     solver,
@@ -181,16 +162,11 @@ def apply_cte_to_solver(
     """
     Apply CTE correction to solver._img_data[img]['xys'] for all images.
 
-    On first call, stores 'xys_orig' for each image.  Subsequent calls update
-    'xys' from 'xys_orig' + R_j @ δCTE, ensuring the correction is always
-    applied to the original positions (not accumulated).
+    Stores 'xys_orig' on first call.  Each subsequent call recomputes from
+    xys_orig so corrections don't accumulate.
 
-    Parameters
-    ----------
-    solver      : BP3MSolver instance
-    image_names : list of sub_name strings
-    cte_params  : {'hi': CTEChipParams, 'lo': CTEChipParams}
-    t_epoch0_yr : reference epoch (Julian year) for temporal model
+    Skips images where chip cannot be determined (merged/unsplit images) or
+    where mag_inst is missing / entirely NaN.
     """
     from astropy.time import Time
 
@@ -199,182 +175,106 @@ def apply_cte_to_solver(
         if d is None:
             continue
 
-        # Store original xys on first call
         if 'xys_orig' not in d:
             d['xys_orig'] = d['xys'].copy()
 
         chip = _chip_from_image(img)
-        if chip not in cte_params:
+        if chip is None or chip not in cte_params:
             continue
 
-        # Image epoch
+        mag = d.get('mag_inst')
+        if mag is None:
+            continue
+        ok = np.isfinite(mag)
+        if not ok.any():
+            continue
+
         hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
                              format='mjd').jyear)
-        dt = hst_yr - t_epoch0_yr   # scalar
+        dt_scalar = hst_yr - t_epoch0_yr
+        dt = np.full(len(mag), dt_scalar)
 
-        # Per-detection CTE displacement in chip-centered pixel frame
-        X_c = d['X_c']   # (n,)
-        Y_c = d['Y_c']   # (n,)
-        mag = d.get('mag_inst')
-        if mag is None or not np.isfinite(mag).any():
-            continue
+        delta_cte_raw = np.zeros((len(mag), 2))
+        if ok.any():
+            X_c = d['X_c']
+            Y_c = d['Y_c']
+            delta_cte_raw[ok] = compute_cte_displacement(
+                X_c[ok], Y_c[ok], mag[ok], dt[ok], cte_params[chip])
 
-        delta_cte_raw = compute_cte_displacement(
-            X_c, Y_c, mag, np.full(len(X_c), dt), cte_params[chip])  # (n, 2)
-
-        # Rotate chip-frame correction to pseudo-image frame using R_j = solver.R[img]
-        R_j = solver.R[img]                                            # (2, 2)
-        delta_cte_pseudo = delta_cte_raw @ R_j.T                      # (n, 2)
-
+        R_j = solver.R[img]                             # (2, 2)
+        delta_cte_pseudo = delta_cte_raw @ R_j.T        # (n, 2)
         d['xys'] = d['xys_orig'] + delta_cte_pseudo
-
-
-def remove_cte_from_solver(solver, image_names: list[str]) -> None:
-    """Restore original xys for all images (set xys = xys_orig)."""
-    for img in image_names:
-        d = solver._img_data.get(img)
-        if d is None or 'xys_orig' not in d:
-            continue
-        d['xys'] = d['xys_orig'].copy()
 
 
 # ── Residual collection ───────────────────────────────────────────────────────
 
 def collect_cte_residuals(
+    img_to_df: dict,
     solver,
     image_names: list[str],
     r_hat: np.ndarray,
     t_epoch0_yr: float,
-    data_root: Path,
-    field_name: str,
-    use_catalog_npz: bool = True,
 ) -> dict[str, dict]:
     """
-    Collect per-chip GDC-frame residuals needed to update CTE parameters.
+    Collect per-chip GDC-frame residuals for updating CTE parameters.
 
-    Reads detections_catalog.npz (all ~127k stars) rather than the solver
-    BP3M stars only, to maximize signal on faint stars where CTE is strongest.
+    Uses the full master-catalog detection set (all ~127k stars via img_to_df),
+    not just the solver's BP3M alignment stars.  img_to_df is the output of
+    _load_full_catalog_df and should be cached across CTE iterations.
 
     Returns
     -------
-    residuals : {'hi': {...}, 'lo': {...}} each containing:
-        'dx'    : (n,) x residual in GDC pixels
-        'dy'    : (n,) y residual in GDC pixels
-        'X_c'   : (n,) centered X position
-        'Y_c'   : (n,) centered Y position
-        'mag'   : (n,) instrumental magnitude
-        'dt'    : (n,) time since t_epoch0_yr [years]
-        'z'     : (n,) soft weights (1.0 if not available)
+    residuals : {'hi': {...}, 'lo': {...}} each with arrays:
+        dx, dy : (n,) GDC residuals [pixels]
+        X_c, Y_c, mag, dt, z : per-detection geometry/weighting
     """
-    import pandas as pd
     from astropy.time import Time
-    from bp3m.astro_utils import (
-        plane_project, plane_project_jacobian, plane_project_tangent_derivs,
-        get_tele_position, get_parallax_factors,
-    )
+    from .run_alignment_v2 import _compute_full_catalog_residuals_from_df
 
-    n_r = solver.N_R
-    poly_order = solver.poly_order
+    bp3m_gaia_ids = set(int(g) for g in solver.star_id_to_idx.keys() if int(g) > 0)
+    out_arrays = _compute_full_catalog_residuals_from_df(
+        img_to_df, bp3m_gaia_ids, solver, image_names, r_hat)
 
-    xmatch_dir = data_root / field_name / "hst_xmatch"
-    cat_npz_path = (data_root / field_name / "BP3M_v2_results"
-                    / "detections_catalog.npz")
+    residuals = {c: {'dx': [], 'dy': [], 'X_c': [], 'Y_c': [],
+                     'mag': [], 'dt': [], 'z': []}
+                 for c in ('hi', 'lo')}
 
-    residuals = {chip: {'dx': [], 'dy': [], 'X_c': [], 'Y_c': [],
-                         'mag': [], 'dt': [], 'z': []}
-                 for chip in ('hi', 'lo')}
+    for img in image_names:
+        if f'{img}_X_c' not in out_arrays:
+            continue
+        chip = _chip_from_image(img)
+        if chip is None:
+            continue
 
-    if use_catalog_npz and cat_npz_path.exists():
-        # Fast path: use precomputed GDC residuals from detections_catalog.npz.
-        # These already include the full _save_full_catalog_residuals geometry.
-        # We recompute the residuals relative to the CURRENT xys (CTE-corrected),
-        # so we load the raw catalog positions and recompute.
-        # For now fall through to the geometry path (catalog npz gives post-v2
-        # residuals which are a reasonable starting point for the warm start).
-        cat = np.load(cat_npz_path, allow_pickle=True)
-        for j_idx, img in enumerate(image_names):
-            if f'{img}_X_c' not in cat:
-                continue
-            chip = _chip_from_image(img)
-            hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
-                                 format='mjd').jyear)
-            dt = hst_yr - t_epoch0_yr
+        hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
+                             format='mjd').jyear)
+        dt = hst_yr - t_epoch0_yr
 
-            X_c = cat[f'{img}_X_c'].astype(float)
-            Y_c = cat[f'{img}_Y_c'].astype(float)
-            dx  = cat[f'{img}_dx_gdc'].astype(float)
-            dy  = cat[f'{img}_dy_gdc'].astype(float)
-            mag = cat[f'{img}_mag_inst'].astype(float)
+        X_c = out_arrays[f'{img}_X_c'].astype(float)
+        Y_c = out_arrays[f'{img}_Y_c'].astype(float)
+        dx  = out_arrays[f'{img}_dx_gdc'].astype(float)
+        dy  = out_arrays[f'{img}_dy_gdc'].astype(float)
+        mag = out_arrays[f'{img}_mag_inst'].astype(float)
 
-            ok = np.isfinite(dx) & np.isfinite(dy) & np.isfinite(mag)
-            residuals[chip]['dx'].append(dx[ok])
-            residuals[chip]['dy'].append(dy[ok])
-            residuals[chip]['X_c'].append(X_c[ok])
-            residuals[chip]['Y_c'].append(Y_c[ok])
-            residuals[chip]['mag'].append(mag[ok])
-            residuals[chip]['dt'].append(np.full(ok.sum(), dt))
-            residuals[chip]['z'].append(np.ones(ok.sum()))
+        ok = np.isfinite(dx) & np.isfinite(dy) & np.isfinite(mag)
+        n_ok = int(ok.sum())
+        if n_ok == 0:
+            continue
 
-    else:
-        # Fallback: recompute from solver's current _img_data
-        print("    collect_cte_residuals: detections_catalog.npz not found, "
-              "using solver stars only")
-        for j_idx, img in enumerate(image_names):
-            d = solver._img_data.get(img)
-            if d is None:
-                continue
-            chip = _chip_from_image(img)
-            hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
-                                 format='mjd').jyear)
-            dt = hst_yr - t_epoch0_yr
+        residuals[chip]['dx'].append(dx[ok])
+        residuals[chip]['dy'].append(dy[ok])
+        residuals[chip]['X_c'].append(X_c[ok])
+        residuals[chip]['Y_c'].append(Y_c[ok])
+        residuals[chip]['mag'].append(mag[ok])
+        residuals[chip]['dt'].append(np.full(n_ok, dt))
+        residuals[chip]['z'].append(np.ones(n_ok))
 
-            r_j   = r_hat[j_idx * n_r:(j_idx + 1) * n_r]
-            X_c   = d['X_c']
-            Y_c   = d['Y_c']
-            mag   = d.get('mag_inst')
-            if mag is None:
-                continue
-
-            # Current residuals in pseudo-image frame
-            xys_orig = d.get('xys_orig', d['xys'])
-            X_mat = d['X_mat']
-            JU    = d['JU']
-            sidx  = d['sidx']
-            v_approx = np.zeros((len(sidx), 5))
-            v_approx[:, 2] = solver.v_survey[sidx, 2]   # pmra
-            v_approx[:, 3] = solver.v_survey[sidx, 3]   # pmdec
-            v_approx[:, 4] = solver.v_survey[sidx, 4]   # plx
-            pred = (np.einsum('nij,j->ni', X_mat, r_j)
-                    - np.einsum('nij,nj->ni', JU, v_approx))
-            resid_pseudo = xys_orig - pred   # (n, 2)
-
-            if poly_order == 1:
-                J_inv = np.linalg.inv(solver.R[img])
-                dxy = resid_pseudo @ J_inv.T
-            else:
-                from bp3m.astro_utils import compute_poly_jacobian
-                J_loc = compute_poly_jacobian(r_j, X_c, Y_c, poly_order)
-                J_inv = np.linalg.inv(J_loc)
-                dxy = np.einsum('nij,nj->ni', J_inv, resid_pseudo)
-
-            ok = np.isfinite(dxy[:, 0]) & np.isfinite(mag)
-            residuals[chip]['dx'].append(dxy[ok, 0])
-            residuals[chip]['dy'].append(dxy[ok, 1])
-            residuals[chip]['X_c'].append(X_c[ok])
-            residuals[chip]['Y_c'].append(Y_c[ok])
-            residuals[chip]['mag'].append(mag[ok])
-            residuals[chip]['dt'].append(np.full(ok.sum(), dt))
-            residuals[chip]['z'].append(np.ones(ok.sum()))
-
-    # Concatenate per-chip lists
     for chip in ('hi', 'lo'):
         for key in residuals[chip]:
             arr = residuals[chip][key]
             residuals[chip][key] = np.concatenate(arr) if arr else np.array([])
-
-    for chip in ('hi', 'lo'):
         n = len(residuals[chip]['dx'])
-        print(f"    collect_cte_residuals: {chip} — {n:,} detections")
+        print(f"    {chip}: {n:,} detections")
 
     return residuals
 
@@ -386,27 +286,16 @@ def update_cte_params(
     cte_params: dict[str, CTEChipParams],
     n_inner: int = 5,
     delta_tol: float = 1e-4,
-    regularize: float = 1e-6,
+    regularize: float = 1e-8,
 ) -> tuple[dict[str, CTEChipParams], dict]:
     """
-    Update CTE parameters (γ, δ) from current GDC-frame residuals.
+    Update CTE parameters (γ, δ) from GDC-frame residuals via Gauss-Newton.
 
-    Uses Gauss-Newton inner iterations to solve for δ jointly with γ.
-    The update for γ is linear (least squares); δ update is from the
-    linearized (analytic gradient) column appended to the design matrix.
+    Linear step: solve for γ_x, γ_y (3 coefficients each).
+    Nonlinear step: augment design matrix with analytic dφ/dδ column,
+    solve for Δδ jointly, update δ ← δ + Δδ.
 
-    Parameters
-    ----------
-    residuals_by_chip : output of collect_cte_residuals
-    cte_params        : current parameters (modified in-place copy returned)
-    n_inner           : Gauss-Newton iterations for δ
-    delta_tol         : convergence threshold for |Δδ|
-    regularize        : Tikhonov regularization coefficient (applied to γ)
-
-    Returns
-    -------
-    new_params : updated CTEChipParams for each chip
-    info       : convergence info dict
+    Returns updated copy of cte_params and convergence info dict.
     """
     new_params = {c: cte_params[c].copy() for c in ('hi', 'lo')}
     info = {}
@@ -414,96 +303,82 @@ def update_cte_params(
     for chip in ('hi', 'lo'):
         res = residuals_by_chip[chip]
         if len(res['dx']) == 0:
-            info[chip] = {'converged': True, 'n_inner': 0}
+            info[chip] = {'converged': True, 'n_inner': 0, 'n_det': 0}
             continue
 
-        dx   = res['dx'].astype(float)
-        dy   = res['dy'].astype(float)
-        X_c  = res['X_c'].astype(float)
-        Y_c  = res['Y_c'].astype(float)
-        mag  = res['mag'].astype(float)
-        dt   = res['dt'].astype(float)
-        z    = res['z'].astype(float)
+        dx  = res['dx'].astype(float)
+        dy  = res['dy'].astype(float)
+        X_c = res['X_c'].astype(float)
+        Y_c = res['Y_c'].astype(float)
+        mag = res['mag'].astype(float)
+        dt  = res['dt'].astype(float)
+        z   = res['z'].astype(float)
 
-        # Remove invalid rows
-        ok = np.isfinite(dx) & np.isfinite(dy) & np.isfinite(mag) & np.isfinite(dt)
-        ok &= (np.abs(dt) > 0)    # no residual from zero-time images
-        dx, dy, X_c, Y_c, mag, dt, z = (arr[ok] for arr in (dx, dy, X_c, Y_c, mag, dt, z))
+        ok = (np.isfinite(dx) & np.isfinite(dy) & np.isfinite(mag)
+              & np.isfinite(dt) & (np.abs(dt) > 0))
+        dx, dy, X_c, Y_c, mag, dt, z = (arr[ok] for arr in
+                                          (dx, dy, X_c, Y_c, mag, dt, z))
         n = len(dx)
 
         if n < 10:
             info[chip] = {'converged': True, 'n_inner': 0, 'n_det': n}
             continue
 
-        p = new_params[chip]
-        delta_n = float(p.delta)
+        p         = new_params[chip]
+        delta_n   = float(p.delta)
         y_readout = p.y_readout
 
         delta_history = [delta_n]
         for it in range(n_inner):
-            phi   = phi_flux(mag, delta_n)        # (n,)
-            dphi  = dphi_ddelta(mag, delta_n)     # (n,) analytic gradient
+            phi  = phi_flux(mag, delta_n)
+            dphi = dphi_ddelta(mag, delta_n)
+            Phi  = dt * phi
+            dPhi = dt * dphi
 
-            Phi   = dt * phi                      # (n,)
-            dPhi  = dt * dphi                     # (n,) for δ gradient column
+            Bx = cte_x_basis(X_c, Y_c)
+            By = cte_y_basis(X_c, Y_c, y_readout)
 
-            Bx = cte_x_basis(X_c, Y_c)           # (n, 3)
-            By = cte_y_basis(X_c, Y_c, y_readout) # (n, 3)
+            # Linearized δ column: d(Φ·B·γ)/dδ = dΦ·B·γ_current
+            Bx_g = Bx @ p.gamma_x
+            By_g = By @ p.gamma_y
 
-            # Design matrices for x and y (3 γ columns + 1 δ column)
-            # dx = Φ·Bx·γ_x + dΦ·Bx·γ_x·Δδ  (linearized around current δ)
-            # Collect: A_x = [Φ·Bx, dΦ·Bx·γ_x_current]  shape (n, 4)
-            Bx_gamma_curr = Bx @ p.gamma_x   # (n,) current CTE_x prediction (γ factor)
-            By_gamma_curr = By @ p.gamma_y   # (n,)
+            # Design matrices (n, 4): [γ(3) | Δδ(1)]
+            Ax = np.column_stack([Phi[:, None] * Bx, dPhi * Bx_g])
+            Ay = np.column_stack([Phi[:, None] * By, dPhi * By_g])
 
-            Ax = np.column_stack([Phi[:, None] * Bx,           # (n, 3) γ_x columns
-                                  dPhi * Bx_gamma_curr])        # (n, 1) Δδ column
-            Ay = np.column_stack([Phi[:, None] * By,
-                                  dPhi * By_gamma_curr])
-
-            # Weighted normal equations: A^T W A θ = A^T W r
-            # x and y share the δ column but solve independently per component,
-            # then average the Δδ estimates.
-            W = z                                               # (n,)
-
-            def solve_wls(A, r):
-                """Solve weighted least-squares with Tikhonov regularization."""
-                AtW  = A.T * W[None, :]             # (4, n)
-                AtWA = AtW @ A                       # (4, 4)
-                AtWr = AtW @ r                       # (4,)
-                # Regularize γ columns only (first 3)
-                reg = np.zeros(4)
-                reg[:3] = regularize
-                AtWA += np.diag(reg)
+            def _wls(A, r):
+                AtW  = A.T * z[None, :]
+                AtWA = AtW @ A
+                AtWr = AtW @ r
+                reg        = np.zeros(4)
+                reg[:3]    = regularize
+                AtWA      += np.diag(reg)
                 try:
-                    theta = np.linalg.solve(AtWA, AtWr)
+                    return np.linalg.solve(AtWA, AtWr)
                 except np.linalg.LinAlgError:
                     return None
-                return theta
 
-            theta_x = solve_wls(Ax, dx)
-            theta_y = solve_wls(Ay, dy)
-
-            if theta_x is None or theta_y is None:
+            tx = _wls(Ax, dx)
+            ty = _wls(Ay, dy)
+            if tx is None or ty is None:
                 break
 
-            # Update γ
-            p.gamma_x = theta_x[:3]
-            p.gamma_y = theta_y[:3]
-
-            # Average Δδ from x and y updates
-            delta_delta = 0.5 * (theta_x[3] + theta_y[3])
-            delta_n = delta_n + delta_delta
-            p.delta = delta_n
+            p.gamma_x   = tx[:3]
+            p.gamma_y   = ty[:3]
+            delta_delta = 0.5 * (tx[3] + ty[3])
+            delta_n    += delta_delta
+            p.delta     = delta_n
             delta_history.append(delta_n)
 
             if abs(delta_delta) < delta_tol:
                 break
 
-        rms_x = float(np.sqrt(np.mean((dx - dt * phi_flux(mag, p.delta) *
-                                        (cte_x_basis(X_c, Y_c) @ p.gamma_x)) ** 2)))
-        rms_y = float(np.sqrt(np.mean((dy - dt * phi_flux(mag, p.delta) *
-                                        (cte_y_basis(X_c, Y_c, y_readout) @ p.gamma_y)) ** 2)))
+        # Residual RMS after update
+        phi_f = phi_flux(mag, p.delta)
+        rms_x = float(np.sqrt(np.mean(
+            (dx - dt * phi_f * (cte_x_basis(X_c, Y_c) @ p.gamma_x)) ** 2)))
+        rms_y = float(np.sqrt(np.mean(
+            (dy - dt * phi_f * (cte_y_basis(X_c, Y_c, y_readout) @ p.gamma_y)) ** 2)))
 
         info[chip] = {
             'n_det': n,
@@ -512,11 +387,10 @@ def update_cte_params(
             'rms_y': rms_y,
             'n_inner': len(delta_history) - 1,
         }
-        print(f"    CTE update {chip}: δ={p.delta:.4f}  "
+        print(f"    {chip}: δ={p.delta:.4f}  "
               f"|γ_y|={np.linalg.norm(p.gamma_y):.4e}  "
               f"|γ_x|={np.linalg.norm(p.gamma_x):.4e}  "
-              f"rms_y={rms_y:.4f}px  rms_x={rms_x:.4f}px  "
-              f"n={n:,}")
+              f"rms_y={rms_y:.4f}px  n={n:,}")
 
     return new_params, info
 
@@ -524,79 +398,53 @@ def update_cte_params(
 # ── Warm start ────────────────────────────────────────────────────────────────
 
 def warm_start_cte(
-    cat_npz_path: Path,
-    image_names: list[str],
+    img_to_df: dict,
     solver,
+    image_names: list[str],
+    r_hat_init: np.ndarray,
     t_epoch0_yr: float,
 ) -> dict[str, CTEChipParams]:
     """
-    Estimate initial γ from BP3M v2 post-fit residuals in detections_catalog.npz.
+    Estimate initial γ from BP3M v2 (or v1) post-fit residuals.
 
-    Assumes δ = 1.0 (linear flux model) and regresses the existing GDC residuals
-    onto the CTE basis to provide a starting point for the outer loop.
-
-    Returns initial CTEChipParams for each chip.
+    Collects full-catalog residuals using r_hat_init (the pre-CTE transformation),
+    then regresses onto the CTE basis with δ=1.0 fixed.  This gives a starting
+    point that reduces the first-iteration residual.
     """
-    from astropy.time import Time
+    print("  Warm-starting CTE model from initial transformation residuals...")
+    residuals = collect_cte_residuals(
+        img_to_df, solver, image_names, r_hat_init, t_epoch0_yr)
 
     params = default_cte_params()
 
-    if not cat_npz_path.exists():
-        print("  warm_start_cte: detections_catalog.npz not found — using δ=1, γ=0")
-        return params
-
-    print("  Warm-starting CTE model from detections_catalog.npz residuals...")
-    cat = np.load(cat_npz_path, allow_pickle=True)
-
-    chip_data = {c: {'dx': [], 'dy': [], 'X_c': [], 'Y_c': [],
-                      'mag': [], 'dt': []} for c in ('hi', 'lo')}
-
-    for img in image_names:
-        if f'{img}_X_c' not in cat:
-            continue
-        chip = _chip_from_image(img)
-        hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
-                             format='mjd').jyear)
-        dt = hst_yr - t_epoch0_yr
-        if abs(dt) < 1e-3:
-            continue   # skip reference epoch (no differential CTE signal)
-
-        X_c = cat[f'{img}_X_c'].astype(float)
-        Y_c = cat[f'{img}_Y_c'].astype(float)
-        dx  = cat[f'{img}_dx_gdc'].astype(float)
-        dy  = cat[f'{img}_dy_gdc'].astype(float)
-        mag = cat[f'{img}_mag_inst'].astype(float)
-
-        ok = np.isfinite(dx) & np.isfinite(dy) & np.isfinite(mag)
-        for key, arr in zip(('dx','dy','X_c','Y_c','mag','dt'),
-                             (dx[ok], dy[ok], X_c[ok], Y_c[ok], mag[ok],
-                              np.full(ok.sum(), dt))):
-            chip_data[chip][key].append(arr)
-
     for chip in ('hi', 'lo'):
-        for key in chip_data[chip]:
-            arr = chip_data[chip][key]
-            chip_data[chip][key] = np.concatenate(arr) if arr else np.array([])
-
-        cd = chip_data[chip]
-        n = len(cd['dx'])
-        if n < 10:
+        cd = residuals[chip]
+        if len(cd['dx']) == 0:
             continue
 
-        # Linear regression with δ = 1.0 fixed
-        delta_fixed = 1.0
-        phi = phi_flux(cd['mag'], delta_fixed)
-        dt  = cd['dt']
-        Phi = dt * phi
-        Bx = cte_x_basis(cd['X_c'], cd['Y_c'])
-        By = cte_y_basis(cd['X_c'], cd['Y_c'], params[chip].y_readout)
+        dt  = cd['dt'].astype(float)
+        mag = cd['mag'].astype(float)
+        ok  = np.isfinite(cd['dx']) & np.isfinite(cd['dy']) & np.isfinite(mag) & (np.abs(dt) > 0)
+        if ok.sum() < 10:
+            continue
 
-        Ax = Phi[:, None] * Bx   # (n, 3)
-        Ay = Phi[:, None] * By
+        dx  = cd['dx'][ok]
+        dy  = cd['dy'][ok]
+        X_c = cd['X_c'][ok]
+        Y_c = cd['Y_c'][ok]
+        mag = mag[ok]
+        dt  = dt[ok]
+
+        delta_fixed = 1.0
+        phi = phi_flux(mag, delta_fixed)
+        Phi = dt * phi
+
+        Ax = Phi[:, None] * cte_x_basis(X_c, Y_c)
+        Ay = Phi[:, None] * cte_y_basis(X_c, Y_c, params[chip].y_readout)
 
         try:
-            gamma_x, _, _, _ = np.linalg.lstsq(Ax, cd['dx'], rcond=None)
-            gamma_y, _, _, _ = np.linalg.lstsq(Ay, cd['dy'], rcond=None)
+            gamma_x, _, _, _ = np.linalg.lstsq(Ax, dx, rcond=None)
+            gamma_y, _, _, _ = np.linalg.lstsq(Ay, dy, rcond=None)
         except np.linalg.LinAlgError:
             continue
 
@@ -604,49 +452,18 @@ def warm_start_cte(
         params[chip].gamma_x = gamma_x
         params[chip].gamma_y = gamma_y
 
-        rms_y = float(np.sqrt(np.mean((cd['dy'] - Ay @ gamma_y) ** 2)))
-        print(f"  Warm start {chip}: δ=1.0  "
-              f"|γ_y|={np.linalg.norm(gamma_y):.4e}  "
-              f"rms_y={rms_y:.4f}px  n={n:,}")
+        rms_y = float(np.sqrt(np.mean((dy - Ay @ gamma_y) ** 2)))
+        print(f"    {chip}: δ=1.0 (fixed)  "
+              f"|γ_y|={np.linalg.norm(gamma_y):.4e}  rms_y={rms_y:.4f}px  "
+              f"n={ok.sum():,}")
 
     return params
 
 
-# ── Diagnostic save ───────────────────────────────────────────────────────────
+# ── Convergence CSV ────────────────────────────────────────────────────────────
 
-def _save_cte_residuals(
-    output_dir: Path,
-    solver,
-    image_names: list[str],
-    r_hat: np.ndarray,
-    data_root: Path,
-    field_name: str,
-    suffix: str = '_cte',
-) -> None:
-    """Save full-catalog residuals after CTE correction (same format as detections_catalog.npz)."""
-    from .run_alignment_v2 import _save_full_catalog_residuals
-    try:
-        _save_full_catalog_residuals(
-            output_dir, solver, image_names, r_hat, data_root, field_name)
-        # Rename to detections_catalog{suffix}.npz
-        src = output_dir / 'detections_catalog.npz'
-        dst = output_dir / f'detections_catalog{suffix}.npz'
-        if src.exists():
-            src.rename(dst)
-            print(f"  Renamed → {dst.name}")
-    except Exception as exc:
-        import traceback
-        print(f"  WARNING: _save_cte_residuals failed — {exc}")
-        traceback.print_exc()
-
-
-def _save_cte_convergence(
-    output_dir: Path,
-    outer_iter: int,
-    cte_params: dict[str, CTEChipParams],
-    info: dict,
-) -> None:
-    """Append one row to cte_convergence.csv."""
+def _save_cte_convergence(output_dir: Path, outer_iter: int,
+                          cte_params: dict, info: dict) -> None:
     import csv
     csv_path = output_dir / 'cte_convergence.csv'
     fieldnames = ['iter', 'chip', 'delta', 'gamma_y0', 'gamma_y1', 'gamma_y2',
@@ -657,7 +474,7 @@ def _save_cte_convergence(
         if write_header:
             writer.writeheader()
         for chip in ('hi', 'lo'):
-            p = cte_params[chip]
+            p  = cte_params[chip]
             ci = info.get(chip, {})
             writer.writerow({
                 'iter':     outer_iter,
@@ -669,10 +486,361 @@ def _save_cte_convergence(
                 'gamma_x0': f'{p.gamma_x[0]:.6e}',
                 'gamma_x1': f'{p.gamma_x[1]:.6e}',
                 'gamma_x2': f'{p.gamma_x[2]:.6e}',
-                'rms_y':    f'{ci.get("rms_y", np.nan):.6f}',
-                'rms_x':    f'{ci.get("rms_x", np.nan):.6f}',
+                'rms_y':    f'{ci.get("rms_y", float("nan")):.6f}',
+                'rms_x':    f'{ci.get("rms_x", float("nan")):.6f}',
                 'n_det':    ci.get('n_det', 0),
             })
+
+
+# ── Diagnostic plots ───────────────────────────────────────────────────────────
+
+def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
+                          before_npz: Path, after_npz: Path,
+                          image_names: list[str], solver) -> None:
+    """
+    Create CTE diagnostic figures:
+      1. cte_amplitude.png   — δCTE_y amplitude vs Y_c for mag bins, per chip
+      2. cte_before_after.png — dy_gdc vs Y_c before/after correction, per chip × epoch
+      3. cte_slope_vs_mag.png — slope d(dy_gdc)/d(Y_c) vs mag, before/after, both chips
+      4. cte_convergence.png  — δ and |γ_y| vs outer iteration (from convergence CSV)
+      5. cte_2d_map.png       — 2D detector maps of dy_gdc before/after
+    """
+    import warnings
+    warnings.filterwarnings('ignore')
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+    import pandas as pd
+    from astropy.time import Time
+
+    plot_dir = output_dir / 'plots'
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Load residual arrays ──────────────────────────────────────────────────
+    def _load_npz(path):
+        if path is None or not path.exists():
+            return None
+        return np.load(path, allow_pickle=True)
+
+    npz_before = _load_npz(before_npz)
+    npz_after  = _load_npz(after_npz)
+
+    if npz_before is None and npz_after is None:
+        print("  _plot_cte_diagnostics: no residual arrays found — skipping plots")
+        return
+
+    # Build combined per-chip arrays from npz, annotated with chip/epoch/dt
+    def _collect_from_npz(npz, image_names, solver):
+        if npz is None:
+            return None
+        recs = {c: {'X_c': [], 'Y_c': [], 'dx': [], 'dy': [], 'mag': [],
+                    'dt': [], 'epoch_yr': []} for c in ('hi', 'lo')}
+        for img in image_names:
+            if f'{img}_X_c' not in npz:
+                continue
+            chip = _chip_from_image(img)
+            if chip is None:
+                continue
+            hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
+                                 format='mjd').jyear)
+            X_c = npz[f'{img}_X_c'].astype(float)
+            Y_c = npz[f'{img}_Y_c'].astype(float)
+            dx  = npz[f'{img}_dx_gdc'].astype(float)
+            dy  = npz[f'{img}_dy_gdc'].astype(float)
+            mag = npz[f'{img}_mag_inst'].astype(float)
+            ok  = np.isfinite(dx) & np.isfinite(dy) & np.isfinite(mag)
+            n   = ok.sum()
+            if n == 0:
+                continue
+            recs[chip]['X_c'].append(X_c[ok])
+            recs[chip]['Y_c'].append(Y_c[ok])
+            recs[chip]['dx'].append(dx[ok])
+            recs[chip]['dy'].append(dy[ok])
+            recs[chip]['mag'].append(mag[ok])
+            recs[chip]['dt'].append(np.full(n, hst_yr))
+            recs[chip]['epoch_yr'].append(np.full(n, round(hst_yr)))
+        for chip in ('hi', 'lo'):
+            for k in recs[chip]:
+                arr = recs[chip][k]
+                recs[chip][k] = np.concatenate(arr) if arr else np.array([])
+        return recs
+
+    data_before = _collect_from_npz(npz_before, image_names, solver)
+    data_after  = _collect_from_npz(npz_after,  image_names, solver)
+
+    chip_colors = {'hi': 'steelblue', 'lo': 'darkorange'}
+    mag_ref = _MAG_REF
+
+    # ── Figure 1: CTE amplitude vs Y_c for mag bins ───────────────────────────
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+        Y_grid = np.linspace(-2100, 2100, 500)
+        X_grid = np.zeros_like(Y_grid)
+
+        # Use epoch with largest |dt| for amplitude display
+        all_mjds  = [float(solver.images[img]['hst_time_mjd'])
+                     for img in image_names if img in solver.images]
+        t0_mjd    = min(all_mjds)
+        t1_mjd    = max(all_mjds)
+        dt_max    = (t1_mjd - t0_mjd) / 365.25
+
+        for col_i, chip in enumerate(('hi', 'lo')):
+            ax = axes[col_i]
+            p  = cte_params[chip]
+            for mag_v, col, lbl in [(18.0, 'steelblue', 'mag=18'),
+                                    (20.0, 'green',     'mag=20'),
+                                    (22.0, 'firebrick', 'mag=22')]:
+                phi  = float(phi_flux(np.array([mag_v]), p.delta)[0])
+                By   = cte_y_basis(X_grid, Y_grid, p.y_readout)
+                dcte = dt_max * phi * (By @ p.gamma_y)
+                ax.plot(Y_grid, dcte, color=col, lw=1.8, label=lbl)
+
+            ax.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
+            ax.axvline(p.y_readout, color='k', lw=0.8, ls=':', alpha=0.5)
+            ax.set_xlabel('Y_c (centered GDC px)')
+            ax.set_ylabel('δCTE_y (px)' if col_i == 0 else '')
+            ax.set_title(f'_{chip} chip — CTE_y amplitude (at Δt={dt_max:.1f} yr)')
+            ax.legend(fontsize=9)
+        fig.suptitle('CTE correction amplitude (X_c=0, converged parameters)',
+                     fontsize=11)
+        fig.tight_layout()
+        fig.savefig(plot_dir / 'cte_amplitude.png', dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  Saved: plots/cte_amplitude.png")
+    except Exception as exc:
+        print(f"  WARNING: cte_amplitude.png failed — {exc}")
+
+    # ── Helper: binned mean ───────────────────────────────────────────────────
+    def _binned(x, y, n_bins=10):
+        order = np.argsort(x)
+        xo, yo = x[order], y[order]
+        edges = np.array_split(np.arange(len(xo)), n_bins)
+        xm, ym, ye = [], [], []
+        for idx in edges:
+            if len(idx) < 3:
+                continue
+            xm.append(xo[idx].mean())
+            ym.append(yo[idx].mean())
+            ye.append(yo[idx].std() / np.sqrt(len(idx)))
+        return np.array(xm), np.array(ym), np.array(ye)
+
+    def _slope(x, y):
+        ok = np.isfinite(x) & np.isfinite(y)
+        if ok.sum() < 5:
+            return np.nan, np.nan
+        x, y = x[ok], y[ok]
+        xm, ym = x.mean(), y.mean()
+        dx = x - xm
+        b  = np.dot(dx, y - ym) / max(np.dot(dx, dx), 1e-30)
+        r  = y - (ym + b * dx)
+        var_b = r.var() / max(np.dot(dx, dx), 1e-30)
+        return b, np.sqrt(max(var_b, 0))
+
+    # ── Figure 2: dy_gdc vs Y_c before/after by chip × mag tertile ────────────
+    if data_before is not None or data_after is not None:
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharey='row')
+
+            # Determine global mag tertiles
+            all_mags = []
+            for src in [data_before, data_after]:
+                if src is not None:
+                    for chip in ('hi', 'lo'):
+                        m = src[chip]['mag']
+                        if len(m):
+                            all_mags.append(m)
+            if all_mags:
+                all_mags = np.concatenate(all_mags)
+                pcts = np.nanpercentile(all_mags, [0, 33, 67, 100])
+            else:
+                pcts = [17, 19, 21, 23]
+
+            bin_cols   = ['steelblue', 'darkorange', 'firebrick']
+            bin_labels = [f'bright ({pcts[0]:.1f}–{pcts[1]:.1f})',
+                          f'mid ({pcts[1]:.1f}–{pcts[2]:.1f})',
+                          f'faint ({pcts[2]:.1f}–{pcts[3]:.1f})']
+
+            for row_i, chip in enumerate(('hi', 'lo')):
+                for col_i, (src, label, ls) in enumerate(
+                        [(data_before, 'before CTE', '-'),
+                         (data_after,  'after CTE',  '--')]):
+                    ax = axes[row_i, col_i]
+                    if src is None:
+                        ax.text(0.5, 0.5, 'no data', transform=ax.transAxes,
+                                ha='center', va='center')
+                        continue
+                    cd = src[chip]
+                    if len(cd['dy']) == 0:
+                        continue
+                    for bi, (col, blbl) in enumerate(zip(bin_cols, bin_labels)):
+                        m = cd['mag']
+                        mask = (np.isfinite(m) & (m >= pcts[bi]) & (m < pcts[bi+1])
+                                & np.isfinite(cd['dy']))
+                        if mask.sum() < 10:
+                            continue
+                        xm, ym, ye = _binned(cd['Y_c'][mask], cd['dy'][mask])
+                        ax.plot(xm, ym, ls=ls, color=col, lw=1.8,
+                                label=blbl, zorder=4)
+                        ax.fill_between(xm, ym-ye, ym+ye, color=col,
+                                        alpha=0.18, zorder=3)
+                    ax.axhline(0, color='k', lw=0.8, alpha=0.5)
+                    ax.set_xlabel('Y_c (px)')
+                    ax.set_ylabel(r'$\delta y_\mathrm{GDC}$ (px)')
+                    ax.set_title(f'_{chip} chip — {label}')
+                    ax.set_ylim(-0.12, 0.12)
+                    ax.legend(fontsize=7, ncol=1, loc='upper left')
+
+            fig.suptitle('dy_gdc vs Y_c by magnitude: before vs after CTE correction',
+                         fontsize=12)
+            fig.tight_layout()
+            fig.savefig(plot_dir / 'cte_before_after.png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"  Saved: plots/cte_before_after.png")
+        except Exception as exc:
+            print(f"  WARNING: cte_before_after.png failed — {exc}")
+
+    # ── Figure 3: CTE slope vs magnitude before/after ─────────────────────────
+    if data_before is not None or data_after is not None:
+        try:
+            fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+            N_MAG_BINS = 8
+
+            all_mags = []
+            for src in [data_before, data_after]:
+                if src is None:
+                    continue
+                for chip in ('hi', 'lo'):
+                    m = src[chip]['mag']
+                    if len(m):
+                        all_mags.append(m)
+            if not all_mags:
+                plt.close(fig)
+                raise ValueError("no data for slope plot")
+            all_mags   = np.concatenate(all_mags)
+            mag_edges  = np.nanpercentile(all_mags, np.linspace(0, 100, N_MAG_BINS+1))
+            mag_mids   = 0.5 * (mag_edges[:-1] + mag_edges[1:])
+
+            styles = {
+                ('hi', 'before'): dict(fmt='o-',  color='steelblue',  label='_hi before'),
+                ('hi', 'after'):  dict(fmt='o--', color='steelblue',  label='_hi after',
+                                       mfc='none'),
+                ('lo', 'before'): dict(fmt='s-',  color='darkorange', label='_lo before'),
+                ('lo', 'after'):  dict(fmt='s--', color='darkorange', label='_lo after',
+                                       mfc='none'),
+            }
+
+            for col_i, comp in enumerate(('dy', 'dx')):
+                ax = axes[col_i]
+                ax.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
+                for (chip, when), sty in styles.items():
+                    src = data_before if when == 'before' else data_after
+                    if src is None:
+                        continue
+                    cd = src[chip]
+                    if len(cd[comp]) == 0:
+                        continue
+                    slopes, errs, ns = [], [], []
+                    for bi in range(N_MAG_BINS):
+                        m = cd['mag']
+                        mask = (np.isfinite(m) & (m >= mag_edges[bi])
+                                & (m < mag_edges[bi+1])
+                                & np.isfinite(cd[comp]))
+                        if mask.sum() < 8:
+                            slopes.append(np.nan); errs.append(np.nan); ns.append(0)
+                            continue
+                        sl, sl_e = _slope(cd['Y_c'][mask], cd[comp][mask])
+                        slopes.append(sl); errs.append(sl_e); ns.append(mask.sum())
+                    slopes = np.array(slopes); errs = np.array(errs)
+                    ok = np.isfinite(slopes)
+                    if ok.any():
+                        fmt = sty.pop('fmt')
+                        ax.errorbar(mag_mids[ok], slopes[ok], yerr=errs[ok],
+                                    fmt=fmt, ms=6, capsize=3, lw=1.5, **sty)
+                        sty['fmt'] = fmt   # put back for next iteration
+
+                comp_lbl = (r'slope $\delta y_\mathrm{GDC}$ (px/px)'
+                            if comp == 'dy'
+                            else r'slope $\delta x_\mathrm{GDC}$ (px/px)')
+                ax.set_xlabel('Instrumental magnitude', fontsize=10)
+                ax.set_ylabel(comp_lbl, fontsize=10)
+                ax.set_title(f'CTE slope vs magnitude ({comp})', fontsize=11)
+                ax.legend(fontsize=8)
+
+            fig.suptitle('CTE slope d(residual)/d(Y_c): before vs after correction',
+                         fontsize=11)
+            fig.tight_layout()
+            fig.savefig(plot_dir / 'cte_slope_vs_mag.png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"  Saved: plots/cte_slope_vs_mag.png")
+        except Exception as exc:
+            print(f"  WARNING: cte_slope_vs_mag.png failed — {exc}")
+
+    # ── Figure 4: convergence ─────────────────────────────────────────────────
+    try:
+        conv_path = output_dir / 'cte_convergence.csv'
+        if conv_path.exists():
+            import pandas as _pd
+            cdf = _pd.read_csv(conv_path)
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+            for chip, col in [('hi', 'steelblue'), ('lo', 'darkorange')]:
+                sub = cdf[cdf['chip'] == chip]
+                if len(sub) == 0:
+                    continue
+                axes[0].plot(sub['iter'], sub['delta'], 'o-', color=col,
+                             label=f'δ_{chip}', lw=1.8)
+                gy_norm = np.sqrt(sub['gamma_y0']**2 + sub['gamma_y1']**2
+                                  + sub['gamma_y2']**2)
+                axes[1].plot(sub['iter'], gy_norm, 'o-', color=col,
+                             label=f'|γ_y|_{chip}', lw=1.8)
+                # Overplot rms_y on secondary axis
+            axes[0].set_xlabel('CTE outer iteration')
+            axes[0].set_ylabel('δ (flux power-law exponent)')
+            axes[0].set_title('CTE δ convergence')
+            axes[0].legend(fontsize=9)
+            axes[1].set_xlabel('CTE outer iteration')
+            axes[1].set_ylabel('|γ_y|')
+            axes[1].set_title('CTE |γ_y| convergence')
+            axes[1].legend(fontsize=9)
+            fig.suptitle('CTE parameter convergence', fontsize=11)
+            fig.tight_layout()
+            fig.savefig(plot_dir / 'cte_convergence.png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"  Saved: plots/cte_convergence.png")
+    except Exception as exc:
+        print(f"  WARNING: cte_convergence.png failed — {exc}")
+
+    # ── Figure 5: 2D detector map before/after ─────────────────────────────────
+    for label, npz_data in [('before', data_before), ('after', data_after)]:
+        if npz_data is None:
+            continue
+        try:
+            fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+            clip = 0.05
+            norm = TwoSlopeNorm(vcenter=0, vmin=-clip, vmax=clip)
+            for col_i, chip in enumerate(('hi', 'lo')):
+                ax   = axes[col_i]
+                cd   = npz_data[chip]
+                if len(cd['dy']) == 0:
+                    continue
+                ok   = np.isfinite(cd['dy'])
+                sc   = ax.scatter(cd['X_c'][ok], cd['Y_c'][ok], c=cd['dy'][ok],
+                                  cmap='RdBu_r', norm=norm, s=2, alpha=0.5,
+                                  linewidths=0, rasterized=True)
+                cb   = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                cb.set_label(r'$\delta y_\mathrm{GDC}$ (px)', fontsize=9)
+                ax.set_xlabel('X_c (px)')
+                ax.set_ylabel('Y_c (px)')
+                ax.set_title(f'_{chip} chip — {label} CTE correction')
+            fig.suptitle(f'2D detector map of dy_gdc ({label} CTE)', fontsize=11)
+            fig.tight_layout()
+            out_path = plot_dir / f'cte_2d_map_{label}.png'
+            fig.savefig(out_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"  Saved: plots/cte_2d_map_{label}.png")
+        except Exception as exc:
+            print(f"  WARNING: cte_2d_map_{label}.png failed — {exc}")
 
 
 # ── Main function ──────────────────────────────────────────────────────────────
@@ -705,24 +873,20 @@ def run_alignment_cte(
     bp3m_dir: Path | None = None,
 ) -> Path:
     """
-    Run joint CTE + astrometry alignment using the master_combined_v2.csv catalog.
+    Joint CTE + astrometry alignment using master_combined_v2.csv catalog.
 
-    This is a wrapper around BP3M v2 that adds an outer Gauss-Newton loop for the
-    CTE parameters.  In each outer iteration:
-      1. Apply current CTE model to solver xys (modify solver._img_data[img]['xys']).
-      2. Run BP3M v2 solve for (r_j, v_i) with CTE-corrected positions.
-      3. Collect full-catalog residuals (dx_gdc, dy_gdc for all ~127k stars).
-      4. Update CTE parameters (γ_c, δ_c) from residuals via Gauss-Newton.
-      5. Check convergence; break early if ‖Δγ‖/‖γ‖ < cte_gamma_rtol.
+    Outer Gauss-Newton loop:
+      1. Apply current CTE model → modify solver._img_data[img]['xys'].
+      2. Run BP3M v2 solve (r_j, v_i) on CTE-corrected positions.
+      3. Collect full-catalog GDC residuals (~127k stars) using current r_hat.
+      4. Update CTE parameters (γ_c, δ_c) via Gauss-Newton.
+      5. Check convergence; stop early if ‖Δγ‖/‖γ‖ < cte_gamma_rtol.
 
     Parameters
     ----------
-    output_dir      : pipeline root directory
-    field_name      : field subdirectory name
-    n_iter_bp3m     : BP3M EM iterations per CTE outer iteration
-    n_iter_cte      : maximum CTE outer Gauss-Newton iterations
-    n_samples       : posterior samples for final marginalisation
-    (remaining params same as run_alignment_v2)
+    n_iter_bp3m : BP3M EM iterations per CTE outer step
+    n_iter_cte  : max CTE Gauss-Newton outer iterations
+    (remaining params identical to run_alignment_v2)
 
     Returns
     -------
@@ -736,21 +900,26 @@ def run_alignment_cte(
 
     from .data_loader_master import load_master_v2
     from .run_alignment_v2 import (
-        V2AlignmentCallback,
-        _save_full_catalog_residuals,
+        V2AlignmentCallback, _load_full_catalog_df,
+        _compute_full_catalog_residuals_from_df,
         _plot_soft_weights,
     )
     from .run_alignment import _save_results
 
-    data_root   = Path(output_dir)
-    output_cte  = data_root / field_name / "BP3M_cte_results"
+    data_root  = Path(output_dir)
+    output_cte = data_root / field_name / "BP3M_cte_results"
     output_cte.mkdir(parents=True, exist_ok=True)
+
+    # Remove stale convergence CSV so each run starts fresh
+    _conv_csv = output_cte / 'cte_convergence.csv'
+    if _conv_csv.exists():
+        _conv_csv.unlink()
 
     print("\n" + "─" * 60)
     print("BP3M CTE: joint CTE + astrometry alignment")
     print("─" * 60)
     print(f"  n_iter_bp3m={n_iter_bp3m}  n_iter_cte={n_iter_cte}  "
-          f"poly_order={poly_order}")
+          f"poly_order={poly_order}  clip_sigma={clip_sigma}")
 
     # ── Load data (same as v2) ─────────────────────────────────────────────────
     print(f"\n  Loading v2 master catalog for '{field_name}'...")
@@ -767,24 +936,30 @@ def run_alignment_cte(
 
     star_id_to_idx, image_names, star_in_image = build_index_maps(
         stars_per_image, gaia_catalog)
-    imgs = {n: images[n] for n in image_names if n in images}
+    imgs         = {n: images[n] for n in image_names if n in images}
     filtered_spi = {n: stars_per_image[n] for n in image_names}
 
     print(f"  Stars: {len(gaia_catalog)} "
           f"({int((~hst_only_mask).sum())} Gaia + {int(hst_only_mask.sum())} HST-only)  "
           f"Images: {len(image_names)}")
 
+    # ── Load full-catalog detection DataFrame (cached for all CTE iterations) ──
+    print("\n  Loading full-catalog detection data (cached for CTE iterations)...")
+    img_to_df = _load_full_catalog_df(data_root, field_name)
+    if img_to_df is None:
+        raise RuntimeError(
+            "detections_F814W.csv or master_combined_v2.csv not found. "
+            "Run hst_catalog_crossmatch first.")
+
     # ── Reference epoch: first exposure ───────────────────────────────────────
-    # t_epoch0 is the absolute reference for the temporal CTE model.
-    # Using the first exposure avoids unidentifiability of the absolute CTE level.
-    all_mjds = [float(images[img]['hst_time_mjd']) for img in image_names
-                if img in images]
+    all_mjds     = [float(images[img]['hst_time_mjd']) for img in image_names
+                    if img in images]
     t_epoch0_mjd = float(min(all_mjds))
     t_epoch0_yr  = float(Time(t_epoch0_mjd, format='mjd').jyear)
     print(f"  t_epoch0 = {t_epoch0_yr:.4f} yr  "
-          f"(MJD {t_epoch0_mjd:.2f}, {Time(t_epoch0_mjd, format='mjd').isot[:10]})")
+          f"({Time(t_epoch0_mjd, format='mjd').isot[:10]})")
 
-    # ── Inject v1 BP3M transformation (warm start) ────────────────────────────
+    # ── Inject v1/v2 BP3M transformation as warm start ────────────────────────
     v1_bp3m_dir   = data_root / field_name / "BP3M_results"
     v1_xform_path = v1_bp3m_dir / "image_transformations.csv"
     v1_abcdwz: dict[str, np.ndarray] = {}
@@ -811,29 +986,11 @@ def run_alignment_cte(
         poly_order=poly_order,
     )
 
-    # Load mag_inst into _img_data (needed for CTE calculation)
-    # The mag_inst arrays are available in stars_per_image DataFrames.
-    for img in image_names:
-        d = solver._img_data.get(img)
-        if d is None:
-            continue
-        spi_df = filtered_spi.get(img)
-        if spi_df is None or 'mag_gdc' not in spi_df.columns:
-            continue
-        gid_col = spi_df['Gaia_id'].to_numpy(dtype=np.int64)
-        # Reorder to match sidx order in d
-        mag_by_gid = {int(gid_col[k]): float(spi_df['mag_gdc'].iloc[k])
-                      for k in range(len(spi_df))}
-        sidx = d['sidx']
-        gc_ids = gaia_catalog['Gaia_id'].to_numpy(dtype=np.int64)
-        mag_arr = np.full(len(sidx), np.nan)
-        for k, s in enumerate(sidx):
-            gid = int(gc_ids[s])
-            if gid in mag_by_gid:
-                mag_arr[k] = mag_by_gid[gid]
-        d['mag_inst'] = mag_arr
+    # ── Inject mag_inst into solver._img_data ─────────────────────────────────
+    # Must be done before apply_cte_to_solver is called.
+    _inject_mag_inst(solver, image_names, filtered_spi, gaia_catalog)
 
-    # ── PM seed and HST-only diffuse prior ────────────────────────────────────
+    # ── HST-only diffuse PM prior ──────────────────────────────────────────────
     if hst_pm_sigma_diffuse != 100.0:
         hst_star_indices = np.where(hst_only_mask)[0]
         if len(hst_star_indices) > 0:
@@ -841,8 +998,9 @@ def run_alignment_cte(
             solver._C_VG_inv_per_star[hst_star_indices, 2] = sigma_pm_inv2
             solver._C_VG_inv_per_star[hst_star_indices, 3] = sigma_pm_inv2
 
+    # ── PM seeds for HST-only (callback) ──────────────────────────────────────
     _n_stars = len(gaia_catalog)
-    pm_init = np.full((_n_stars, 2), np.nan)
+    pm_init  = np.full((_n_stars, 2), np.nan)
     if "pmra_xmatch" in gaia_catalog.columns:
         pm_init[:, 0] = pd.to_numeric(
             gaia_catalog["pmra_xmatch"], errors='coerce').fillna(np.nan).values
@@ -856,13 +1014,15 @@ def run_alignment_cte(
         pm_init=pm_init,
     )
 
-    # ── Phase 0: fixed-transform pre-filter (same as v2) ─────────────────────
+    # ── Phase 0: fixed-transformation pre-filter ───────────────────────────────
+    r_init_hat = None
     if v1_abcdwz:
         r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
                                       for img in image_names])
         solver._update_R(r_init_hat)
         solver._update_geometry(r_init_hat, solver.v_survey)
         print("\n  Phase 0: fixed-transform pre-filter (v1 BP3M posterior)")
+
         n_flag0 = 0
         for img in image_names:
             d = solver._img_data.get(img)
@@ -877,44 +1037,47 @@ def run_alignment_cte(
             x_pred    = np.einsum("nkl,l->nk", d["X_mat"], r_j) - motion
             resid_mag = np.hypot(*(d["xys"] - x_pred).T)
             if use.any():
-                r_align   = resid_mag[use]
-                mad_sigma = np.median(np.abs(r_align - np.median(r_align))) / 0.6745
-                thresh    = max(5.0 * mad_sigma, 0.3)
-                bad       = use & (resid_mag > thresh)
-                n_flag0  += int(bad.sum())
+                r_align    = resid_mag[use]
+                mad_sigma  = np.median(np.abs(r_align - np.median(r_align))) / 0.6745
+                thresh     = max(5.0 * mad_sigma, 0.3)
+                bad        = use & (resid_mag > thresh)
+                n_flag0   += int(bad.sum())
                 if bad.any():
                     d["use_for_fit"][bad]     = False
                     d["use_for_fit_max"][bad] = False
                     if "use_for_astrom" in d:
                         d["use_for_astrom"][bad] = False
         print(f"  Phase 0: {n_flag0} detections flagged")
+    else:
+        # No v1 results: use the fast_cross_match initialisation
+        r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
+                                      for img in image_names])
+        solver._update_R(r_init_hat)
 
-    # ── CTE warm start ────────────────────────────────────────────────────────
-    cat_npz_path = data_root / field_name / "BP3M_v2_results" / "detections_catalog.npz"
-    cte_params = warm_start_cte(cat_npz_path, image_names, solver, t_epoch0_yr)
+    # ── Store xys_orig for all images ──────────────────────────────────────────
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is not None and 'xys_orig' not in d:
+            d['xys_orig'] = d['xys'].copy()
+
+    # ── CTE warm start ─────────────────────────────────────────────────────────
+    print("\n  CTE warm start...")
+    cte_params = warm_start_cte(
+        img_to_df, solver, image_names, r_init_hat, t_epoch0_yr)
 
     # ── Outer CTE + BP3M Gauss-Newton loop ────────────────────────────────────
-    clip = clip_sigma if clip_sigma > 0 else None
+    clip      = clip_sigma if clip_sigma > 0 else None
     _min_outer = max(hst_enable_iter + 3, 4) if n_iter_bp3m >= hst_enable_iter else 4
 
     r_hat = C_r = v_hat = C_vT = a_arr = K_img = z_weights_out = None
-    conv_history = []
-
     print(f"\n  Starting CTE outer loop ({n_iter_cte} iterations)...")
+
     for cte_iter in range(n_iter_cte):
         print(f"\n  ─── CTE iteration {cte_iter + 1}/{n_iter_cte} ───")
         t_iter = time.time()
 
-        # Step 1: Apply CTE to solver xys
-        if cte_iter > 0:
-            # Only apply non-trivial CTE after first iteration (warm start may be zero)
-            apply_cte_to_solver(solver, image_names, cte_params, t_epoch0_yr)
-        else:
-            # Store xys_orig without applying (zero CTE at iteration 0)
-            for img in image_names:
-                d = solver._img_data.get(img)
-                if d is not None and 'xys_orig' not in d:
-                    d['xys_orig'] = d['xys'].copy()
+        # Step 1: Apply CTE correction to solver xys
+        apply_cte_to_solver(solver, image_names, cte_params, t_epoch0_yr)
 
         # Step 2: BP3M solve
         print(f"  BP3M solve ({n_iter_bp3m} EM iterations)...")
@@ -925,23 +1088,26 @@ def run_alignment_cte(
             inflate_hst_errors=True,
             inflate_from_iter=0,
             min_outer_iters=_min_outer,
-            prefilter=(cte_iter == 0),   # prefilter only on first BP3M solve
+            # Only run solver prefilter on first iteration (Phase 0 already did it)
+            prefilter=False,
             use_influence_clip=use_influence_clip,
             influence_d_thresh=influence_d_thresh,
             influence_sigma_min=influence_sigma_min,
             use_two_tier=True,
+            # Fire callback only on iter 0 (enables HST-only sources)
             per_iter_callback=callback if cte_iter == 0 else None,
             use_soft_weights=use_soft_weights,
             student_t_nu=student_t_nu,
         )
         print(f"  BP3M done ({time.time() - t_iter:.1f}s)")
 
-        # Step 3: Collect full-catalog residuals
+        # Update solver.R for the new r_hat so subsequent CTE computation is correct
+        solver._update_R(r_hat)
+
+        # Step 3: Collect full-catalog residuals with current r_hat
+        print(f"  Collecting residuals ({len(img_to_df)} images)...")
         residuals = collect_cte_residuals(
-            solver, image_names, r_hat, t_epoch0_yr,
-            data_root, field_name,
-            use_catalog_npz=(cte_iter == 0),  # use precomputed npz for warm start
-        )
+            img_to_df, solver, image_names, r_hat, t_epoch0_yr)
 
         # Step 4: Update CTE parameters
         gamma_before = {c: cte_params[c].gamma_y.copy() for c in ('hi', 'lo')}
@@ -952,19 +1118,17 @@ def run_alignment_cte(
         )
         _save_cte_convergence(output_cte, cte_iter + 1, cte_params, info)
 
-        # Step 5: Convergence check
+        # Step 5: Convergence check (require at least 2 iterations)
+        gamma_norms  = [np.linalg.norm(cte_params[c].gamma_y) for c in ('hi', 'lo')]
+        gamma_deltas = [np.linalg.norm(cte_params[c].gamma_y - gamma_before[c])
+                        for c in ('hi', 'lo')]
         gamma_rchg = max(
-            np.linalg.norm(cte_params[c].gamma_y - gamma_before[c])
-            / max(np.linalg.norm(gamma_before[c]), 1e-10)
-            for c in ('hi', 'lo')
-        )
-        conv_history.append({'iter': cte_iter + 1, 'gamma_rchg': gamma_rchg,
-                              **{f'delta_{c}': cte_params[c].delta
-                                  for c in ('hi', 'lo')}})
-        print(f"  γ relative change = {gamma_rchg:.4e}  "
+            d / max(n, 1e-10) for d, n in zip(gamma_deltas, gamma_norms))
+
+        print(f"  γ_y relative change = {gamma_rchg:.4e}  "
               f"δ_hi={cte_params['hi'].delta:.4f}  δ_lo={cte_params['lo'].delta:.4f}")
 
-        if gamma_rchg < cte_gamma_rtol and cte_iter >= 2:
+        if gamma_rchg < cte_gamma_rtol and cte_iter >= 1:
             print(f"  CTE converged at iteration {cte_iter + 1}")
             break
 
@@ -987,18 +1151,20 @@ def run_alignment_cte(
         use_soft_weights=use_soft_weights,
         student_t_nu=student_t_nu,
     )
+    solver._update_R(r_hat)
 
-    # ── Save CTE parameters ────────────────────────────────────────────────────
-    cte_params_out = {}
+    # ── Save converged CTE parameters ─────────────────────────────────────────
+    cte_out = {}
     for chip in ('hi', 'lo'):
         p = cte_params[chip]
-        cte_params_out[f'{chip}_delta']   = np.array([p.delta])
-        cte_params_out[f'{chip}_gamma_x'] = p.gamma_x
-        cte_params_out[f'{chip}_gamma_y'] = p.gamma_y
-        cte_params_out[f'{chip}_y_readout'] = np.array([p.y_readout])
-    cte_params_out['t_epoch0_yr'] = np.array([t_epoch0_yr])
-    np.savez(output_cte / 'cte_params.npz', **cte_params_out)
-    print(f"  Saved: cte_params.npz")
+        cte_out[f'{chip}_delta']    = np.array([p.delta])
+        cte_out[f'{chip}_gamma_x']  = p.gamma_x
+        cte_out[f'{chip}_gamma_y']  = p.gamma_y
+        cte_out[f'{chip}_y_readout'] = np.array([p.y_readout])
+    cte_out['t_epoch0_yr'] = np.array([t_epoch0_yr])
+    np.savez(output_cte / 'cte_params.npz', **cte_out)
+    print(f"  Saved: cte_params.npz  "
+          f"(δ_hi={cte_params['hi'].delta:.4f}, δ_lo={cte_params['lo'].delta:.4f})")
 
     # ── Sample posteriors ──────────────────────────────────────────────────────
     print(f"  Drawing {n_samples} posterior samples...")
@@ -1010,22 +1176,31 @@ def run_alignment_cte(
         output_cte, solver, imgs, gaia_catalog, image_names,
         r_hat, C_r, v_hat, C_vT, v_mean, v_cov, K_img, a_arr,
         run_config={
-            "n_iter_bp3m":    n_iter_bp3m,
-            "n_iter_cte":     n_iter_cte,
-            "n_samples":      n_samples,
-            "clip_sigma":     clip_sigma,
-            "poly_order":     poly_order,
-            "t_epoch0_yr":    t_epoch0_yr,
-            **{f'delta_{c}':  float(cte_params[c].delta) for c in ('hi', 'lo')},
+            "n_iter_bp3m":   n_iter_bp3m,
+            "n_iter_cte":    n_iter_cte,
+            "n_samples":     n_samples,
+            "clip_sigma":    clip_sigma,
+            "poly_order":    poly_order,
+            "t_epoch0_yr":   t_epoch0_yr,
+            **{f'delta_{c}': float(cte_params[c].delta) for c in ('hi', 'lo')},
         },
     )
 
     # ── Save post-CTE full-catalog residuals ──────────────────────────────────
-    _save_cte_residuals(output_cte, solver, image_names, r_hat,
-                        data_root, field_name, suffix='_cte')
+    print("\n  Saving post-CTE full-catalog residuals...")
+    bp3m_gaia_ids = set(int(g) for g in solver.star_id_to_idx.keys() if int(g) > 0)
+    out_arrays_cte = _compute_full_catalog_residuals_from_df(
+        img_to_df, bp3m_gaia_ids, solver, image_names, r_hat)
+    if out_arrays_cte:
+        np.savez(output_cte / 'detections_catalog_cte.npz', **out_arrays_cte)
+        n_imgs  = sum(1 for k in out_arrays_cte if k.endswith('_X_c'))
+        n_total = sum(len(v) for k, v in out_arrays_cte.items() if k.endswith('_X_c'))
+        print(f"  Saved detections_catalog_cte.npz: {n_imgs} images, "
+              f"{n_total:,} detections")
 
     # ── Soft-weight output ─────────────────────────────────────────────────────
     if use_soft_weights and z_weights_out is not None:
+        import csv as _csv
         rows = []
         for img, z in z_weights_out.items():
             if z is None:
@@ -1034,24 +1209,45 @@ def run_alignment_cte(
             for k in range(len(z)):
                 rows.append({'image': img, 'star_idx': int(d['sidx'][k]),
                              'z_det': float(z[k])})
-        import csv as _csv
         zcsv = output_cte / 'soft_weights.csv'
         with open(zcsv, 'w', newline='') as f:
             writer = _csv.DictWriter(f, fieldnames=['image', 'star_idx', 'z_det'])
             writer.writeheader()
             writer.writerows(rows)
         print(f"  Saved: soft_weights.csv  ({len(rows)} detection weights)")
+        _plot_dir = output_cte / 'plots'
+        _plot_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _plot_soft_weights(z_weights_out, solver, _plot_dir)
+        except Exception as exc:
+            print(f"  WARNING: soft_weights_diagnostic plot failed — {exc}")
 
-    # ── Diagnostic plots ───────────────────────────────────────────────────────
+    # ── Standard BP3M diagnostic plots ────────────────────────────────────────
     if not no_plots:
         try:
             from bp3m.pipeline.plot_results import make_plots
-            print("  Generating diagnostic plots...")
+            print("  Generating standard BP3M diagnostic plots...")
             make_plots(solver, imgs, gaia_catalog,
                        r_hat, v_hat, v_mean, v_cov, C_vT, C_r,
                        output_dir=output_cte)
         except Exception as exc:
-            print(f"  WARNING: plots failed — {exc}")
+            print(f"  WARNING: standard plots failed — {exc}")
+
+        # ── CTE-specific diagnostic plots ─────────────────────────────────────
+        before_npz = data_root / field_name / "BP3M_v2_results" / "detections_catalog.npz"
+        after_npz  = output_cte / "detections_catalog_cte.npz"
+        try:
+            _plot_cte_diagnostics(
+                output_cte, cte_params,
+                before_npz=before_npz,
+                after_npz=after_npz,
+                image_names=image_names,
+                solver=solver,
+            )
+        except Exception as exc:
+            import traceback
+            print(f"  WARNING: CTE diagnostic plots failed — {exc}")
+            traceback.print_exc()
 
     print(f"\n  CTE results written to: {output_cte}")
     return output_cte
