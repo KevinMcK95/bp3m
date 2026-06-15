@@ -14,14 +14,14 @@ For chip c (hi/lo), detection k in image j (epoch t_j):
   δCTE_y_k = (t_j − t_0) · φ(mag_k; δ_c) · b_y(X_k, Y_k) · γ_y_c
 
   φ(mag; δ) = 10^{0.4·δ·(mag − mag_ref)} − 1
-  b_y = [Y', Xc·Y', Xc²·Y', Y'², Xc·Y'², Xc²·Y'²]  (6 terms, CTE_y=0 at Y'=0)
-  b_x = [Xc, Xc·Y', Xc·Y'², Xc², Xc²·Y', Xc²·Y'²]  (6 terms, CTE_x=0 at Xc=0)
+  b_y = [Y', Xc·Y']   (2 terms, 2nd-order, CTE_y=0 at Y'=0)
+  b_x = [Xc, Xc·Y']  (2 terms, 2nd-order, CTE_x=0 at Xc=0)
   Y' = y_raw − y_readout_raw  (distance from readout register in raw pixels)
   Xc = x_gdc − 2048           (x-position centred on detector)
   γ_x_c: (6,) coefficients;  γ_y_c: (6,) coefficients
   δ_c: shared flux exponent for chip c
 
-Parameters: 13 total per chip: δ(1) + γ_x(6) + γ_y(6) (two chips → 26 params).
+Parameters: 5 total per chip: δ(1) + γ_x(2) + γ_y(2) (two chips → 10 params).
 
 Note on y_raw coordinate system: py1pass stores pixel y in a unified global frame
 (0..~4096). lo chip occupies y_raw ∈ [8, 2039]; hi chip occupies y_raw ∈ [2056, 4087].
@@ -60,8 +60,8 @@ class CTEChipParams:
     y_readout: float          # GDC-centred readout Y (kept for diagnostics/legacy)
     y_readout_raw: float      # raw chip-local readout Y (used for CTE basis)
     delta: float = 1.0
-    gamma_x: np.ndarray = field(default_factory=lambda: np.zeros(6))
-    gamma_y: np.ndarray = field(default_factory=lambda: np.zeros(6))
+    gamma_x: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    gamma_y: np.ndarray = field(default_factory=lambda: np.zeros(2))
 
     def copy(self) -> 'CTEChipParams':
         return CTEChipParams(chip=self.chip,
@@ -113,27 +113,27 @@ def dphi_ddelta(mag: np.ndarray, delta: float,
 
 def cte_y_basis(X_c: np.ndarray, y_raw: np.ndarray,
                 y_readout_raw: float) -> np.ndarray:
-    """b_y = [Y', Xc·Y', Xc²·Y', Y'², Xc·Y'², Xc²·Y'²]  (6 terms).
+    """b_y = [Y', Xc·Y']  (2 terms, 2nd-order polynomial in position).
 
     Y' = y_raw − y_readout_raw (distance from readout register in raw pixels).
-    Boundary condition: all terms vanish at Y'=0 (readout register).
-    Column normalization in callers is essential — the 6 terms span ~10 decades
-    in magnitude (Y' vs Xc²·Y'²), so without scaling the lstsq condition number
-    exceeds 1e10 and kills the higher-order signal.
+    Boundary condition: both terms vanish at Y'=0 (readout register), so
+    δCTE_y = 0 at the readout by construction.  Xc·Y' captures linear
+    variation of the CTE amplitude across the chip width.
     """
     Yp = y_raw - y_readout_raw
-    return np.stack([Yp, X_c*Yp, X_c**2*Yp, Yp**2, X_c*Yp**2, X_c**2*Yp**2], axis=1)
+    return np.stack([Yp, X_c*Yp], axis=1)
 
 
 def cte_x_basis(X_c: np.ndarray, y_raw: np.ndarray,
                 y_readout_raw: float) -> np.ndarray:
-    """b_x = [Xc, Xc·Y', Xc·Y'², Xc², Xc²·Y', Xc²·Y'²]  (6 terms).
+    """b_x = [Xc, Xc·Y']  (2 terms, 2nd-order polynomial in position).
 
     Y' = y_raw − y_readout_raw (same raw-frame distance from readout as y-basis).
-    Boundary condition: all terms vanish at Xc=0 (centre between serial amplifiers).
+    Boundary condition: both terms vanish at Xc=0 (centre between serial amplifiers).
+    Xc·Y' captures how serial CTE amplitude varies with parallel distance from readout.
     """
     Yp = y_raw - y_readout_raw
-    return np.stack([X_c, X_c*Yp, X_c*Yp**2, X_c**2, X_c**2*Yp, X_c**2*Yp**2], axis=1)
+    return np.stack([X_c, X_c*Yp], axis=1)
 
 
 # ── CTE displacement computation ──────────────────────────────────────────────
@@ -453,17 +453,17 @@ def update_cte_params(
             # Sign convention: dy_gdc = y_obs − y_pred > 0 when CTE shifts in +y.
             # Fit Φ·B@γ = −dx/dy so that γ < 0 and apply_cte_to_solver (which adds
             # Φ·B@γ to xys) SUBTRACTS the CTE offset.  Dynamic column normalization
-            # is essential — the 6-term basis spans ~10 decades without it.
-            raw_Ax = Phi[:, None] * Bx    # (n, 6) before scaling
-            raw_Ay = Phi[:, None] * By    # (n, 6) before scaling
+            # keeps the 2-term basis well-conditioned (Y' vs Xc·Y' differ by ~2 decades).
+            raw_Ax = Phi[:, None] * Bx    # (n, 2) before scaling
+            raw_Ay = Phi[:, None] * By    # (n, 2) before scaling
             col_scale_x = np.std(raw_Ax, axis=0).clip(min=1e-30)
             col_scale_y = np.std(raw_Ay, axis=0).clip(min=1e-30)
             Ax_s = raw_Ax / col_scale_x   # O(1) columns
             Ay_s = raw_Ay / col_scale_y   # O(1) columns
 
-            AtWA_x = (Ax_s * z[:, None]).T @ Ax_s + regularize * np.eye(6)
+            AtWA_x = (Ax_s * z[:, None]).T @ Ax_s + regularize * np.eye(2)
             AtWr_x = (Ax_s * z[:, None]).T @ (-dx)
-            AtWA_y = (Ay_s * z[:, None]).T @ Ay_s + regularize * np.eye(6)
+            AtWA_y = (Ay_s * z[:, None]).T @ Ay_s + regularize * np.eye(2)
             AtWr_y = (Ay_s * z[:, None]).T @ (-dy)
 
             try:
@@ -939,8 +939,8 @@ def _save_cte_convergence(output_dir: Path, outer_iter: int,
                           cte_params: dict, info: dict) -> None:
     import csv
     csv_path = output_dir / 'cte_convergence.csv'
-    _gy_names = [f'gamma_y{k}' for k in range(6)]
-    _gx_names = [f'gamma_x{k}' for k in range(6)]
+    _gy_names = [f'gamma_y{k}' for k in range(2)]
+    _gx_names = [f'gamma_x{k}' for k in range(2)]
     fieldnames = ['iter', 'chip', 'delta'] + _gy_names + _gx_names + ['rms_y', 'rms_x', 'n_det']
     write_header = not csv_path.exists()
     with open(csv_path, 'a', newline='') as f:
@@ -958,7 +958,7 @@ def _save_cte_convergence(output_dir: Path, outer_iter: int,
                 'rms_x': f'{ci.get("rms_x", float("nan")):.6f}',
                 'n_det': ci.get('n_det', 0),
             }
-            for k in range(6):
+            for k in range(2):
                 row[f'gamma_y{k}'] = f'{p.gamma_y[k]:.6e}'
                 row[f'gamma_x{k}'] = f'{p.gamma_x[k]:.6e}'
             writer.writerow(row)
@@ -1063,6 +1063,25 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
         t1_mjd    = max(all_mjds)
         dt_max    = (t1_mjd - t0_mjd) / 365.25
 
+        # Collect actual mag_inst percentiles from after-CTE npz for labelling
+        all_mag_inst = []
+        npz_src = npz_after if npz_after is not None else npz_before
+        if npz_src is not None:
+            for img in image_names:
+                key = f'{img}_mag_inst'
+                if key in npz_src:
+                    m = npz_src[key].astype(float)
+                    all_mag_inst.append(m[np.isfinite(m)])
+        if all_mag_inst:
+            all_mag_inst = np.concatenate(all_mag_inst)
+            mag_p10, mag_p50, mag_p90 = np.percentile(all_mag_inst, [10, 50, 90])
+        else:
+            mag_p10, mag_p50, mag_p90 = -9.5, -7.8, -6.8  # fallback
+
+        mag_bins = [(mag_p10, 'steelblue', f'bright (p10={mag_p10:.1f})'),
+                    (mag_p50, 'green',     f'med   (p50={mag_p50:.1f})'),
+                    (mag_p90, 'firebrick', f'faint (p90={mag_p90:.1f})')]
+
         for col_i, chip in enumerate(('hi', 'lo')):
             ax  = axes[col_i]
             p   = cte_params[chip]
@@ -1075,9 +1094,7 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
             X_c_grid   = np.zeros_like(y_raw_grid)   # at X centre of chip
             By = cte_y_basis(X_c_grid, y_raw_grid, p.y_readout_raw)
 
-            for mag_v, col, lbl in [(18.0, 'steelblue', 'mag=18'),
-                                    (20.0, 'green',     'mag=20'),
-                                    (22.0, 'firebrick', 'mag=22')]:
+            for mag_v, col, lbl in mag_bins:
                 phi  = float(phi_flux(np.array([mag_v]), p.delta)[0])
                 dcte = dt_max * phi * (By @ p.gamma_y)
                 ax.plot(y_raw_grid, dcte, color=col, lw=1.8, label=lbl)
