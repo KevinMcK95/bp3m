@@ -198,7 +198,8 @@ def _load_fits_catalog(cat_path: Path) -> dict | None:
             "cov_xx": tbl["cov_xx_gdc"].astype(float),
             "cov_yy": tbl["cov_yy_gdc"].astype(float),
             "cov_xy": tbl["cov_xy_gdc"].astype(float),
-            "mag":    tbl["mag"].astype(float),
+            "mag":     tbl["mag"].astype(float),
+            "mag_gdc": tbl["mag_gdc"].astype(float),
             "qfit":   tbl["qfit"].astype(float),
             "n_sat":  tbl["n_sat"].astype(int),
         }
@@ -344,6 +345,14 @@ def load_master_v2(
     # ── Parse detections and classify sources ─────────────────────────────────
     print(f"  Parsing {len(master)} source rows...")
 
+    # Pre-extract gaia_source_id as int64 BEFORE the iterrows loop.
+    # iterrows() recasts int64 columns to float64 in mixed-dtype DataFrames
+    # (confirmed pandas 3.0.2), which causes catastrophic precision loss for
+    # 19-digit Gaia IDs.  Extracting the array first preserves exact int64 values.
+    _gaia_src_ids = (master["gaia_source_id"].to_numpy(dtype=np.int64)
+                     if "gaia_source_id" in master.columns
+                     else np.zeros(len(master), dtype=np.int64))
+
     source_records: list[dict] = []
 
     for row_i, row in master.iterrows():
@@ -390,11 +399,10 @@ def load_master_v2(
         has_gaia = bool(row.get("has_gaia_match", False))
         gaia_id: np.int64 | None = None
         if has_gaia:
-            raw_id = row.get("gaia_source_id", 0)
+            # Use pre-extracted int64 array — iterrows() loses precision on 19-digit IDs.
+            raw_id = int(_gaia_src_ids[row_i])
             try:
-                # gaia_source_id column was corrected to int64 above, so raw_id
-                # is already an exact int64 value (0 for missing).
-                gaia_id = np.int64(int(raw_id))
+                gaia_id = np.int64(raw_id)
                 if gaia_id == 0:
                     has_gaia = False
                 elif gaia_id not in gaia_id_set:
