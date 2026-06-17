@@ -935,6 +935,7 @@ def fit_batch_jax(
         psf_frac           : (n_stars,) float64 — PSF value at center pixel
         central_res        : (n_stars,) float64 — normalised central residual
     """
+    import math
     import jax
     import jax.numpy as jnp
 
@@ -944,24 +945,46 @@ def fit_batch_jax(
     n_stars   = len(inputs_dict['dx0'])
     n_devices = len(jax.devices())
 
+    # Pad n_stars to the nearest multiple of TIER_SIZE so that images with
+    # similar star counts share the same JIT-compiled kernel.  Without this,
+    # every distinct n_stars triggers a fresh XLA compilation (~250 MB each)
+    # that accumulates permanently in the worker's [anon] mmap pool.
+    # Dummy stars have all-zero valid_masks so they don't affect results;
+    # their outputs are trimmed before returning.
+    TIER_SIZE = 5000
+    n_tier = max(TIER_SIZE, math.ceil(n_stars / TIER_SIZE) * TIER_SIZE)
+    pad = n_tier - n_stars
+
     cache_key = (hw, psf_scale, has_nm, n_devices)
     if cache_key not in _JAX_KERNEL_CACHE:
         _JAX_KERNEL_CACHE[cache_key] = _build_jax_kernel(hw, psf_scale, has_nm)
     _fn = _JAX_KERNEL_CACHE[cache_key]
 
+    def _pad_1d(arr, dtype, fill=0.0):
+        """Convert arr to a JAX array of length n_tier, padded with fill."""
+        a = jnp.array(arr, dtype=dtype)
+        if pad:
+            a = jnp.concatenate([a, jnp.full((pad,), fill, dtype=dtype)])
+        return a
+
+    def _pad_2d(arr, dtype, fill=0.0):
+        """Convert (n_stars, k) arr to (n_tier, k), padded with fill."""
+        a = jnp.array(arr, dtype=dtype)
+        if pad:
+            a = jnp.concatenate([a, jnp.full((pad,) + a.shape[1:], fill, dtype=dtype)])
+        return a
+
     if n_devices > 1:
-        # Pad n_stars to the next multiple of n_devices, then reshape to
-        # (n_devices, n_per_device, ...) for pmap.
-        pad = (-n_stars) % n_devices
-        n_padded = n_stars + pad
-        n_per = n_padded // n_devices
+        # Further reshape (n_tier, ...) → (n_devices, n_per, ...) for pmap.
+        # n_tier must be divisible by n_devices; add extra padding if needed.
+        extra = (-n_tier) % n_devices
+        n_total = n_tier + extra
+        n_per   = n_total // n_devices
 
         def _prep(arr, dtype, fill=0.0):
-            a = jnp.array(arr, dtype=dtype)
-            if pad:
-                a = jnp.concatenate(
-                    [a, jnp.full((pad,) + a.shape[1:], fill, dtype=dtype)]
-                )
+            a = _pad_2d(arr, dtype, fill) if np.asarray(arr).ndim > 1 else _pad_1d(arr, dtype, fill)
+            if extra:
+                a = jnp.concatenate([a, jnp.full((extra,) + a.shape[1:], fill, dtype=dtype)])
             return a.reshape((n_devices, n_per) + a.shape[1:])
 
         tiles = _prep(inputs_dict['psf_coeff_tiles'], jnp.float64)
@@ -970,7 +993,7 @@ def fit_batch_jax(
         vmask = _prep(inputs_dict['valid_masks'],     jnp.float64)
         dx0   = _prep(inputs_dict['dx0'],             jnp.float64)
         dy0   = _prep(inputs_dict['dy0'],             jnp.float64)
-        flux0 = _prep(inputs_dict['flux0'],           jnp.float64)
+        flux0 = _prep(inputs_dict['flux0'],           jnp.float64, fill=1.0)
         sky0  = _prep(inputs_dict['sky0'],            jnp.float64)
 
         result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
@@ -979,20 +1002,20 @@ def fit_batch_jax(
         def _trim(a):
             return np.asarray(a.reshape((-1,) + a.shape[2:])[:n_stars])
     else:
-        tiles  = jnp.array(inputs_dict['psf_coeff_tiles'], dtype=jnp.float64)
-        pvals  = jnp.array(inputs_dict['pixel_vals'],      dtype=jnp.float64)
-        pvar   = jnp.array(inputs_dict['pixel_var_rn'],    dtype=jnp.float64)
-        vmask  = jnp.array(inputs_dict['valid_masks'],     dtype=jnp.float64)
-        dx0    = jnp.array(inputs_dict['dx0'],             dtype=jnp.float64)
-        dy0    = jnp.array(inputs_dict['dy0'],             dtype=jnp.float64)
-        flux0  = jnp.array(inputs_dict['flux0'],           dtype=jnp.float64)
-        sky0   = jnp.array(inputs_dict['sky0'],            dtype=jnp.float64)
+        tiles = _pad_2d(inputs_dict['psf_coeff_tiles'], jnp.float64)
+        pvals = _pad_2d(inputs_dict['pixel_vals'],      jnp.float64)
+        pvar  = _pad_2d(inputs_dict['pixel_var_rn'],    jnp.float64)
+        vmask = _pad_2d(inputs_dict['valid_masks'],     jnp.float64)
+        dx0   = _pad_1d(inputs_dict['dx0'],             jnp.float64)
+        dy0   = _pad_1d(inputs_dict['dy0'],             jnp.float64)
+        flux0 = _pad_1d(inputs_dict['flux0'],           jnp.float64, fill=1.0)
+        sky0  = _pad_1d(inputs_dict['sky0'],            jnp.float64)
 
         result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
                      float(gain), float(tol), int(max_iter))
 
         def _trim(a):
-            return np.asarray(a)
+            return np.asarray(a[:n_stars])
 
     (flux, dx, dy, sky, cov, n_iter, converged, delta_max,
      qfit, chi2, psf_frac, central_res) = result
