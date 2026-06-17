@@ -2038,6 +2038,9 @@ def run_photometry(
                     gain=gain, zero_point=zero_point,
                     sat_threshold=sat_threshold,
                 )
+                # Free the large tile arrays (psf_coeff_tiles ~ 0.65 GB for 85k
+                # stars) now that fitting and sigma-clip are done.
+                del _jax_inputs, _jax_res
 
             else:
                 if verbose:

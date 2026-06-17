@@ -371,6 +371,9 @@ def refit_stars_jax(residual, records, psf_cube, xs, ys, psf_scale, hw,
         gain=gain, zero_point=zero_point,
         sat_threshold=sat_threshold,
     )
+    # Free the large tile arrays now that fitting, sigma-clip, and
+    # record conversion are done.
+    del inputs, jax_res
 
     ny, nx = residual.shape
     _cube      = psf_coeffs_cube if psf_coeffs_cube is not None else psf_cube

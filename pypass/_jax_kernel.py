@@ -997,7 +997,10 @@ def fit_batch_jax(
     (flux, dx, dy, sky, cov, n_iter, converged, delta_max,
      qfit, chi2, psf_frac, central_res) = result
 
-    return dict(
+    # Convert to numpy immediately and release JAX device arrays.
+    # The tile inputs (largest allocations) are already out of scope here;
+    # the result arrays are ~n_stars × small — trim converts and frees them.
+    out = dict(
         flux        = _trim(flux),
         dx          = _trim(dx),
         dy          = _trim(dy),
@@ -1011,3 +1014,6 @@ def fit_batch_jax(
         psf_frac    = _trim(psf_frac),
         central_res = _trim(central_res),
     )
+    del result, flux, dx, dy, sky, cov, n_iter, converged, delta_max
+    del qfit, chi2, psf_frac, central_res
+    return out
