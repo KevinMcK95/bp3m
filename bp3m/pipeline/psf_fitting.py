@@ -977,15 +977,27 @@ def _image_worker(args):
                 sys.stdout = _old_stdout
                 sys.stderr = _old_stderr
 
-        # Extract summary stats from the written catalog.
+        # Extract summary stats.
+        # n_found  : total initial detections above fmin (parsed from log;
+        #            non-converged sources are removed before catalog write so
+        #            this is the only place this count survives).
+        # n_converged : rows in the catalog (all converged by construction).
+        # n_stars_cls : sources classified as point stars (is_star_candidate).
         n_found = n_converged = n_stars_cls = 0
         if succeeded and catalog_path.exists():
             try:
+                import re as _re
                 from astropy.table import Table as _T
                 _cat = _T.read(str(catalog_path))
-                n_found = len(_cat)
-                n_converged  = int(np.sum(_cat['converged'])) if 'converged' in _cat.colnames else n_found
-                n_stars_cls  = int(np.sum(_cat['is_star']))   if 'is_star'   in _cat.colnames else n_found
+                n_converged = len(_cat)
+                n_stars_cls = (int(np.sum(_cat['is_star_candidate']))
+                               if 'is_star_candidate' in _cat.colnames else n_converged)
+                # Parse N found from the log: sum of "X above fmin=" lines.
+                # Non-converged sources are removed before catalog write so this
+                # is the only place the initial detection count survives.
+                _log_text = log_path.read_text() if log_path.exists() else ''
+                _fmin_hits = _re.findall(r'(\d+) above fmin=', _log_text)
+                n_found = sum(int(x) for x in _fmin_hits) if _fmin_hits else n_converged
             except Exception:
                 n_found = n_converged = n_stars_cls = 0
 
