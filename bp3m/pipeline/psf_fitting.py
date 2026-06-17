@@ -823,19 +823,45 @@ def remeasure_psf_perturbation(
 
 
 def _get_image_header_info(img_path):
-    """Read minimal FITS header info for the one-liner status print. Fast — primary header only."""
+    """Read minimal FITS header info for the one-liner status print."""
     try:
         from astropy.io import fits as _f
         with _f.open(str(img_path), memmap=False) as h:
-            hdr = h[0].header
+            hdr  = h[0].header
+            # SCI extension header has photometric calibration keywords.
+            sci_hdr = next((h[i].header for i in range(1, len(h))
+                            if h[i].name == 'SCI'), None)
         instrume = hdr.get('INSTRUME', '?').strip()
         detector = hdr.get('DETECTOR', '').strip()
         instdet  = f"{instrume}/{detector}" if detector else instrume
-        filt = hdr.get('FILTER2', hdr.get('FILTER1', hdr.get('FILTER', '?'))).strip()
+        filt     = hdr.get('FILTER2', hdr.get('FILTER1', hdr.get('FILTER', '?'))).strip()
         exptime  = float(hdr.get('EXPTIME', 0))
-        return {'instdet': instdet, 'filter': filt, 'exptime': exptime}
+        photflam = float(sci_hdr['PHOTFLAM']) if sci_hdr and 'PHOTFLAM' in sci_hdr else None
+        photzpt  = float(sci_hdr.get('PHOTZPT', -21.10)) if sci_hdr else -21.10
+        return {'instdet': instdet, 'filter': filt, 'exptime': exptime,
+                'photflam': photflam, 'photzpt': photzpt}
     except Exception:
-        return {'instdet': '?', 'filter': '?', 'exptime': 0}
+        return {'instdet': '?', 'filter': '?', 'exptime': 0,
+                'photflam': None, 'photzpt': -21.10}
+
+
+def _effective_fmin(info: dict, params: dict) -> str:
+    """Compute the effective fmin string for the one-liner, matching pypass logic."""
+    fmin_thresh = params.get('fmin_thresh', _HST_DEFAULTS['fmin_thresh'])
+    mag_st_max  = params.get('mag_st_max',  _HST_DEFAULTS['mag_st_max'])
+    photflam    = info.get('photflam')
+    photzpt     = info.get('photzpt', -21.10)
+    exptime     = info.get('exptime', 0)
+    if photflam and exptime > 0:
+        try:
+            import math
+            zp_st = -2.5 * math.log10(photflam) + photzpt + 2.5 * math.log10(exptime)
+            fmin_from_mag = 10 ** ((zp_st - mag_st_max) / 2.5)
+            fmin_eff = max(fmin_from_mag, fmin_thresh)
+            return f"{fmin_eff:.0f}"
+        except Exception:
+            pass
+    return f"{fmin_thresh:.0f}"
 
 
 # Global status queue set by pool initializer in parallel mode.
@@ -1633,9 +1659,9 @@ def run_psf_fitting(
                         _id  = info.get('instdet', '?')
                         _fi  = info.get('filter',  '?')
                         _et  = info.get('exptime',  0)
-                        _ft  = params.get('fmin_thresh', '')
+                        _fm  = _effective_fmin(info, params)
                         print(f"[{_ts()}] Starting  {img_nm} "
-                              f"({_id} {_fi}, {_et:.0f}s, fmin_thresh={_ft}e-)")
+                              f"({_id} {_fi}, {_et:.0f}s, fmin={_fm}e-)")
                     elif kind == 'done':
                         _, img_nm, nf, nc, ns, elapsed = msg
                         _done += 1
