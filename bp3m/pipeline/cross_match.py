@@ -49,17 +49,86 @@ def _find_image_folders(output_dir: Path, field_name: str,
     return folders
 
 
+def _write_xmatch_status(root: Path, status: str, params_meta: dict,
+                          reason: str = '', n_matched: int = 0) -> None:
+    """Write xmatch_status.json recording the outcome of a cross-match attempt."""
+    import datetime
+    (root / 'xmatch_status.json').write_text(json.dumps({
+        'status':    status,
+        'reason':    reason,
+        'n_matched': n_matched,
+        'params':    params_meta,
+        'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+    }, indent=2))
+
+
+def _xmatch_cache_status(hst_root: Path, params_meta: dict
+                          ) -> tuple[str, str]:
+    """Return (action, reason) where action is 'skip' or 'run'.
+
+    Reads xmatch_status.json to determine if a previous attempt (success,
+    failure, or deliberate skip) still applies for the current params.
+    Falls back to the old matched_gaia.csv + xmatch_params.json pair for
+    directories that pre-date xmatch_status.json.
+    """
+    status_path = hst_root / 'xmatch_status.json'
+    if status_path.exists():
+        try:
+            saved = json.loads(status_path.read_text())
+        except Exception:
+            return 'run', 'could not read xmatch_status.json'
+        if saved.get('params') != params_meta:
+            return 'run', 'params changed'
+        st = saved.get('status', 'unknown')
+        if st == 'success':
+            if (hst_root / 'matched_gaia.csv').exists():
+                return 'skip', f"previously matched ({saved.get('n_matched', '?')} stars)"
+            return 'run', 'status=success but matched_gaia.csv missing'
+        if st in ('failed', 'skipped'):
+            return 'skip', f"previously {st}: {saved.get('reason', '')}"
+        return 'run', f'unknown status: {st}'
+
+    # ── Legacy fallback: directories without xmatch_status.json ─────────────
+    out         = hst_root / 'matched_gaia.csv'
+    params_path = hst_root / 'xmatch_params.json'
+    if not out.exists():
+        return 'run', 'no previous result'
+    if not params_path.exists():
+        return 'run', 'results exist but no params sidecar'
+    try:
+        saved = json.loads(params_path.read_text())
+    except Exception:
+        return 'run', 'could not read xmatch_params.json'
+    diffs = [k for k, v in params_meta.items() if saved.get(k) != v]
+    if diffs:
+        return 'run', f'params changed: {diffs}'
+    return 'skip', 'matched_gaia.csv + matching xmatch_params.json (legacy cache)'
+
+
+def _has_mag_calibration(catalog_path: Path) -> bool:
+    """Return True if the catalog contains at least one finite magnitude value."""
+    try:
+        import numpy as np
+        from astropy.table import Table
+        t = Table.read(str(catalog_path), columns=['mag'])
+        return bool(np.any(np.isfinite(t['mag'])))
+    except Exception:
+        return True   # if we can't tell, don't skip
+
+
 def _match_one(args):
     """Worker: cross-match one image. Returns (image_name, n_matched, error)."""
     hst_dict, gaia_df, kwargs = args
     from gaia_cross_match.cross_match import process_single_image
 
-    name = Path(hst_dict['root']).name
+    root        = Path(hst_dict['root'])
+    name        = root.name
     params_meta = kwargs.get('params_meta', {})
-    params_path = Path(hst_dict['root']) / "xmatch_params.json"
+    params_path = root / 'xmatch_params.json'
+
     try:
-        # Remove sidecar BEFORE running so an interrupted match leaves no stale
-        # sidecar that could mark incomplete results as valid on the next run.
+        # Remove legacy sidecar before running so an interrupted match
+        # leaves no stale cache that could mark incomplete results as valid.
         if params_path.exists():
             params_path.unlink()
 
@@ -73,29 +142,15 @@ def _match_one(args):
             discovery_max_offset=kwargs.get('discovery_max_offset', 50),
             use_resid_floor=kwargs.get('use_resid_floor', True),
         )
-        out = Path(hst_dict['root']) / "matched_gaia.csv"
-        n = len(pd.read_csv(out)) if out.exists() else 0
+        out = root / 'matched_gaia.csv'
+        n = len(pd.read_csv(str(out))) if out.exists() else 0
         if params_meta and out.exists():
             params_path.write_text(json.dumps(params_meta, indent=2))
+        _write_xmatch_status(root, 'success', params_meta, n_matched=n)
         return name, n, None
     except Exception as exc:
+        _write_xmatch_status(root, 'failed', params_meta, reason=str(exc))
         return name, 0, str(exc)
-
-
-def _params_cache_status(output_path: Path, params_path: Path,
-                          current_params: dict) -> tuple[bool, list[str]]:
-    """Return (cache_valid, diffs) by comparing saved params sidecar to current."""
-    if not output_path.exists():
-        return False, []
-    if not params_path.exists():
-        return False, ["no params sidecar — cannot verify configuration match"]
-    try:
-        saved = json.loads(params_path.read_text())
-    except Exception as e:
-        return False, [f"could not read params sidecar: {e}"]
-    diffs = [f"  {k}: saved={saved.get(k)!r}  current={v!r}"
-             for k, v in current_params.items() if saved.get(k) != v]
-    return len(diffs) == 0, diffs
 
 
 def run_cross_match(
@@ -188,22 +243,24 @@ def run_cross_match(
 
     work = []
     skipped = []
+    skipped_nophot = []
     for hst in folders:
-        out         = Path(hst['root']) / "matched_gaia.csv"
-        params_path = Path(hst['root']) / "xmatch_params.json"
+        root = Path(hst['root'])
+        name = root.name
 
         if not force_rematch:
-            ok, diffs = _params_cache_status(out, params_path, params_meta)
-            if ok:
-                skipped.append(Path(hst['root']).name)
+            action, reason = _xmatch_cache_status(root, params_meta)
+            if action == 'skip':
+                skipped.append(name)
                 continue
-            if out.exists():
-                if diffs == ["no params sidecar — cannot verify configuration match"]:
-                    print(f"  {Path(hst['root']).name}: results exist but no params sidecar — re-matching")
-                else:
-                    print(f"  {Path(hst['root']).name}: params changed — re-matching:")
-                    for d in diffs:
-                        print(d)
+
+        # Skip images without photometric calibration — their mag column is all
+        # NaN so they cannot contribute to magnitude-based cross-matching.
+        if not _has_mag_calibration(Path(hst['catalog'])):
+            _write_xmatch_status(root, 'skipped', params_meta,
+                                  reason='no photometric calibration (PHOTFLAM/EXPTIME missing)')
+            skipped_nophot.append(name)
+            continue
 
         work.append((hst, gaia_df, {
             'hst_pix_floor':        hst_pix_floor,
@@ -217,7 +274,10 @@ def run_cross_match(
         }))
 
     if skipped:
-        print(f"  {len(skipped)} image(s) already matched with matching params — skipping.")
+        print(f"  {len(skipped)} image(s) already matched — skipping.")
+    if skipped_nophot:
+        print(f"  {len(skipped_nophot)} image(s) skipped — no photometric calibration (PHOTFLAM missing): "
+              f"{', '.join(skipped_nophot)}")
     if not work:
         print("  All cross-matches up to date.")
         existing = [Path(f['root']) / "matched_gaia.csv" for f in folders]
@@ -269,10 +329,22 @@ def run_cross_match(
     except Exception as _e:
         print(f"  WARNING: cross-image validation failed — {_e}")
 
-    # Include previously-skipped results in the return list
+    # Include previously-cached successful results in the return list.
+    # Exclude images flagged as skipped (no photometric calibration) or failed.
     for hst in folders:
-        p = Path(hst['root']) / "matched_gaia.csv"
+        root = Path(hst['root'])
+        p = root / 'matched_gaia.csv'
         if p not in results and p.exists():
+            # Don't include results from no-photflam skips even if a stale
+            # matched_gaia.csv somehow exists from an older run.
+            status_path = root / 'xmatch_status.json'
+            if status_path.exists():
+                try:
+                    st = json.loads(status_path.read_text()).get('status', 'success')
+                    if st == 'skipped':
+                        continue
+                except Exception:
+                    pass
             results.append(p)
 
     print(f"  Cross-match complete: {len(results)}/{len(folders)} available.")
