@@ -886,7 +886,9 @@ def _image_worker(args):
     try:
         with open(log_path, 'w', buffering=1) as _log:
             _old_stdout = sys.stdout
+            _old_stderr = sys.stderr
             sys.stdout  = _log
+            sys.stderr  = _log
             try:
                 # Replicate the per-image PSF iteration loop from run_psf_fitting.
                 use_clean = clean_psf or (not apply_psf_delta) or force_refit
@@ -947,6 +949,7 @@ def _image_worker(args):
                 succeeded = False
             finally:
                 sys.stdout = _old_stdout
+                sys.stderr = _old_stderr
 
         # Extract summary stats from the written catalog.
         n_found = n_converged = n_stars_cls = 0
