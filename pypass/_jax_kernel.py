@@ -945,98 +945,106 @@ def fit_batch_jax(
     n_stars   = len(inputs_dict['dx0'])
     n_devices = len(jax.devices())
 
-    # Pad n_stars to the nearest multiple of TIER_SIZE so that images with
-    # similar star counts share the same JIT-compiled kernel.  Without this,
-    # every distinct n_stars triggers a fresh XLA compilation (~250 MB each)
-    # that accumulates permanently in the worker's [anon] mmap pool.
-    # Dummy stars have all-zero valid_masks so they don't affect results;
-    # their outputs are trimmed before returning.
-    TIER_SIZE = 5000
-    n_tier = max(TIER_SIZE, math.ceil(n_stars / TIER_SIZE) * TIER_SIZE)
-    pad = n_tier - n_stars
+    # Process stars in fixed-size chunks so the JAX compiled kernel shape is
+    # always CHUNK_SIZE regardless of image star count.  Benefits:
+    #   1. One XLA compilation total (reused across all images and all chunks)
+    #      eliminating the unbounded [anon] mmap growth (~750 MB per unique size)
+    #   2. Peak tile memory per call = CHUNK_SIZE × ts × ts × 8 bytes instead
+    #      of n_stars × ts × ts × 8 (e.g. 77 MB vs 363 MB for 47k stars)
+    # Dummy pad stars have all-zero valid_masks; outputs are trimmed to n_stars.
+    CHUNK_SIZE = 10_000
 
     cache_key = (hw, psf_scale, has_nm, n_devices)
     if cache_key not in _JAX_KERNEL_CACHE:
         _JAX_KERNEL_CACHE[cache_key] = _build_jax_kernel(hw, psf_scale, has_nm)
     _fn = _JAX_KERNEL_CACHE[cache_key]
 
-    def _pad_1d(arr, dtype, fill=0.0):
-        """Convert arr to a JAX array of length n_tier, padded with fill."""
-        a = jnp.array(arr, dtype=dtype)
-        if pad:
-            a = jnp.concatenate([a, jnp.full((pad,), fill, dtype=dtype)])
-        return a
+    result_keys = ('flux','dx','dy','sky','cov','n_iter','converged',
+                   'delta_max','qfit','chi2','psf_frac','central_res')
+    chunks_out = {k: [] for k in result_keys}
 
-    def _pad_2d(arr, dtype, fill=0.0):
-        """Convert (n_stars, k) arr to (n_tier, k), padded with fill."""
-        a = jnp.array(arr, dtype=dtype)
-        if pad:
-            a = jnp.concatenate([a, jnp.full((pad,) + a.shape[1:], fill, dtype=dtype)])
-        return a
+    for chunk_start in range(0, n_stars, CHUNK_SIZE):
+        chunk_end = min(chunk_start + CHUNK_SIZE, n_stars)
+        n_chunk   = chunk_end - chunk_start
+        pad       = CHUNK_SIZE - n_chunk
 
-    if n_devices > 1:
-        # Further reshape (n_tier, ...) → (n_devices, n_per, ...) for pmap.
-        # n_tier must be divisible by n_devices; add extra padding if needed.
-        extra = (-n_tier) % n_devices
-        n_total = n_tier + extra
-        n_per   = n_total // n_devices
+        def _c1d(key, fill=0.0):
+            a = jnp.array(inputs_dict[key][chunk_start:chunk_end], dtype=jnp.float64)
+            if pad:
+                a = jnp.concatenate([a, jnp.full((pad,), fill, dtype=jnp.float64)])
+            return a
 
-        def _prep(arr, dtype, fill=0.0):
-            a = _pad_2d(arr, dtype, fill) if np.asarray(arr).ndim > 1 else _pad_1d(arr, dtype, fill)
-            if extra:
-                a = jnp.concatenate([a, jnp.full((extra,) + a.shape[1:], fill, dtype=dtype)])
-            return a.reshape((n_devices, n_per) + a.shape[1:])
+        def _c2d(key, fill=0.0):
+            a = jnp.array(inputs_dict[key][chunk_start:chunk_end], dtype=jnp.float64)
+            if pad:
+                a = jnp.concatenate([a, jnp.full((pad,) + a.shape[1:], fill, dtype=jnp.float64)])
+            return a
 
-        tiles = _prep(inputs_dict['psf_coeff_tiles'], jnp.float64)
-        pvals = _prep(inputs_dict['pixel_vals'],      jnp.float64)
-        pvar  = _prep(inputs_dict['pixel_var_rn'],    jnp.float64)
-        vmask = _prep(inputs_dict['valid_masks'],     jnp.float64)
-        dx0   = _prep(inputs_dict['dx0'],             jnp.float64)
-        dy0   = _prep(inputs_dict['dy0'],             jnp.float64)
-        flux0 = _prep(inputs_dict['flux0'],           jnp.float64, fill=1.0)
-        sky0  = _prep(inputs_dict['sky0'],            jnp.float64)
+        if n_devices > 1:
+            extra  = (-CHUNK_SIZE) % n_devices
+            n_total = CHUNK_SIZE + extra
+            n_per   = n_total // n_devices
 
-        result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
-                     float(gain), float(tol), int(max_iter))
+            def _prep_pmap(key, is2d, fill=0.0):
+                a = _c2d(key, fill) if is2d else _c1d(key, fill)
+                if extra:
+                    a = jnp.concatenate([a, jnp.full((extra,) + a.shape[1:], fill, dtype=jnp.float64)])
+                return a.reshape((n_devices, n_per) + a.shape[1:])
 
-        def _trim(a):
-            return np.asarray(a.reshape((-1,) + a.shape[2:])[:n_stars])
-    else:
-        tiles = _pad_2d(inputs_dict['psf_coeff_tiles'], jnp.float64)
-        pvals = _pad_2d(inputs_dict['pixel_vals'],      jnp.float64)
-        pvar  = _pad_2d(inputs_dict['pixel_var_rn'],    jnp.float64)
-        vmask = _pad_2d(inputs_dict['valid_masks'],     jnp.float64)
-        dx0   = _pad_1d(inputs_dict['dx0'],             jnp.float64)
-        dy0   = _pad_1d(inputs_dict['dy0'],             jnp.float64)
-        flux0 = _pad_1d(inputs_dict['flux0'],           jnp.float64, fill=1.0)
-        sky0  = _pad_1d(inputs_dict['sky0'],            jnp.float64)
+            tiles = _prep_pmap('psf_coeff_tiles', True)
+            pvals = _prep_pmap('pixel_vals',      True)
+            pvar  = _prep_pmap('pixel_var_rn',    True)
+            vmask = _prep_pmap('valid_masks',      True)
+            dx0   = _prep_pmap('dx0',              False)
+            dy0   = _prep_pmap('dy0',              False)
+            flux0 = _prep_pmap('flux0',            False, fill=1.0)
+            sky0  = _prep_pmap('sky0',             False)
 
-        result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
-                     float(gain), float(tol), int(max_iter))
+            result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
+                         float(gain), float(tol), int(max_iter))
 
-        def _trim(a):
-            return np.asarray(a[:n_stars])
+            def _trim(a):
+                return np.asarray(a.reshape((-1,) + a.shape[2:])[:n_chunk])
+        else:
+            tiles = _c2d('psf_coeff_tiles')
+            pvals = _c2d('pixel_vals')
+            pvar  = _c2d('pixel_var_rn')
+            vmask = _c2d('valid_masks')
+            dx0   = _c1d('dx0')
+            dy0   = _c1d('dy0')
+            flux0 = _c1d('flux0', fill=1.0)
+            sky0  = _c1d('sky0')
 
-    (flux, dx, dy, sky, cov, n_iter, converged, delta_max,
-     qfit, chi2, psf_frac, central_res) = result
+            result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
+                         float(gain), float(tol), int(max_iter))
 
-    # Convert to numpy immediately and release JAX device arrays.
-    # The tile inputs (largest allocations) are already out of scope here;
-    # the result arrays are ~n_stars × small — trim converts and frees them.
+            def _trim(a):
+                return np.asarray(a[:n_chunk])
+
+        (flux, dx, dy, sky, cov, n_iter, converged, delta_max,
+         qfit, chi2, psf_frac, central_res) = result
+
+        for k, v in zip(result_keys, (flux, dx, dy, sky, cov, n_iter, converged,
+                                      delta_max, qfit, chi2, psf_frac, central_res)):
+            chunks_out[k].append(_trim(v))
+
+        # Explicitly free JAX device arrays for this chunk before the next.
+        del tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0, result
+        del flux, dx, dy, sky, cov, n_iter, converged, delta_max
+        del qfit, chi2, psf_frac, central_res
+
     out = dict(
-        flux        = _trim(flux),
-        dx          = _trim(dx),
-        dy          = _trim(dy),
-        sky         = _trim(sky),
-        cov         = _trim(cov),
-        n_iter      = _trim(n_iter),
-        converged   = _trim(converged),
-        delta_max   = _trim(delta_max),
-        qfit        = _trim(qfit),
-        chi2        = _trim(chi2),
-        psf_frac    = _trim(psf_frac),
-        central_res = _trim(central_res),
+        flux        = np.concatenate(chunks_out['flux']),
+        dx          = np.concatenate(chunks_out['dx']),
+        dy          = np.concatenate(chunks_out['dy']),
+        sky         = np.concatenate(chunks_out['sky']),
+        cov         = np.concatenate(chunks_out['cov']),
+        n_iter      = np.concatenate(chunks_out['n_iter']),
+        converged   = np.concatenate(chunks_out['converged']),
+        delta_max   = np.concatenate(chunks_out['delta_max']),
+        qfit        = np.concatenate(chunks_out['qfit']),
+        chi2        = np.concatenate(chunks_out['chi2']),
+        psf_frac    = np.concatenate(chunks_out['psf_frac']),
+        central_res = np.concatenate(chunks_out['central_res']),
     )
-    del result, flux, dx, dy, sky, cov, n_iter, converged, delta_max
-    del qfit, chi2, psf_frac, central_res
     return out

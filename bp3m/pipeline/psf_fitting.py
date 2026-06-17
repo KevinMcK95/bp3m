@@ -907,13 +907,9 @@ def _image_worker(args):
     log_path    = img_path.parent / 'psf_fitting_log.txt'
     img_name    = img_path.name
 
-    # In parallel image mode each worker runs on 1 JAX device, so JAX's
-    # multi-core SIMD benefit is gone while its XLA compilation cost
-    # (~750 MB per unique star-count tier, permanent in [anon]) remains.
-    # Forcing the numpy backend eliminates that overhead entirely; numpy
-    # with n_jobs threading achieves comparable throughput for these
-    # per-image workloads.
-    os.environ['PYPASS_BACKEND'] = 'numpy'
+    # Limit resource usage: one worker = one core for numpy/BLAS operations.
+    # JAX is still used for fit_batch_jax but processes stars in fixed-size
+    # chunks (CHUNK_SIZE) so the XLA kernel is compiled once and reused.
     for _var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
         os.environ[_var] = '1'
 
