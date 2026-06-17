@@ -834,8 +834,20 @@ def _get_image_header_info(img_path):
         instrume = hdr.get('INSTRUME', '?').strip()
         detector = hdr.get('DETECTOR', '').strip()
         instdet  = f"{instrume}/{detector}" if detector else instrume
-        filt     = hdr.get('FILTER2', hdr.get('FILTER1', hdr.get('FILTER', '?'))).strip()
         exptime  = float(hdr.get('EXPTIME', 0))
+        # Match _extract_filter logic in pypass/io.py:
+        # ACS has two filter wheels — pick the non-CLEAR one.
+        filt = '?'
+        if instrume.upper() in ('ACS', ''):
+            for _key in ('FILTER1', 'FILTER2'):
+                _v = hdr.get(_key, '').strip().upper()
+                if _v and not _v.startswith('CLEAR'):
+                    filt = _v; break
+        if filt == '?':
+            for _key in ('FILTER', 'FILTNAM1', 'FILTNAM2', 'FILTER1', 'FILTER2'):
+                _v = hdr.get(_key, '').strip().upper()
+                if _v and not _v.startswith('CLEAR'):
+                    filt = _v; break
         photflam = float(sci_hdr['PHOTFLAM']) if sci_hdr and 'PHOTFLAM' in sci_hdr else None
         photzpt  = float(sci_hdr.get('PHOTZPT', -21.10)) if sci_hdr else -21.10
         return {'instdet': instdet, 'filter': filt, 'exptime': exptime,
