@@ -429,7 +429,7 @@ def _jax_results_to_records(
 
     # psf_peak: PSF value at perfect centre (dx=0, dy=0).
     # tile[tr, tr] is the exact integer grid point — no interpolation needed.
-    psf_peaks = inputs_dict['psf_tiles'][:, tr, tr].astype(np.float64)
+    psf_peaks = inputs_dict['psf_peak'].astype(np.float64)
 
     # peak: central pixel above sky (uses pre-fit pixel values — same as NumPy path)
     peaks = pixel_vals[:, center] - sky_arr

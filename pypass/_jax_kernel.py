@@ -397,7 +397,7 @@ def prepare_jax_inputs(
     ts      = tile_side(hw, psf_scale)
     tr      = tile_radius(hw, psf_scale)
 
-    psf_tiles_out       = np.empty((n_stars, ts, ts),   dtype=np.float32)
+    psf_peak_out        = np.empty(n_stars,              dtype=np.float32)
     psf_coeff_tiles_out = np.empty((n_stars, ts, ts),   dtype=np.float64)
     pixel_vals_out      = np.empty((n_stars, n_pix),    dtype=np.float64)
     pixel_var_out       = np.empty((n_stars, n_pix),    dtype=np.float64)
@@ -462,14 +462,14 @@ def prepare_jax_inputs(
 
         flux, sky_fit = flux_sky_init(coeff_tile, pv, valid, dx0, dy0, hw, psf_scale, sky)
 
-        return tile, coeff_tile, pv, pvar, valid, dx0, dy0, flux, sky_fit, xi, yi
+        return tile[tr, tr], coeff_tile, pv, pvar, valid, dx0, dy0, flux, sky_fit, xi, yi
 
     # Threading does not help here: Python-level GIL overhead in interpolate_psf
     # serializes all threads regardless of n_jobs. Run serially.
     results = [_process_star(i) for i in range(n_stars)]
 
-    for i, (tile, coeff_tile, pv, pvar, valid, dx0, dy0, flux, sky_fit, xi, yi) in enumerate(results):
-        psf_tiles_out[i]       = tile
+    for i, (psf_peak, coeff_tile, pv, pvar, valid, dx0, dy0, flux, sky_fit, xi, yi) in enumerate(results):
+        psf_peak_out[i]        = psf_peak
         psf_coeff_tiles_out[i] = coeff_tile
         pixel_vals_out[i]      = pv
         pixel_var_out[i]       = pvar
@@ -482,7 +482,7 @@ def prepare_jax_inputs(
         yi_out[i]              = yi
 
     return dict(
-        psf_tiles       = psf_tiles_out,
+        psf_peak        = psf_peak_out,
         psf_coeff_tiles = psf_coeff_tiles_out,
         pixel_vals      = pixel_vals_out,
         pixel_var_rn    = pixel_var_out,

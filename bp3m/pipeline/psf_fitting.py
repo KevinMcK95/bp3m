@@ -907,14 +907,15 @@ def _image_worker(args):
     log_path    = img_path.parent / 'psf_fitting_log.txt'
     img_name    = img_path.name
 
-    # Limit resource usage: one worker = one core.
+    # In parallel image mode each worker runs on 1 JAX device, so JAX's
+    # multi-core SIMD benefit is gone while its XLA compilation cost
+    # (~750 MB per unique star-count tier, permanent in [anon]) remains.
+    # Forcing the numpy backend eliminates that overhead entirely; numpy
+    # with n_jobs threading achieves comparable throughput for these
+    # per-image workloads.
+    os.environ['PYPASS_BACKEND'] = 'numpy'
     for _var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
         os.environ[_var] = '1'
-    try:
-        import jax as _jax
-        _jax.config.update('jax_num_cpu_devices', 1)
-    except Exception:
-        pass
 
     t0 = time.perf_counter()
 
@@ -1658,6 +1659,7 @@ def run_psf_fitting(
             processes=min(n_workers, n_work),
             initializer=_worker_pool_init,
             initargs=(_queue,),
+            maxtasksperchild=3,
         )
         _async_results = {
             _pool.apply_async(_image_worker, (wargs,)): img
