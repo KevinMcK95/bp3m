@@ -1540,12 +1540,32 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
     # Uncertainty-weighted linear fit through the first 3 bins at the bright
     # edge (index 0 = brightest).  Used for both the Gaussian smoother's left
     # padding and for explicit extrapolated points prepended to the PCHIP.
+    # Constraint: if the fitted slope is positive (chi2 would DECREASE going
+    # brighter), clamp to a flat line at bin_raw[0] — chi2 must not fall below
+    # the brightest measured bin when extrapolating to brighter magnitudes.
     n_fit_l = min(3, n_bins)
     if n_fit_l >= 2:
         _c_bright = np.polyfit(np.arange(n_fit_l, dtype=float), bin_raw[:n_fit_l], 1,
                                w=1.0 / bin_unc[:n_fit_l])
+        if _c_bright[0] > 0:
+            _c_bright = np.array([0.0, float(bin_raw[0])])
     else:
         _c_bright = None
+
+    # Faint-end linear fit through the last 3 bins (index n_bins-1 = faintest).
+    # Used symmetrically to the bright-end: provides a sloped right-side padding
+    # for the Gaussian smoother so the last few bins are not pulled down by the
+    # flat-constant pad, and provides faint-end anchor points for the PCHIP.
+    n_fit_r = min(3, n_bins)
+    faint_x = np.arange(n_bins - n_fit_r, n_bins, dtype=float)
+    if n_fit_r >= 2:
+        _c_faint = np.polyfit(faint_x, bin_raw[-n_fit_r:], 1,
+                              w=1.0 / bin_unc[-n_fit_r:])
+        # Constraint: chi2 must not decrease going fainter.
+        if _c_faint[0] < 0:
+            _c_faint = np.array([0.0, float(bin_raw[-1])])
+    else:
+        _c_faint = None
 
     # Bright-end extrapolated anchor points: spaced by the median bin spacing of
     # the first 3 bins, covering from the brightest bin back to the actual data
@@ -1555,13 +1575,27 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
         if dM > 0:
             gap = bin_mags[0] - float(mags_s[0])
             n_extrap = max(2, int(np.ceil(gap / dM)) + 1)
-            extrap_idx  = np.arange(-n_extrap, 0, dtype=float)     # negative bin indices
-            extrap_mags = bin_mags[0] + extrap_idx * dM            # ascending magnitude
+            extrap_idx  = np.arange(-n_extrap, 0, dtype=float)
+            extrap_mags = bin_mags[0] + extrap_idx * dM
             extrap_chi2 = np.maximum(np.polyval(_c_bright, extrap_idx), 1.0)
         else:
             extrap_mags = extrap_chi2 = np.array([])
     else:
         extrap_mags = extrap_chi2 = np.array([])
+
+    # Faint-end extrapolated anchor points: symmetric with bright end.
+    if _c_faint is not None and n_fit_r >= 2:
+        dM_f = float(np.median(np.diff(bin_mags[-n_fit_r:])))
+        if dM_f > 0:
+            gap_f = float(mags_s[-1]) - bin_mags[-1]
+            n_extrap_f = max(2, int(np.ceil(gap_f / dM_f)) + 1)
+            extrap_faint_bin_idx = np.arange(n_bins, n_bins + n_extrap_f, dtype=float)
+            extrap_faint_mags    = bin_mags[-1] + (extrap_faint_bin_idx - (n_bins - 1)) * dM_f
+            extrap_faint_chi2    = np.maximum(np.polyval(_c_faint, extrap_faint_bin_idx), 1.0)
+        else:
+            extrap_faint_mags = extrap_faint_chi2 = np.array([])
+    else:
+        extrap_faint_mags = extrap_faint_chi2 = np.array([])
 
     # Gaussian kernel smoothing weighted by 1/sigma^2.
     # Distance is measured in bin-index units so smoothing is uniform across
@@ -1573,7 +1607,11 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
         pad_left = np.maximum(np.polyval(_c_bright, np.arange(-n_pad, 0, dtype=float)), 1.0)
     else:
         pad_left = np.full(n_pad, max(float(bin_raw[0]), 1.0))
-    pad_right = np.full(n_pad, float(bin_raw[-1]))
+    if _c_faint is not None:
+        pad_right = np.maximum(
+            np.polyval(_c_faint, np.arange(n_bins, n_bins + n_pad, dtype=float)), 1.0)
+    else:
+        pad_right = np.full(n_pad, float(bin_raw[-1]))
 
     idx_full = np.concatenate([
         np.arange(-n_pad, 0),
@@ -1590,7 +1628,9 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
         smoothed[i] = np.sum(kw * pv) / np.sum(kw)
 
     smoothed = np.clip(smoothed, 0.1, 20.0)
-    return bin_mags, smoothed, bin_raw, bin_unc, extrap_mags, extrap_chi2
+    return (bin_mags, smoothed, bin_raw, bin_unc,
+            extrap_mags, extrap_chi2,
+            extrap_faint_mags, extrap_faint_chi2)
 
 def inflate_chi2(records, zero_point, verbose=False):
     """Apply magnitude-dependent chi²-scaling to covariances across *records* in-place.
@@ -1635,22 +1675,32 @@ def inflate_chi2(records, zero_point, verbose=False):
             bin_chi2_raw = bin_chi2.copy()
             bin_chi2_unc = np.array([0.5, 0.5])
         else:
-            _bin_mags, _bin_smooth, _bin_raw, _bin_unc, _extrap_mags, _extrap_chi2 = result
-            # Prepend extrapolated bright-end points so the PCHIP covers stars
-            # brighter than the first measured bin without flat-clamping.
+            (_bin_mags, _bin_smooth, _bin_raw, _bin_unc,
+             _extrap_mags, _extrap_chi2,
+             _extrap_faint_mags, _extrap_faint_chi2) = result
+            # Prepend/append extrapolated anchor points so the PCHIP covers
+            # stars outside the measured bin range without flat-clamping.
+            _all_mags = _bin_mags
+            _all_chi2 = _bin_smooth
             if _extrap_mags.size:
-                _all_mags  = np.concatenate([_extrap_mags, _bin_mags])
-                _all_chi2  = np.concatenate([_extrap_chi2, _bin_smooth])
-            else:
-                _all_mags  = _bin_mags
-                _all_chi2  = _bin_smooth
+                _all_mags = np.concatenate([_extrap_mags,       _all_mags])
+                _all_chi2 = np.concatenate([_extrap_chi2,       _all_chi2])
+            if _extrap_faint_mags.size:
+                _all_mags = np.concatenate([_all_mags, _extrap_faint_mags])
+                _all_chi2 = np.concatenate([_all_chi2, _extrap_faint_chi2])
             # Convert mag → log-flux; sort ascending lf (faint→bright)
             _bin_lf = (zero_point - _all_mags) / 2.5
             sort_lf = np.argsort(_bin_lf)
             bin_lf       = _bin_lf[sort_lf]
             bin_chi2     = _all_chi2[sort_lf]
-            bin_chi2_raw = np.concatenate([np.full(len(_extrap_mags), np.nan), _bin_raw])[sort_lf]
-            bin_chi2_unc = np.concatenate([np.full(len(_extrap_mags), np.nan), _bin_unc])[sort_lf]
+            _n_eb = len(_extrap_mags)
+            _n_ef = len(_extrap_faint_mags)
+            _raw_padded = np.concatenate([
+                np.full(_n_eb, np.nan), _bin_raw, np.full(_n_ef, np.nan)])
+            _unc_padded = np.concatenate([
+                np.full(_n_eb, np.nan), _bin_unc, np.full(_n_ef, np.nan)])
+            bin_chi2_raw = _raw_padded[sort_lf]
+            bin_chi2_unc = _unc_padded[sort_lf]
 
         correction_info = {
             'flux_bins':    10 ** bin_lf,
