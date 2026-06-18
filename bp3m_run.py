@@ -647,6 +647,8 @@ def main():
             conc_limit=args.conc_limit,
             restrict_to_obsids=_restrict,
             lib_dir=Path(args.lib_dir) if args.lib_dir else None,
+            n_processes=args.n_processes,
+            parallel=not args.single_image,
         )
 
     if args.remeasure_psf_perturbation:

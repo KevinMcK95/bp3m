@@ -282,6 +282,112 @@ def _apply_new_floor(t, records, new_floor_x, new_floor_y, new_eps_flux, new_flo
     t.meta['EPS_FLUX']      = new_eps_flux
 
 
+def _reclassify_one_image_worker(args):
+    """Worker: reclassify one image. Returns (img_name, n_old, n_new, floor_x, floor_y, elapsed, error)."""
+    import time as _time, traceback
+    global _status_queue
+
+    (img_path, conc_lo, lib_dir_str, gdc_helpers_keys) = args
+    img_path = Path(img_path)
+    img_name = img_path.name
+    catalog  = img_path.parent / f"{img_path.stem}_catalog.fits"
+
+    t0 = _time.perf_counter()
+    if _status_queue is not None:
+        _status_queue.put(('start', img_name))
+
+    try:
+        _ensure_py1pass()
+        from pypass.core import classify_stars, inflate_chi2
+        from pypass.diagnostics import (estimate_systematic_floor,
+                                         plot_catalog_stats,
+                                         plot_concentration_diagnostics)
+        from astropy.table import Table as _T
+
+        t = _T.read(str(catalog))
+        records, old_fx, old_fy, old_eps, old_chi2_scales = _records_from_fits_table(t)
+
+        n_old = int(sum(r.is_star_candidate for r in records))
+        classify_stars(records, conc_lo=conc_lo)
+        n_new = int(sum(r.is_star_candidate for r in records))
+        inflate_chi2(records, zero_point=0.0)
+
+        # Re-apply GDC Jacobian if helpers available
+        gdc_reapplied = False
+        if lib_dir_str and gdc_helpers_keys:
+            try:
+                from pypass.io import (_apply_gdc_wcs, find_gdc, load_stdgdc,
+                                        get_chip_config_from_fits, _DETECTOR_PREFIX)
+                from astropy.io import fits as _fits
+                with _fits.open(str(img_path)) as hdul:
+                    primary_hdr = hdul[0].header
+                instrume   = primary_hdr.get('INSTRUME', '').strip().upper()
+                detector   = primary_hdr.get('DETECTOR', '').strip().upper()
+                det_prefix = _DETECTOR_PREFIX.get((instrume, detector))
+                if det_prefix:
+                    gdc_dir  = Path(lib_dir_str) / 'STDGDCs' / det_prefix
+                    gdc_path = find_gdc(str(gdc_dir), primary_hdr) if gdc_dir.is_dir() else None
+                    if gdc_path and os.path.exists(gdc_path):
+                        gdc   = load_stdgdc(gdc_path)
+                        chips = get_chip_config_from_fits(str(img_path), instrume, detector)
+                        _apply_gdc_wcs(records, gdc, str(img_path), chips, instrume, detector)
+                        gdc_reapplied = True
+            except Exception:
+                pass
+
+        floor = estimate_systematic_floor(records)
+        if floor is not None:
+            new_fx  = floor.get('sigma_x_floor_A', old_fx) or old_fx
+            new_fy  = floor.get('sigma_y_floor_A', old_fy) or old_fy
+            new_eps = floor.get('eps_flux_A',       old_eps) or old_eps
+        else:
+            new_fx, new_fy, new_eps = old_fx, old_fy, old_eps
+
+        _apply_new_floor(t, records, new_fx, new_fy, new_eps, floor,
+                         old_chi2_scales=old_chi2_scales)
+
+        params_path = img_path.parent / "psf_params.json"
+        try:
+            existing_params = json.loads(params_path.read_text()) if params_path.exists() else {}
+        except Exception:
+            existing_params = {}
+        if params_path.exists():
+            params_path.unlink()
+        t.write(str(catalog), overwrite=True)
+        existing_params['conc_limit'] = conc_lo
+        params_path.write_text(json.dumps(existing_params, indent=2))
+
+        for _f in ('matched_gaia.csv', 'xmatch_params.json'):
+            _p = img_path.parent / _f
+            if _p.exists():
+                _p.unlink()
+
+        try:
+            plot_catalog_stats(records, floor_params=floor,
+                               output=str(img_path.parent / "psf_catalog_stats.png"),
+                               title=img_name)
+        except Exception:
+            pass
+        try:
+            plot_concentration_diagnostics(records, conc_limit=conc_lo,
+                                           output=str(img_path.parent / "psf_concentration.png"),
+                                           title=img_name)
+        except Exception:
+            pass
+
+        elapsed = _time.perf_counter() - t0
+        if _status_queue is not None:
+            _status_queue.put(('done', img_name, n_old, n_new, new_fx, new_fy, elapsed))
+        return (True, img_name, n_old, n_new, new_fx, new_fy, elapsed, None)
+
+    except Exception as e:
+        elapsed = _time.perf_counter() - t0
+        tb = traceback.format_exc()
+        if _status_queue is not None:
+            _status_queue.put(('fail', img_name, str(e), elapsed))
+        return (False, img_name, 0, 0, 0.0, 0.0, elapsed, str(e))
+
+
 def reclassify_psf_catalogs(
     output_dir: Path,
     field_name: str,
@@ -291,6 +397,8 @@ def reclassify_psf_catalogs(
     restrict_to_obsids: list[str] | None = None,
     psf_dir: Path | None = None,
     lib_dir: Path | None = None,
+    n_processes: int = -1,
+    parallel: bool = True,
 ) -> list[Path]:
     """Re-run the full post-fit pipeline on existing PSF catalogs without re-fitting.
 
@@ -368,114 +476,130 @@ def reclassify_psf_catalogs(
             print(f"  WARNING: could not load GDC helpers from py1pass: {_e}. "
                   "GDC covariance will be approximated.")
 
-    updated = []
+    # Filter to images that have a catalog
+    work = []
     for img in images:
         catalog = img.parent / f"{img.stem}_catalog.fits"
         if not catalog.exists():
             print(f"  {img.name}: no catalog found — run PSF fitting first")
-            continue
-
-        img_name = img.name
-        img_dir  = img.parent
-
-        try:
-            t = Table.read(str(catalog))
-        except Exception as e:
-            print(f"  {img_name}: could not read catalog: {e}")
-            continue
-
-        records, old_fx, old_fy, old_eps, old_chi2_scales = _records_from_fits_table(t)
-
-        # 1. Re-classify with new conc_limit
-        n_old = int(sum(r.is_star_candidate for r in records))
-        classify_stars(records, conc_lo=conc_lo)
-        n_new = int(sum(r.is_star_candidate for r in records))
-
-        # 2. Re-run chi2 inflation with the new star population
-        inflate_chi2(records, zero_point=0.0)
-
-        # 3. Re-apply GDC Jacobian if helpers available
-        gdc_reapplied = False
-        if _gdc_helpers is not None:
-            try:
-                from astropy.io import fits as _fits
-                with _fits.open(str(img)) as hdul:
-                    primary_hdr = hdul[0].header
-                instrume = primary_hdr.get('INSTRUME', '').strip().upper()
-                detector = primary_hdr.get('DETECTOR', '').strip().upper()
-                det_prefix = _gdc_helpers['DETECTOR_PREFIX'].get((instrume, detector))
-                if det_prefix:
-                    gdc_dir = Path(lib_dir) / 'STDGDCs' / det_prefix
-                    gdc_path = _gdc_helpers['find_gdc'](str(gdc_dir), primary_hdr) \
-                               if gdc_dir.is_dir() else None
-                    if gdc_path and os.path.exists(gdc_path):
-                        gdc = _gdc_helpers['load_stdgdc'](gdc_path)
-                        chips = _gdc_helpers['get_chip_config_from_fits'](
-                            str(img), instrume, detector)
-                        _gdc_helpers['apply_gdc_wcs'](
-                            records, gdc, str(img), chips, instrume, detector)
-                        gdc_reapplied = True
-            except Exception as _e:
-                print(f"  WARNING: {img_name}: GDC re-application failed: {_e}")
-
-        # 4. Re-estimate systematic floor with new star classification + chi2_scale
-        floor = estimate_systematic_floor(records)
-        if floor is not None:
-            new_fx  = floor.get('sigma_x_floor_A', old_fx) or old_fx
-            new_fy  = floor.get('sigma_y_floor_A', old_fy) or old_fy
-            new_eps = floor.get('eps_flux_A',       old_eps) or old_eps
         else:
-            new_fx, new_fy, new_eps = old_fx, old_fy, old_eps
+            work.append(img)
 
-        # 5. Patch all dependent catalog columns
-        _apply_new_floor(t, records, new_fx, new_fy, new_eps, floor,
-                         old_chi2_scales=old_chi2_scales)
+    if not work:
+        print("  Reclassification complete: 0/0 catalogs updated.")
+        return []
 
-        # Sidecar safety: delete sidecar, write catalog, rewrite sidecar.
-        params_path = img_dir / "psf_params.json"
-        try:
-            existing_params = json.loads(params_path.read_text()) if params_path.exists() else {}
-        except Exception:
-            existing_params = {}
-        if params_path.exists():
-            params_path.unlink()
-        t.write(str(catalog), overwrite=True)
-        existing_params['conc_limit'] = conc_lo
-        params_path.write_text(json.dumps(existing_params, indent=2))
+    lib_dir_str = str(lib_dir) if lib_dir else None
+    gdc_helpers_keys = True if _gdc_helpers is not None else None
+    worker_args = [(str(img), conc_lo, lib_dir_str, gdc_helpers_keys) for img in work]
 
-        # Invalidate downstream cross-match cache
-        for _f in ('matched_gaia.csv', 'xmatch_params.json'):
-            _p = img_dir / _f
-            if _p.exists():
-                _p.unlink()
+    updated = []
+    n_work  = len(work)
 
-        # Regenerate diagnostic figures
-        try:
-            plot_catalog_stats(
-                records, floor_params=floor,
-                output=str(img_dir / "psf_catalog_stats.png"),
-                title=img_name,
-            )
-        except Exception as _e:
-            print(f"  WARNING: psf_catalog_stats.png failed: {_e}")
+    if parallel and n_work > 1:
+        import multiprocessing as _mp
+        import datetime as _dt
 
-        try:
-            plot_concentration_diagnostics(
-                records, conc_limit=conc_lo,
-                output=str(img_dir / "psf_concentration.png"),
-                title=img_name,
-            )
-        except Exception as _e:
-            print(f"  WARNING: psf_concentration.png failed: {_e}")
+        def _ts():
+            return _dt.datetime.now().strftime('%H:%M:%S')
 
-        gdc_tag = " [GDC re-propagated]" if gdc_reapplied else " [GDC approx]"
-        delta = n_new - n_old
-        sign  = "+" if delta >= 0 else ""
-        print(f"  {img_name}: {n_old}→{n_new} stars  ({sign}{delta})  "
-              f"floor_x={new_fx:.4f} floor_y={new_fy:.4f}{gdc_tag}")
-        updated.append(catalog)
+        n_workers = n_processes if n_processes > 0 else _mp.cpu_count()
+        print(f"  Parallel reclassification: {n_work} image(s), "
+              f"{min(n_workers, n_work)} simultaneous workers.\n")
 
-    print(f"  Reclassification complete: {len(updated)}/{len(images)} catalogs updated.")
+        _mgr   = _mp.Manager()
+        _queue = _mgr.Queue()
+        _pool  = _mp.Pool(processes=min(n_workers, n_work),
+                          initializer=_worker_pool_init,
+                          initargs=(_queue,),
+                          maxtasksperchild=5)
+
+        _async = {_pool.apply_async(_reclassify_one_image_worker, (a,)): img
+                  for a, img in zip(worker_args, work)}
+        _pool.close()
+
+        _pending = set(_async)
+        _done    = 0
+
+        while _pending:
+            while True:
+                try:
+                    msg = _queue.get_nowait()
+                    kind = msg[0]; img_nm = msg[1]
+                    if kind == 'start':
+                        print(f"[{_ts()}] Reclassifying  {img_nm}")
+                    elif kind == 'done':
+                        _, img_nm, n_old, n_new, fx, fy, elapsed = msg
+                        _done += 1
+                        delta = n_new - n_old
+                        sign  = '+' if delta >= 0 else ''
+                        print(f"[{_ts()}] Finished  {img_nm} in {elapsed:.0f}s — "
+                              f"{n_old}→{n_new} stars ({sign}{delta})  "
+                              f"floor_x={fx:.4f} floor_y={fy:.4f}  "
+                              f"[{_done}/{n_work}]")
+                    elif kind == 'fail':
+                        _, img_nm, errmsg, elapsed = msg
+                        _done += 1
+                        print(f"[{_ts()}] FAILED  {img_nm} after {elapsed:.0f}s — "
+                              f"{errmsg}  [{_done}/{n_work}]")
+                except Exception:
+                    break
+
+            finished = [ar for ar in _pending if ar.ready()]
+            for ar in finished:
+                _pending.discard(ar)
+                img = _async[ar]
+                catalog = img.parent / f"{img.stem}_catalog.fits"
+                try:
+                    success, *_ = ar.get()
+                    if success:
+                        updated.append(catalog)
+                except Exception as _e:
+                    print(f"[{_ts()}] FAILED  {img.name} — {_e}")
+
+            if _pending:
+                import time as _time; _time.sleep(0.2)
+
+        # Drain remaining queue messages
+        while True:
+            try:
+                msg = _queue.get_nowait()
+                kind = msg[0]; img_nm = msg[1]
+                if kind == 'done':
+                    _, img_nm, n_old, n_new, fx, fy, elapsed = msg
+                    _done += 1
+                    delta = n_new - n_old
+                    sign  = '+' if delta >= 0 else ''
+                    print(f"[{_ts()}] Finished  {img_nm} in {elapsed:.0f}s — "
+                          f"{n_old}→{n_new} stars ({'+' if delta >= 0 else ''}{delta})  "
+                          f"floor_x={fx:.4f} floor_y={fy:.4f}  [{_done}/{n_work}]")
+                elif kind == 'fail':
+                    _, img_nm, errmsg, elapsed = msg
+                    _done += 1
+                    print(f"[{_ts()}] FAILED  {img_nm} after {elapsed:.0f}s — "
+                          f"{errmsg}  [{_done}/{n_work}]")
+            except Exception:
+                break
+
+        _pool.join()
+        _mgr.shutdown()
+
+    else:
+        # Serial mode
+        for i, (img, wargs) in enumerate(zip(work, worker_args), 1):
+            catalog = img.parent / f"{img.stem}_catalog.fits"
+            success, img_name, n_old, n_new, new_fx, new_fy, elapsed, err = \
+                _reclassify_one_image_worker(wargs)
+            if err:
+                print(f"  ERROR {img_name}: {err}")
+            else:
+                delta = n_new - n_old
+                sign  = '+' if delta >= 0 else ''
+                print(f"  [{i}/{n_work}] {img_name}: {n_old}→{n_new} stars "
+                      f"({sign}{delta})  floor_x={new_fx:.4f} floor_y={new_fy:.4f}")
+                updated.append(catalog)
+
+    print(f"\n  Reclassification complete: {len(updated)}/{n_work} catalogs updated.")
     return updated
 
 
