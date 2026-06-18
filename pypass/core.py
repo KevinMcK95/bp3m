@@ -1552,20 +1552,8 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
     else:
         _c_bright = None
 
-    # Faint-end linear fit through the last 3 bins (index n_bins-1 = faintest).
-    # Used symmetrically to the bright-end: provides a sloped right-side padding
-    # for the Gaussian smoother so the last few bins are not pulled down by the
-    # flat-constant pad, and provides faint-end anchor points for the PCHIP.
-    n_fit_r = min(3, n_bins)
-    faint_x = np.arange(n_bins - n_fit_r, n_bins, dtype=float)
-    if n_fit_r >= 2:
-        _c_faint = np.polyfit(faint_x, bin_raw[-n_fit_r:], 1,
-                              w=1.0 / bin_unc[-n_fit_r:])
-        # Constraint: chi2 must not decrease going fainter.
-        if _c_faint[0] < 0:
-            _c_faint = np.array([0.0, float(bin_raw[-1])])
-    else:
-        _c_faint = None
+    # No faint-end extrapolation — pad with the faintest bin value (flat).
+    _c_faint = None
 
     # Bright-end extrapolated anchor points: spaced by the median bin spacing of
     # the first 3 bins, covering from the brightest bin back to the actual data
@@ -1583,19 +1571,8 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
     else:
         extrap_mags = extrap_chi2 = np.array([])
 
-    # Faint-end extrapolated anchor points: symmetric with bright end.
-    if _c_faint is not None and n_fit_r >= 2:
-        dM_f = float(np.median(np.diff(bin_mags[-n_fit_r:])))
-        if dM_f > 0:
-            gap_f = float(mags_s[-1]) - bin_mags[-1]
-            n_extrap_f = max(2, int(np.ceil(gap_f / dM_f)) + 1)
-            extrap_faint_bin_idx = np.arange(n_bins, n_bins + n_extrap_f, dtype=float)
-            extrap_faint_mags    = bin_mags[-1] + (extrap_faint_bin_idx - (n_bins - 1)) * dM_f
-            extrap_faint_chi2    = np.maximum(np.polyval(_c_faint, extrap_faint_bin_idx), 1.0)
-        else:
-            extrap_faint_mags = extrap_faint_chi2 = np.array([])
-    else:
-        extrap_faint_mags = extrap_faint_chi2 = np.array([])
+    # No faint-end extrapolation.
+    extrap_faint_mags = extrap_faint_chi2 = np.array([])
 
     # Gaussian kernel smoothing weighted by 1/sigma^2.
     # Distance is measured in bin-index units so smoothing is uniform across
@@ -1607,11 +1584,7 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
         pad_left = np.maximum(np.polyval(_c_bright, np.arange(-n_pad, 0, dtype=float)), 1.0)
     else:
         pad_left = np.full(n_pad, max(float(bin_raw[0]), 1.0))
-    if _c_faint is not None:
-        pad_right = np.maximum(
-            np.polyval(_c_faint, np.arange(n_bins, n_bins + n_pad, dtype=float)), 1.0)
-    else:
-        pad_right = np.full(n_pad, float(bin_raw[-1]))
+    pad_right = np.full(n_pad, float(bin_raw[-1]))
 
     idx_full = np.concatenate([
         np.arange(-n_pad, 0),
