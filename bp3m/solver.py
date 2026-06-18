@@ -1855,9 +1855,12 @@ class BP3MSolver:
                     C_s_block[r0:r0+2, r0:r0+2]  = Cs_j[k]
 
                 # Accumulate H^T C_s^{-1} H and H^T C_s^{-1} δ (vectorised)
-                HtCsi_j = np.einsum('nij,njk->nik', H_j, Csi_j)  # (nj, 5, 2)
-                HtCsiH += np.einsum('nij,njk->ik', HtCsi_j, H_j)
-                HtCsi_d += np.einsum('nij,nj->i', HtCsi_j, dj)
+                # H_j: (nj, 2, 5) = (n, a=2, b=5)
+                # H^T C_s^{-1}: result[b,c] = Σ_a H[a,b] * Csi[a,c]
+                # → einsum nab,nac->nbc  (contract over a=measurement dim=2)
+                HtCsi_j = np.einsum('nab,nac->nbc', H_j, Csi_j)  # (nj, 5, 2)
+                HtCsiH  += np.einsum('nij,njk->ik', HtCsi_j, H_j)  # (5,5)
+                HtCsi_d += np.einsum('nij,nj->i',   HtCsi_j, dj)   # (5,)
 
                 row += 2 * nj
 
