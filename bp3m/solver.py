@@ -1750,147 +1750,53 @@ class BP3MSolver:
 
         return n_new
 
-    def compute_analytic_posteriors(self, r_hat, C_r, a_arr, C_vT):
-        """Compute exactly marginalised per-star posteriors analytically via Big_C.
+    def compute_analytic_posteriors(self, r_hat, C_r, a_arr, K_img, C_vT):
+        """Compute exactly marginalised per-star posteriors analytically.
 
-        For each star i, builds:
-            Big_C_i  =  C_hst_i  +  X_i C_r X_i^T          (2N × 2N, pix²)
+        Analytic counterpart to sample_posteriors.  The conditional stellar mean
+        is a linear function of r:
 
-        and solves the marginalised normal equations exactly:
-            C_u_i^{-1}  =  C_vT_i^{-1} + H_i^T (Big_C_i^{-1} - C_hst_i^{-1}) H_i
-            u_i          =  C_u_i (H_i^T Big_C_i^{-1} δ_i - H_i^T C_s_i^{-1} δ_i
-                                   + C_vT_i^{-1} a_i)
+            v_i(r) = a_arr_i + C_vT_i  Σ_j K_{ij}  (r_j − r_hat_j)
 
-        Big_C is ALWAYS positive-definite (C_hst is full-rank), so the 2N×2N
-        inversion is numerically stable regardless of how many alignment stars
-        there are.  The Woodbury decomposition (B + C_r^{-1})^{-1} was used
-        previously but is ill-conditioned when B is rank-deficient (rank 2 per
-        8×8 block for a single detection per image), producing wildly wrong means.
+        Marginalising over r ~ N(r_hat, C_r) gives:
 
-        Phase 1 — vectorised image pass: for each image, compute H, X, C_s,
-        δ in batch and group by star using Python loops over unique star indices
-        (O(n_unique_per_image) ≈ 150 per image × 50 images = 7500 total).
+            v_mean_i  = a_arr_i                    (mean unchanged)
+            C_extra_i = (C_vT_i K_i) C_r (C_vT_i K_i)^T
 
-        Phase 2 — per-star solve: build Big_C from accumulated blocks, invert
-        (≤100×100), compute 5×5 C_u and 5-vector mean.
+        where K_i = Σ_{detections of star i across all images} K_{ij}
+        is the (5, n_r_tot) linear sensitivity of v_i to r.
 
         Returns
         -------
-        v_mean : (n_stars, 5)
-        v_cov  : (n_stars, 5, 5)  C_u − C_vT  (v_cov + C_vT = C_u exactly)
+        v_mean : (n_stars, 5)      same as a_arr (no change in mean)
+        v_cov  : (n_stars, 5, 5)  C_extra = C_u − C_vT  (add C_vT to get full C_u)
         """
         nr      = self.N_R
         n_r_tot = nr * self.n_images
         n_stars = self.n_stars
 
-        C_vT_inv = np.linalg.inv(C_vT)   # (n_stars, 5, 5) — batched once
+        # Build K_all[i, :, cs:cs+nr] = Σ_{detections of star i in img j} K_{ij}
+        K_all = np.zeros((n_stars, 5, n_r_tot))
 
-        # Per-star block lists: each entry is (H_j, X_j, C_s_j, Csi_j, delta_j, cs)
-        # where C_s_j is the 2×2 covariance and Csi_j its inverse.
-        star_blocks = [[] for _ in range(n_stars)]
-
-        # ── Phase 1: vectorised image pass ───────────────────────────────────
         for j_idx, img in enumerate(self.image_names):
-            d = self._img_data.get(img)
-            if d is None:
+            if K_img.get(img) is None:
                 continue
-            use_fit = d['use_for_fit']
-            use_ast = d.get('use_for_astrom', use_fit)
-            use_any = use_fit | use_ast
+            d = self._img_data[img]
+            use_fit    = d['use_for_fit']
+            use_astrom = d.get('use_for_astrom', use_fit)
+            use_any    = use_fit | use_astrom
             if not use_any.any():
                 continue
+            sidx = d['sidx'][use_any]
+            K    = K_img[img][use_any]   # (n, 5, nr)
+            cs   = j_idx * nr
+            np.add.at(K_all[:, :, cs:cs + nr], sidx, K)
 
-            cs    = j_idx * nr
-            r_j   = r_hat[cs:cs + nr]
-            sidx  = d['sidx'][use_any]             # (n,)
-            X_n   = d['X_mat'][use_any]             # (n, 2, nr)
-            H_n   = d['JU'][use_any]                # (n, 2, 5)
-            y_n   = d['xys'][use_any]               # (n, 2)
-            C_s_n = self._compute_Cs(img, r_j)[use_any]   # (n, 2, 2)
+        # C_extra[i] = (C_vT[i] @ K_all[i]) @ C_r @ (C_vT[i] @ K_all[i]).T
+        CvT_K   = np.einsum('nij,njk->nik', C_vT, K_all)           # (n_stars, 5, n_r_tot)
+        C_extra = CvT_K @ C_r @ np.swapaxes(CvT_K, -1, -2)        # (n_stars, 5, 5)
 
-            delta_n = y_n - np.einsum('nij,j->ni', X_n, r_j)   # (n, 2)
-
-            # 2×2 analytic inverse (avoids np.linalg.inv per detection)
-            det_n = C_s_n[:, 0, 0] * C_s_n[:, 1, 1] - C_s_n[:, 0, 1] ** 2
-            det_n = np.where(np.abs(det_n) > 1e-30, det_n, 1e-30)
-            Csi_n = np.empty_like(C_s_n)
-            Csi_n[:, 0, 0] =  C_s_n[:, 1, 1] / det_n
-            Csi_n[:, 1, 1] =  C_s_n[:, 0, 0] / det_n
-            Csi_n[:, 0, 1] = -C_s_n[:, 0, 1] / det_n
-            Csi_n[:, 1, 0] = -C_s_n[:, 1, 0] / det_n
-
-            # Group detections by star (O(n_unique) Python iters per image)
-            for star_i in np.unique(sidx):
-                m = sidx == star_i
-                star_blocks[star_i].append(
-                    (H_n[m], X_n[m], C_s_n[m], Csi_n[m], delta_n[m], cs))
-
-        # ── Phase 2: per-star Big_C solve ────────────────────────────────────
-        C_u    = C_vT.copy()
-        v_mean = a_arr.copy()
-
-        for i, blocks in enumerate(star_blocks):
-            if not blocks:
-                continue
-
-            N_det = sum(b[0].shape[0] for b in blocks)
-            D     = 2 * N_det
-
-            H_stack   = np.empty((D, 5))
-            X_flat    = np.zeros((D, n_r_tot))
-            C_s_block = np.zeros((D, D))    # C_hst block-diagonal (covariance)
-            delta_v   = np.empty(D)
-            HtCsiH    = np.zeros((5, 5))    # Σ H^T C_s^{-1} H  (for C_prior^{-1})
-            HtCsi_d   = np.zeros(5)         # Σ H^T C_s^{-1} δ
-
-            row = 0
-            for H_j, X_j, Cs_j, Csi_j, dj, cs in blocks:
-                nj = H_j.shape[0]
-                sl = slice(row, row + 2 * nj)
-                H_stack[sl]                       = H_j.reshape(-1, 5)
-                X_flat[sl, cs:cs + nr]            = X_j.reshape(-1, nr)
-                delta_v[sl]                       = dj.ravel()
-                for k in range(nj):
-                    r0 = row + 2 * k
-                    C_s_block[r0:r0+2, r0:r0+2]  = Cs_j[k]
-
-                # Accumulate H^T C_s^{-1} H and H^T C_s^{-1} δ (vectorised)
-                # H_j: (nj, 2, 5) = (n, a=2, b=5)
-                # H^T C_s^{-1}: result[b,c] = Σ_a H[a,b] * Csi[a,c]
-                # → einsum nab,nac->nbc  (contract over a=measurement dim=2)
-                HtCsi_j = np.einsum('nab,nac->nbc', H_j, Csi_j)  # (nj, 5, 2)
-                HtCsiH  += np.einsum('nij,njk->ik', HtCsi_j, H_j)  # (5,5)
-                HtCsi_d += np.einsum('nij,nj->i',   HtCsi_j, dj)   # (5,)
-
-                row += 2 * nj
-
-            # Big_C = C_s_block + X_flat @ C_r_sub @ X_flat.T  (D × D)
-            # Use sparsity: only columns corresponding to star i's images are non-zero
-            nz_cols = np.flatnonzero(np.any(X_flat, axis=0))
-            X_sub   = X_flat[:, nz_cols]                        # (D, J*nr)
-            C_r_sub = C_r[np.ix_(nz_cols, nz_cols)]             # (J*nr, J*nr)
-            Big_C   = C_s_block + X_sub @ C_r_sub @ X_sub.T    # (D, D) — always PD!
-
-            try:
-                Big_C_inv = np.linalg.inv(Big_C)
-            except np.linalg.LinAlgError:
-                continue
-
-            HtBiH   = H_stack.T @ Big_C_inv @ H_stack   # (5, 5)
-            HtBi_d  = H_stack.T @ Big_C_inv @ delta_v   # (5,)
-
-            # C_u^{-1} = C_vT^{-1} + H^T (Big_C^{-1} − C_s^{-1}) H
-            #           = C_vT^{-1} + HtBiH − HtCsiH
-            try:
-                C_u[i] = np.linalg.inv(C_vT_inv[i] + HtBiH - HtCsiH)
-            except np.linalg.LinAlgError:
-                continue
-
-            # u = C_u (H^T Big_C^{-1} δ − H^T C_s^{-1} δ + C_vT^{-1} a)
-            # C_prior^{-1} v_survey = C_vT_inv a − H^T C_s^{-1} δ (absorbed via a_arr)
-            v_mean[i] = C_u[i] @ (HtBi_d - HtCsi_d + C_vT_inv[i] @ a_arr[i])
-
-        return v_mean, C_u - C_vT
+        return a_arr.copy(), C_extra
 
     def sample_posteriors(self, r_hat, C_r, a_arr, K_img, C_vT,
                           n_samples=1000, seed=42):

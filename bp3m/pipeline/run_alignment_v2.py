@@ -1359,8 +1359,8 @@ def run_alignment_v2(
         _, v_mean, v_cov = solver.sample_posteriors(
             r_hat, C_r, a_arr, K_img, C_vT, n_samples=n_samples)
     else:
-        print(f"  Computing analytic marginalised posteriors (Big_C)...")
-        v_mean, v_cov = solver.compute_analytic_posteriors(r_hat, C_r, a_arr, C_vT)
+        print(f"  Computing analytic marginalised posteriors...")
+        v_mean, v_cov = solver.compute_analytic_posteriors(r_hat, C_r, a_arr, K_img, C_vT)
 
     # ── Save results ──────────────────────────────────────────────────────────
     from .run_alignment import _save_results
