@@ -144,9 +144,15 @@ def _match_one(args):
         )
         out = root / 'matched_gaia.csv'
         n = len(pd.read_csv(str(out))) if out.exists() else 0
-        if params_meta and out.exists():
-            params_path.write_text(json.dumps(params_meta, indent=2))
-        _write_xmatch_status(root, 'success', params_meta, n_matched=n)
+        if out.exists() and n > 0:
+            if params_meta:
+                params_path.write_text(json.dumps(params_meta, indent=2))
+            _write_xmatch_status(root, 'success', params_meta, n_matched=n)
+        else:
+            # No output file produced (e.g. "4P Discovery failed") — treat as
+            # failed so subsequent runs skip rather than retry indefinitely.
+            _write_xmatch_status(root, 'failed', params_meta,
+                                  reason='no matches found (gaia_cross_match produced no output)')
         return name, n, None
     except Exception as exc:
         _write_xmatch_status(root, 'failed', params_meta, reason=str(exc))

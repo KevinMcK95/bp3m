@@ -613,19 +613,18 @@ def _style_ax(ax):
 
 def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir):
     """Three panels: sky map coloured by |PM|, CMD coloured by |PM|, CMD coloured by σ_PM."""
-    from matplotlib.cm import ScalarMappable
-    from matplotlib.colors import Normalize
+    from matplotlib.colors import LogNorm
 
-    # --- common colour scales ---
-    pm_vals  = pm_size[ok]
-    unc_vals = pm_unc[ok]
+    # --- common colour scales (log-normalised) ---
+    pm_vals  = pm_size[ok & (pm_size > 0)]
+    unc_vals = pm_unc[ok & (pm_unc > 0)]
     vmin_pm  = float(np.nanpercentile(pm_vals,  1))
     vmax_pm  = float(np.nanpercentile(pm_vals, 99))
     vmin_unc = float(np.nanpercentile(unc_vals,  1))
     vmax_unc = float(np.nanpercentile(unc_vals, 99))
 
-    norm_pm  = Normalize(vmin=vmin_pm,  vmax=vmax_pm)
-    norm_unc = Normalize(vmin=vmin_unc, vmax=vmax_unc)
+    norm_pm  = LogNorm(vmin=max(vmin_pm,  1e-3), vmax=vmax_pm)
+    norm_unc = LogNorm(vmin=max(vmin_unc, 1e-3), vmax=vmax_unc)
     cmap_pm  = "plasma"
     cmap_unc = "viridis"
 
