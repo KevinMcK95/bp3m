@@ -518,7 +518,10 @@ def download_hst_images(
     footprint_png = hst_dir / f"{field_name}_footprints.png"
     try:
         plot_footprints(obs_df, footprint_png,
-                        gaia_df=gaia_df, field_name=field_name)
+                        gaia_df=gaia_df, field_name=field_name,
+                        ra=ra, dec=dec,
+                        search_width=search_width,
+                        search_height=search_height)
     except Exception as _e:
         print(f"  WARNING: footprint plot failed — {_e}")
 
@@ -704,6 +707,10 @@ def plot_footprints(
     save_path: str | Path,
     gaia_df: 'pd.DataFrame | None' = None,
     field_name: str = '',
+    ra: float | None = None,
+    dec: float | None = None,
+    search_width: float | None = None,
+    search_height: float | None = None,
 ) -> None:
     """
     Plot HST image footprints on the sky with Gaia stars in the background.
@@ -714,11 +721,16 @@ def plot_footprints(
 
     Parameters
     ----------
-    obs_df     : observations DataFrame with columns field_id, s_region, filters,
-                 proposal_id, instrument_name, obs_time.
-    save_path  : output PNG path.
-    gaia_df    : optional Gaia catalogue; plotted as background scatter.
-    field_name : used in the figure title.
+    obs_df        : observations DataFrame with columns field_id, s_region, filters,
+                    proposal_id, instrument_name, obs_time.
+    save_path     : output PNG path.
+    gaia_df       : optional Gaia catalogue; plotted as background scatter.
+    field_name    : used in the figure title.
+    ra, dec       : field centre (degrees).  When provided together with
+                    search_width / search_height, the axes are fixed to the
+                    user-specified search box, preventing wildly-offset HST
+                    WCS entries from zooming the plot out.
+    search_width, search_height : search box full-width in degrees.
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -768,25 +780,42 @@ def plot_footprints(
                 facecolor='none', edgecolor=color, lw=1.5,
                 label=filt)
 
-    # ── Axes limits from all footprint vertices + Gaia stars ─────────────────
-    all_ra, all_dec = [], []
-    for _, row in obs_df.iterrows():
-        bbox = _footprint_bbox(str(row.get('s_region', '')))
-        if bbox:
-            all_ra  += [bbox[0], bbox[1]]
-            all_dec += [bbox[2], bbox[3]]
-    if gaia_df is not None and len(gaia_df) > 0:
-        all_ra  += list(gaia_df['ra'].values)
-        all_dec += list(gaia_df['dec'].values)
-
-    if all_ra:
+    # ── Axes limits ───────────────────────────────────────────────────────────
+    # Prefer the user-supplied search box so that wildly-offset HST WCS entries
+    # cannot zoom the plot out.  Fall back to data-derived limits when the
+    # search box is not available.
+    if ra is not None and dec is not None and search_width and search_height:
+        pad_factor = 0.08
+        half_w = search_width  / 2 * (1 + pad_factor)
+        half_h = search_height / 2 * (1 + pad_factor)
+        cos_d  = np.cos(np.deg2rad(dec))
+        ra_lo  = ra  - half_w / cos_d
+        ra_hi  = ra  + half_w / cos_d
+        dec_lo = dec - half_h
+        dec_hi = dec + half_h
+        center_dec = dec
+    else:
+        all_ra, all_dec = [], []
+        for _, row in obs_df.iterrows():
+            bbox = _footprint_bbox(str(row.get('s_region', '')))
+            if bbox:
+                all_ra  += [bbox[0], bbox[1]]
+                all_dec += [bbox[2], bbox[3]]
+        if gaia_df is not None and len(gaia_df) > 0:
+            all_ra  += list(gaia_df['ra'].values)
+            all_dec += list(gaia_df['dec'].values)
+        if not all_ra:
+            plt.close(fig)
+            return
         pad_ra  = (max(all_ra)  - min(all_ra))  * 0.08
         pad_dec = (max(all_dec) - min(all_dec)) * 0.08
-        ax.set_xlim(max(all_ra) + pad_ra, min(all_ra) - pad_ra)   # RA right-to-left
-        ax.set_ylim(min(all_dec) - pad_dec, max(all_dec) + pad_dec)
-        # Correct aspect ratio for sky projection at the field centre
-        center_dec = (min(all_dec) + max(all_dec)) / 2
-        ax.set_aspect(1.0 / np.cos(np.deg2rad(center_dec)), adjustable='box')
+        ra_lo, ra_hi   = min(all_ra) - pad_ra, max(all_ra) + pad_ra
+        dec_lo, dec_hi = min(all_dec) - pad_dec, max(all_dec) + pad_dec
+        center_dec = (dec_lo + dec_hi) / 2
+
+    ax.set_xlim(ra_hi, ra_lo)   # RA right-to-left
+    ax.set_ylim(dec_lo, dec_hi)
+    ax.set_aspect(1.0 / np.cos(np.deg2rad(center_dec)), adjustable='box')
 
     # ── Legend, labels, title ─────────────────────────────────────────────────
     if filter_patches:
