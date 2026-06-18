@@ -1753,140 +1753,132 @@ class BP3MSolver:
     def compute_analytic_posteriors(self, r_hat, C_r, a_arr, C_vT):
         """Compute exactly marginalised per-star posteriors analytically via Big_C.
 
-        Replaces the Monte Carlo approximation in sample_posteriors with the
-        exact Bayesian result for a linear-Gaussian model.
+        Uses the Woodbury identity to avoid building the full per-star Big_C:
 
-        For each star i, builds:
-            Big_C_i = X_i C_r X_i^T  +  C_hst_i            (2N × 2N, survey-pix²)
+            C_u_i^{-1}  =  C_vT_i^{-1}  −  M_i (C_r_sub^{-1} + B_i)^{-1} M_i^T
+            u_i          =  C_u_i (C_vT_i^{-1} a_i − M_i Γ_i^{-1} ξ_i)
 
-        and solves the marginalised normal equations:
-            C_u_i^{-1}  =  H_i^T Big_C_i^{-1} H_i  +  C_prior_i^{-1}
-                         =  C_vT_i^{-1} + H_i^T (Big_C_i^{-1} - C_hst_i^{-1}) H_i
-            u_i          =  C_u_i (H_i^T Big_C_i^{-1} δ_i  +  C_prior_i^{-1} v_survey_i)
+        where M_i = Σ H^T C_s^{-1} X, B_i = Σ X^T C_s^{-1} X (block-diag per image),
+        ξ_i = Σ X^T C_s^{-1} δ, and Γ_i = C_r_sub^{-1} + B_i.
 
-        where δ_i = y_obs_i − X_i r_hat is the already-subtracted residual.
-
-        Using the Woodbury identity avoids ever inverting C_prior explicitly:
-            C_prior_i^{-1} = C_vT_i^{-1} − H_i^T C_hst_i^{-1} H_i
+        Vectorised over detections: a single pass over images accumulates
+        M, B, ξ per star using scatter-add (np.add.at).  Per-star work is
+        then pure NumPy linear algebra on small matrices (~n_img×nr ≤ ~200).
 
         Returns
         -------
-        v_mean : (n_stars, 5)    analytically marginalised mean
-        v_cov  : (n_stars, 5, 5) C_u_i − C_vT_i  (so v_cov + C_vT = C_u exactly)
+        v_mean : (n_stars, 5)
+        v_cov  : (n_stars, 5, 5)  C_u − C_vT  (v_cov + C_vT = C_u exactly)
         """
-        nr      = self.N_R
-        n_r_tot = nr * self.n_images
-        n_stars = self.n_stars
+        nr       = self.N_R
+        n_img    = self.n_images
+        n_r_tot  = nr * n_img
+        n_stars  = self.n_stars
 
-        v_mean = a_arr.copy()          # initial value; overwritten star-by-star
-        C_u    = np.empty_like(C_vT)
+        # ── Pre-compute batch inverses ────────────────────────────────────────
+        C_vT_inv = np.linalg.inv(C_vT)                    # (n_stars, 5, 5)
+        C_r_inv  = np.linalg.inv(C_r + 1e-14 * np.eye(n_r_tot))
 
-        for star_i in range(n_stars):
-            # ── Collect detections for this star across all images ──────────
-            blocks = []   # (X_j, H_j, C_s_j, delta_j, cs_j) per image
-            for j_idx, img in enumerate(self.image_names):
-                d = self._img_data.get(img)
-                if d is None:
-                    continue
-                sidx     = d['sidx']
-                use_fit  = d['use_for_fit']
-                use_ast  = d.get('use_for_astrom', use_fit)
-                use_any  = use_fit | use_ast
-                mask     = (sidx == star_i) & use_any
-                if not mask.any():
-                    continue
-                cs   = j_idx * nr
-                r_j  = r_hat[cs:cs + nr]
-                X_j  = d['X_mat'][mask]          # (n, 2, nr)
-                H_j  = d['JU'][mask]              # (n, 2, 5)
-                y_j  = d['xys'][mask]             # (n, 2)
-                C_s_j = self._compute_Cs(img, r_j)[mask]   # (n, 2, 2)
-                pred_j = np.einsum('nij,j->ni', X_j, r_j)  # (n, 2)
-                delta_j = y_j - pred_j                       # (n, 2)
-                blocks.append((X_j, H_j, C_s_j, delta_j, cs))
+        # ── Accumulators (per-star, per-image) ───────────────────────────────
+        # M_all[i, :, cs:cs+nr]  +=  H^T C_s^{-1} X   (5 × nr per image)
+        M_all            = np.zeros((n_stars, 5, n_r_tot))
+        # B_all[i, j, :, :]      +=  X^T C_s^{-1} X   (nr × nr per image)
+        B_all            = np.zeros((n_stars, n_img, nr, nr))
+        # xi_all[i, j, :]        +=  X^T C_s^{-1} δ   (nr per image)
+        xi_all           = np.zeros((n_stars, n_img, nr))
 
-            if not blocks:
-                C_u[star_i] = C_vT[star_i]
+        # ── Single pass over images — vectorised within each image ────────────
+        for j_idx, img in enumerate(self.image_names):
+            d = self._img_data.get(img)
+            if d is None:
+                continue
+            use_fit = d['use_for_fit']
+            use_ast = d.get('use_for_astrom', use_fit)
+            use_any = use_fit | use_ast
+            if not use_any.any():
                 continue
 
-            N_det = sum(b[0].shape[0] for b in blocks)
-            D     = 2 * N_det
+            cs   = j_idx * nr
+            r_j  = r_hat[cs:cs + nr]
+            sidx = d['sidx'][use_any]                    # (n,)
+            X_n  = d['X_mat'][use_any]                   # (n, 2, nr)
+            H_n  = d['JU'][use_any]                      # (n, 2, 5)
+            y_n  = d['xys'][use_any]                     # (n, 2)
+            C_s_n = self._compute_Cs(img, r_j)[use_any]  # (n, 2, 2)
 
-            H_stack  = np.empty((D, 5))
-            X_flat   = np.zeros((D, n_r_tot))
-            C_hst_bl = np.zeros((D, D))
-            delta_v  = np.empty(D)
+            delta_n = y_n - np.einsum('nij,j->ni', X_n, r_j)   # (n, 2)
 
-            row = 0
-            for X_j, H_j, C_s_j, delta_j, cs in blocks:
-                n = X_j.shape[0]
-                sl = slice(row, row + 2 * n)
-                H_stack[sl] = H_j.reshape(-1, 5)
-                X_flat[sl, cs:cs + nr] = X_j.reshape(-1, nr)
-                delta_v[sl] = delta_j.ravel()
-                for k in range(n):
-                    r0 = row + 2 * k
-                    C_hst_bl[r0:r0 + 2, r0:r0 + 2] = C_s_j[k]
-                row += 2 * n
+            # C_s^{-1}: batch invert (n, 2, 2)
+            # 2×2 analytic inverse is faster than np.linalg.inv for tiny matrices
+            det_n = C_s_n[:, 0, 0] * C_s_n[:, 1, 1] - C_s_n[:, 0, 1] ** 2
+            det_n = np.where(np.abs(det_n) > 1e-30, det_n, 1e-30)
+            C_s_inv_n = np.empty_like(C_s_n)
+            C_s_inv_n[:, 0, 0] =  C_s_n[:, 1, 1] / det_n
+            C_s_inv_n[:, 1, 1] =  C_s_n[:, 0, 0] / det_n
+            C_s_inv_n[:, 0, 1] = -C_s_n[:, 0, 1] / det_n
+            C_s_inv_n[:, 1, 0] = -C_s_n[:, 1, 0] / det_n
 
-            # Big_C = X C_r X^T + C_hst
-            Big_C = C_hst_bl + X_flat @ C_r @ X_flat.T
+            # C_s^{-1} X: (n, 2, nr)
+            CsiX_n = np.einsum('nij,njk->nik', C_s_inv_n, X_n)
 
+            # X^T C_s^{-1} X: (n, nr, nr)
+            XtCsiX_n = np.einsum('nij,nik->njk', X_n, CsiX_n)
+
+            # H^T C_s^{-1} X: (n, 5, nr)  [H_n is (n,2,5), H^T is (n,5,2)]
+            HtCsiX_n = np.einsum('nij,nik->njk', H_n, CsiX_n)   # (n, 5, nr)
+
+            # X^T C_s^{-1} δ: (n, nr)
+            XtCsi_delta_n = np.einsum('nij,nj->ni', CsiX_n.transpose(0, 2, 1), delta_n)
+
+            # Scatter-add into per-star accumulators
+            np.add.at(M_all[:, :, cs:cs + nr], sidx, HtCsiX_n)
+            np.add.at(B_all[:, j_idx, :, :],   sidx, XtCsiX_n)
+            np.add.at(xi_all[:, j_idx, :],     sidx, XtCsi_delta_n)
+
+        # ── Per-star analytic solve ───────────────────────────────────────────
+        # img_has_det[i, j] = True if star i has detections in image j
+        img_has_det = np.any(B_all != 0, axis=(-2, -1))   # (n_stars, n_img)
+
+        C_u    = C_vT.copy()
+        v_mean = a_arr.copy()
+
+        for i in range(n_stars):
+            imgs_i = np.where(img_has_det[i])[0]
+            if len(imgs_i) == 0:
+                continue
+
+            # Build B_sub (block-diagonal, len_sub × len_sub)
+            len_sub = len(imgs_i) * nr
+            B_sub = np.zeros((len_sub, len_sub))
+            for k, j in enumerate(imgs_i):
+                B_sub[k * nr:(k + 1) * nr, k * nr:(k + 1) * nr] = B_all[i, j]
+
+            # Extract C_r_sub and its inverse
+            r_idx = np.concatenate([np.arange(j * nr, (j + 1) * nr) for j in imgs_i])
+            C_r_inv_sub = C_r_inv[np.ix_(r_idx, r_idx)]   # (len_sub, len_sub)
+
+            # Γ_i = C_r_sub^{-1} + B_sub
+            Gamma = C_r_inv_sub + B_sub                     # (len_sub, len_sub)
             try:
-                Big_C_inv = np.linalg.inv(Big_C)
+                Gamma_inv = np.linalg.inv(Gamma)
             except np.linalg.LinAlgError:
-                C_u[star_i] = C_vT[star_i]
                 continue
 
-            HtBiH = H_stack.T @ Big_C_inv @ H_stack   # (5, 5)
+            # M_sub: (5, len_sub)
+            M_sub = M_all[i][:, r_idx]                     # (5, len_sub)
 
-            # C_u^{-1} = C_vT^{-1} + H^T (Big_C^{-1} - C_hst^{-1}) H
-            # Compute H^T C_hst^{-1} H directly from the blocks
-            HtCiH = np.zeros((5, 5))
-            for _, H_j, C_s_j, *_ in blocks:
-                for k in range(H_j.shape[0]):
-                    try:
-                        C_s_inv_k = np.linalg.inv(C_s_j[k])
-                        HtCiH += H_j[k].T @ C_s_inv_k @ H_j[k]
-                    except np.linalg.LinAlgError:
-                        pass
-
+            # C_u^{-1} = C_vT^{-1} - M_sub Γ^{-1} M_sub^T
+            correction = M_sub @ Gamma_inv @ M_sub.T        # (5, 5)
             try:
-                C_vT_inv_i = np.linalg.inv(C_vT[star_i])
+                C_u[i] = np.linalg.inv(C_vT_inv[i] - correction)
             except np.linalg.LinAlgError:
-                C_u[star_i] = C_vT[star_i]
                 continue
 
-            C_u_inv = C_vT_inv_i + (HtBiH - HtCiH)
-
-            try:
-                C_u_i = np.linalg.inv(C_u_inv)
-            except np.linalg.LinAlgError:
-                C_u[star_i] = C_vT[star_i]
-                continue
-
-            C_u[star_i] = C_u_i
-
-            # ── Analytic marginalised mean ────────────────────────────────
-            # u_i = C_u_i (H^T Big_C^{-1} δ  +  C_prior^{-1} v_survey_i)
-            # C_prior^{-1} v_survey_i = C_vT_inv_i a_arr_i - HtCiH a_arr_i
-            #   (from  a_arr_i = C_vT_i (H^T C_hst^{-1} δ + C_prior^{-1} v_survey_i))
-            #   ⟹ C_prior^{-1} v_survey_i = C_vT_inv_i a_arr_i - H^T C_hst^{-1} δ
-            HtBi_delta     = H_stack.T @ Big_C_inv @ delta_v     # (5,)
-            HtCi_delta_arr = HtCiH @ np.linalg.solve(         # (5,)  H^T C_hst^{-1} δ
-                C_vT[star_i], a_arr[star_i]) if True else np.zeros(5)
-            # Simpler: extract H^T C_hst^{-1} δ directly from blocks
-            HtCi_delta = np.zeros(5)
-            for _, H_j, C_s_j, delta_j, *_ in blocks:
-                for k in range(H_j.shape[0]):
-                    try:
-                        C_s_inv_k = np.linalg.inv(C_s_j[k])
-                        HtCi_delta += H_j[k].T @ C_s_inv_k @ delta_j[k]
-                    except np.linalg.LinAlgError:
-                        pass
-
-            C_prior_inv_v = C_vT_inv_i @ a_arr[star_i] - HtCi_delta
-            v_mean[star_i] = C_u_i @ (HtBi_delta + C_prior_inv_v)
+            # Analytic mean: u_i = C_u_i (C_vT_inv_i a_i − M_sub Γ^{-1} ξ_sub)
+            # C_prior^{-1} v_survey absorbed via: C_vT_inv a = H^T Cs^{-1} δ + C_prior^{-1} v
+            xi_sub = np.concatenate([xi_all[i, j] for j in imgs_i])  # (len_sub,)
+            rhs = C_vT_inv[i] @ a_arr[i] - M_sub @ (Gamma_inv @ xi_sub)
+            v_mean[i] = C_u[i] @ rhs
 
         return v_mean, C_u - C_vT
 
