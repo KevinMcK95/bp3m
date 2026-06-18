@@ -1449,7 +1449,7 @@ def classify_stars(records,
 # ---------------------------------------------------------------------------
 
 def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
-                         min_stars=50, max_stars=200, smooth_bandwidth=1.5):
+                         min_stars=50, max_stars=200, smooth_bandwidth=0.75):
     """Bin chi2 by adaptive magnitude bins, merge small bins, then smooth.
 
     Steps:
@@ -1619,16 +1619,6 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
         smoothed[i] = np.sum(kw * pv) / np.sum(kw)
 
     smoothed = np.clip(smoothed, 0.1, 20.0)
-
-    # The Gaussian smoother pulls the first n_fit_l bright-end bins below their
-    # raw medians because lower-chi2 interior bins to their right dominate the
-    # kernel.  Clamp each boundary bin to be at least the local bright-end
-    # linear-fit prediction (which closely tracks the raw bin values), so the
-    # PCHIP curve does not dip below the plotted red dots at the bright end.
-    if _c_bright is not None:
-        for i in range(min(n_fit_l, n_bins)):
-            floor_i = float(np.maximum(np.polyval(_c_bright, float(i)), 1.0))
-            smoothed[i] = max(smoothed[i], floor_i)
     return (bin_mags, smoothed, bin_raw, bin_unc,
             extrap_mags, extrap_chi2,
             extrap_faint_mags, extrap_faint_chi2)
