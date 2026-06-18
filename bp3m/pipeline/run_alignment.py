@@ -24,11 +24,12 @@ def _ensure_bp3m(bp3m_dir=None):
     pass  # bp3m is installed as a package; no sys.path manipulation needed
 
 
-def run_alignment(
+def run_alignment(  # noqa: C901
     output_dir: Path,
     field_name: str,
     n_iter: int = 20,
     n_samples: int = 1000,
+    mcmc_posteriors: bool = False,
     clip_sigma: float = 4.5,
     poly_order: int = 1,
     split_ccd: bool = True,
@@ -207,9 +208,13 @@ def run_alignment(
     print(f"  Fit completed in {time.time()-t0:.1f}s")
 
     # ── Sample posteriors ─────────────────────────────────────────────────────
-    print(f"  Drawing {n_samples} posterior samples...")
-    print(f"  Computing analytic marginalised posteriors...")
-    v_mean, v_cov = solver.compute_analytic_posteriors(r_hat, C_r, a_arr, C_vT)
+    if mcmc_posteriors:
+        print(f"  Drawing {n_samples} posterior samples (MCMC marginalisation)...")
+        _, v_mean, v_cov = solver.sample_posteriors(
+            r_hat, C_r, a_arr, K_img, C_vT, n_samples=n_samples)
+    else:
+        print(f"  Computing analytic marginalised posteriors (Big_C)...")
+        v_mean, v_cov = solver.compute_analytic_posteriors(r_hat, C_r, a_arr, C_vT)
 
     # ── Save results ──────────────────────────────────────────────────────────
     _save_results(

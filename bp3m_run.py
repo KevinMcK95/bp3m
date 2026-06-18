@@ -183,7 +183,13 @@ def _parse_args():
     bp.add_argument('--n_bp3m_iter', type=int, default=20,
                     help='Maximum BP3M outer iterations (default 20)')
     bp.add_argument('--n_samples', type=int, default=1000,
-                    help='Posterior samples for uncertainty estimation (default 1000)')
+                    help='Posterior samples for uncertainty estimation (default 1000). '
+                         'Only used when --mcmc_posteriors is set.')
+    bp.add_argument('--mcmc_posteriors', action='store_true',
+                    help='Use Monte Carlo sampling to marginalise over C_r instead of '
+                         'the default exact analytic Big_C approach. The analytic method '
+                         'is more accurate when few Gaia alignment stars are available; '
+                         'this flag restores the old sampling behaviour for comparison.')
     bp.add_argument('--bp3m_clip_sigma', type=float, default=4.5,
                     help='MAD sigma threshold for outlier rejection (default 4.5; '
                          '0 = disabled)')
@@ -744,6 +750,7 @@ def main():
                 field_name=syn_name,
                 n_iter=args.n_bp3m_iter,
                 n_samples=args.n_samples,
+                mcmc_posteriors=args.mcmc_posteriors,
                 clip_sigma=args.bp3m_clip_sigma,
                 poly_order=args.poly_order,
                 split_ccd=not args.no_split_ccd,
@@ -792,6 +799,7 @@ def main():
                 output_dir=output_dir, field_name=field,
                 n_iter=args.n_bp3m_iter,
                 n_samples=args.n_samples,
+                mcmc_posteriors=args.mcmc_posteriors,
                 clip_sigma=args.bp3m_clip_sigma,
                 poly_order=args.poly_order,
                 split_ccd=not args.no_split_ccd,

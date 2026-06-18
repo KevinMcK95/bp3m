@@ -605,6 +605,7 @@ def run_alignment_v2(
     field_name: str,
     n_iter: int = 20,
     n_samples: int = 1000,
+    mcmc_posteriors: bool = False,
     clip_sigma: float = 4.5,
     poly_order: int = 1,
     use_sparse: bool = False,
@@ -1353,9 +1354,13 @@ def run_alignment_v2(
             print(f"  WARNING: soft_weights_diagnostic plot failed — {_exc}")
 
     # ── Sample posteriors ─────────────────────────────────────────────────────
-    print(f"  Drawing {n_samples} posterior samples...")
-    print(f"  Computing analytic marginalised posteriors...")
-    v_mean, v_cov = solver.compute_analytic_posteriors(r_hat, C_r, a_arr, C_vT)
+    if mcmc_posteriors:
+        print(f"  Drawing {n_samples} posterior samples (MCMC marginalisation)...")
+        _, v_mean, v_cov = solver.sample_posteriors(
+            r_hat, C_r, a_arr, K_img, C_vT, n_samples=n_samples)
+    else:
+        print(f"  Computing analytic marginalised posteriors (Big_C)...")
+        v_mean, v_cov = solver.compute_analytic_posteriors(r_hat, C_r, a_arr, C_vT)
 
     # ── Save results ──────────────────────────────────────────────────────────
     from .run_alignment import _save_results
@@ -1365,6 +1370,7 @@ def run_alignment_v2(
         run_config={
             "n_iter":            n_iter,
             "n_samples":         n_samples,
+            "mcmc_posteriors":   mcmc_posteriors,
             "clip_sigma":        clip_sigma,
             "poly_order":        poly_order,
             "hst_enable_iter":   hst_enable_iter,
