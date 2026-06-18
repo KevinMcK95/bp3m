@@ -781,19 +781,58 @@ def plot_footprints(
                 label=filt)
 
     # ── Axes limits ───────────────────────────────────────────────────────────
-    # Prefer the user-supplied search box so that wildly-offset HST WCS entries
-    # cannot zoom the plot out.  Fall back to data-derived limits when the
-    # search box is not available.
+    # Strategy: use data-derived limits (zoom in to where HST actually points)
+    # but clamp to the user's cutout so that wildly-offset WCS entries cannot
+    # zoom the plot out beyond the requested field of view.
+    #
+    # When the search box is available:
+    #   - Only footprint centroids that fall inside the cutout contribute to
+    #     the data bounds (filters out corrupt WCS entries).
+    #   - Final limits = data bounds with 8 % padding, clamped to cutout.
+    # When the search box is not available: use raw data bounds as before.
+
+    pad_factor = 0.08
+
     if ra is not None and dec is not None and search_width and search_height:
-        pad_factor = 0.08
-        half_w = search_width  / 2 * (1 + pad_factor)
-        half_h = search_height / 2 * (1 + pad_factor)
-        cos_d  = np.cos(np.deg2rad(dec))
-        ra_lo  = ra  - half_w / cos_d
-        ra_hi  = ra  + half_w / cos_d
-        dec_lo = dec - half_h
-        dec_hi = dec + half_h
-        center_dec = dec
+        cos_d = np.cos(np.deg2rad(dec))
+        cut_ra_lo  = ra  - search_width  / 2 / cos_d
+        cut_ra_hi  = ra  + search_width  / 2 / cos_d
+        cut_dec_lo = dec - search_height / 2
+        cut_dec_hi = dec + search_height / 2
+
+        # Collect bounds from footprints whose centroid lies inside the cutout.
+        all_ra, all_dec = [], []
+        for _, row in obs_df.iterrows():
+            bbox = _footprint_bbox(str(row.get('s_region', '')))
+            if not bbox:
+                continue
+            cra  = (bbox[0] + bbox[1]) / 2
+            cdec = (bbox[2] + bbox[3]) / 2
+            if cut_ra_lo <= cra <= cut_ra_hi and cut_dec_lo <= cdec <= cut_dec_hi:
+                all_ra  += [bbox[0], bbox[1]]
+                all_dec += [bbox[2], bbox[3]]
+        if gaia_df is not None and len(gaia_df) > 0:
+            all_ra  += list(gaia_df['ra'].values)
+            all_dec += list(gaia_df['dec'].values)
+
+        if all_ra:
+            span_ra  = max(all_ra)  - min(all_ra)
+            span_dec = max(all_dec) - min(all_dec)
+            data_ra_lo  = min(all_ra)  - span_ra  * pad_factor
+            data_ra_hi  = max(all_ra)  + span_ra  * pad_factor
+            data_dec_lo = min(all_dec) - span_dec * pad_factor
+            data_dec_hi = max(all_dec) + span_dec * pad_factor
+            # Clamp: zoom in freely, but never exceed the cutout.
+            ra_lo  = max(cut_ra_lo,  data_ra_lo)
+            ra_hi  = min(cut_ra_hi,  data_ra_hi)
+            dec_lo = max(cut_dec_lo, data_dec_lo)
+            dec_hi = min(cut_dec_hi, data_dec_hi)
+        else:
+            # No footprints inside cutout — show full cutout.
+            ra_lo, ra_hi   = cut_ra_lo,  cut_ra_hi
+            dec_lo, dec_hi = cut_dec_lo, cut_dec_hi
+
+        center_dec = (dec_lo + dec_hi) / 2
     else:
         all_ra, all_dec = [], []
         for _, row in obs_df.iterrows():
@@ -807,8 +846,8 @@ def plot_footprints(
         if not all_ra:
             plt.close(fig)
             return
-        pad_ra  = (max(all_ra)  - min(all_ra))  * 0.08
-        pad_dec = (max(all_dec) - min(all_dec)) * 0.08
+        pad_ra  = (max(all_ra)  - min(all_ra))  * pad_factor
+        pad_dec = (max(all_dec) - min(all_dec)) * pad_factor
         ra_lo, ra_hi   = min(all_ra) - pad_ra, max(all_ra) + pad_ra
         dec_lo, dec_hi = min(all_dec) - pad_dec, max(all_dec) + pad_dec
         center_dec = (dec_lo + dec_hi) / 2
