@@ -42,6 +42,7 @@ def run_alignment(  # noqa: C901
     remove_images: list[str] | None = None,
     restrict_filters: list[str] | None = None,
     restrict_instdet: list[str] | None = None,
+    bp3m_min_stars: int = 0,
     bp3m_dir: Path | None = None,
     checkpoint_dir: Path | None = None,
     use_influence_clip: bool = True,
@@ -154,6 +155,14 @@ def run_alignment(  # noqa: C901
             if (imgs[n].get('instrument', '') + imgs[n].get('detector', '')).upper()
                in keep_id
         ]
+
+    if bp3m_min_stars > 0:
+        before = len(image_names)
+        image_names = [n for n in image_names if len(stars_per_image[n]) >= bp3m_min_stars]
+        dropped = before - len(image_names)
+        if dropped:
+            print(f"  --bp3m_min_stars {bp3m_min_stars}: dropped {dropped} image(s) "
+                  f"with fewer than {bp3m_min_stars} Gaia stars")
 
     if not image_names:
         raise RuntimeError("No images remain after filtering.")

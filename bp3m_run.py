@@ -233,6 +233,9 @@ def _parse_args():
     bp.add_argument('--restrict_instdet', type=str, nargs='+', default=None,
                     help='Keep only images from these instrument+detector combinations '
                          'for BP3M (e.g. ACSWFC WFC3UVIS)')
+    bp.add_argument('--bp3m_min_stars', type=int, default=0,
+                    help='Exclude images with fewer than this many Gaia cross-matched '
+                         'stars from BP3M (default: 0 = keep all images)')
 
     # ── Synthetic tests ───────────────────────────────────────────────────────
     syn = p.add_argument_group('Synthetic tests (requires completed cross-match, Step 4)')
@@ -762,6 +765,7 @@ def main():
                 remove_images=args.bp3m_remove_images,
                 restrict_filters=args.restrict_filters,
                 restrict_instdet=args.restrict_instdet,
+                bp3m_min_stars=args.bp3m_min_stars,
                 checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
                 use_influence_clip=not args.no_influence_clip,
                 influence_d_thresh=args.influence_d_thresh,
@@ -811,6 +815,7 @@ def main():
                 remove_images=args.bp3m_remove_images,
                 restrict_filters=args.restrict_filters,
                 restrict_instdet=args.restrict_instdet,
+                bp3m_min_stars=args.bp3m_min_stars,
                 checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
                 use_influence_clip=not args.no_influence_clip,
                 influence_d_thresh=args.influence_d_thresh,
