@@ -1750,6 +1750,146 @@ class BP3MSolver:
 
         return n_new
 
+    def compute_analytic_posteriors(self, r_hat, C_r, a_arr, C_vT):
+        """Compute exactly marginalised per-star posteriors analytically via Big_C.
+
+        Replaces the Monte Carlo approximation in sample_posteriors with the
+        exact Bayesian result for a linear-Gaussian model.
+
+        For each star i, builds:
+            Big_C_i = X_i C_r X_i^T  +  C_hst_i            (2N × 2N, survey-pix²)
+
+        and solves the marginalised normal equations:
+            C_u_i^{-1}  =  H_i^T Big_C_i^{-1} H_i  +  C_prior_i^{-1}
+                         =  C_vT_i^{-1} + H_i^T (Big_C_i^{-1} - C_hst_i^{-1}) H_i
+            u_i          =  C_u_i (H_i^T Big_C_i^{-1} δ_i  +  C_prior_i^{-1} v_survey_i)
+
+        where δ_i = y_obs_i − X_i r_hat is the already-subtracted residual.
+
+        Using the Woodbury identity avoids ever inverting C_prior explicitly:
+            C_prior_i^{-1} = C_vT_i^{-1} − H_i^T C_hst_i^{-1} H_i
+
+        Returns
+        -------
+        v_mean : (n_stars, 5)    analytically marginalised mean
+        v_cov  : (n_stars, 5, 5) C_u_i − C_vT_i  (so v_cov + C_vT = C_u exactly)
+        """
+        nr      = self.N_R
+        n_r_tot = nr * self.n_images
+        n_stars = self.n_stars
+
+        v_mean = a_arr.copy()          # initial value; overwritten star-by-star
+        C_u    = np.empty_like(C_vT)
+
+        for star_i in range(n_stars):
+            # ── Collect detections for this star across all images ──────────
+            blocks = []   # (X_j, H_j, C_s_j, delta_j, cs_j) per image
+            for j_idx, img in enumerate(self.image_names):
+                d = self._img_data.get(img)
+                if d is None:
+                    continue
+                sidx     = d['sidx']
+                use_fit  = d['use_for_fit']
+                use_ast  = d.get('use_for_astrom', use_fit)
+                use_any  = use_fit | use_ast
+                mask     = (sidx == star_i) & use_any
+                if not mask.any():
+                    continue
+                cs   = j_idx * nr
+                r_j  = r_hat[cs:cs + nr]
+                X_j  = d['X_mat'][mask]          # (n, 2, nr)
+                H_j  = d['JU'][mask]              # (n, 2, 5)
+                y_j  = d['xys'][mask]             # (n, 2)
+                C_s_j = self._compute_Cs(img, r_j)[mask]   # (n, 2, 2)
+                pred_j = np.einsum('nij,j->ni', X_j, r_j)  # (n, 2)
+                delta_j = y_j - pred_j                       # (n, 2)
+                blocks.append((X_j, H_j, C_s_j, delta_j, cs))
+
+            if not blocks:
+                C_u[star_i] = C_vT[star_i]
+                continue
+
+            N_det = sum(b[0].shape[0] for b in blocks)
+            D     = 2 * N_det
+
+            H_stack  = np.empty((D, 5))
+            X_flat   = np.zeros((D, n_r_tot))
+            C_hst_bl = np.zeros((D, D))
+            delta_v  = np.empty(D)
+
+            row = 0
+            for X_j, H_j, C_s_j, delta_j, cs in blocks:
+                n = X_j.shape[0]
+                sl = slice(row, row + 2 * n)
+                H_stack[sl] = H_j.reshape(-1, 5)
+                X_flat[sl, cs:cs + nr] = X_j.reshape(-1, nr)
+                delta_v[sl] = delta_j.ravel()
+                for k in range(n):
+                    r0 = row + 2 * k
+                    C_hst_bl[r0:r0 + 2, r0:r0 + 2] = C_s_j[k]
+                row += 2 * n
+
+            # Big_C = X C_r X^T + C_hst
+            Big_C = C_hst_bl + X_flat @ C_r @ X_flat.T
+
+            try:
+                Big_C_inv = np.linalg.inv(Big_C)
+            except np.linalg.LinAlgError:
+                C_u[star_i] = C_vT[star_i]
+                continue
+
+            HtBiH = H_stack.T @ Big_C_inv @ H_stack   # (5, 5)
+
+            # C_u^{-1} = C_vT^{-1} + H^T (Big_C^{-1} - C_hst^{-1}) H
+            # Compute H^T C_hst^{-1} H directly from the blocks
+            HtCiH = np.zeros((5, 5))
+            for _, H_j, C_s_j, *_ in blocks:
+                for k in range(H_j.shape[0]):
+                    try:
+                        C_s_inv_k = np.linalg.inv(C_s_j[k])
+                        HtCiH += H_j[k].T @ C_s_inv_k @ H_j[k]
+                    except np.linalg.LinAlgError:
+                        pass
+
+            try:
+                C_vT_inv_i = np.linalg.inv(C_vT[star_i])
+            except np.linalg.LinAlgError:
+                C_u[star_i] = C_vT[star_i]
+                continue
+
+            C_u_inv = C_vT_inv_i + (HtBiH - HtCiH)
+
+            try:
+                C_u_i = np.linalg.inv(C_u_inv)
+            except np.linalg.LinAlgError:
+                C_u[star_i] = C_vT[star_i]
+                continue
+
+            C_u[star_i] = C_u_i
+
+            # ── Analytic marginalised mean ────────────────────────────────
+            # u_i = C_u_i (H^T Big_C^{-1} δ  +  C_prior^{-1} v_survey_i)
+            # C_prior^{-1} v_survey_i = C_vT_inv_i a_arr_i - HtCiH a_arr_i
+            #   (from  a_arr_i = C_vT_i (H^T C_hst^{-1} δ + C_prior^{-1} v_survey_i))
+            #   ⟹ C_prior^{-1} v_survey_i = C_vT_inv_i a_arr_i - H^T C_hst^{-1} δ
+            HtBi_delta     = H_stack.T @ Big_C_inv @ delta_v     # (5,)
+            HtCi_delta_arr = HtCiH @ np.linalg.solve(         # (5,)  H^T C_hst^{-1} δ
+                C_vT[star_i], a_arr[star_i]) if True else np.zeros(5)
+            # Simpler: extract H^T C_hst^{-1} δ directly from blocks
+            HtCi_delta = np.zeros(5)
+            for _, H_j, C_s_j, delta_j, *_ in blocks:
+                for k in range(H_j.shape[0]):
+                    try:
+                        C_s_inv_k = np.linalg.inv(C_s_j[k])
+                        HtCi_delta += H_j[k].T @ C_s_inv_k @ delta_j[k]
+                    except np.linalg.LinAlgError:
+                        pass
+
+            C_prior_inv_v = C_vT_inv_i @ a_arr[star_i] - HtCi_delta
+            v_mean[star_i] = C_u_i @ (HtBi_delta + C_prior_inv_v)
+
+        return v_mean, C_u - C_vT
+
     def sample_posteriors(self, r_hat, C_r, a_arr, K_img, C_vT,
                           n_samples=1000, seed=42):
         """
