@@ -1552,8 +1552,22 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
     else:
         _c_bright = None
 
-    # No faint-end extrapolation — pad with the faintest bin value (flat).
-    _c_faint = None
+    # Faint-end linear fit through the last 3 bins.  Used ONLY for the
+    # Gaussian smoother's right-side padding so the last few smoothed bins
+    # are not pulled below their raw medians by the flat-constant pad.
+    # The PCHIP itself receives no faint-end anchor points (extrap_faint_mags
+    # stays empty) so the curve clamps flat at the faintest measured bin
+    # beyond the data — "padding using the faintest bin" in the plotted curve.
+    n_fit_r = min(3, n_bins)
+    faint_x = np.arange(n_bins - n_fit_r, n_bins, dtype=float)
+    if n_fit_r >= 2:
+        _c_faint = np.polyfit(faint_x, bin_raw[-n_fit_r:], 1,
+                              w=1.0 / bin_unc[-n_fit_r:])
+        # Constraint: chi2 must not decrease going fainter.
+        if _c_faint[0] < 0:
+            _c_faint = np.array([0.0, float(bin_raw[-1])])
+    else:
+        _c_faint = None
 
     # Bright-end extrapolated anchor points: spaced by the median bin spacing of
     # the first 3 bins, covering from the brightest bin back to the actual data
@@ -1584,7 +1598,11 @@ def _build_chi2_mag_bins(mags, chi2s, bin_width=0.5, min_bin_width=0.1,
         pad_left = np.maximum(np.polyval(_c_bright, np.arange(-n_pad, 0, dtype=float)), 1.0)
     else:
         pad_left = np.full(n_pad, max(float(bin_raw[0]), 1.0))
-    pad_right = np.full(n_pad, float(bin_raw[-1]))
+    if _c_faint is not None:
+        pad_right = np.maximum(
+            np.polyval(_c_faint, np.arange(n_bins, n_bins + n_pad, dtype=float)), 1.0)
+    else:
+        pad_right = np.full(n_pad, float(bin_raw[-1]))
 
     idx_full = np.concatenate([
         np.arange(-n_pad, 0),
