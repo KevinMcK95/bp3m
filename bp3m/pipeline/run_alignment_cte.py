@@ -791,6 +791,23 @@ def _joint_solve_cte(
     return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a, K_img, C_vT
 
 
+def _gamma_to_cte_params(gamma_hat: np.ndarray,
+                         template: dict) -> dict:
+    """
+    Convert the 20-vector gamma_hat from _joint_solve_cte into CTEChipParams.
+
+    Layout (must match _joint_solve_cte):
+      hi_x[0:5], hi_y[5:10], lo_x[10:15], lo_y[15:20]
+    """
+    import copy
+    params = copy.deepcopy(template)
+    params['hi'].gamma_x = gamma_hat[0:5].copy()
+    params['hi'].gamma_y = gamma_hat[5:10].copy()
+    params['lo'].gamma_x = gamma_hat[10:15].copy()
+    params['lo'].gamma_y = gamma_hat[15:20].copy()
+    return params
+
+
 # ── Field mean PM via iterative sigma-clipping ────────────────────────────────
 
 def _compute_warmstart_field_pm(
@@ -951,6 +968,69 @@ def _compute_field_mean_pm(
     print(f"  Field mean PM ({weight_label}): ({pmra_mean:+.3f}, {pmdec_mean:+.3f}) mas/yr  "
           f"σ={sigma_final:.3f}  n_members={n_members}/{len(pmra)}")
     return (pmra_mean, pmdec_mean)
+
+
+def _select_members_from_a(
+    a_arr: np.ndarray,
+    mu_pop: np.ndarray,
+    hst_only_mask: np.ndarray,
+    n_hst: np.ndarray,
+    sigma_clip: float = 3.0,
+    n_iter: int = 5,
+    min_members: int = 5,
+    init_window_masyr: float = 2.0,
+) -> np.ndarray:
+    """
+    Sigma-clip on PM distance from mu_pop to identify likely cluster members.
+
+    Only Gaia-matched stars with at least one HST detection contributing to
+    the astrometry solution are eligible (HST-only stars have unconstrained PMs
+    and should not drive the population prior).
+
+    An initial ±init_window_masyr cut around mu_pop bootstraps the sigma
+    estimate before iterative clipping, preventing background stars from
+    dominating the MAD when they outnumber members.
+
+    Parameters
+    ----------
+    a_arr       : (n_stars, 5) posterior stellar astrometry from _joint_solve_cte
+    mu_pop      : (2,) current population mean PM (mas/yr)
+    hst_only_mask : (n_stars,) True for HST-only stars
+    n_hst       : (n_stars,) count of contributing HST detections per star
+    sigma_clip  : number of robust sigmas for membership cut
+    n_iter      : max sigma-clipping iterations
+    min_members : minimum members to keep; returns all eligible if below
+    init_window_masyr : initial PM distance window to seed sigma estimate
+
+    Returns
+    -------
+    (n_mem,) array of global star indices into the solver star array
+    """
+    eligible    = (~hst_only_mask) & (n_hst >= 1)
+    eidx        = np.where(eligible)[0]
+    if len(eidx) < min_members:
+        return eidx
+
+    pmra  = a_arr[eidx, 2]
+    pmdec = a_arr[eidx, 3]
+    dist  = np.hypot(pmra - mu_pop[0], pmdec - mu_pop[1])
+
+    # Bootstrap from a narrow window around mu_pop (same as warm_start_cte)
+    keep = np.isfinite(dist) & (dist < init_window_masyr)
+    if keep.sum() < min_members:
+        keep = np.isfinite(dist)   # fall back to all finite
+
+    for _ in range(n_iter):
+        if keep.sum() < min_members:
+            break
+        sigma    = float(np.median(dist[keep])) / 0.6745
+        sigma    = max(sigma, 0.005)
+        new_keep = np.isfinite(dist) & (dist < sigma_clip * sigma)
+        if new_keep.sum() == keep.sum():
+            break
+        keep = new_keep
+
+    return eidx[keep]
 
 
 # ── Warm start ────────────────────────────────────────────────────────────────
@@ -2096,6 +2176,145 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
         traceback.print_exc()
 
 
+# ── Joint CTE outer loop ──────────────────────────────────────────────────────
+
+def _run_joint_cte_loop(
+    solver,
+    image_names: list[str],
+    cte_params: dict,
+    t_launch_yr: float,
+    filtered_spi: dict | None,
+    hst_only_mask: np.ndarray,
+    sigma_pm: float,
+    plx_pop: float,
+    sigma_plx_tot: float,
+    mu_pop_prior: np.ndarray,
+    C_pop_prior_inv: np.ndarray,
+    n_iter: int = 20,
+    member_sigma_clip: float = 3.0,
+    regularize_gamma: float = 1e-8,
+) -> tuple:
+    """
+    Outer Gauss-Newton loop for the joint (r, γ_CTE, μ_pop) solve.
+
+    Replaces the alternating solver.fit() + update_cte_params() loop with a
+    single coherent joint optimisation.  Each iteration calls _joint_solve_cte
+    once, updates r_current / mu_pop_current, then re-selects member stars from
+    the updated posterior PMs.
+
+    Parameters
+    ----------
+    solver          : BP3MSolver with _img_data, C_survey_inv, etc.
+    image_names     : ordered list of image keys
+    cte_params      : initial CTEChipParams dict (gamma values ignored —
+                      they are solved for from scratch each iteration)
+    t_launch_yr     : ACS launch year (for CTE dt calculation)
+    filtered_spi    : per-image SPI DataFrames (for Y_orig lookup); may be None
+    hst_only_mask   : (n_stars,) True for HST-only stars (excluded from members)
+    sigma_pm        : LVD intrinsic PM dispersion (mas/yr)
+    plx_pop         : LVD mean parallax (mas)
+    sigma_plx_tot   : LVD total parallax uncertainty (mas)
+    mu_pop_prior    : (2,) empirical prior mean for population PM (mas/yr)
+    C_pop_prior_inv : (2,2) prior precision on mu_pop (mas/yr)^{-2}
+    n_iter          : maximum Gauss-Newton iterations
+    member_sigma_clip : sigma threshold for membership selection
+    regularize_gamma : diagonal regularisation on H_gamma
+
+    Returns
+    -------
+    r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT, cte_params
+    """
+    n_images  = len(image_names)
+    n_r_total = solver.N_R * n_images
+
+    # r_current from the most recent _update_R call (set by caller before entry)
+    r_current = solver._r_hat_current.copy()
+
+    mu_pop_current = mu_pop_prior.copy()
+
+    # Count contributing HST detections per star for member eligibility
+    n_stars = solver.C_survey_inv.shape[0]
+    n_hst   = np.zeros(n_stars, dtype=int)
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        sidx    = d['sidx']
+        use_any = d.get('use_for_astrom', d['use_for_fit'])
+        np.add.at(n_hst, sidx[use_any], 1)
+
+    # Initial member selection: all eligible Gaia stars (broad; refined after iter 1)
+    eligible_mask = (~hst_only_mask) & (n_hst >= 1)
+    member_sidx   = np.where(eligible_mask)[0]
+
+    # Output variables (initialised to sensible defaults)
+    r_hat      = r_current.copy()
+    C_r        = None
+    gamma_hat  = np.zeros(20)
+    mu_pop_hat = mu_pop_prior.copy()
+    C_shared   = None
+    a_arr      = None
+    K_img      = {}
+    C_vT       = None
+
+    solver._update_R(r_current)
+    solver._update_geometry(r_current, solver.v_survey)
+
+    for it in range(n_iter):
+        r_prev      = r_current.copy()
+        gamma_prev  = gamma_hat.copy()
+        mu_pop_prev = mu_pop_current.copy()
+
+        result = _joint_solve_cte(
+            solver, image_names, cte_params, t_launch_yr, filtered_spi,
+            member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
+            mu_pop_current, mu_pop_prior, C_pop_prior_inv, r_current,
+            regularize_gamma=regularize_gamma,
+        )
+        r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT = result
+
+        # Update state
+        cte_params     = _gamma_to_cte_params(gamma_hat, cte_params)
+        mu_pop_current = mu_pop_hat
+        r_current      = r_hat
+
+        # Update solver geometry for next iteration
+        solver._update_R(r_hat)
+        solver._update_geometry(r_hat, solver.v_survey)
+
+        # Refresh n_hst counts (use_for_astrom flags may have changed)
+        n_hst[:] = 0
+        for img in image_names:
+            d = solver._img_data.get(img)
+            if d is None:
+                continue
+            sidx    = d['sidx']
+            use_any = d.get('use_for_astrom', d['use_for_fit'])
+            np.add.at(n_hst, sidx[use_any], 1)
+
+        # Refine member selection from posterior PMs
+        member_sidx = _select_members_from_a(
+            a_arr, mu_pop_current, hst_only_mask, n_hst,
+            sigma_clip=member_sigma_clip)
+
+        # Convergence diagnostics
+        dr   = float(np.max(np.abs(r_hat - r_prev)))
+        dg   = float(np.max(np.abs(gamma_hat - gamma_prev)))
+        dmu  = float(np.max(np.abs(mu_pop_hat - mu_pop_prev)))
+        gy_hi = float(np.linalg.norm(gamma_hat[5:10]))
+        gy_lo = float(np.linalg.norm(gamma_hat[15:20]))
+        print(f"  Joint iter {it+1:2d}: Δr={dr:.3e}  Δγ={dg:.3e}  Δμ={dmu:.4f}  "
+              f"n_mem={len(member_sidx):5d}  "
+              f"μ_pop=({mu_pop_hat[0]:+.3f},{mu_pop_hat[1]:+.3f})  "
+              f"|γ_y|=hi:{gy_hi:.3e} lo:{gy_lo:.3e}")
+
+        if it >= 2 and dr < 1e-6 and dg < 1e-8 and dmu < 1e-4:
+            print(f"  Converged at iteration {it + 1}")
+            break
+
+    return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT, cte_params
+
+
 # ── Main function ──────────────────────────────────────────────────────────────
 
 def run_alignment_cte(
@@ -2538,3 +2757,331 @@ def run_alignment_cte(
 
     print(f"\n  CTE results written to: {output_cte}")
     return output_cte
+
+
+# ── Joint CTE + population entry point ────────────────────────────────────────
+
+def run_alignment_joint_cte(
+    output_dir: Path,
+    field_name: str,
+    # Population / LVD priors
+    sigma_pm: float = 0.01,
+    plx_pop: float = 0.004,
+    sigma_plx_tot: float = 1e-4,
+    mu_pop_prior_sigma: float = 0.5,
+    # Iteration / convergence
+    n_iter_joint: int = 20,
+    member_sigma_clip: float = 3.0,
+    regularize_gamma: float = 1e-8,
+    # Standard alignment options (same defaults as run_alignment_cte)
+    poly_order: int = 1,
+    use_sparse: bool = False,
+    no_plots: bool = False,
+    plot_residuals: bool = False,
+    hst_max_pm_unc: float = 5.0,
+    hst_max_per_image: int = 100_000,
+    hst_pm_sigma_diffuse: float = 100.0,
+    pos_err_floor: float = 5e-3,
+    det_chi2_threshold: float | None = None,
+    bp3m_dir: Path | None = None,
+) -> Path:
+    """
+    Joint CTE + population mean PM alignment.
+
+    Replaces the alternating solver.fit() + update_cte_params() loop with
+    _run_joint_cte_loop, which simultaneously fits image transformations (r),
+    CTE coefficients (γ, 20 params), and population mean PM (μ_pop) after
+    analytically marginalising stellar astrometry {v_i}.
+
+    LVD priors for the target field:
+      sigma_pm        : intrinsic PM dispersion (mas/yr).
+                        Approx. σ_LOS / (4.74047 × d_kpc).
+      plx_pop         : mean parallax (mas) = 1000 / d_kpc.
+      sigma_plx_tot   : total parallax uncertainty (mas).
+      mu_pop_prior_sigma : width of the Gaussian prior on μ_pop (mas/yr).
+
+    The population mean PM prior is warm-started from the field Gaia cross-match
+    (same as warm_start_cte).
+
+    Parameters
+    ----------
+    output_dir  : root data directory (same as run_alignment_cte)
+    field_name  : subdirectory name (e.g. 'Leo_I')
+    sigma_pm    : LVD intrinsic PM dispersion σ_PM (mas/yr)
+    plx_pop     : LVD mean parallax (mas)
+    sigma_plx_tot : LVD total parallax uncertainty (mas, incl. depth)
+    mu_pop_prior_sigma : Gaussian prior half-width on μ_pop (mas/yr)
+    n_iter_joint : maximum joint Gauss-Newton iterations
+    member_sigma_clip : sigma for PM-distance membership cut
+
+    Returns
+    -------
+    Path to output directory ({output_dir}/{field}/BP3M_joint_cte_results/)
+    """
+    import time as _time
+    from bp3m.data_loader import build_index_maps
+    from bp3m.solver import BP3MSolver
+    from bp3m.solver_sparse import BP3MSolverSparse
+    from astropy.time import Time
+    import pandas as pd
+
+    from .data_loader_master import load_master_v2
+    from .run_alignment_v2 import (
+        _load_full_catalog_df,
+        _compute_full_catalog_residuals_from_df,
+    )
+    from .run_alignment import _save_results
+
+    data_root  = Path(output_dir)
+    output_dir_joint = data_root / field_name / "BP3M_joint_cte_results"
+    output_dir_joint.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "─" * 60)
+    print("BP3M joint CTE + population: joint (r, γ, μ_pop) solve")
+    print("─" * 60)
+    print(f"  sigma_pm={sigma_pm:.4f} mas/yr  plx_pop={plx_pop:.5f} mas  "
+          f"mu_prior_sigma={mu_pop_prior_sigma:.2f} mas/yr")
+    print(f"  n_iter_joint={n_iter_joint}  member_sigma_clip={member_sigma_clip}")
+
+    # ── Load data (identical to run_alignment_cte) ────────────────────────────
+    print(f"\n  Loading v2 master catalog for '{field_name}'...")
+    images, stars_per_image, gaia_catalog, hst_only_mask = load_master_v2(
+        data_root, field_name,
+        hst_max_pm_unc=hst_max_pm_unc,
+        hst_max_per_image=hst_max_per_image,
+        pos_err_floor=pos_err_floor,
+        det_chi2_threshold=det_chi2_threshold,
+    )
+    if not images:
+        raise RuntimeError(f"No usable images for '{field_name}'.")
+
+    star_id_to_idx, image_names, star_in_image = build_index_maps(
+        stars_per_image, gaia_catalog)
+    imgs         = {n: images[n] for n in image_names if n in images}
+    filtered_spi = {n: stars_per_image[n] for n in image_names}
+
+    print(f"  Stars: {len(gaia_catalog)} "
+          f"({int((~hst_only_mask).sum())} Gaia + {int(hst_only_mask.sum())} HST-only)  "
+          f"Images: {len(image_names)}")
+
+    img_to_df = _load_full_catalog_df(data_root, field_name)
+    if img_to_df is None:
+        raise RuntimeError(
+            "detections_F814W.csv or master_combined_v2.csv not found. "
+            "Run hst_catalog_crossmatch first.")
+
+    all_mjds     = [float(images[img]['hst_time_mjd']) for img in image_names
+                    if img in images]
+    t_epoch0_mjd = float(min(all_mjds))
+    t_epoch0_yr  = float(Time(t_epoch0_mjd, format='mjd').jyear)
+    t_launch_yr  = _ACS_LAUNCH_YR
+    print(f"  t_epoch0 = {t_epoch0_yr:.4f} yr")
+
+    # ── Warm start from v1/v2 transformations ─────────────────────────────────
+    v1_bp3m_dir   = data_root / field_name / "BP3M_results"
+    v1_xform_path = v1_bp3m_dir / "image_transformations.csv"
+    v1_abcdwz: dict[str, np.ndarray] = {}
+    if v1_xform_path.exists():
+        v1_df = pd.read_csv(v1_xform_path)
+        for _, row in v1_df.iterrows():
+            img_key = str(row["image_name"])
+            v1_abcdwz[img_key] = np.array([
+                float(row["a"]), float(row["b"]),
+                float(row["c"]), float(row["d"]),
+                float(row["w"]), float(row["z"]),
+            ])
+        imgs = {sub: dict(meta) for sub, meta in imgs.items()}
+        for sub, meta in imgs.items():
+            if sub in v1_abcdwz:
+                meta["fcm_abcdwz"] = v1_abcdwz[sub]
+        print(f"  Loaded v1 BP3M: {len(v1_abcdwz)} images as initialization")
+
+    # ── Initialise solver ──────────────────────────────────────────────────────
+    SolverClass = BP3MSolverSparse if use_sparse else BP3MSolver
+    solver = SolverClass(
+        imgs, filtered_spi, gaia_catalog,
+        star_id_to_idx, image_names, star_in_image,
+        poly_order=poly_order,
+    )
+
+    _inject_mag_inst(solver, image_names, filtered_spi, gaia_catalog)
+
+    if hst_pm_sigma_diffuse != 100.0:
+        hst_star_indices = np.where(hst_only_mask)[0]
+        if len(hst_star_indices) > 0:
+            sigma_pm_inv2 = float(hst_pm_sigma_diffuse) ** -2
+            solver._C_VG_inv_per_star[hst_star_indices, 2] = sigma_pm_inv2
+            solver._C_VG_inv_per_star[hst_star_indices, 3] = sigma_pm_inv2
+
+    # ── Phase 0: fixed-transform pre-filter ──────────────────────────────────
+    r_init_hat = None
+    if v1_abcdwz:
+        r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
+                                      for img in image_names])
+        solver._update_R(r_init_hat)
+        solver._update_geometry(r_init_hat, solver.v_survey)
+        print("\n  Phase 0: fixed-transform pre-filter")
+        n_flag0 = 0
+        for img in image_names:
+            d = solver._img_data.get(img)
+            if d is None:
+                continue
+            j_idx  = image_names.index(img)
+            r_j    = r_init_hat[j_idx * solver.N_R:(j_idx + 1) * solver.N_R]
+            use    = d["use_for_fit"].copy()
+            _v_pm  = np.zeros_like(solver.v_survey[d["sidx"]])
+            _v_pm[:, 2:] = solver.v_survey[d["sidx"], 2:]
+            motion    = np.einsum("nij,nj->ni", d["JU"], _v_pm)
+            x_pred    = np.einsum("nkl,l->nk", d["X_mat"], r_j) - motion
+            resid_mag = np.hypot(*(d["xys"] - x_pred).T)
+            if use.any():
+                r_align   = resid_mag[use]
+                mad_sigma = np.median(np.abs(r_align - np.median(r_align))) / 0.6745
+                thresh    = max(5.0 * mad_sigma, 0.3)
+                bad       = use & (resid_mag > thresh)
+                n_flag0  += int(bad.sum())
+                if bad.any():
+                    d["use_for_fit"][bad]     = False
+                    d["use_for_fit_max"][bad] = False
+                    if "use_for_astrom" in d:
+                        d["use_for_astrom"][bad] = False
+        print(f"  Phase 0: {n_flag0} detections flagged")
+    else:
+        r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
+                                      for img in image_names])
+        solver._update_R(r_init_hat)
+
+    # Store xys_orig (required by _joint_solve_cte)
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is not None and 'xys_orig' not in d:
+            d['xys_orig'] = d['xys'].copy()
+
+    # ── Population mean PM prior from Gaia cross-match ────────────────────────
+    _ws_field_pm = _compute_warmstart_field_pm(data_root, field_name)
+    if _ws_field_pm is not None:
+        mu_pop_prior = np.array([_ws_field_pm[0], _ws_field_pm[1]])
+    else:
+        print("  WARNING: could not estimate field PM — using (0, 0) as prior")
+        mu_pop_prior = np.zeros(2)
+    C_pop_prior_inv = np.eye(2) / mu_pop_prior_sigma**2
+
+    print(f"  μ_pop prior: ({mu_pop_prior[0]:+.3f}, {mu_pop_prior[1]:+.3f}) ± "
+          f"{mu_pop_prior_sigma:.2f} mas/yr")
+
+    # ── CTE warm start ─────────────────────────────────────────────────────────
+    print("\n  CTE warm start...")
+    cte_params = warm_start_cte(
+        img_to_df, solver, image_names, r_init_hat, t_launch_yr,
+        field_mean_pm=_ws_field_pm)
+
+    # ── Joint solve loop ───────────────────────────────────────────────────────
+    print(f"\n  Starting joint (r, γ, μ_pop) loop ({n_iter_joint} iterations)...")
+    t0 = _time.time()
+
+    (r_hat, C_r, gamma_hat, mu_pop_hat, C_shared,
+     a_arr, K_img, C_vT, cte_params) = _run_joint_cte_loop(
+        solver, image_names, cte_params, t_launch_yr, filtered_spi,
+        hst_only_mask,
+        sigma_pm, plx_pop, sigma_plx_tot,
+        mu_pop_prior, C_pop_prior_inv,
+        n_iter=n_iter_joint,
+        member_sigma_clip=member_sigma_clip,
+        regularize_gamma=regularize_gamma,
+    )
+    print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
+    print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
+    print(f"  Final |γ_y_hi| = {np.linalg.norm(gamma_hat[5:10]):.4e}  "
+          f"|γ_y_lo| = {np.linalg.norm(gamma_hat[15:20]):.4e}")
+
+    # Use a_arr as the working stellar astrometry estimate (matches solver.fit convention)
+    v_hat = a_arr
+
+    # ── Save converged CTE parameters ─────────────────────────────────────────
+    cte_out = {}
+    for chip in ('hi', 'lo'):
+        p = cte_params[chip]
+        cte_out[f'{chip}_gamma_x']       = p.gamma_x
+        cte_out[f'{chip}_gamma_y']       = p.gamma_y
+        cte_out[f'{chip}_y_readout_raw'] = np.array([p.y_readout_raw])
+        cte_out[f'{chip}_x0']            = np.array([p.x0])
+    cte_out['t_epoch0_yr'] = np.array([t_epoch0_yr])
+    cte_out['t_launch_yr'] = np.array([t_launch_yr])
+    cte_out['mu_pop_hat']  = mu_pop_hat
+    cte_out['gamma_hat']   = gamma_hat
+    np.savez(output_dir_joint / 'cte_params.npz', **cte_out)
+    print(f"  Saved: cte_params.npz")
+
+    # ── Analytic marginalised posteriors ──────────────────────────────────────
+    print("  Computing analytic marginalised posteriors...")
+    v_mean, v_cov = solver.compute_analytic_posteriors(r_hat, C_r, a_arr, K_img, C_vT)
+
+    # ── Save results ──────────────────────────────────────────────────────────
+    _save_results(
+        output_dir_joint, solver, imgs, gaia_catalog, image_names,
+        r_hat, C_r, v_hat, C_vT, v_mean, v_cov, K_img, a_arr,
+        run_config={
+            "solver":          "joint_cte",
+            "sigma_pm":        sigma_pm,
+            "plx_pop":         plx_pop,
+            "sigma_plx_tot":   sigma_plx_tot,
+            "mu_pop_prior":    mu_pop_prior.tolist(),
+            "mu_pop_hat":      mu_pop_hat.tolist(),
+            "n_iter_joint":    n_iter_joint,
+            "poly_order":      poly_order,
+            "t_epoch0_yr":     t_epoch0_yr,
+            "t_launch_yr":     t_launch_yr,
+        },
+    )
+
+    # ── Star influence ────────────────────────────────────────────────────────
+    try:
+        import pandas as _pd
+        influence_df = solver.compute_star_influence(r_hat, C_r, a_arr)
+        influence_df.to_csv(output_dir_joint / "star_influence.csv", index=False)
+        print(f"  Saved: star_influence.csv  ({len(influence_df)} star-image pairs)")
+    except Exception as _exc:
+        print(f"  WARNING: star influence computation failed — {_exc}")
+
+    # ── Post-CTE full-catalog residuals ───────────────────────────────────────
+    print("\n  Saving post-CTE full-catalog residuals...")
+    # Apply converged CTE to solver xys so residual collector sees corrected positions
+    apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
+                        filtered_spi=filtered_spi)
+    bp3m_gaia_ids = set(int(g) for g in solver.star_id_to_idx.keys() if int(g) > 0)
+    out_arrays = _compute_full_catalog_residuals_from_df(
+        img_to_df, bp3m_gaia_ids, solver, image_names, r_hat)
+    if out_arrays:
+        np.savez(output_dir_joint / 'detections_catalog_cte.npz', **out_arrays)
+        n_imgs  = sum(1 for k in out_arrays if k.endswith('_X_c'))
+        n_total = sum(len(v) for k, v in out_arrays.items() if k.endswith('_X_c'))
+        print(f"  Saved detections_catalog_cte.npz: {n_imgs} images, "
+              f"{n_total:,} detections")
+
+    # ── Standard BP3M diagnostic plots ────────────────────────────────────────
+    if not no_plots:
+        try:
+            from bp3m.pipeline.plot_results import make_plots
+            print("  Generating standard BP3M diagnostic plots...")
+            make_plots(solver, imgs, gaia_catalog,
+                       r_hat, v_hat, v_mean, v_cov, C_vT, C_r,
+                       output_dir=output_dir_joint,
+                       plot_residuals=plot_residuals)
+        except Exception as exc:
+            print(f"  WARNING: standard plots failed — {exc}")
+
+        before_npz = data_root / field_name / "BP3M_v2_results" / "detections_catalog.npz"
+        after_npz  = output_dir_joint / "detections_catalog_cte.npz"
+        try:
+            _plot_cte_diagnostics(
+                output_dir_joint, cte_params,
+                before_npz=before_npz,
+                after_npz=after_npz,
+                image_names=image_names,
+                solver=solver,
+            )
+        except Exception as exc:
+            print(f"  WARNING: CTE diagnostic plots failed — {exc}")
+
+    print(f"\n  Joint CTE results written to: {output_dir_joint}")
+    return output_dir_joint
