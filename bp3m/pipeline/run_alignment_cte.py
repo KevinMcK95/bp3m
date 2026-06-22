@@ -10,23 +10,21 @@ CTE model summary
 -----------------
 For chip c (hi/lo), detection k in image j (epoch t_j):
 
-  δCTE_x_k = (t_j − t_0) · φ(mag_k; δ_c) · b_x(X_k, Y_k) · γ_x_c
-  δCTE_y_k = (t_j − t_0) · φ(mag_k; δ_c) · b_y(X_k, Y_k) · γ_y_c
+  δCTE_x_k = (t_j − t_launch) · f1(mag_k) · b(xt_k, yt_k) · γ_x_c
+  δCTE_y_k = (t_j − t_launch) · f1(mag_k) · b(xt_k, yt_k) · γ_y_c
 
-  φ(mag; δ) = 10^{0.4·δ·(mag − mag_ref)} − 1
-  b_y = [Y', Xc·Y']   (2 terms, 2nd-order, CTE_y=0 at Y'=0)
-  b_x = [Xc, Xc·Y']  (2 terms, 2nd-order, CTE_x=0 at Xc=0)
-  Y' = y_raw − y_readout_raw  (distance from readout register in raw pixels)
-  Xc = x_gdc − 2048           (x-position centred on detector)
-  γ_x_c: (6,) coefficients;  γ_y_c: (6,) coefficients
-  δ_c: shared flux exponent for chip c
+  f1(mag) = 10^{0.4·(mag − mag_ref)}   (fixed, no free parameters)
+  b = [yt, yt², xt·yt, xt²·yt, xt·yt²]  (5 terms, unified x/y basis)
+  xt = (x_raw − 2048) / 2048  (normalised x)
+  yt = (y_raw − y_readout_raw) / 2048  (normalised distance from readout)
+  γ_x_c: (5,) coefficients;  γ_y_c: (5,) coefficients
 
-Parameters: 5 total per chip: δ(1) + γ_x(2) + γ_y(2) (two chips → 10 params).
+Parameters: 10 total per chip: γ_x(5) + γ_y(5) (two chips → 20 params).
 
 Note on y_raw coordinate system: py1pass stores pixel y in a unified global frame
 (0..~4096). lo chip occupies y_raw ∈ [8, 2039]; hi chip occupies y_raw ∈ [2056, 4087].
 Both chips read AWAY from the gap (CTE trails toward high y_raw), so dy_gdc > 0 and
-increases with Y' for both chips. 6-term basis spans the full 2D (Xc, Y') space while
+increases with yt for both chips. 5-term basis spans the full 2D (xt, yt) space while
 preserving the boundary condition CTE=0 at the readout register.
 """
 
@@ -49,7 +47,8 @@ _LO_Y_READOUT = -2048.0   # readout register for _lo chip in GDC-centred frame
 # Empirically confirmed: dy_gdc > 0 and increasing with y_raw for both chips.
 _HI_Y_READOUT_RAW = 2048.0
 _LO_Y_READOUT_RAW = 0.0
-_MAG_REF      = -15.0   # just below the brightest instrumental mag (~-14.5); ensures phi>0 for all stars
+_ACS_LAUNCH_YR = 2002.165   # ACS launch 2002-03-01; used as CTE time origin
+_MAG_REF      = -15.0   # just below the brightest instrumental mag (~-14.5)
 
 
 # ── CTE parameter dataclass ───────────────────────────────────────────────────
@@ -57,17 +56,15 @@ _MAG_REF      = -15.0   # just below the brightest instrumental mag (~-14.5); en
 @dataclass
 class CTEChipParams:
     chip: str
-    y_readout: float          # GDC-centred readout Y (kept for diagnostics/legacy)
     y_readout_raw: float      # raw chip-local readout Y (used for CTE basis)
-    delta: float = 1.0
-    gamma_x: np.ndarray = field(default_factory=lambda: np.zeros(2))
-    gamma_y: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    x0: float = 2048.0
+    gamma_x: np.ndarray = field(default_factory=lambda: np.zeros(5))
+    gamma_y: np.ndarray = field(default_factory=lambda: np.zeros(5))
 
     def copy(self) -> 'CTEChipParams':
         return CTEChipParams(chip=self.chip,
-                             y_readout=self.y_readout,
                              y_readout_raw=self.y_readout_raw,
-                             delta=float(self.delta),
+                             x0=float(self.x0),
                              gamma_x=self.gamma_x.copy(),
                              gamma_y=self.gamma_y.copy())
 
@@ -75,10 +72,8 @@ class CTEChipParams:
 def default_cte_params() -> dict[str, CTEChipParams]:
     return {
         'hi': CTEChipParams(chip='hi',
-                            y_readout=_HI_Y_READOUT,
                             y_readout_raw=_HI_Y_READOUT_RAW),
         'lo': CTEChipParams(chip='lo',
-                            y_readout=_LO_Y_READOUT,
                             y_readout_raw=_LO_Y_READOUT_RAW),
     }
 
@@ -94,46 +89,22 @@ def _chip_from_image(img: str) -> str | None:
     return None   # merged image — no CTE model applies
 
 
-# ── Flux power-law model ──────────────────────────────────────────────────────
+# ── Magnitude weighting ───────────────────────────────────────────────────────
 
-def phi_flux(mag: np.ndarray, delta: float,
-             mag_ref: float = _MAG_REF) -> np.ndarray:
-    """φ(mag; δ) = 10^{0.4·δ·(mag − mag_ref)} − 1."""
-    return np.power(10.0, 0.4 * delta * (np.asarray(mag, dtype=float) - mag_ref)) - 1.0
-
-
-def dphi_ddelta(mag: np.ndarray, delta: float,
-                mag_ref: float = _MAG_REF) -> np.ndarray:
-    """dφ/dδ = 0.4·ln(10)·(mag − mag_ref)·10^{0.4·δ·(mag − mag_ref)}."""
-    dm = np.asarray(mag, dtype=float) - mag_ref
-    return 0.4 * np.log(10.0) * dm * np.power(10.0, 0.4 * delta * dm)
+def func1_mag(mag: np.ndarray, mag_ref: float = _MAG_REF) -> np.ndarray:
+    """Fixed magnitude weighting: 10^{0.4*(mag - mag_ref)}. No free parameters."""
+    return np.power(10.0, 0.4 * (np.asarray(mag, dtype=float) - mag_ref))
 
 
-# ── CTE basis functions ───────────────────────────────────────────────────────
+# ── CTE basis function ────────────────────────────────────────────────────────
 
-def cte_y_basis(X_c: np.ndarray, y_raw: np.ndarray,
-                y_readout_raw: float) -> np.ndarray:
-    """b_y = [Y', Xc·Y']  (2 terms, 2nd-order polynomial in position).
+def cte_basis(xt: np.ndarray, yt: np.ndarray) -> np.ndarray:
+    """Unified 5-term CTE basis: [yt, yt², xt·yt, xt²·yt, xt·yt²].
 
-    Y' = y_raw − y_readout_raw (distance from readout register in raw pixels).
-    Boundary condition: both terms vanish at Y'=0 (readout register), so
-    δCTE_y = 0 at the readout by construction.  Xc·Y' captures linear
-    variation of the CTE amplitude across the chip width.
+    All terms contain yt, so CTE = 0 at yt = 0 (readout register).
+    (xt, yt) should be normalised: xt = (x_raw − 2048)/2048, yt = (y_raw − y_readout)/2048.
     """
-    Yp = y_raw - y_readout_raw
-    return np.stack([Yp, X_c*Yp], axis=1)
-
-
-def cte_x_basis(X_c: np.ndarray, y_raw: np.ndarray,
-                y_readout_raw: float) -> np.ndarray:
-    """b_x = [Xc, Xc·Y']  (2 terms, 2nd-order polynomial in position).
-
-    Y' = y_raw − y_readout_raw (same raw-frame distance from readout as y-basis).
-    Boundary condition: both terms vanish at Xc=0 (centre between serial amplifiers).
-    Xc·Y' captures how serial CTE amplitude varies with parallel distance from readout.
-    """
-    Yp = y_raw - y_readout_raw
-    return np.stack([X_c, X_c*Yp], axis=1)
+    return np.stack([yt, yt**2, xt*yt, xt**2*yt, xt*yt**2], axis=1)
 
 
 # ── CTE displacement computation ──────────────────────────────────────────────
@@ -144,19 +115,21 @@ def compute_cte_displacement(
     chip_params: CTEChipParams,
 ) -> np.ndarray:
     """
-    CTE displacement in GDC pixel frame (after applying raw→GDC ≈ identity).
+    CTE displacement in GDC pixel frame.
 
-    X_c : GDC-centred x coordinate [px]
-    y_raw : raw chip-local y coordinate [px] (pre-GDC, 0..2047)
+    X_c   : GDC-centred x coordinate [px] (= x_gdc − 2048)
+    y_raw : raw chip-local y coordinate [px]
+    dt    : years since ACS launch (t_obs − t_launch)
 
     Returns (n, 2) array of (δCTE_x, δCTE_y) in pixels.
     """
-    phi  = phi_flux(mag, chip_params.delta)
-    Phi  = dt * phi
-    Bx   = cte_x_basis(X_c, y_raw, chip_params.y_readout_raw)
-    By   = cte_y_basis(X_c, y_raw, chip_params.y_readout_raw)
-    return np.stack([Phi * (Bx @ chip_params.gamma_x),
-                     Phi * (By @ chip_params.gamma_y)], axis=1)
+    f1  = func1_mag(mag)
+    Psi = dt * f1                                   # (n,) time-magnitude weight
+    xt  = X_c / 2048.0                              # normalised x
+    yt  = (y_raw - chip_params.y_readout_raw) / 2048.0  # normalised y
+    B   = cte_basis(xt, yt)                         # (n, 5)
+    return np.stack([Psi * (B @ chip_params.gamma_x),
+                     Psi * (B @ chip_params.gamma_y)], axis=1)
 
 
 # ── mag_inst injection ────────────────────────────────────────────────────────
@@ -196,7 +169,7 @@ def apply_cte_to_solver(
     solver,
     image_names: list[str],
     cte_params: dict[str, CTEChipParams],
-    t_epoch0_yr: float,
+    t_launch_yr: float,
     filtered_spi: dict | None = None,
 ) -> None:
     """
@@ -235,7 +208,7 @@ def apply_cte_to_solver(
 
         hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
                              format='mjd').jyear)
-        dt_scalar = hst_yr - t_epoch0_yr
+        dt_scalar = hst_yr - t_launch_yr
         dt = np.full(len(mag), dt_scalar)
 
         X_c = d['X_c']   # GDC-centred x
@@ -274,7 +247,7 @@ def collect_cte_residuals(
     solver,
     image_names: list[str],
     r_hat: np.ndarray,
-    t_epoch0_yr: float,
+    t_launch_yr: float,
     field_mean_pm: tuple[float, float] | None = None,
 ) -> dict[str, dict]:
     """
@@ -322,7 +295,7 @@ def collect_cte_residuals(
 
         hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
                              format='mjd').jyear)
-        dt = hst_yr - t_epoch0_yr
+        dt = hst_yr - t_launch_yr
 
         X_c  = out_arrays[f'{img}_X_c'].astype(float)
         dx   = out_arrays[f'{img}_dx_gdc'].astype(float)
@@ -393,22 +366,14 @@ def collect_cte_residuals(
 def update_cte_params(
     residuals_by_chip: dict[str, dict],
     cte_params: dict[str, CTEChipParams],
-    n_inner: int = 5,
-    delta_tol: float = 1e-4,
     regularize: float = 1e-8,
-    lambda_delta: float = 1e-6,
+    **_kwargs,   # absorb legacy n_inner / delta_tol kwargs silently
 ) -> tuple[dict[str, CTEChipParams], dict]:
     """
-    Update CTE parameters (γ, δ) from GDC-frame residuals via Gauss-Newton.
+    Update CTE parameters (γ_x, γ_y) from GDC-frame residuals via linear WLS.
 
-    Alternating updates — avoids joint [γ, Δδ] degeneracy when γ ≈ 0:
-      Step A: Linear WLS for γ_x, γ_y (3 coefficients each) with δ fixed.
-      Step B: 1D Newton step for δ with γ fixed.
-                Δδ = (Σ z·r_x·j_x + Σ z·r_y·j_y) / (Σ z·j_x² + Σ z·j_y² + λ_δ)
-              where j = dt·(dφ/dδ)·(B@γ) is the Jacobian and r is the residual.
-              Δδ is clipped to [-0.3, 0.3] per step; δ is clipped to [0.05, 3.0].
-
-    Returns updated copy of cte_params and convergence info dict.
+    With func1_mag fixed, both x and y updates are independent linear solves —
+    no nonlinear inner loop needed.
     """
     new_params = {c: cte_params[c].copy() for c in ('hi', 'lo')}
     info = {}
@@ -416,7 +381,7 @@ def update_cte_params(
     for chip in ('hi', 'lo'):
         res = residuals_by_chip[chip]
         if len(res['dx']) == 0:
-            info[chip] = {'converged': True, 'n_inner': 0, 'n_det': 0}
+            info[chip] = {'converged': True, 'n_det': 0}
             continue
 
         dx    = res['dx'].astype(float)
@@ -434,86 +399,396 @@ def update_cte_params(
         n = len(dx)
 
         if n < 10:
-            info[chip] = {'converged': True, 'n_inner': 0, 'n_det': n}
+            info[chip] = {'converged': True, 'n_det': n}
             continue
 
-        p              = new_params[chip]
-        delta_n        = float(p.delta)
-        y_readout_raw  = p.y_readout_raw
+        p   = new_params[chip]
+        xt  = X_c / 2048.0
+        yt  = (y_raw - p.y_readout_raw) / 2048.0
+        f1  = func1_mag(mag)
+        Psi = dt * f1              # (n,)
+        B   = cte_basis(xt, yt)   # (n, 5)
+        A   = Psi[:, None] * B    # (n, 5) design matrix
 
-        Bx = cte_x_basis(X_c, y_raw, y_readout_raw)
-        By = cte_y_basis(X_c, y_raw, y_readout_raw)
+        col_scale = np.std(A, axis=0).clip(min=1e-30)
+        A_s = A / col_scale
 
-        delta_history = [delta_n]
-        for it in range(n_inner):
-            phi = phi_flux(mag, delta_n)
-            Phi = dt * phi              # (n,)
+        AtWA = (A_s * z[:, None]).T @ A_s + regularize * np.eye(5)
+        try:
+            AtWr_y = (A_s * z[:, None]).T @ (-dy)
+            p.gamma_y = np.linalg.solve(AtWA, AtWr_y) / col_scale
+        except np.linalg.LinAlgError:
+            pass
+        try:
+            AtWr_x = (A_s * z[:, None]).T @ (-dx)
+            p.gamma_x = np.linalg.solve(AtWA, AtWr_x) / col_scale
+        except np.linalg.LinAlgError:
+            pass
 
-            # ── Step A: linear solve for γ with δ fixed ───────────────────────
-            # Sign convention: dy_gdc = y_obs − y_pred > 0 when CTE shifts in +y.
-            # Fit Φ·B@γ = −dx/dy so that γ < 0 and apply_cte_to_solver (which adds
-            # Φ·B@γ to xys) SUBTRACTS the CTE offset.  Dynamic column normalization
-            # keeps the 2-term basis well-conditioned (Y' vs Xc·Y' differ by ~2 decades).
-            raw_Ax = Phi[:, None] * Bx    # (n, 2) before scaling
-            raw_Ay = Phi[:, None] * By    # (n, 2) before scaling
-            col_scale_x = np.std(raw_Ax, axis=0).clip(min=1e-30)
-            col_scale_y = np.std(raw_Ay, axis=0).clip(min=1e-30)
-            Ax_s = raw_Ax / col_scale_x   # O(1) columns
-            Ay_s = raw_Ay / col_scale_y   # O(1) columns
+        rms_y = float(np.sqrt(np.mean((-dy - A @ p.gamma_y) ** 2)))
+        rms_x = float(np.sqrt(np.mean((-dx - A @ p.gamma_x) ** 2)))
 
-            AtWA_x = (Ax_s * z[:, None]).T @ Ax_s + regularize * np.eye(2)
-            AtWr_x = (Ax_s * z[:, None]).T @ (-dx)
-            AtWA_y = (Ay_s * z[:, None]).T @ Ay_s + regularize * np.eye(2)
-            AtWr_y = (Ay_s * z[:, None]).T @ (-dy)
-
-            try:
-                p.gamma_x = np.linalg.solve(AtWA_x, AtWr_x) / col_scale_x
-                p.gamma_y  = np.linalg.solve(AtWA_y, AtWr_y) / col_scale_y
-            except np.linalg.LinAlgError:
-                break
-
-            # ── Step B: 1D Newton step for δ with γ fixed ────────────────────
-            dphi  = dphi_ddelta(mag, delta_n)   # (n,)
-            Bx_g  = Bx @ p.gamma_x              # (n,)
-            By_g  = By @ p.gamma_y              # (n,)
-            jac_x = dt * dphi * Bx_g            # (n,)
-            jac_y = dt * dphi * By_g            # (n,)
-
-            rx = -dx - Phi * Bx_g
-            ry = -dy - Phi * By_g
-
-            numer = float(np.dot(z * rx, jac_x) + np.dot(z * ry, jac_y))
-            denom = float(np.dot(z * jac_x, jac_x) + np.dot(z * jac_y, jac_y)
-                          + lambda_delta)
-
-            delta_delta = np.clip(numer / denom if denom > 0 else 0.0, -0.3, 0.3)
-            delta_n     = float(np.clip(delta_n + delta_delta, 0.05, 3.0))
-            p.delta     = delta_n
-            delta_history.append(delta_n)
-
-            if abs(delta_delta) < delta_tol:
-                break
-
-        # Residual RMS: how well model Φ·B@γ explains target −dx/dy
-        phi_f = phi_flux(mag, p.delta)
-        rms_x = float(np.sqrt(np.mean(
-            (-dx - dt * phi_f * (Bx @ p.gamma_x)) ** 2)))
-        rms_y = float(np.sqrt(np.mean(
-            (-dy - dt * phi_f * (By @ p.gamma_y)) ** 2)))
-
-        info[chip] = {
-            'n_det': n,
-            'delta_history': delta_history,
-            'rms_x': rms_x,
-            'rms_y': rms_y,
-            'n_inner': len(delta_history) - 1,
-        }
-        print(f"    {chip}: δ={p.delta:.4f}  "
+        info[chip] = {'n_det': n, 'rms_x': rms_x, 'rms_y': rms_y}
+        print(f"    {chip}: "
               f"|γ_y|={np.linalg.norm(p.gamma_y):.4e}  "
               f"|γ_x|={np.linalg.norm(p.gamma_x):.4e}  "
               f"rms_y={rms_y:.4f}px  n={n:,}")
 
     return new_params, info
+
+
+# ── Joint Schur-complement solve for (r, γ_CTE, μ_pop) ───────────────────────
+
+def _joint_solve_cte(
+    solver,
+    image_names: list[str],
+    cte_params: dict[str, CTEChipParams],
+    t_launch_yr: float,
+    filtered_spi: dict | None,
+    member_sidx: np.ndarray,
+    sigma_pm: float,
+    plx_pop: float,
+    sigma_plx_tot: float,
+    mu_pop_current: np.ndarray,
+    mu_pop_prior: np.ndarray,
+    C_pop_prior_inv: np.ndarray,
+    r_current: np.ndarray,
+    regularize_gamma: float = 1e-8,
+) -> tuple:
+    """
+    Joint Schur-complement solve for (r, γ_CTE, μ_pop) after marginalising
+    stellar astrometry {v_i}, mirroring solver._solve_one_pass.
+
+    Parameters
+    ----------
+    solver           : BP3M Solver (read-only)
+    image_names      : images to process; r_current is indexed by position here
+    cte_params       : CTEChipParams keyed by 'hi' / 'lo'
+    t_launch_yr      : CTE time origin in Julian years (_ACS_LAUNCH_YR)
+    filtered_spi     : stars_per_image dict for exact y_raw (may be None)
+    member_sidx      : (n_mem,) global star indices of likely cluster members
+    sigma_pm         : LVD-derived intrinsic PM dispersion (mas/yr)
+    plx_pop          : LVD mean parallax (mas)
+    sigma_plx_tot    : total LVD parallax uncertainty (mas, including depth)
+    mu_pop_current   : (2,) current iterate of population mean PM (mas/yr)
+    mu_pop_prior     : (2,) empirical prior mean for mu_pop (mas/yr)
+    C_pop_prior_inv  : (2,2) prior precision on mu_pop (mas/yr)^{-2}
+    r_current        : (n_r,) current image-parameter iterate, stacked over
+                       image_names in order
+    regularize_gamma : small ridge added to H_γγ
+
+    Returns
+    -------
+    r_hat       : (n_r,)               updated image parameters
+    C_r         : (n_r, n_r)           marginal posterior covariance of r
+    gamma_hat   : (20,)                CTE parameters [hi_x, hi_y, lo_x, lo_y]
+    mu_pop_hat  : (2,)                 updated population mean PM (mas/yr)
+    C_shared    : (n_shared, n_shared) full joint posterior covariance
+    a_arr       : (n_stars, 5)         stellar astrometry posterior mean
+    K_img       : dict{img -> (n,5,N_R)}
+    C_vT        : (n_stars, 5, 5)      stellar astrometry posterior covariance
+    """
+    from astropy.time import Time
+
+    nr       = solver.N_R
+    n_images = len(image_names)
+    n_r      = nr * n_images
+    n_gamma  = 20
+    N_V      = 5
+    n_shared = n_r + n_gamma + 2
+
+    idx_r   = slice(0, n_r)
+    idx_gam = slice(n_r, n_r + n_gamma)
+    idx_mu  = slice(n_r + n_gamma, n_shared)
+
+    # Population mean couples to PM components of stellar astrometry
+    M = np.zeros((N_V, 2))
+    M[2, 0] = 1.0   # μ_α* row
+    M[3, 1] = 1.0   # μ_δ row
+
+    sigma_pm_inv_sq  = 1.0 / sigma_pm**2
+    sigma_plx_inv_sq = 1.0 / sigma_plx_tot**2
+
+    n_stars     = len(solver.C_survey_inv)
+    member_mask = np.zeros(n_stars, dtype=bool)
+    member_mask[member_sidx] = True
+
+    # ── Precision matrices and information vectors ────────────────────────────
+    # Start from solver's Gaia prior; add diagonal _C_VG_inv_per_star (HST-only
+    # PM dispersion 100 mas/yr) then add population and parallax priors for members.
+    H_vv = solver.C_survey_inv.copy()
+    H_vv[:, np.arange(N_V), np.arange(N_V)] += solver._C_VG_inv_per_star
+
+    H_vv[member_sidx, 2, 2] += sigma_pm_inv_sq    # population PM prior (μ_α*)
+    H_vv[member_sidx, 3, 3] += sigma_pm_inv_sq    # population PM prior (μ_δ)
+    H_vv[member_sidx, 4, 4] += sigma_plx_inv_sq   # LVD parallax prior
+
+    h_align = solver.C_survey_inv_dot_v.copy()
+    h_all   = solver.C_survey_inv_dot_v.copy()
+
+    # Prior information term: σ_pm^{-2} M μ_pop_current for member stars
+    h_align[member_sidx, 2] += sigma_pm_inv_sq * mu_pop_current[0]
+    h_align[member_sidx, 3] += sigma_pm_inv_sq * mu_pop_current[1]
+    h_all[member_sidx, 2]   += sigma_pm_inv_sq * mu_pop_current[0]
+    h_all[member_sidx, 3]   += sigma_pm_inv_sq * mu_pop_current[1]
+
+    # LVD parallax prior information: σ_plx^{-2} * plx_pop
+    h_align[member_sidx, 4] += sigma_plx_inv_sq * plx_pop
+    h_all[member_sidx, 4]   += sigma_plx_inv_sq * plx_pop
+
+    # ── Shared-parameter precision and data accumulations ─────────────────────
+    H_rr       = np.zeros((n_r, n_r))
+    H_gamma    = np.zeros((n_gamma, n_gamma))
+    P_rg       = np.zeros((n_r, n_gamma))      # X^T Cs^{-1} G, align ∩ member
+    GCs_xresid = np.zeros(n_gamma)             # G^T Cs^{-1} x_resid, member stars
+    Q_total    = np.zeros((n_stars, N_V, n_gamma))  # summed JUT_Cs @ G per member star
+
+    K_img      = {}
+    Q_img      = {}
+    XCs_xresid = {}
+
+    # ── Per-image first pass: H_vv, h, K, G, Q, H_rr, H_gamma ───────────────
+    for j_idx, img in enumerate(image_names):
+        d = solver._img_data.get(img)
+        if d is None:
+            K_img[img] = None
+            Q_img[img] = None
+            continue
+
+        use_align  = d["use_for_fit"]
+        use_astrom = (d.get("use_for_astrom", use_align)
+                      if getattr(solver, '_use_two_tier', False) else use_align)
+        use_any    = use_align | use_astrom
+        sidx       = d["sidx"]
+        use_member = use_any & member_mask[sidx]
+
+        sidx_any   = sidx[use_any]
+        sidx_align = sidx[use_align]
+
+        JU  = d["JU"]
+        X   = d["X_mat"]
+        xys = d.get("xys_orig", d["xys"])   # use raw (pre-CTE) positions
+
+        cs  = j_idx * nr
+        r_j = r_current[cs:cs + nr]
+
+        Cs     = solver._compute_Cs(img, r_j)
+        Cs_inv = np.linalg.inv(Cs)
+
+        x_pred  = np.einsum('nkl,l->nk', X, r_j)
+        x_resid = xys - x_pred
+
+        JUT_Cs = np.einsum('nki,nkl->nil', JU, Cs_inv)
+
+        # Stellar precision/information (mirrors solver._solve_one_pass)
+        np.add.at(H_vv, sidx_any,
+                  np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
+        np.subtract.at(h_all, sidx_any,
+                       np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
+        np.subtract.at(h_align, sidx_align,
+                       np.einsum('nik,nk->ni', JUT_Cs[use_align], x_resid[use_align]))
+
+        K = np.einsum('nik,nkl->nil', JUT_Cs, X)   # (n, 5, N_R)
+        K_img[img] = K
+
+        XCsX = np.einsum('nki,nkl,nlj->ij',
+                         X[use_align], Cs_inv[use_align], X[use_align])
+        H_rr[cs:cs+nr, cs:cs+nr] += XCsX + d["C_r_prior_inv"]
+        XCs_xresid[img] = np.einsum('nki,nkl,nl->ni',
+                                    X[use_align], Cs_inv[use_align], x_resid[use_align])
+
+        # ── CTE design matrix G ────────────────────────────────────────────────
+        chip = _chip_from_image(img)
+        if chip is None or chip not in cte_params:
+            Q_img[img] = None
+            continue
+
+        mag = d.get('mag_inst')
+        if mag is None:
+            Q_img[img] = None
+            continue
+
+        Y_c    = d['Y_c']
+        spi_df = filtered_spi.get(img) if filtered_spi else None
+        if (spi_df is not None and 'Y_orig' in spi_df.columns
+                and len(spi_df) == len(mag)):
+            y_raw = spi_df['Y_orig'].to_numpy(float)
+        else:
+            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+
+        hst_yr    = float(Time(float(solver.images[img]['hst_time_mjd']),
+                               format='mjd').jyear)
+        dt_scalar = hst_yr - t_launch_yr
+
+        p   = cte_params[chip]
+        n   = len(sidx)
+        xt  = d['X_c'] / 2048.0
+        yt  = (y_raw - p.y_readout_raw) / 2048.0
+        ok  = np.isfinite(mag) & np.isfinite(y_raw)
+        f1  = np.where(ok, func1_mag(mag), 0.0)
+        PsiB = (dt_scalar * f1)[:, None] * cte_basis(xt, yt)   # (n, 5)
+
+        cx, cy = (0, 5) if chip == 'hi' else (10, 15)
+        R_j    = r_j[:4].reshape(2, 2)   # [[a, b], [c, d]]
+
+        G = np.zeros((n, 2, n_gamma))
+        G[ok, :, cx:cx+5] = PsiB[ok, None, :] * R_j[None, :, 0:1]
+        G[ok, :, cy:cy+5] = PsiB[ok, None, :] * R_j[None, :, 1:2]
+
+        Q = np.einsum('nik,nkl->nil', JUT_Cs, G)   # (n, 5, 20)
+        Q_img[img] = Q
+
+        if use_member.any():
+            H_gamma    += np.einsum('nki,nkl,nlj->ij',
+                                    G[use_member], Cs_inv[use_member], G[use_member])
+            GCs_xresid += np.einsum('nki,nkl,nl->i',
+                                    G[use_member], Cs_inv[use_member], x_resid[use_member])
+            np.add.at(Q_total, sidx[use_member], Q[use_member])
+
+            use_al_mem = use_align & member_mask[sidx]
+            if use_al_mem.any():
+                P_rg[cs:cs+nr] += np.einsum('nki,nkl,nlj->ij',
+                                            X[use_al_mem], Cs_inv[use_al_mem], G[use_al_mem])
+
+    # ── Invert H_vv → C_vT, stellar posteriors ───────────────────────────────
+    C_vT    = np.linalg.inv(H_vv)
+    a_align = np.einsum('nij,nj->ni', C_vT, h_align)
+    a       = np.einsum('nij,nj->ni', C_vT, h_all)
+
+    # ── Assemble full Schur complement system ─────────────────────────────────
+    H_gamma += regularize_gamma * np.eye(n_gamma)
+
+    # H_μμ direct: prior precision + sum_members σ_pm^{-2} I₂ (M^T M = I₂)
+    H_mu  = C_pop_prior_inv.copy()
+    H_mu += sigma_pm_inv_sq * float(len(member_sidx)) * np.eye(2)
+
+    Lambda = np.zeros((n_shared, n_shared))
+    Lambda[idx_r,   idx_r]   = H_rr
+    Lambda[idx_gam, idx_gam] = H_gamma
+    Lambda[idx_mu,  idx_mu]  = H_mu
+    Lambda[idx_r,   idx_gam] = P_rg        # direct H_rγ (positive)
+    Lambda[idx_gam, idx_r]   = P_rg.T
+
+    # RHS initialisation
+    rhs = np.zeros(n_shared)
+    for j_idx, img in enumerate(image_names):
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        cs = j_idx * nr
+        rhs[cs:cs+nr] += d["C_r_prior_inv"] @ (d["r_prior"] - r_current[cs:cs+nr])
+        if img in XCs_xresid:
+            rhs[cs:cs+nr] += XCs_xresid[img].sum(axis=0)
+    rhs[idx_gam] = GCs_xresid
+    # μ_pop rhs: prior gradient + linearisation of population prior at v=0.
+    # The population prior ½σ⁻²(v−μ_pop_current−Δμ)² has gradient w.r.t. Δμ of
+    # −σ⁻²(v−μ_pop_current−Δμ) which at v=0, Δμ=0 gives +σ⁻²·μ_pop_current.
+    # h_μ = −gradient → C_pop_prior_inv(μ_prior−μ_current) − σ⁻²·n_mem·μ_current.
+    # The Schur correction (+σ⁻² Σ a[members,2:4]) then cancels this at convergence.
+    rhs[idx_mu]  = C_pop_prior_inv @ (mu_pop_prior - mu_pop_current)
+    rhs[idx_mu] -= sigma_pm_inv_sq * float(len(member_sidx)) * mu_pop_current
+
+    # ── Global Schur corrections from member stars (γ and μ blocks) ───────────
+    if len(member_sidx) > 0:
+        Qt_m     = Q_total[member_sidx]                            # (n_mem, 5, 20)
+        Cv_m     = C_vT[member_sidx]                               # (n_mem, 5, 5)
+        CvT_Q_m  = np.einsum('nij,njk->nik', Cv_m, Qt_m)          # (n_mem, 5, 20)
+
+        # (γ, γ) Schur: -Q_total^T C_vT Q_total
+        Lambda[idx_gam, idx_gam] -= np.einsum('nji,njk->ik', Qt_m, CvT_Q_m)
+        rhs[idx_gam]             += np.einsum('nji,nj->i',   Qt_m, a[member_sidx])
+
+        # (γ, μ) Schur: -σ^{-2} Q_total^T C_vT M
+        CvT_M_m  = Cv_m @ M                                        # (n_mem, 5, 2)
+        QT_CvT_M = np.einsum('nji,njk->ik', Qt_m, CvT_M_m)        # (20, 2)
+        Lambda[idx_gam, idx_mu] -= sigma_pm_inv_sq * QT_CvT_M
+        Lambda[idx_mu, idx_gam] -= sigma_pm_inv_sq * QT_CvT_M.T
+
+        # (μ, μ) Schur: -σ^{-4} Σ_i C_vT_i[2:4, 2:4]  (= M^T C_vT M per star)
+        Lambda[idx_mu, idx_mu] -= (sigma_pm_inv_sq**2
+                                   * Cv_m[:, 2:4, 2:4].sum(axis=0))
+
+        # μ rhs: +σ^{-2} Σ_i a[member_i, 2:4]
+        rhs[idx_mu] += sigma_pm_inv_sq * a[member_sidx, 2:4].sum(axis=0)
+
+    # ── Per-image Schur corrections (r, r), (r, γ), (r, μ), cross-image ──────
+    for j_idx, img in enumerate(image_names):
+        d = solver._img_data.get(img)
+        if d is None or K_img.get(img) is None:
+            continue
+
+        cs         = j_idx * nr
+        sidx       = d["sidx"]
+        use_align  = d["use_for_fit"]
+        use_astrom = (d.get("use_for_astrom", use_align)
+                      if getattr(solver, '_use_two_tier', False) else use_align)
+        use_any    = use_align | use_astrom
+
+        sidx_al  = sidx[use_align]
+        K_al     = K_img[img][use_align]         # (n_al, 5, N_R)
+        Cv_al    = C_vT[sidx_al]                 # (n_al, 5, 5)
+
+        # (r, r) diagonal Schur block
+        CvT_K_al = np.einsum('nij,njk->nik', Cv_al, K_al)
+        Lambda[cs:cs+nr, cs:cs+nr] -= np.einsum('nji,njk->ik', K_al, CvT_K_al)
+        rhs[cs:cs+nr]              += np.einsum('nji,nj->i',   K_al, a_align[sidx_al])
+
+        # (r, γ) Schur: K_al^T C_vT Q_total  (Q_total is 0 for non-members)
+        Qt_al    = Q_total[sidx_al]
+        CvT_Q_al = np.einsum('nij,njk->nik', Cv_al, Qt_al)
+        KT_CvT_Q = np.einsum('nji,njk->ik', K_al, CvT_Q_al)     # (N_R, 20)
+        Lambda[cs:cs+nr, idx_gam] -= KT_CvT_Q
+        Lambda[idx_gam, cs:cs+nr] -= KT_CvT_Q.T
+
+        # (r, μ) Schur: -σ^{-2} K_{align∩member}^T C_vT M
+        use_al_mem = use_align & member_mask[sidx]
+        if use_al_mem.any():
+            sidx_alm  = sidx[use_al_mem]
+            K_alm     = K_img[img][use_al_mem]
+            CvT_M_alm = C_vT[sidx_alm] @ M                        # (n_alm, 5, 2)
+            KT_CvT_M  = np.einsum('nji,njk->ik', K_alm, CvT_M_alm)  # (N_R, 2)
+            Lambda[cs:cs+nr, idx_mu] -= sigma_pm_inv_sq * KT_CvT_M
+            Lambda[idx_mu, cs:cs+nr] -= sigma_pm_inv_sq * KT_CvT_M.T
+
+        # (r, r) cross-image coupling (identical to solver._solve_one_pass)
+        for j2_idx, img2 in enumerate(image_names):
+            if j2_idx <= j_idx:
+                continue
+            d2 = solver._img_data.get(img2)
+            if d2 is None or K_img.get(img2) is None:
+                continue
+            use2   = d2["use_for_fit"]
+            sidx2  = d2["sidx"][use2]
+            K2     = K_img[img2][use2]
+
+            common, ix1, ix2 = np.intersect1d(sidx_al, sidx2,
+                                               return_indices=True)
+            if len(common) == 0:
+                continue
+
+            CvT_K2 = np.einsum('nij,njk->nik', C_vT[common], K2[ix2])
+            block  = np.einsum('nji,njk->ik', K_al[ix1], CvT_K2)
+            cs2    = j2_idx * nr
+            Lambda[cs:cs+nr,   cs2:cs2+nr] -= block
+            Lambda[cs2:cs2+nr, cs:cs+nr]   -= block.T
+
+    # ── Solve (Δr, γ, Δμ) with diagonal preconditioning ─────────────────────
+    d_diag    = np.sqrt(np.maximum(np.abs(np.diag(Lambda)), 1e-30))
+    d_inv     = 1.0 / d_diag
+    Lambda_sc = d_inv[:, None] * Lambda * d_inv[None, :]
+    try:
+        C_shared_sc = np.linalg.inv(Lambda_sc)
+    except np.linalg.LinAlgError:
+        C_shared_sc = np.linalg.pinv(Lambda_sc)
+    C_shared = d_inv[:, None] * C_shared_sc * d_inv[None, :]
+    delta    = C_shared @ rhs
+
+    r_hat      = r_current + delta[idx_r]
+    gamma_hat  = delta[idx_gam]
+    mu_pop_hat = mu_pop_current + delta[idx_mu]
+    C_r        = C_shared[idx_r, idx_r]
+
+    return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a, K_img, C_vT
 
 
 # ── Field mean PM via iterative sigma-clipping ────────────────────────────────
@@ -865,15 +1140,16 @@ def warm_start_cte(
         dpm_ra  = sub['pmra_xmatch'].to_numpy(float)  - mean_pmra    # mas/yr
         sigma   = sub['sigma_pmdec'].to_numpy(float).clip(0.01)
 
-        phi = phi_flux(mag, 1.0)   # phi > 0, larger for fainter stars
-        By  = cte_y_basis(X_c, y_raw, p.y_readout_raw)
-        Bx  = cte_x_basis(X_c, y_raw, p.y_readout_raw)
+        phi = func1_mag(mag)
+        xt  = X_c / 2048.0
+        yt  = (y_raw - p.y_readout_raw) / 2048.0
+        B   = cte_basis(xt, yt)
 
         w   = 1.0 / sigma**2
         sqw = np.sqrt(w)
 
-        # y-CTE: dpm_dec ≈ pscale·d·phi·By @ gamma_y (+ intercept)
-        Ay_phys = pscale * d_coef * phi[:, None] * By   # physical units (mas/yr)
+        # y-CTE: dpm_dec ≈ pscale·d·phi·B @ gamma_y (+ intercept)
+        Ay_phys = pscale * d_coef * phi[:, None] * B   # (n, 5) physical units (mas/yr)
         col_scale_y = np.std(Ay_phys, axis=0).clip(min=1e-30)
         A_y = np.column_stack([np.ones(len(sub)), Ay_phys / col_scale_y])
         try:
@@ -882,20 +1158,20 @@ def warm_start_cte(
             params[chip].gamma_y = coeffs_y[1:] / col_scale_y
         except np.linalg.LinAlgError:
             print(f"    {chip}: y-CTE WLS failed")
-            coeffs_y = np.zeros(len(col_scale_y) + 1)
+            coeffs_y = np.zeros(6)
 
         pred_y = A_y @ coeffs_y
         rms_y  = float(np.sqrt(np.average((dpm_dec - pred_y)**2, weights=w)))
         med_phi = float(np.median(phi))
-        med_yp  = float(np.median(np.abs(y_raw - p.y_readout_raw)))
+        med_yp  = float(np.median(np.abs(yt)))   # normalised
         cte_mas_yr = abs(pscale * d_coef * med_phi * med_yp * params[chip].gamma_y[0])
         print(f"    {chip} y-CTE: γ_y[0]={params[chip].gamma_y[0]:.3e}  "
               f"CTE@med={cte_mas_yr:.3f} mas/yr  "
               f"intercept={coeffs_y[0]:+.3f} mas/yr  "
               f"rms={rms_y:.3f} mas/yr  n={len(sub):,}")
 
-        # x-CTE: dpm_ra ≈ pscale·a·phi·Bx @ gamma_x (+ intercept)
-        Ax_phys = pscale * a_coef * phi[:, None] * Bx   # physical units (mas/yr)
+        # x-CTE: dpm_ra ≈ pscale·a·phi·B @ gamma_x (+ intercept)
+        Ax_phys = pscale * a_coef * phi[:, None] * B   # (n, 5) physical units (mas/yr)
         col_scale_x = np.std(Ax_phys, axis=0).clip(min=1e-30)
         A_x = np.column_stack([np.ones(len(sub)), Ax_phys / col_scale_x])
         try:
@@ -904,7 +1180,7 @@ def warm_start_cte(
             params[chip].gamma_x = coeffs_x[1:] / col_scale_x
         except np.linalg.LinAlgError:
             print(f"    {chip}: x-CTE WLS failed")
-            coeffs_x = np.zeros(len(col_scale_x) + 1)
+            coeffs_x = np.zeros(6)
 
         pred_x = A_x @ coeffs_x
         rms_x  = float(np.sqrt(np.average((dpm_ra - pred_x)**2, weights=w)))
@@ -939,9 +1215,9 @@ def _save_cte_convergence(output_dir: Path, outer_iter: int,
                           cte_params: dict, info: dict) -> None:
     import csv
     csv_path = output_dir / 'cte_convergence.csv'
-    _gy_names = [f'gamma_y{k}' for k in range(2)]
-    _gx_names = [f'gamma_x{k}' for k in range(2)]
-    fieldnames = ['iter', 'chip', 'delta'] + _gy_names + _gx_names + ['rms_y', 'rms_x', 'n_det']
+    _gy_names = [f'gamma_y{k}' for k in range(5)]
+    _gx_names = [f'gamma_x{k}' for k in range(5)]
+    fieldnames = ['iter', 'chip'] + _gy_names + _gx_names + ['rms_y', 'rms_x', 'n_det']
     write_header = not csv_path.exists()
     with open(csv_path, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -953,12 +1229,11 @@ def _save_cte_convergence(output_dir: Path, outer_iter: int,
             row = {
                 'iter':  outer_iter,
                 'chip':  chip,
-                'delta': f'{p.delta:.6f}',
                 'rms_y': f'{ci.get("rms_y", float("nan")):.6f}',
                 'rms_x': f'{ci.get("rms_x", float("nan")):.6f}',
                 'n_det': ci.get('n_det', 0),
             }
-            for k in range(2):
+            for k in range(5):
                 row[f'gamma_y{k}'] = f'{p.gamma_y[k]:.6e}'
                 row[f'gamma_x{k}'] = f'{p.gamma_x[k]:.6e}'
             writer.writerow(row)
@@ -1092,11 +1367,12 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
             else:
                 y_raw_grid = np.linspace(p.y_readout_raw, 2039, 500)
             X_c_grid   = np.zeros_like(y_raw_grid)   # at X centre of chip
-            By = cte_y_basis(X_c_grid, y_raw_grid, p.y_readout_raw)
 
             for mag_v, col, lbl in mag_bins:
-                phi  = float(phi_flux(np.array([mag_v]), p.delta)[0])
-                dcte = dt_max * phi * (By @ p.gamma_y)
+                f1   = float(func1_mag(np.array([mag_v]))[0])
+                yt_g = (y_raw_grid - p.y_readout_raw) / 2048.0
+                B_g  = cte_basis(X_c_grid, yt_g)  # X_c_grid already 0 → xt=0
+                dcte = dt_max * f1 * (B_g @ p.gamma_y)
                 ax.plot(y_raw_grid, dcte, color=col, lw=1.8, label=lbl)
 
             ax.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
@@ -1312,20 +1588,21 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                 sub = cdf[cdf['chip'] == chip]
                 if len(sub) == 0:
                     continue
-                axes[0].plot(sub['iter'], sub['delta'], 'o-', color=col,
-                             label=f'δ_{chip}', lw=1.8)
                 gy_cols = [c for c in sub.columns if c.startswith('gamma_y')]
+                gx_cols = [c for c in sub.columns if c.startswith('gamma_x')]
                 gy_norm = np.sqrt((sub[gy_cols] ** 2).sum(axis=1))
-                axes[1].plot(sub['iter'], gy_norm, 'o-', color=col,
+                gx_norm = np.sqrt((sub[gx_cols] ** 2).sum(axis=1))
+                axes[0].plot(sub['iter'], gy_norm, 'o-', color=col,
                              label=f'|γ_y|_{chip}', lw=1.8)
-                # Overplot rms_y on secondary axis
+                axes[1].plot(sub['iter'], gx_norm, 's--', color=col,
+                             label=f'|γ_x|_{chip}', lw=1.8)
             axes[0].set_xlabel('CTE outer iteration')
-            axes[0].set_ylabel('δ (flux power-law exponent)')
-            axes[0].set_title('CTE δ convergence')
+            axes[0].set_ylabel('|γ_y| norm')
+            axes[0].set_title('CTE |γ_y| convergence')
             axes[0].legend(fontsize=9)
             axes[1].set_xlabel('CTE outer iteration')
-            axes[1].set_ylabel('|γ_y|')
-            axes[1].set_title('CTE |γ_y| convergence')
+            axes[1].set_ylabel('|γ_x| norm')
+            axes[1].set_title('CTE |γ_x| convergence')
             axes[1].legend(fontsize=9)
             fig.suptitle('CTE parameter convergence', fontsize=11)
             fig.tight_layout()
@@ -1936,6 +2213,8 @@ def run_alignment_cte(
     t_epoch0_yr  = float(Time(t_epoch0_mjd, format='mjd').jyear)
     print(f"  t_epoch0 = {t_epoch0_yr:.4f} yr  "
           f"({Time(t_epoch0_mjd, format='mjd').isot[:10]})")
+    t_launch_yr = _ACS_LAUNCH_YR
+    print(f"  t_launch = {t_launch_yr:.4f} yr (ACS launch 2002-03-01)")
 
     # ── Inject v1/v2 BP3M transformation as warm start ────────────────────────
     v1_bp3m_dir   = data_root / field_name / "BP3M_results"
@@ -2045,7 +2324,7 @@ def run_alignment_cte(
     _ws_field_pm = _compute_warmstart_field_pm(data_root, field_name)
     print(f"\n  CTE warm start (field_mean_pm={_ws_field_pm})...")
     cte_params = warm_start_cte(
-        img_to_df, solver, image_names, r_init_hat, t_epoch0_yr,
+        img_to_df, solver, image_names, r_init_hat, t_launch_yr,
         field_mean_pm=_ws_field_pm)
 
     # ── Outer CTE + BP3M Gauss-Newton loop ────────────────────────────────────
@@ -2060,7 +2339,7 @@ def run_alignment_cte(
         t_iter = time.time()
 
         # Step 1: Apply CTE correction to solver xys
-        apply_cte_to_solver(solver, image_names, cte_params, t_epoch0_yr,
+        apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
                             filtered_spi=filtered_spi)
 
         # Step 2: BP3M solve
@@ -2096,7 +2375,7 @@ def run_alignment_cte(
         print(f"  Collecting residuals ({len(img_to_df)} images)  "
               f"[field PM: {field_mean_pm[0]:.2f}, {field_mean_pm[1]:.2f} mas/yr]...")
         residuals = collect_cte_residuals(
-            img_to_df, solver, image_names, r_hat, t_epoch0_yr,
+            img_to_df, solver, image_names, r_hat, t_launch_yr,
             field_mean_pm=field_mean_pm)
 
         # Step 4: Update CTE parameters
@@ -2115,8 +2394,7 @@ def run_alignment_cte(
         gamma_rchg = max(
             d / max(n, 1e-10) for d, n in zip(gamma_deltas, gamma_norms))
 
-        print(f"  γ_y relative change = {gamma_rchg:.4e}  "
-              f"δ_hi={cte_params['hi'].delta:.4f}  δ_lo={cte_params['lo'].delta:.4f}")
+        print(f"  γ_y relative change = {gamma_rchg:.4e}")
 
         if gamma_rchg < cte_gamma_rtol and cte_iter >= 1:
             print(f"  CTE converged at iteration {cte_iter + 1}")
@@ -2124,7 +2402,7 @@ def run_alignment_cte(
 
     # ── Final BP3M solve with converged CTE ───────────────────────────────────
     print("\n  Final BP3M solve with converged CTE parameters...")
-    apply_cte_to_solver(solver, image_names, cte_params, t_epoch0_yr,
+    apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
                         filtered_spi=filtered_spi)
     (r_hat, C_r, v_hat, C_vT,
      a_arr, K_img, z_weights_out) = solver.fit(
@@ -2148,15 +2426,16 @@ def run_alignment_cte(
     cte_out = {}
     for chip in ('hi', 'lo'):
         p = cte_params[chip]
-        cte_out[f'{chip}_delta']        = np.array([p.delta])
-        cte_out[f'{chip}_gamma_x']      = p.gamma_x
-        cte_out[f'{chip}_gamma_y']      = p.gamma_y
-        cte_out[f'{chip}_y_readout']    = np.array([p.y_readout])
+        cte_out[f'{chip}_gamma_x']       = p.gamma_x
+        cte_out[f'{chip}_gamma_y']       = p.gamma_y
         cte_out[f'{chip}_y_readout_raw'] = np.array([p.y_readout_raw])
-    cte_out['t_epoch0_yr'] = np.array([t_epoch0_yr])
+        cte_out[f'{chip}_x0']            = np.array([p.x0])
+    cte_out['t_epoch0_yr']  = np.array([t_epoch0_yr])
+    cte_out['t_launch_yr']  = np.array([t_launch_yr])
     np.savez(output_cte / 'cte_params.npz', **cte_out)
     print(f"  Saved: cte_params.npz  "
-          f"(δ_hi={cte_params['hi'].delta:.4f}, δ_lo={cte_params['lo'].delta:.4f})")
+          f"(|γ_y_hi|={np.linalg.norm(cte_params['hi'].gamma_y):.4e}, "
+          f"|γ_y_lo|={np.linalg.norm(cte_params['lo'].gamma_y):.4e})")
 
     # ── Posteriors ────────────────────────────────────────────────────────────
     if mcmc_posteriors:
@@ -2178,7 +2457,7 @@ def run_alignment_cte(
             "clip_sigma":    clip_sigma,
             "poly_order":    poly_order,
             "t_epoch0_yr":   t_epoch0_yr,
-            **{f'delta_{c}': float(cte_params[c].delta) for c in ('hi', 'lo')},
+            "t_launch_yr":   t_launch_yr,
         },
     )
 

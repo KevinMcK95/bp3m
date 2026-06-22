@@ -3,9 +3,9 @@
 ## Overview
 
 This document describes the design and implementation plan for jointly fitting HST image
-transformations (r_j), stellar astrometry (v_i), and a parametric CTE (Charge Transfer
-Efficiency) model within the BP3M framework. The code lives in
-`bp3m/pipeline/run_alignment_cte.py`.
+transformations (r_j), stellar astrometry (v_i), a parametric CTE (Charge Transfer
+Efficiency) model, and a population-level PM prior within the BP3M framework. The code
+lives in `bp3m/pipeline/run_alignment_cte.py`.
 
 ## Motivation
 
@@ -53,13 +53,11 @@ where:
   allowing the model to constrain the absolute CTE level (not just differential CTE
   between epochs). For Leo I: epoch 1 (2006) dt ≈ 4.0 yr, epoch 2 (2011) dt ≈ 9.0 yr.
 
-- `func1(mag_raw)` is a fixed 3rd or 4th order polynomial in the raw instrumental
-  magnitude. This encodes the physical flux dependence of CTE: fainter stars (higher mag,
-  fewer electrons) experience stronger parallel CTE trailing. The polynomial is evaluated
-  per star and produces a single scalar — there are no free parameters in func1 itself.
-  All amplitude and spatial information is absorbed into the free γ coefficients.
-  A natural choice approximates the empirical flux-dependence over the data's magnitude
-  range (e.g., a normalised polynomial fit from pilot residuals, or func1(mag) ∝ mag^3).
+- `func1(mag_raw)` is a fixed polynomial in the raw instrumental magnitude. This encodes
+  the physical flux dependence of CTE: fainter stars (higher mag, fewer electrons)
+  experience stronger parallel CTE trailing. The polynomial is evaluated per star and
+  produces a single scalar — there are no free parameters in func1 itself. All amplitude
+  and spatial information is absorbed into the free γ coefficients.
 
 - `b(xt, yt) = [yt, yt², xt·yt, xt²·yt, xt·yt²]` (5 terms; yt appears in every term).
   **Boundary condition**: all terms vanish at yt = 0 (readout register), so δCTE = 0
@@ -107,117 +105,291 @@ CTE parameters.
 
 ---
 
+## Population-Level Priors and Membership Selection
+
+### Membership Selection
+
+Only likely member stars contribute to constraining the CTE parameters and the population
+mean PM. A star is a likely member if its PM is consistent with the field mean to within
+a few times the intrinsic PM dispersion σ_pm (see below). This applies equally to all
+stellar types:
+
+- **Gaia 5p/6p stars**: membership assessed from their Gaia-measured PMs. Members receive
+  a population prior on their PMs alongside their Gaia prior; non-members are excluded
+  from the CTE and μ_pop constraints. (Their detections still receive the CTE position
+  correction, but their residuals do not inform γ or μ_pop.)
+- **HST-only / Gaia 2p stars**: membership assessed from their BP3M-fitted PMs, which
+  evolve each outer iteration. On the first iteration (warm start), a ±2 mas/yr window
+  around the empirical field mean is used as a preliminary membership selection.
+
+Non-member stars still get the CTE correction applied to their observed positions (they
+experience CTE like any other star on the detector), but they are excluded from the linear
+system that determines γ and μ_pop.
+
+### Population Mean PM (Free Parameter)
+
+The population mean PM μ_pop = (μ_α*, μ_δ*) is estimated jointly with all other shared
+parameters. Its prior is:
+
+```
+μ_pop  ~  N(μ_empirical, C_pop_prior)
+C_pop_prior  =  (0.5 mas/yr)² × I₂
+```
+
+where μ_empirical is the field mean PM from the warm-start empirical estimate (derived
+from Gaia-matched member stars via iterative sigma-clipping of their pmra_xmatch /
+pmdec_xmatch values in master_combined_v2.csv). The 0.5 mas/yr prior width is wide
+enough to be nearly uninformative relative to the constraint from hundreds to thousands
+of member stars, but provides regularisation on the first outer iteration before the
+star PMs have converged.
+
+### Intrinsic PM Dispersion from LVD
+
+The Local Volume Database (LVD; Pace et al. 2024) provides for each system:
+- Line-of-sight velocity dispersion: σ_LOS (km/s)
+- Distance: d (kpc)
+
+Under the assumption of spherical symmetry, the 1D proper motion dispersion equals the
+1D LOS velocity dispersion in physical units:
+
+```
+σ_pm  =  σ_LOS / (4.74047 × d)    [mas/yr]
+```
+
+(4.74047 converts 1 kpc·mas/yr to km/s). This σ_pm sets the population prior width on
+individual member star PMs. For each member star i, the prior on the PM components of
+v_i is:
+
+```
+(μ_α_i, μ_δ_i) | μ_pop  ~  N(μ_pop, σ_pm² × I₂)
+```
+
+For Leo I: σ_LOS ≈ 9.2 km/s, d ≈ 254 kpc → σ_pm ≈ 0.008 mas/yr. Member PMs are
+essentially at a single point in PM space; the population prior is very tight. For more
+nearby or dynamically hotter systems (Draco: σ_LOS ≈ 9.1 km/s, d ≈ 76 kpc →
+σ_pm ≈ 0.025 mas/yr), σ_pm is still small compared to HST measurement uncertainties
+for faint stars, so the constraint is significant.
+
+### Parallax Prior from LVD (Fixed)
+
+LVD provides:
+- Mean distance: d ± σ_d (kpc)
+- Physical depth estimate: δ_d (kpc, e.g., from half-light radius or reported uncertainty)
+
+These map to a parallax prior applied to every member star:
+
+```
+plx_pop       =  1 / d                          [mas]
+σ_plx_dist    =  σ_d / d²                       [mas]   (from distance uncertainty)
+σ_plx_depth   =  δ_d / (√3 × d²)               [mas]   (uniform depth → 1σ half-width)
+σ_plx_tot²    =  σ_plx_dist² + σ_plx_depth²
+
+plx_i  ~  N(plx_pop, σ_plx_tot²)
+```
+
+Unlike μ_pop, the parallax population mean plx_pop is treated as a **fixed input** from
+LVD, not a free parameter. Individual star parallax deviations from plx_pop reflect either
+true line-of-sight depth differences (negligible for dSph members at HST precision) or
+HST systematic parallax effects. The tight prior substantially reduces the PM–parallax
+degeneracy for stars with non-uniform epoch parallax factors, and is especially important
+for HST-only stars whose parallax was previously unconstrained (σ ~ 100 mas/yr diffuse
+prior in v2).
+
+---
+
 ## Current GitHub Model vs Proposed Model
 
-| Aspect                    | Current (on GitHub)                                 | Proposed                                        |
-|---------------------------|-----------------------------------------------------|-------------------------------------------------|
-| **Time reference**        | `t − t_epoch0` (first exposure MJD)                 | `t − t_launch` (ACS launch 2002-03-01)         |
-| **Magnitude function**    | `φ(mag; δ) = 10^{0.4δ(mag−mag_ref)} − 1` (free δ)  | `func1(mag)` = fixed polynomial in mag_raw     |
-| **y-CTE basis**           | `[Y', Xc·Y']` (2 terms, un-normalised)              | `[yt, yt², xt·yt, xt²·yt, xt·yt²]` (5 terms)  |
-| **x-CTE basis**           | `[Xc, Xc·Y']` (2 terms, un-normalised)              | `[yt, yt², xt·yt, xt²·yt, xt·yt²]` (5 terms, same as y) |
-| **Coordinates**           | `Y' = y_raw − y_readout_raw`, `Xc = x_gdc − 2048`  | `yt = (y_raw − y_readout)/2048`, `xt = (x_raw − 2048)/2048` |
-| **Free params per chip**  | δ(1) + γ_x(2) + γ_y(2) = **5**                     | γ_x(5) + γ_y(5) = **10**                       |
-| **Total CTE params**      | 5×2 chips = **10**                                  | 10×2 chips = **20**                             |
-| **δ update**              | Gauss-Newton inner loop (nonlinear)                 | None (func1 is fixed — fully linear solve)      |
+| Aspect                    | Current (on GitHub)                                 | Proposed                                         |
+|---------------------------|-----------------------------------------------------|--------------------------------------------------|
+| **Time reference**        | `t − t_epoch0` (first exposure MJD)                 | `t − t_launch` (ACS launch 2002-03-01)          |
+| **Magnitude function**    | `φ(mag; δ) = 10^{0.4δ(mag−mag_ref)} − 1` (free δ)  | `func1(mag)` = fixed polynomial in mag_raw      |
+| **y-CTE basis**           | `[Y', Xc·Y']` (2 terms, un-normalised)              | `[yt, yt², xt·yt, xt²·yt, xt·yt²]` (5 terms)   |
+| **x-CTE basis**           | `[Xc, Xc·Y']` (2 terms, un-normalised)              | same 5-term basis as y                           |
+| **Coordinates**           | `Y' = y_raw − y_readout_raw`, `Xc = x_gdc − 2048`  | `yt = (y_raw − y_readout)/2048`, `xt = X_c/2048` |
+| **Free params per chip**  | δ(1) + γ_x(2) + γ_y(2) = **5**                     | γ_x(5) + γ_y(5) = **10**                        |
+| **Total CTE params**      | 5 × 2 chips = **10**                                | 10 × 2 chips = **20**                            |
+| **δ update**              | Gauss-Newton inner loop (nonlinear)                 | None (func1 is fixed — fully linear solve)       |
+| **Population mean PM**    | Fixed empirical estimate, not a model parameter     | Free parameter μ_pop jointly fit with γ and θ_dist |
+| **Pop PM prior**          | —                                                   | N(μ_empirical, (0.5 mas/yr)² I₂)                |
+| **Intrinsic PM dispersion** | Not modelled                                      | σ_pm = σ_LOS / (4.74 × d) from LVD              |
+| **Parallax prior**        | Diffuse (HST-only: σ ≈ 100 mas/yr)                  | N(plx_LVD, σ_plx_tot²) from LVD distance+depth  |
+| **Member selection**      | PM quality cut + \|pm\| < 3 mas/yr (absolute)       | Population prior; member window ±N·σ_pm          |
+| **Inference approach**    | Alternating BP3M + CTE updates (EM-like)            | Single joint marginalisation over {v_i} per iteration |
+| **Shared param count**    | N_images × N_dist                                   | N_images × N_dist + 20 (CTE) + 2 (μ_pop)        |
 
-Key changes:
-- **t_launch vs t_epoch0**: switching to the ACS launch date gives each epoch its own
-  nonzero CTE amplitude, allowing the model to constrain absolute (not just differential)
-  CTE level.
-- **Polynomial vs power-law**: removing the free δ parameter simplifies the fit to a
-  pure linear WLS — no Gauss-Newton inner loop needed. The magnitude dependence is
-  absorbed into a fixed polynomial shape chosen from physical/empirical considerations.
-- **5-term vs 2-term basis**: the new basis has 5 spatial terms (instead of 2 separate
-  2-term bases for x and y), providing more flexibility to capture the 2D position
-  dependence of CTE. Crucially, both x and y CTE now use the same basis, which may
-  over-constrain x-CTE (y-direction boundary condition imposed on x-CTE), but serial
-  CTE is expected to be small.
-- **Normalised coordinates**: dividing by 2048 keeps all 5 basis terms at similar scales
-  (previously Y' ranged 0–2047 and Xc ranged −2048 to +2048, causing conditioning issues).
+Key changes beyond the CTE model itself:
+- **Joint marginalisation** eliminates the EM-like alternation between BP3M, CTE, and
+  population mean updates (see Joint Marginalisation Framework section).
+- **Population prior** tightens PM and parallax constraints for HST-only faint stars,
+  breaking the degeneracy between per-star PM absorption and CTE trailing.
+- **μ_pop as free parameter** allows the bulk field PM to respond to CTE corrections
+  and propagates the CTE ↔ field-mean covariance into the posterior.
+
+---
+
+## Joint Marginalisation Framework
+
+### Why Not Alternating Updates (EM)?
+
+An appealing but suboptimal approach is to alternate:
+1. Fix (γ, μ_pop) → BP3M solve for ({v_i}, θ_dist)
+2. Fix ({v_i}, μ_pop) → WLS update for γ from residuals
+3. Fix {v_i} → precision-weighted mean update for μ_pop
+... and repeat.
+
+This is expectation-maximisation (EM). For linear Gaussian models EM converges to the
+correct MAP, but has two important drawbacks:
+
+1. **Convergence rate**: EM converges at most linearly. The joint solve below converges
+   in one pass per outer CTE iteration.
+2. **Missing cross-covariances**: EM's separate steps do not propagate correlations
+   between θ_dist, γ, and μ_pop. The posterior is overconfident, and physically important
+   covariances are missed — in particular, misestimated CTE appears partly as a bulk PM
+   shift, so γ and μ_pop are correlated; EM treats them as independent.
+
+### The Joint Solve
+
+Define the shared parameter vector:
+
+```
+θ_shared  =  (θ_dist_1, …, θ_dist_N,   γ_CTE,   μ_pop)
+                    ↑                     ↑          ↑
+              per-image distortion    20 params   2 params
+              (N_images × N_dist)
+```
+
+For each **member** star i with J_i detections, reparametrise the stellar astrometry:
+
+```
+v_i  =  δv_i  +  M_i μ_pop  +  b_i
+```
+
+where:
+- `δv_i ~ N(0, C_prior_i)` is the deviation from the population-mean prior.
+  C_prior_i is diagonal with σ_pm² in the PM rows and σ_plx_tot² in the parallax row;
+  for Gaia 5p/6p member stars, C_prior_i also includes the Gaia measurement covariance.
+- `M_i` is the 5×2 matrix that places μ_pop into the (μ_α, μ_δ) rows of v_i.
+- `b_i` is the fixed prior mean: (0, 0, 0, 0, plx_pop)ᵀ for HST-only stars; for Gaia
+  stars it also shifts the position and PM components by their Gaia-measured values.
+
+After marginalising δv_i analytically, the stacked detections of star i satisfy:
+
+```
+ỹ_i  ~  N(D_i θ_shared,  Ω_i)
+
+ỹ_i  =  y_i − B_i b_i                        (data adjusted for fixed prior mean)
+D_i  =  [A_i  |  F_i  |  B_i M_i]           (shared-parameter design matrix)
+Ω_i  =  Σ_obs_i + B_i C_prior_i Bᵢᵀ         (obs covariance inflated by marginalisation)
+```
+
+Columns of D_i:
+- **A_i**: distortion polynomial rows for the images where star i is detected — identical
+  to the current K_img computation.
+- **F_i**: CTE rows, one per detection: `dt_j · func1(mag_i) · b(xt_ij, yt_ij)` → 5 columns.
+- **B_i M_i**: population-mean coupling. B_ij is the pointing matrix (maps v_i to the
+  observable frame); M_i selects the PM components; the product maps μ_pop into the
+  observable. This column block is nonzero for all member stars.
+
+Each member star contributes to the joint precision and information vector:
+
+```
+Λ_shared  +=  D_iᵀ Ω_i⁻¹ D_i
+r_shared  +=  D_iᵀ Ω_i⁻¹ ỹ_i
+```
+
+Adding the μ_pop prior and solving:
+
+```
+Λ_total   =  Λ_shared  +  diag(0, …, 0,  C_pop_prior⁻¹)
+θ_shared  =  Λ_total⁻¹ r_shared
+
+Posterior covariance:  C_shared  =  Λ_total⁻¹
+```
+
+This is the exact joint marginal posterior p(θ_dist, γ, μ_pop | data), computed in a
+single pass over the member stars — no alternating inner loop.
+
+### System Dimensions
+
+| Block | Typical size |
+|---|---|
+| Per-image distortion (N_images × N_dist) | ~150 (15 images × 10 params) |
+| CTE γ (2 chips × 2 directions × 5 terms) | 20 |
+| Population mean PM | 2 |
+| **Total** | **~172** |
+
+A 172 × 172 linear system. The matrix has an arrowhead structure (per-image distortion
+blocks are nearly independent; CTE and μ_pop rows couple all images), but at this scale
+a direct dense solve is trivially fast. Inversion is O(172³) ≈ 5 million flops.
+
+### The Remaining Outer Iteration
+
+The outer CTE loop persists because the CTE design matrix F_i depends on raw pixel
+positions (xt_ij, yt_ij), which are the result of the distortion correction θ_dist.
+This mild coupling means the design matrix must be rebuilt each outer iteration around
+the current solution. Within each outer iteration, (θ_dist, γ, μ_pop) are solved jointly
+in one pass. Convergence is monitored via ‖Δγ‖/‖γ‖ and ‖Δμ_pop‖ / (0.5 mas/yr);
+3–5 outer iterations typically suffice.
 
 ---
 
 ## Forward Model Integration with BP3M
 
-### Solver Integration (no solver.py changes)
+### Design Principle: No Core BP3M Modifications
+
+The CTE pipeline is intentionally standalone. **No files in the core BP3M package
+(solver.py, run_alignment.py, etc.) are modified.** Where the joint model requires
+logic beyond what the existing solver exposes (e.g., the joint K_img-style accumulation
+over member stars), new helper functions are written in `run_alignment_cte.py` or
+adjacent CTE-specific modules, reusing BP3M internals as black-box calls where possible.
+
+### Solver Integration
 
 The CTE correction is applied by modifying `solver._img_data[img]['xys']` before each
-BP3M solve pass. The workflow:
+BP3M solve pass — the only interface to the core solver. The workflow:
 
 1. **Before the outer loop**: store `d['xys_orig'] = d['xys'].copy()` for all images.
 2. **Each CTE iteration**:
    - Compute `δCTE_raw` = (δCTE_x, δCTE_y) in raw chip-centered pixel frame.
    - Map to pseudo-image frame: `Δxys = R_j @ δCTE_raw` (2×2 rotation from r_j).
    - Set `d['xys'] = d['xys_orig'] + Δxys`.
-3. **Run BP3M solve** (r_j, v_i) with CTE-corrected xys.
-4. **Collect full-catalog residuals** from detections_catalog.npz (all ~127k stars).
-5. **Update CTE parameters** (γ_x, γ_y) from residuals via linear WLS.
-
-The rotation matrix `R_j = solver.R[img]` (2×2, updated by `solver._update_R`) converts
-chip-frame pixel shifts to pseudo-image-frame shifts for poly_order=1. This is the same
-matrix used in `compute_gdc_residuals` in solver.py.
+3. **Run joint solve** over member stars for (θ_dist, γ, μ_pop) — single pass, see above.
+   This step is implemented entirely in new helper code within run_alignment_cte.py;
+   it does not call solver.solve() or modify any solver internals.
+4. **Collect full-catalog residuals** from detections_catalog.npz (all ~127k stars, for
+   CTE diagnostic purposes and to feed back into next iteration's design matrices).
+5. **Update membership** based on current μ_pop and σ_pm.
 
 ### Soft Weights Compatibility
 
 The CTE correction modifies `xys` before the IRLS computation. Since z_{ij} weights in
-soft-weight IRLS are applied to `(xys - X_mat @ r_j - JU @ v_i)^2`, and `xys` now
+soft-weight IRLS are applied to `(xys - X_mat @ r_j - JU @ v_i)²`, and `xys` now
 includes the CTE correction, the z weights automatically down-weight CTE-corrected
 detections with large residuals. No special handling is needed.
 
 ---
 
-## Parameter Update Algorithm
-
-### Linear update for γ (fully linear solve)
-
-Given current residuals in GDC frame `(dx_k, dy_k)` for detection k in image j (chip c),
-define the time-magnitude weight:
-
-```
-Ψ_k = (t_j − t_launch) · func1(mag_k)
-```
-
-The CTE design matrix row for each detection is:
-
-```
-A_k = Ψ_k · [yt_k, yt_k², xt_k·yt_k, xt_k²·yt_k, xt_k·yt_k²]    (5 columns)
-```
-
-Stack all detections for chip c across all images → solve two independent (N, 5) weighted
-least squares systems:
-
-```
-γ_y_c = argmin Σ_k z_k · (−dy_k − A_k @ γ)²
-γ_x_c = argmin Σ_k z_k · (−dx_k − A_k @ γ)²
-```
-
-Dynamic column normalisation (dividing each column by its standard deviation) keeps the
-5-term basis well-conditioned.
-
-There is no nonlinear δ update. With func1 fixed, the entire parameter estimation is a
-single linear WLS solve per chip per direction — simpler and faster than the previous
-Gauss-Newton inner loop.
-
----
-
 ## Warm-Start Strategy
 
-Before the outer iteration loop, estimate initial γ from existing BP3M v2 PM residuals:
+Before the outer iteration loop, estimate initial (γ, μ_pop) from existing BP3M v2 PM
+residuals:
 
-1. Load per-star PM residuals (pmdec_xmatch − field_mean_pmdec) from master_combined_v2.csv.
-2. For each chip, select member stars within ±2 mas/yr of the field mean PM.
+1. Compute the empirical field mean PM μ_empirical from Gaia-matched member stars in
+   master_combined_v2.csv via iterative 2D sigma-clipping. This initialises μ_pop.
+2. For each chip, select likely member stars within ±2 mas/yr of μ_empirical.
 3. Build the CTE design matrix Ψ·b(xt, yt) with func1 evaluated at each star's mag.
 4. Solve the (N, 5) WLS system (per direction) for initial γ_x, γ_y.
 5. Cross-seed: if γ_y[0] > 0 for one chip (wrong sign), borrow from the other chip.
 
 The warm start uses 1/σ²_pmdec weighting so faint stars with large CTE signal have
-more influence on the initial estimate.
+more influence on the initial estimate. The initial μ_pop is then refined jointly with
+γ in the first outer iteration.
 
 ---
 
 ## Implementation Steps
 
-### Step 1: CTEChipParams dataclass (proposed revision)
+### Step 1: CTEChipParams dataclass
 ```python
 @dataclass
 class CTEChipParams:
@@ -230,50 +402,60 @@ class CTEChipParams:
 Note: `delta` has been removed; all magnitude dependence is in the fixed func1.
 
 ### Step 2: Magnitude weighting function
-- `func1_mag(mag, order=3, mag_ref=mag_ref)` → scalar per star  
-  Evaluates a fixed polynomial at each star's mag. No free parameters.
+- `func1_mag(mag, mag_ref=_MAG_REF)` → scalar per star.
+  Fixed function, no free parameters. Current implementation: `10^{0.4*(mag − mag_ref)}`.
 
 ### Step 3: Unified CTE basis function (same for x and y)
 - `cte_basis(xt, yt)` → (n, 5): `[yt, yt², xt·yt, xt²·yt, xt·yt²]`
 
-### Step 4: `compute_cte_displacement(xt, yt, mag, dt, chip_params)`
+### Step 4: `compute_cte_displacement(X_c, y_raw, mag, dt, chip_params)`
 - `dt = t_j − t_launch` (years since ACS launch, not t_epoch0).
-- Returns (n, 2) array of (δCTE_x, δCTE_y) in normalised chip coordinates.
+- `xt = X_c / 2048`, `yt = (y_raw − y_readout_raw) / 2048`.
+- Returns (n, 2) array of (δCTE_x, δCTE_y) in pixels.
 
 ### Step 5: `apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr)`
 - Stores `xys_orig` on first call.
 - Updates `d['xys']` for all images using current CTE parameters.
 - Uses `solver.R[img]` to rotate chip-frame correction to pseudo-image frame.
 
-### Step 6: `warm_start_cte(img_to_df, solver, image_names, r_hat_init, t_launch_yr, field_mean_pm)`
-- Estimates initial γ from PM residuals (see Warm-Start Strategy above).
+### Step 6: `warm_start_cte(img_to_df, solver, image_names, r_hat_init, t_epoch0_yr, field_mean_pm)`
+- Estimates initial γ from PM residuals and initialises μ_pop (see Warm-Start above).
 
-### Step 7: `update_cte_params(residuals_by_chip, cte_params)`
-- Linear WLS for γ_x, γ_y (5 coefficients each, solved separately).
-- No δ update needed — fully linear solve.
+### Step 7: Joint solve step (target implementation)
+- New function `_joint_solve_cte(solver, image_names, member_mask, cte_params, mu_pop,
+  sigma_pm, plx_pop, sigma_plx, C_pop_prior, t_launch_yr)` in run_alignment_cte.py.
+- Iterates over member stars, builds D_i = [A_i | F_i | B_i M_i] and Ω_i for each,
+  accumulates Λ_shared and r_shared, then solves Λ_total θ_shared = r_shared.
+- No changes to solver.py; the function reads solver._img_data and solver internals
+  (R, JU, X_mat, etc.) as read-only inputs.
+- Current stepping stone: alternating BP3M `solver.solve()` + `update_cte_params` WLS.
 
 ### Step 8: `collect_cte_residuals(img_to_df, solver, image_names, r_hat, t_launch_yr, field_mean_pm)`
-- Returns per-chip (dx, dy, xt, yt, mag, dt, z) arrays from the full master catalog.
+- Returns per-chip (dx, dy, X_c, y_raw, mag, dt, z) arrays from member stars only.
 
 ### Step 9: `run_alignment_cte(...)` main function
-- Outer loop: apply_cte → BP3M fit → collect_residuals → update_cte → repeat.
-- Convergence: ‖Δγ‖/‖γ‖ < tol.
+- Outer loop: apply_cte → joint solve (or alternating) → collect_residuals → repeat.
+- Convergence: ‖Δγ‖/‖γ‖ < tol and ‖Δμ_pop‖ < 0.01 mas/yr.
 
 ---
 
 ## Convergence Behavior and Diagnostics
 
 Expected behavior:
-- After 2-3 outer iterations, γ_y should converge to nonzero values for both chips.
+- After 2–3 outer iterations, γ_y should converge to nonzero values for both chips.
 - γ_y[0] (the [yt] coefficient) captures the dominant parallel CTE signal.
 - CTE_x coefficients are expected to be small; if they converge to ~0 within noise, the
   serial CTE is negligible for this dataset.
+- μ_pop should shift from the empirical warm-start estimate by at most ~0.1–0.2 mas/yr
+  once CTE is properly accounted for; a larger shift indicates significant CTE absorption
+  in the v2 field mean.
 
 Diagnostic outputs saved to `BP3M_cte_results/`:
-- `cte_params.npz`: converged CTEChipParams for each chip (γ_x, γ_y per chip).
+- `cte_params.npz`: converged CTEChipParams for each chip (γ_x, γ_y per chip, μ_pop).
 - `detections_catalog_cte.npz`: post-CTE residuals (same format as detections_catalog.npz).
-- `cte_convergence.csv`: per-outer-iteration γ_c, RMS residuals.
-- `cte_diagnostic.png`: 4-panel plot of CTE correction amplitude vs yt and magnitude.
+- `cte_convergence.csv`: per-outer-iteration γ_c, μ_pop, RMS residuals.
+- `cte_diagnostic.png`: diagnostic plots of CTE correction amplitude, PM residuals, and
+  μ_pop convergence.
 
 ---
 
@@ -292,7 +474,8 @@ dt ≈ 4.0 yr and ≈ 9.0 yr respectively, giving a 4/9 amplitude ratio. Key tes
 
 3. **PM sensitivity test**: Compare Leo I bulk proper motion (field mean μ_α*, μ_δ)
    from BP3M v2 vs BP3M-CTE. CTE effects project partly onto the bulk PM; any shift
-   exceeding ~0.1 mas/yr is significant.
+   exceeding ~0.1 mas/yr is significant. With the joint model, μ_pop is a model output
+   rather than a fixed input, so this shift is measured directly.
 
 4. **Comparison with pixel-level correction**: The FLC files apply a pixel-level CTE
    correction (Anderson & Bedin 2010). The residual CTE captured by our model is
@@ -302,25 +485,31 @@ dt ≈ 4.0 yr and ≈ 9.0 yr respectively, giving a 4/9 amplitude ratio. Key tes
 5. **Individual star PM uncertainties**: After CTE correction, faint stars should have
    reduced scatter in their per-image residuals, leading to smaller formal PM errors.
 
+6. **μ_pop shift**: The difference between μ_pop (jointly estimated) and μ_empirical
+   (pre-CTE field mean from Gaia xmatch) quantifies how much CTE leaked into the v2
+   field mean estimate.
+
 ---
 
-## Future Work: Draco dSph and Multi-Epoch Fields
+## Future Work
 
-For fields with N > 2 HST epochs (e.g., Draco_dSph), the linear temporal model
-h(t) = t − t_launch is well-motivated (CTE accumulates linearly with radiation dose).
-With more epochs, the absolute CTE level is better constrained.
-
-**Other future improvements**:
-- Fit CTE separately per sub-image (jitter in readout efficiency).
-- Cross-validate γ_hi vs γ_lo — if they agree across multiple fields, share γ between
-  chips and reduce to 10 total CTE parameters.
-- Use the magnitude-dependence of CTE to improve stellar mass estimates.
-- Apply the learned CTE model as a correction to the FLC positions before running the
-  standard pipeline (feedback loop into py1pass).
-- Test whether CTE_x (serial register) is detectable with deep, high-stellar-density
-  fields (e.g., ω Cen, 47 Tuc).
-- Allow func1 to have free polynomial coefficients in a future extension (would require
-  an alternating or joint nonlinear solve coupling the magnitude and spatial parameters).
+- **Implement full joint solve** (Step 7 above): currently the code uses alternating
+  BP3M + CTE updates as a stepping stone. Replacing this with the single-pass joint
+  marginalisation will improve convergence speed and give correct cross-covariances.
+- **Draco dSph and multi-epoch fields**: with N > 2 epochs, the absolute CTE level is
+  better constrained. The linear temporal model h(t) = t − t_launch is well-motivated
+  (CTE accumulates linearly with radiation dose); more epochs directly test this.
+- **Cross-validate γ_hi vs γ_lo**: if they agree across multiple fields, share γ between
+  chips to reduce to 10 total CTE parameters.
+- **Fit func1 jointly** (future extension): allowing the magnitude weighting to have free
+  polynomial coefficients would require extending the joint design matrix D_i. With the
+  marginalisation framework already in place, this is a natural extension.
+- **Sub-image CTE variation**: fit CTE separately per sub-image (jitter in readout
+  efficiency) by splitting the 20 CTE parameters into per-image groups.
+- **Apply γ to FLC positions**: feed the learned CTE model back into py1pass as a
+  correction to raw positions before running the standard pipeline.
+- **Test serial CTE (γ_x)** in high-stellar-density fields (ω Cen, 47 Tuc) where serial
+  CTE may be detectable.
 
 ---
 
@@ -330,3 +519,5 @@ With more epochs, the absolute CTE level is better constrained.
 - Massey (2010): power-law flux model for CTE, Equation 1 motivates the flux dependence
 - ACS Instrument Science Report ACS 2012-03: time-dependent CTE model for ACS/WFC
 - McKinnon et al. (2024): BP3M algorithm (bp3m paper; see memory/reference_key_papers.md)
+- Pace et al. (2024): Local Volume Database (LVD) — σ_LOS, distances, and structural
+  parameters for Local Group dwarf galaxies
