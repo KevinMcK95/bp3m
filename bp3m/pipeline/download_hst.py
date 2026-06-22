@@ -867,7 +867,6 @@ def plot_footprints(
     title = f'{field_name} — HST footprints' if field_name else 'HST footprints'
     ax.set_title(title, fontsize=12)
 
-    plt.tight_layout()
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
