@@ -518,7 +518,10 @@ def download_hst_images(
     footprint_png = hst_dir / f"{field_name}_footprints.png"
     try:
         plot_footprints(obs_df, footprint_png,
-                        gaia_df=gaia_df, field_name=field_name)
+                        gaia_df=gaia_df, field_name=field_name,
+                        ra=ra, dec=dec,
+                        search_width=search_width,
+                        search_height=search_height)
     except Exception as _e:
         print(f"  WARNING: footprint plot failed — {_e}")
 
@@ -704,6 +707,10 @@ def plot_footprints(
     save_path: str | Path,
     gaia_df: 'pd.DataFrame | None' = None,
     field_name: str = '',
+    ra: float | None = None,
+    dec: float | None = None,
+    search_width: float | None = None,
+    search_height: float | None = None,
 ) -> None:
     """
     Plot HST image footprints on the sky with Gaia stars in the background.
@@ -714,11 +721,16 @@ def plot_footprints(
 
     Parameters
     ----------
-    obs_df     : observations DataFrame with columns field_id, s_region, filters,
-                 proposal_id, instrument_name, obs_time.
-    save_path  : output PNG path.
-    gaia_df    : optional Gaia catalogue; plotted as background scatter.
-    field_name : used in the figure title.
+    obs_df        : observations DataFrame with columns field_id, s_region, filters,
+                    proposal_id, instrument_name, obs_time.
+    save_path     : output PNG path.
+    gaia_df       : optional Gaia catalogue; plotted as background scatter.
+    field_name    : used in the figure title.
+    ra, dec       : field centre (degrees).  When provided together with
+                    search_width / search_height, the axes are fixed to the
+                    user-specified search box, preventing wildly-offset HST
+                    WCS entries from zooming the plot out.
+    search_width, search_height : search box full-width in degrees.
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -768,25 +780,81 @@ def plot_footprints(
                 facecolor='none', edgecolor=color, lw=1.5,
                 label=filt)
 
-    # ── Axes limits from all footprint vertices + Gaia stars ─────────────────
-    all_ra, all_dec = [], []
-    for _, row in obs_df.iterrows():
-        bbox = _footprint_bbox(str(row.get('s_region', '')))
-        if bbox:
-            all_ra  += [bbox[0], bbox[1]]
-            all_dec += [bbox[2], bbox[3]]
-    if gaia_df is not None and len(gaia_df) > 0:
-        all_ra  += list(gaia_df['ra'].values)
-        all_dec += list(gaia_df['dec'].values)
+    # ── Axes limits ───────────────────────────────────────────────────────────
+    # Strategy: use data-derived limits (zoom in to where HST actually points)
+    # but clamp to the user's cutout so that wildly-offset WCS entries cannot
+    # zoom the plot out beyond the requested field of view.
+    #
+    # When the search box is available:
+    #   - Only footprint centroids that fall inside the cutout contribute to
+    #     the data bounds (filters out corrupt WCS entries).
+    #   - Final limits = data bounds with 8 % padding, clamped to cutout.
+    # When the search box is not available: use raw data bounds as before.
 
-    if all_ra:
-        pad_ra  = (max(all_ra)  - min(all_ra))  * 0.08
-        pad_dec = (max(all_dec) - min(all_dec)) * 0.08
-        ax.set_xlim(max(all_ra) + pad_ra, min(all_ra) - pad_ra)   # RA right-to-left
-        ax.set_ylim(min(all_dec) - pad_dec, max(all_dec) + pad_dec)
-        # Correct aspect ratio for sky projection at the field centre
-        center_dec = (min(all_dec) + max(all_dec)) / 2
-        ax.set_aspect(1.0 / np.cos(np.deg2rad(center_dec)), adjustable='box')
+    pad_factor = 0.08
+
+    if ra is not None and dec is not None and search_width and search_height:
+        cos_d = np.cos(np.deg2rad(dec))
+        cut_ra_lo  = ra  - search_width  / 2 / cos_d
+        cut_ra_hi  = ra  + search_width  / 2 / cos_d
+        cut_dec_lo = dec - search_height / 2
+        cut_dec_hi = dec + search_height / 2
+
+        # Collect bounds from footprints whose centroid lies inside the cutout.
+        all_ra, all_dec = [], []
+        for _, row in obs_df.iterrows():
+            bbox = _footprint_bbox(str(row.get('s_region', '')))
+            if not bbox:
+                continue
+            cra  = (bbox[0] + bbox[1]) / 2
+            cdec = (bbox[2] + bbox[3]) / 2
+            if cut_ra_lo <= cra <= cut_ra_hi and cut_dec_lo <= cdec <= cut_dec_hi:
+                all_ra  += [bbox[0], bbox[1]]
+                all_dec += [bbox[2], bbox[3]]
+        if gaia_df is not None and len(gaia_df) > 0:
+            all_ra  += list(gaia_df['ra'].values)
+            all_dec += list(gaia_df['dec'].values)
+
+        if all_ra:
+            span_ra  = max(all_ra)  - min(all_ra)
+            span_dec = max(all_dec) - min(all_dec)
+            data_ra_lo  = min(all_ra)  - span_ra  * pad_factor
+            data_ra_hi  = max(all_ra)  + span_ra  * pad_factor
+            data_dec_lo = min(all_dec) - span_dec * pad_factor
+            data_dec_hi = max(all_dec) + span_dec * pad_factor
+            # Clamp: zoom in freely, but never exceed the cutout.
+            ra_lo  = max(cut_ra_lo,  data_ra_lo)
+            ra_hi  = min(cut_ra_hi,  data_ra_hi)
+            dec_lo = max(cut_dec_lo, data_dec_lo)
+            dec_hi = min(cut_dec_hi, data_dec_hi)
+        else:
+            # No footprints inside cutout — show full cutout.
+            ra_lo, ra_hi   = cut_ra_lo,  cut_ra_hi
+            dec_lo, dec_hi = cut_dec_lo, cut_dec_hi
+
+        center_dec = (dec_lo + dec_hi) / 2
+    else:
+        all_ra, all_dec = [], []
+        for _, row in obs_df.iterrows():
+            bbox = _footprint_bbox(str(row.get('s_region', '')))
+            if bbox:
+                all_ra  += [bbox[0], bbox[1]]
+                all_dec += [bbox[2], bbox[3]]
+        if gaia_df is not None and len(gaia_df) > 0:
+            all_ra  += list(gaia_df['ra'].values)
+            all_dec += list(gaia_df['dec'].values)
+        if not all_ra:
+            plt.close(fig)
+            return
+        pad_ra  = (max(all_ra)  - min(all_ra))  * pad_factor
+        pad_dec = (max(all_dec) - min(all_dec)) * pad_factor
+        ra_lo, ra_hi   = min(all_ra) - pad_ra, max(all_ra) + pad_ra
+        dec_lo, dec_hi = min(all_dec) - pad_dec, max(all_dec) + pad_dec
+        center_dec = (dec_lo + dec_hi) / 2
+
+    ax.set_xlim(ra_hi, ra_lo)   # RA right-to-left
+    ax.set_ylim(dec_lo, dec_hi)
+    ax.set_aspect(1.0 / np.cos(np.deg2rad(center_dec)), adjustable='box')
 
     # ── Legend, labels, title ─────────────────────────────────────────────────
     if filter_patches:
@@ -799,7 +867,6 @@ def plot_footprints(
     title = f'{field_name} — HST footprints' if field_name else 'HST footprints'
     ax.set_title(title, fontsize=12)
 
-    plt.tight_layout()
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)

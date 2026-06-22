@@ -332,6 +332,7 @@ def prepare_jax_inputs(
     y_offset: float = 0.0,
     psf_coeffs_cube: np.ndarray | None = None,
     restore_fluxes: np.ndarray | None = None,
+    n_jobs: int = 1,
 ) -> dict:
     """Batch all stars into fixed-shape NumPy arrays for the JAX kernel.
 
@@ -396,7 +397,7 @@ def prepare_jax_inputs(
     ts      = tile_side(hw, psf_scale)
     tr      = tile_radius(hw, psf_scale)
 
-    psf_tiles_out       = np.empty((n_stars, ts, ts),   dtype=np.float32)
+    psf_peak_out        = np.empty(n_stars,              dtype=np.float32)
     psf_coeff_tiles_out = np.empty((n_stars, ts, ts),   dtype=np.float64)
     pixel_vals_out      = np.empty((n_stars, n_pix),    dtype=np.float64)
     pixel_var_out       = np.empty((n_stars, n_pix),    dtype=np.float64)
@@ -408,7 +409,7 @@ def prepare_jax_inputs(
     xi_out              = np.empty(n_stars,             dtype=np.int32)
     yi_out              = np.empty(n_stars,             dtype=np.int32)
 
-    for i in range(n_stars):
+    def _process_star(i):
         x0  = float(xs_stars[i])
         y0  = float(ys_stars[i])
         sky = float(sky_estimates[i])
@@ -453,14 +454,22 @@ def prepare_jax_inputs(
         # Restore this star's flux into its pixel window (refit mode only).
         # residual image has all stars subtracted; adding back flux_k lets
         # the solver see an isolated star instead of a star-shaped hole.
-        if restore_fluxes is not None and restore_fluxes[i] != 0.0:
+        rf = restore_fluxes[i] if restore_fluxes is not None else 0.0
+        if rf != 0.0:
             P_restore, _, _ = eval_psf_on_tile(coeff_tile, dx0, dy0, hw, psf_scale)
             pv = pv.copy()
-            pv[valid] += restore_fluxes[i] * P_restore[valid]
+            pv[valid] += rf * P_restore[valid]
 
         flux, sky_fit = flux_sky_init(coeff_tile, pv, valid, dx0, dy0, hw, psf_scale, sky)
 
-        psf_tiles_out[i]       = tile
+        return tile[tr, tr], coeff_tile, pv, pvar, valid, dx0, dy0, flux, sky_fit, xi, yi
+
+    # Threading does not help here: Python-level GIL overhead in interpolate_psf
+    # serializes all threads regardless of n_jobs. Run serially.
+    results = [_process_star(i) for i in range(n_stars)]
+
+    for i, (psf_peak, coeff_tile, pv, pvar, valid, dx0, dy0, flux, sky_fit, xi, yi) in enumerate(results):
+        psf_peak_out[i]        = psf_peak
         psf_coeff_tiles_out[i] = coeff_tile
         pixel_vals_out[i]      = pv
         pixel_var_out[i]       = pvar
@@ -473,7 +482,7 @@ def prepare_jax_inputs(
         yi_out[i]              = yi
 
     return dict(
-        psf_tiles       = psf_tiles_out,
+        psf_peak        = psf_peak_out,
         psf_coeff_tiles = psf_coeff_tiles_out,
         pixel_vals      = pixel_vals_out,
         pixel_var_rn    = pixel_var_out,
@@ -772,13 +781,17 @@ def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool):
         return P, dPdx, dPdy
 
     def _atwa_and_atwr(A0, A1, A2, A3, w, r):
-        """Build 4×4 weighted normal-equation matrix and 4-vector RHS."""
-        cols = (A0, A1, A2, A3)
-        AtWA = jnp.array([
-            [jnp.dot(cols[i], cols[j] * w) for j in range(4)]
-            for i in range(4)
-        ])
-        AtWr = jnp.array([jnp.dot(cols[i], w * r) for i in range(4)])
+        """Build 4×4 weighted normal-equation matrix and 4-vector RHS.
+
+        A = stack([A0,A1,A2,A3])  shape (4, n_pix)
+        AtWA = A @ diag(w) @ A.T = (A*w) @ A.T   — one (4,4) matmul
+        AtWr = A @ diag(w) @ r   = (A*w) @ r     — one (4,) matvec
+        Replaces 20 scalar dot products with 2 BLAS calls.
+        """
+        A = jnp.stack([A0, A1, A2, A3], axis=0)  # (4, n_pix)
+        Aw = A * w                                 # (4, n_pix)
+        AtWA = Aw @ A.T                            # (4, 4)
+        AtWr = Aw @ r                              # (4,)
         return AtWA, AtWr
 
     def _fit_one(coeff_tile, pixel_vals, pixel_var_rn, valid_f,
@@ -877,10 +890,15 @@ def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool):
         return (flux, dx, dy, sky, cov, n_iter, converged, _dm,
                 qfit, chi2, psf_frac, central_res)
 
-    _batched = jax.jit(jax.vmap(
-        _fit_one,
-        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, None, None),
-    ))
+    n_devices = len(jax.devices())
+    _vmapped = jax.vmap(_fit_one, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, None, None))
+    if n_devices > 1:
+        # pmap distributes shards across virtual CPU devices (each device gets its
+        # own OS thread and a portion of the XLA thread pool), then vmap maps over
+        # stars within each shard. Inputs must be pre-shaped (n_devices, n_per_device, ...).
+        _batched = jax.pmap(_vmapped, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, None, None))
+    else:
+        _batched = jax.jit(_vmapped)
     return _batched
 
 
@@ -917,44 +935,116 @@ def fit_batch_jax(
         psf_frac           : (n_stars,) float64 — PSF value at center pixel
         central_res        : (n_stars,) float64 — normalised central residual
     """
+    import math
+    import jax
     import jax.numpy as jnp
 
-    hw         = inputs_dict['hw']
-    psf_scale  = inputs_dict['psf_scale']
-    has_nm     = inputs_dict.get('has_noise_map', False)
+    hw        = inputs_dict['hw']
+    psf_scale = inputs_dict['psf_scale']
+    has_nm    = inputs_dict.get('has_noise_map', False)
+    n_stars   = len(inputs_dict['dx0'])
+    n_devices = len(jax.devices())
 
-    cache_key = (hw, psf_scale, has_nm)
+    # Process stars in fixed-size chunks so the JAX compiled kernel shape is
+    # always CHUNK_SIZE regardless of image star count.  Benefits:
+    #   1. One XLA compilation total (reused across all images and all chunks)
+    #      eliminating the unbounded [anon] mmap growth (~750 MB per unique size)
+    #   2. Peak tile memory per call = CHUNK_SIZE × ts × ts × 8 bytes instead
+    #      of n_stars × ts × ts × 8 (e.g. 77 MB vs 363 MB for 47k stars)
+    # Dummy pad stars have all-zero valid_masks; outputs are trimmed to n_stars.
+    CHUNK_SIZE = 10_000
+
+    cache_key = (hw, psf_scale, has_nm, n_devices)
     if cache_key not in _JAX_KERNEL_CACHE:
         _JAX_KERNEL_CACHE[cache_key] = _build_jax_kernel(hw, psf_scale, has_nm)
     _fn = _JAX_KERNEL_CACHE[cache_key]
 
-    tiles  = jnp.array(inputs_dict['psf_coeff_tiles'], dtype=jnp.float64)
-    pvals  = jnp.array(inputs_dict['pixel_vals'],      dtype=jnp.float64)
-    pvar   = jnp.array(inputs_dict['pixel_var_rn'],    dtype=jnp.float64)
-    vmask  = jnp.array(inputs_dict['valid_masks'],     dtype=jnp.float64)
-    dx0    = jnp.array(inputs_dict['dx0'],           dtype=jnp.float64)
-    dy0    = jnp.array(inputs_dict['dy0'],           dtype=jnp.float64)
-    flux0  = jnp.array(inputs_dict['flux0'],         dtype=jnp.float64)
-    sky0   = jnp.array(inputs_dict['sky0'],          dtype=jnp.float64)
+    result_keys = ('flux','dx','dy','sky','cov','n_iter','converged',
+                   'delta_max','qfit','chi2','psf_frac','central_res')
+    chunks_out = {k: [] for k in result_keys}
 
-    (flux, dx, dy, sky, cov, n_iter, converged, delta_max,
-     qfit, chi2, psf_frac, central_res) = _fn(
-        tiles, pvals, pvar, vmask,
-        dx0, dy0, flux0, sky0,
-        float(gain), float(tol), int(max_iter),
-    )
+    for chunk_start in range(0, n_stars, CHUNK_SIZE):
+        chunk_end = min(chunk_start + CHUNK_SIZE, n_stars)
+        n_chunk   = chunk_end - chunk_start
+        pad       = CHUNK_SIZE - n_chunk
 
-    return dict(
-        flux        = np.asarray(flux),
-        dx          = np.asarray(dx),
-        dy          = np.asarray(dy),
-        sky         = np.asarray(sky),
-        cov         = np.asarray(cov),
-        n_iter      = np.asarray(n_iter),
-        converged   = np.asarray(converged),
-        delta_max   = np.asarray(delta_max),
-        qfit        = np.asarray(qfit),
-        chi2        = np.asarray(chi2),
-        psf_frac    = np.asarray(psf_frac),
-        central_res = np.asarray(central_res),
+        def _c1d(key, fill=0.0):
+            a = jnp.array(inputs_dict[key][chunk_start:chunk_end], dtype=jnp.float64)
+            if pad:
+                a = jnp.concatenate([a, jnp.full((pad,), fill, dtype=jnp.float64)])
+            return a
+
+        def _c2d(key, fill=0.0):
+            a = jnp.array(inputs_dict[key][chunk_start:chunk_end], dtype=jnp.float64)
+            if pad:
+                a = jnp.concatenate([a, jnp.full((pad,) + a.shape[1:], fill, dtype=jnp.float64)])
+            return a
+
+        if n_devices > 1:
+            extra  = (-CHUNK_SIZE) % n_devices
+            n_total = CHUNK_SIZE + extra
+            n_per   = n_total // n_devices
+
+            def _prep_pmap(key, is2d, fill=0.0):
+                a = _c2d(key, fill) if is2d else _c1d(key, fill)
+                if extra:
+                    a = jnp.concatenate([a, jnp.full((extra,) + a.shape[1:], fill, dtype=jnp.float64)])
+                return a.reshape((n_devices, n_per) + a.shape[1:])
+
+            tiles = _prep_pmap('psf_coeff_tiles', True)
+            pvals = _prep_pmap('pixel_vals',      True)
+            pvar  = _prep_pmap('pixel_var_rn',    True)
+            vmask = _prep_pmap('valid_masks',      True)
+            dx0   = _prep_pmap('dx0',              False)
+            dy0   = _prep_pmap('dy0',              False)
+            flux0 = _prep_pmap('flux0',            False, fill=1.0)
+            sky0  = _prep_pmap('sky0',             False)
+
+            result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
+                         float(gain), float(tol), int(max_iter))
+
+            def _trim(a):
+                return np.asarray(a.reshape((-1,) + a.shape[2:])[:n_chunk])
+        else:
+            tiles = _c2d('psf_coeff_tiles')
+            pvals = _c2d('pixel_vals')
+            pvar  = _c2d('pixel_var_rn')
+            vmask = _c2d('valid_masks')
+            dx0   = _c1d('dx0')
+            dy0   = _c1d('dy0')
+            flux0 = _c1d('flux0', fill=1.0)
+            sky0  = _c1d('sky0')
+
+            result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
+                         float(gain), float(tol), int(max_iter))
+
+            def _trim(a):
+                return np.asarray(a[:n_chunk])
+
+        (flux, dx, dy, sky, cov, n_iter, converged, delta_max,
+         qfit, chi2, psf_frac, central_res) = result
+
+        for k, v in zip(result_keys, (flux, dx, dy, sky, cov, n_iter, converged,
+                                      delta_max, qfit, chi2, psf_frac, central_res)):
+            chunks_out[k].append(_trim(v))
+
+        # Explicitly free JAX device arrays for this chunk before the next.
+        del tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0, result
+        del flux, dx, dy, sky, cov, n_iter, converged, delta_max
+        del qfit, chi2, psf_frac, central_res
+
+    out = dict(
+        flux        = np.concatenate(chunks_out['flux']),
+        dx          = np.concatenate(chunks_out['dx']),
+        dy          = np.concatenate(chunks_out['dy']),
+        sky         = np.concatenate(chunks_out['sky']),
+        cov         = np.concatenate(chunks_out['cov']),
+        n_iter      = np.concatenate(chunks_out['n_iter']),
+        converged   = np.concatenate(chunks_out['converged']),
+        delta_max   = np.concatenate(chunks_out['delta_max']),
+        qfit        = np.concatenate(chunks_out['qfit']),
+        chi2        = np.concatenate(chunks_out['chi2']),
+        psf_frac    = np.concatenate(chunks_out['psf_frac']),
+        central_res = np.concatenate(chunks_out['central_res']),
     )
+    return out

@@ -314,7 +314,7 @@ def refit_stars_jax(residual, records, psf_cube, xs, ys, psf_scale, hw,
                     zero_point, max_iter, tol, psf_coeffs_cube=None,
                     sat_threshold=float('inf'), verbose=False,
                     sigma_clip=True, sigma_clip_sigma=4.0, sigma_clip_iter=2,
-                    psf_cache=None):
+                    psf_cache=None, n_jobs=1):
     """Re-fit all stars via leave-one-out batch fitting using JAX.
 
     Jacobi (parallel) equivalent of ``refit_stars``: each star's pixel window
@@ -353,8 +353,8 @@ def refit_stars_jax(residual, records, psf_cube, xs, ys, psf_scale, hw,
         x_offset=x_offset, y_offset=y_offset,
         psf_coeffs_cube=psf_coeffs_cube,
         restore_fluxes=restore_fluxes,
+        n_jobs=n_jobs,
     )
-
     jax_res = fit_batch_jax(inputs, gain=gain, tol=tol, max_iter=max_iter)
 
     if sigma_clip and sigma_clip_iter > 0:
@@ -371,6 +371,9 @@ def refit_stars_jax(residual, records, psf_cube, xs, ys, psf_scale, hw,
         gain=gain, zero_point=zero_point,
         sat_threshold=sat_threshold,
     )
+    # Free the large tile arrays now that fitting, sigma-clip, and
+    # record conversion are done.
+    del inputs, jax_res
 
     ny, nx = residual.shape
     _cube      = psf_coeffs_cube if psf_coeffs_cube is not None else psf_cube

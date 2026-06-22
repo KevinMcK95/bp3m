@@ -1750,6 +1750,54 @@ class BP3MSolver:
 
         return n_new
 
+    def compute_analytic_posteriors(self, r_hat, C_r, a_arr, K_img, C_vT):
+        """Compute exactly marginalised per-star posteriors analytically.
+
+        Analytic counterpart to sample_posteriors.  The conditional stellar mean
+        is a linear function of r:
+
+            v_i(r) = a_arr_i + C_vT_i  Σ_j K_{ij}  (r_j − r_hat_j)
+
+        Marginalising over r ~ N(r_hat, C_r) gives:
+
+            v_mean_i  = a_arr_i                    (mean unchanged)
+            C_extra_i = (C_vT_i K_i) C_r (C_vT_i K_i)^T
+
+        where K_i = Σ_{detections of star i across all images} K_{ij}
+        is the (5, n_r_tot) linear sensitivity of v_i to r.
+
+        Returns
+        -------
+        v_mean : (n_stars, 5)      same as a_arr (no change in mean)
+        v_cov  : (n_stars, 5, 5)  C_extra = C_u − C_vT  (add C_vT to get full C_u)
+        """
+        nr      = self.N_R
+        n_r_tot = nr * self.n_images
+        n_stars = self.n_stars
+
+        # Build K_all[i, :, cs:cs+nr] = Σ_{detections of star i in img j} K_{ij}
+        K_all = np.zeros((n_stars, 5, n_r_tot))
+
+        for j_idx, img in enumerate(self.image_names):
+            if K_img.get(img) is None:
+                continue
+            d = self._img_data[img]
+            use_fit    = d['use_for_fit']
+            use_astrom = d.get('use_for_astrom', use_fit)
+            use_any    = use_fit | use_astrom
+            if not use_any.any():
+                continue
+            sidx = d['sidx'][use_any]
+            K    = K_img[img][use_any]   # (n, 5, nr)
+            cs   = j_idx * nr
+            np.add.at(K_all[:, :, cs:cs + nr], sidx, K)
+
+        # C_extra[i] = (C_vT[i] @ K_all[i]) @ C_r @ (C_vT[i] @ K_all[i]).T
+        CvT_K   = np.einsum('nij,njk->nik', C_vT, K_all)           # (n_stars, 5, n_r_tot)
+        C_extra = CvT_K @ C_r @ np.swapaxes(CvT_K, -1, -2)        # (n_stars, 5, 5)
+
+        return a_arr.copy(), C_extra
+
     def sample_posteriors(self, r_hat, C_r, a_arr, K_img, C_vT,
                           n_samples=1000, seed=42):
         """

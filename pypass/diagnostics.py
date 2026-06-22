@@ -612,25 +612,30 @@ def plot_catalog_stats(records, output=None, title=None, floor_params=None):
         if result is None:
             return _empty
 
-        bin_mags, bin_smooth, bin_raw, bin_unc, extrap_mags, extrap_chi2 = result
+        (bin_mags, bin_smooth, bin_raw, bin_unc,
+         extrap_mags, extrap_chi2,
+         extrap_faint_mags, extrap_faint_chi2) = result
 
         try:
             from scipy.interpolate import PchipInterpolator as _Pchip
         except ImportError:
             return _empty
 
-        # Include extrap points in the PCHIP so the curve extends to the data edge
+        # Include bright- and faint-end anchor points so the curve extends
+        # to the data edge without flat-clamping.
+        pchip_mags = bin_mags
+        pchip_chi2 = bin_smooth
         if extrap_mags.size:
-            pchip_mags  = np.concatenate([extrap_mags, bin_mags])
-            pchip_chi2  = np.concatenate([extrap_chi2, bin_smooth])
-        else:
-            pchip_mags  = bin_mags
-            pchip_chi2  = bin_smooth
+            pchip_mags = np.concatenate([extrap_mags,       pchip_mags])
+            pchip_chi2 = np.concatenate([extrap_chi2,       pchip_chi2])
+        if extrap_faint_mags.size:
+            pchip_mags = np.concatenate([pchip_mags, extrap_faint_mags])
+            pchip_chi2 = np.concatenate([pchip_chi2, extrap_faint_chi2])
 
         pchip     = _Pchip(pchip_mags, pchip_chi2)
         mag_fine  = np.linspace(float(mags_u.min()), float(mags_u.max()), 300)
         chi2_fine = np.clip(pchip(mag_fine), 0.1, 20.0)
-        # Clamp outside the fitted range
+        # Clamp outside the anchor range
         chi2_fine = np.where(mag_fine <= pchip_mags[0],  float(pchip_chi2[0]),  chi2_fine)
         chi2_fine = np.where(mag_fine >= pchip_mags[-1], float(pchip_chi2[-1]), chi2_fine)
 

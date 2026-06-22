@@ -344,6 +344,17 @@ def make_plots(solver, images, gaia_catalog,
     print("  Plotting HST chi2 distributions...")
     _plot_chi2_distributions(solver, r_hat, v_hat, plot_dir)
 
+    # ── Figures: sky map + CMDs coloured by PM size / uncertainty ────────────
+    print("  Plotting sky distribution and colour-magnitude diagrams...")
+    _gc = solver.gaia_cat
+    ra   = _gc["ra"].to_numpy(float)
+    dec  = _gc["dec"].to_numpy(float)
+    bp_rp = _gc["bp_rp"].to_numpy(float) if "bp_rp" in _gc.columns else np.full(len(_gc), np.nan)
+    pm_size = np.sqrt(pmra_bp3m**2 + pmdec_bp3m**2)
+    pm_unc  = np.sqrt(sig_pmra_bp3m**2 + sig_pmdec_bp3m**2)
+    ok = bp3m_converged & np.isfinite(gmag) & np.isfinite(pm_size)
+    _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir)
+
     # ── Figure: HST XY residuals + BP3M proper motions on detector ───────────
     if not plot_residuals:
         print(f"  All plots saved to {plot_dir}/")
@@ -598,6 +609,63 @@ def _style_ax(ax):
     ax.grid(True, which="major", linestyle="-",  linewidth=0.5, alpha=0.6)
     ax.grid(True, which="minor", linestyle=":",  linewidth=0.3, alpha=0.4)
     ax.tick_params(which="both", direction="in", top=True, right=True)
+
+
+def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir):
+    """Three panels: sky map coloured by |PM|, CMD coloured by |PM|, CMD coloured by σ_PM."""
+    from matplotlib.colors import LogNorm
+
+    # --- common colour scales (log-normalised) ---
+    pm_vals  = pm_size[ok & (pm_size > 0)]
+    unc_vals = pm_unc[ok & (pm_unc > 0)]
+    vmin_pm  = float(np.nanpercentile(pm_vals,  1))
+    vmax_pm  = float(np.nanpercentile(pm_vals, 99))
+    vmin_unc = float(np.nanpercentile(unc_vals,  1))
+    vmax_unc = float(np.nanpercentile(unc_vals, 99))
+
+    norm_pm  = LogNorm(vmin=max(vmin_pm,  1e-3), vmax=vmax_pm)
+    norm_unc = LogNorm(vmin=max(vmin_unc, 1e-3), vmax=vmax_unc)
+    cmap_pm  = "plasma"
+    cmap_unc = "viridis"
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6), layout="constrained")
+    ms = 6
+
+    # ── Panel 1: sky distribution coloured by |PM| ──────────────────────────
+    ax = axes[0]
+    sc = ax.scatter(ra[ok], dec[ok], c=pm_size[ok], cmap=cmap_pm,
+                    norm=norm_pm, s=ms, linewidths=0, rasterized=True)
+    plt.colorbar(sc, ax=ax, label="|PM| (mas/yr)")
+    ax.set_xlabel("R.A. (deg)")
+    ax.set_ylabel("Dec. (deg)")
+    ax.set_title("Sky distribution  (colour = |PM|)")
+    ax.invert_xaxis()
+    _style_ax(ax)
+
+    # ── Panel 2: CMD coloured by |PM| ───────────────────────────────────────
+    ax = axes[1]
+    has_cmd = ok & np.isfinite(bp_rp)
+    sc = ax.scatter(bp_rp[has_cmd], gmag[has_cmd], c=pm_size[has_cmd],
+                    cmap=cmap_pm, norm=norm_pm, s=ms, linewidths=0, rasterized=True)
+    plt.colorbar(sc, ax=ax, label="|PM| (mas/yr)")
+    ax.set_xlabel("Gaia BP − RP (mag)")
+    ax.set_ylabel("Gaia G (mag)")
+    ax.set_title("CMD  (colour = |PM|)")
+    ax.invert_yaxis()
+    _style_ax(ax)
+
+    # ── Panel 3: CMD coloured by PM uncertainty ──────────────────────────────
+    ax = axes[2]
+    sc = ax.scatter(bp_rp[has_cmd], gmag[has_cmd], c=pm_unc[has_cmd],
+                    cmap=cmap_unc, norm=norm_unc, s=ms, linewidths=0, rasterized=True)
+    plt.colorbar(sc, ax=ax, label="σ_PM (mas/yr)")
+    ax.set_xlabel("Gaia BP − RP (mag)")
+    ax.set_ylabel("Gaia G (mag)")
+    ax.set_title("CMD  (colour = σ_PM)")
+    ax.invert_yaxis()
+    _style_ax(ax)
+
+    _save(fig, plot_dir / "sky_cmd_pm.png")
 
 
 def _save(fig, path):
