@@ -1827,10 +1827,12 @@ def run_alignment_cte(
     n_iter_bp3m: int = 10,
     n_iter_cte: int = 8,
     n_samples: int = 1000,
+    mcmc_posteriors: bool = False,
     clip_sigma: float = 4.5,
     poly_order: int = 1,
     use_sparse: bool = False,
     no_plots: bool = False,
+    plot_residuals: bool = False,
     hst_enable_iter: int = 5,
     hst_max_pm_unc: float = 5.0,
     hst_max_per_image: int = 100_000,
@@ -2156,10 +2158,14 @@ def run_alignment_cte(
     print(f"  Saved: cte_params.npz  "
           f"(δ_hi={cte_params['hi'].delta:.4f}, δ_lo={cte_params['lo'].delta:.4f})")
 
-    # ── Sample posteriors ──────────────────────────────────────────────────────
-    print(f"  Drawing {n_samples} posterior samples...")
-    r_samp, v_mean, v_cov = solver.sample_posteriors(
-        r_hat, C_r, a_arr, K_img, C_vT, n_samples=n_samples)
+    # ── Posteriors ────────────────────────────────────────────────────────────
+    if mcmc_posteriors:
+        print(f"  Drawing {n_samples} posterior samples (MCMC marginalisation)...")
+        _, v_mean, v_cov = solver.sample_posteriors(
+            r_hat, C_r, a_arr, K_img, C_vT, n_samples=n_samples)
+    else:
+        print(f"  Computing analytic marginalised posteriors...")
+        v_mean, v_cov = solver.compute_analytic_posteriors(r_hat, C_r, a_arr, K_img, C_vT)
 
     # ── Save results (same format as v2) ──────────────────────────────────────
     _save_results(
@@ -2175,6 +2181,17 @@ def run_alignment_cte(
             **{f'delta_{c}': float(cte_params[c].delta) for c in ('hi', 'lo')},
         },
     )
+
+    # ── Star influence ────────────────────────────────────────────────────────
+    print("  Computing star influence metrics...")
+    try:
+        import pandas as _pd
+        influence_df = solver.compute_star_influence(r_hat, C_r, a_arr)
+        influence_df.to_csv(output_cte / "star_influence.csv", index=False)
+        print(f"  Saved: star_influence.csv  ({len(influence_df)} star-image pairs)")
+    except Exception as _exc:
+        print(f"  WARNING: star influence computation failed — {_exc}")
+        import traceback; traceback.print_exc()
 
     # ── Save post-CTE full-catalog residuals ──────────────────────────────────
     print("\n  Saving post-CTE full-catalog residuals...")
@@ -2219,7 +2236,8 @@ def run_alignment_cte(
             print("  Generating standard BP3M diagnostic plots...")
             make_plots(solver, imgs, gaia_catalog,
                        r_hat, v_hat, v_mean, v_cov, C_vT, C_r,
-                       output_dir=output_cte)
+                       output_dir=output_cte,
+                       plot_residuals=plot_residuals)
         except Exception as exc:
             print(f"  WARNING: standard plots failed — {exc}")
 
