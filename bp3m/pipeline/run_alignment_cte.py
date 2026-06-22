@@ -2836,6 +2836,7 @@ def run_alignment_joint_cte(
 
     from .data_loader_master import load_master_v2
     from .run_alignment_v2 import (
+        V2AlignmentCallback,
         _load_full_catalog_df,
         _compute_full_catalog_residuals_from_df,
     )
@@ -2965,6 +2966,24 @@ def run_alignment_joint_cte(
         d = solver._img_data.get(img)
         if d is not None and 'xys_orig' not in d:
             d['xys_orig'] = d['xys'].copy()
+
+    # ── Pre-enable HST-only stars for astrometry (use_for_astrom only) ────────
+    # HST-only sources start with use_for_alignment=False so the solver never
+    # enables them via the standard quality filter.  Here we do the equivalent
+    # of V2AlignmentCallback's transition step: enable sources with ≥ 2
+    # detections as use_for_astrom=True (NOT use_for_fit) and seed their
+    # v_survey PMs from the crossmatch values in the catalog.
+    print("  Pre-enabling HST-only stars for astrometry...")
+    _pm_seed = None
+    if 'pmra_xmatch' in gaia_catalog.columns and 'pmdec_xmatch' in gaia_catalog.columns:
+        _pm_seed = gaia_catalog[['pmra_xmatch', 'pmdec_xmatch']].to_numpy(float)
+    _v2cb = V2AlignmentCallback(
+        hst_star_mask=hst_only_mask,
+        hst_enable_iter=1,
+        pm_init=_pm_seed,
+    )
+    solver._r_hat_current = r_init_hat
+    _v2cb(solver, it_outer=1)   # transition: enables hst-only stars with n_det >= 2
 
     # ── Population mean PM prior from Gaia cross-match ────────────────────────
     _ws_field_pm = _compute_warmstart_field_pm(data_root, field_name)
