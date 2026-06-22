@@ -53,6 +53,8 @@ def main():
                         help='Sigma for PM-distance membership selection')
     parser.add_argument('--regularize_gamma', type=float, default=1e-8,
                         help='Diagonal regularisation on H_gamma')
+    parser.add_argument('--pm_sys_floor', type=float, default=0.2,
+                        help='Systematic PM floor for membership sigma-clipping (mas/yr)')
     # Alignment options
     parser.add_argument('--poly_order', type=int, default=1)
     parser.add_argument('--hst_max_pm_unc', type=float, default=5.0)
@@ -76,6 +78,7 @@ def main():
         n_iter_joint=args.n_iter,
         member_sigma_clip=args.member_sigma_clip,
         regularize_gamma=args.regularize_gamma,
+        pm_sys_floor=args.pm_sys_floor,
         poly_order=args.poly_order,
         hst_max_pm_unc=args.hst_max_pm_unc,
         hst_max_per_image=args.hst_max_per_image,

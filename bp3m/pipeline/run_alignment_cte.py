@@ -150,12 +150,17 @@ def _inject_mag_inst(solver, image_names: list, filtered_spi: dict,
         if d is None:
             continue
         spi_df = filtered_spi.get(img)
-        if spi_df is None or 'mag_gdc' not in spi_df.columns:
+        if spi_df is None:
+            continue
+        mag_col = ('mag_gdc' if 'mag_gdc' in spi_df.columns
+                   else 'mag' if 'mag' in spi_df.columns
+                   else None)
+        if mag_col is None:
             continue
 
-        # Build Gaia_id → mag_gdc lookup (vectorized, no iterrows)
+        # Build Gaia_id → mag lookup (vectorized, no iterrows)
         _gids = spi_df['Gaia_id'].to_numpy(dtype=np.int64)
-        _mags = spi_df['mag_gdc'].to_numpy(dtype=float)
+        _mags = spi_df[mag_col].to_numpy(dtype=float)
         gid_to_mag = {int(_gids[k]): float(_mags[k]) for k in range(len(spi_df))}
 
         sidx = d['sidx']
@@ -979,6 +984,7 @@ def _select_members_from_a(
     n_iter: int = 5,
     min_members: int = 5,
     init_window_masyr: float = 2.0,
+    pm_sys_floor: float = 0.2,
 ) -> np.ndarray:
     """
     Sigma-clip on PM distance from mu_pop to identify likely cluster members.
@@ -1024,7 +1030,7 @@ def _select_members_from_a(
         if keep.sum() < min_members:
             break
         sigma    = float(np.median(dist[keep])) / 0.6745
-        sigma    = max(sigma, 0.005)
+        sigma    = max(sigma, pm_sys_floor)
         new_keep = np.isfinite(dist) & (dist < sigma_clip * sigma)
         if new_keep.sum() == keep.sum():
             break
@@ -2193,6 +2199,7 @@ def _run_joint_cte_loop(
     n_iter: int = 20,
     member_sigma_clip: float = 3.0,
     regularize_gamma: float = 1e-8,
+    pm_sys_floor: float = 0.2,
 ) -> tuple:
     """
     Outer Gauss-Newton loop for the joint (r, γ_CTE, μ_pop) solve.
@@ -2295,7 +2302,8 @@ def _run_joint_cte_loop(
         # Refine member selection from posterior PMs
         member_sidx = _select_members_from_a(
             a_arr, mu_pop_current, hst_only_mask, n_hst,
-            sigma_clip=member_sigma_clip)
+            sigma_clip=member_sigma_clip,
+            pm_sys_floor=pm_sys_floor)
 
         # Convergence diagnostics
         dr   = float(np.max(np.abs(r_hat - r_prev)))
@@ -2773,6 +2781,7 @@ def run_alignment_joint_cte(
     n_iter_joint: int = 20,
     member_sigma_clip: float = 3.0,
     regularize_gamma: float = 1e-8,
+    pm_sys_floor: float = 0.2,
     # Standard alignment options (same defaults as run_alignment_cte)
     poly_order: int = 1,
     use_sparse: bool = False,
@@ -2988,6 +2997,7 @@ def run_alignment_joint_cte(
         n_iter=n_iter_joint,
         member_sigma_clip=member_sigma_clip,
         regularize_gamma=regularize_gamma,
+        pm_sys_floor=pm_sys_floor,
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
     print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
@@ -3005,10 +3015,16 @@ def run_alignment_joint_cte(
         cte_out[f'{chip}_gamma_y']       = p.gamma_y
         cte_out[f'{chip}_y_readout_raw'] = np.array([p.y_readout_raw])
         cte_out[f'{chip}_x0']            = np.array([p.x0])
-    cte_out['t_epoch0_yr'] = np.array([t_epoch0_yr])
-    cte_out['t_launch_yr'] = np.array([t_launch_yr])
-    cte_out['mu_pop_hat']  = mu_pop_hat
-    cte_out['gamma_hat']   = gamma_hat
+    cte_out['t_epoch0_yr']       = np.array([t_epoch0_yr])
+    cte_out['t_launch_yr']       = np.array([t_launch_yr])
+    cte_out['mu_pop_hat']        = mu_pop_hat
+    cte_out['gamma_hat']         = gamma_hat
+    cte_out['mu_pop_prior']      = mu_pop_prior
+    cte_out['mu_pop_prior_sigma'] = np.array([mu_pop_prior_sigma])
+    if C_shared is not None:
+        n_r = C_shared.shape[0] - 22  # n_shared = n_r + n_gamma(20) + n_mu(2)
+        cte_out['C_mu_pop'] = C_shared[-2:, -2:]
+        cte_out['C_gamma']  = C_shared[n_r:n_r + 20, n_r:n_r + 20]
     np.savez(output_dir_joint / 'cte_params.npz', **cte_out)
     print(f"  Saved: cte_params.npz")
 
@@ -3025,9 +3041,10 @@ def run_alignment_joint_cte(
             "sigma_pm":        sigma_pm,
             "plx_pop":         plx_pop,
             "sigma_plx_tot":   sigma_plx_tot,
-            "mu_pop_prior":    mu_pop_prior.tolist(),
-            "mu_pop_hat":      mu_pop_hat.tolist(),
-            "n_iter_joint":    n_iter_joint,
+            "mu_pop_prior":        mu_pop_prior.tolist(),
+            "mu_pop_prior_sigma":  mu_pop_prior_sigma,
+            "mu_pop_hat":          mu_pop_hat.tolist(),
+            "n_iter_joint":        n_iter_joint,
             "poly_order":      poly_order,
             "t_epoch0_yr":     t_epoch0_yr,
             "t_launch_yr":     t_launch_yr,
