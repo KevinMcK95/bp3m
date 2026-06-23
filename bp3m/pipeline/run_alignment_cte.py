@@ -209,6 +209,7 @@ def apply_cte_to_solver(
     cte_params: dict[str, CTEChipParams],
     t_launch_yr: float,
     filtered_spi: dict | None = None,
+    subtract: bool = False,
 ) -> None:
     """
     Apply CTE correction to solver._img_data[img]['xys'] for all images.
@@ -275,7 +276,10 @@ def apply_cte_to_solver(
 
         R_j = solver.R[img]                             # (2, 2)
         delta_cte_pseudo = delta_cte_raw @ R_j.T        # (n, 2)
-        d['xys'] = d['xys_orig'] + delta_cte_pseudo
+        if subtract:
+            d['xys'] = d['xys_orig'] - delta_cte_pseudo
+        else:
+            d['xys'] = d['xys_orig'] + delta_cte_pseudo
 
 
 # ── Residual collection ───────────────────────────────────────────────────────
@@ -3698,9 +3702,10 @@ def run_alignment_joint_cte(
 
     # ── Post-CTE full-catalog residuals ───────────────────────────────────────
     print("\n  Saving post-CTE full-catalog residuals...")
-    # Apply converged CTE to solver xys so residual collector sees corrected positions
+    # Joint solve: gamma satisfies G@gamma ≈ +x_resid, so correction subtracts
+    # (standalone pipeline uses opposite sign convention: A@gamma ≈ -dy, adds)
     apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
-                        filtered_spi=filtered_spi)
+                        filtered_spi=filtered_spi, subtract=True)
     bp3m_gaia_ids = set(int(g) for g in solver.star_id_to_idx.keys() if int(g) > 0)
     out_arrays = _compute_full_catalog_residuals_from_df(
         img_to_df, bp3m_gaia_ids, solver, image_names, r_hat)
