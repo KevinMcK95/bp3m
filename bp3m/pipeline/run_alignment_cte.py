@@ -1224,9 +1224,6 @@ def _diagnose_cte_by_magbin(
     """
     from astropy.time import Time as _ATime
 
-    if mag_bins is None:
-        mag_bins = [(14, 18), (18, 20), (20, 22), (22, 24), (24, 28)]
-
     n_stars = solver.C_survey_inv.shape[0]
     member_mask = np.zeros(n_stars, dtype=bool)
     member_mask[member_sidx] = True
@@ -1234,12 +1231,39 @@ def _diagnose_cte_by_magbin(
     nr      = solver.N_R
     n_gamma = 20
     cte_zero = default_cte_params()
+    _use_two_tier = getattr(solver, '_use_two_tier', False)
+
+    # Auto-range magnitude bins from actual data if not provided
+    if mag_bins is None:
+        _all_mags = []
+        for img in image_names:
+            d = solver._img_data.get(img)
+            if d is None:
+                continue
+            mag = d.get('mag_inst')
+            if mag is None:
+                continue
+            sidx = d['sidx']
+            use_al = d['use_for_fit'] & member_mask[sidx]
+            if _use_two_tier:
+                use_ast = d.get('use_for_astrom', d['use_for_fit']) & member_mask[sidx]
+            else:
+                use_ast = use_al
+            use_m = use_al | use_ast
+            mf = mag[use_m]
+            _all_mags.append(mf[np.isfinite(mf)])
+        if _all_mags:
+            _all_mags = np.concatenate(_all_mags)
+            lo, hi = np.percentile(_all_mags, [2, 98])
+            edges = np.linspace(lo, hi, 7)   # 6 bins
+            mag_bins = [(float(edges[i]), float(edges[i+1])) for i in range(len(edges)-1)]
+            print(f"  Auto mag bins: {lo:.1f} – {hi:.1f}  ({len(mag_bins)} bins)")
+        else:
+            mag_bins = [(14, 18), (18, 20), (20, 22), (22, 24), (24, 28)]
 
     H_bins = {b: np.zeros((n_gamma, n_gamma)) for b in mag_bins}
     b_bins = {b: np.zeros(n_gamma) for b in mag_bins}
     n_bins = {b: 0 for b in mag_bins}
-
-    _use_two_tier = getattr(solver, '_use_two_tier', False)
 
     for j_idx, img in enumerate(image_names):
         d = solver._img_data.get(img)
