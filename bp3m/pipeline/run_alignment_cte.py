@@ -1200,6 +1200,175 @@ def _plot_warmstart_cte(
         traceback.print_exc()
 
 
+def _diagnose_cte_by_magbin(
+    solver,
+    image_names,
+    filtered_spi,
+    t_launch_yr,
+    member_sidx,
+    r_current,
+    mag_bins=None,
+    regularize_gamma=1e-8,
+    output_dir=None,
+    label='warmstart',
+):
+    """
+    Direct (no Schur) gamma regression per magnitude bin with fixed r.
+
+    Fixes r = r_current and marginalises stellar positions analytically, then
+    for each magnitude bin solves: H_gamma_bin @ gamma = GCs_xresid_bin.
+    This bypasses the full Schur complement and directly shows whether the CTE
+    signal is present and magnitude-dependent.
+
+    Returns dict {(mag_lo, mag_hi): gamma_20vec}.
+    """
+    from astropy.time import Time as _ATime
+
+    if mag_bins is None:
+        mag_bins = [(14, 18), (18, 20), (20, 22), (22, 24), (24, 28)]
+
+    n_stars = solver.C_survey_inv.shape[0]
+    member_mask = np.zeros(n_stars, dtype=bool)
+    member_mask[member_sidx] = True
+
+    nr      = solver.N_R
+    n_gamma = 20
+    cte_zero = default_cte_params()
+
+    H_bins = {b: np.zeros((n_gamma, n_gamma)) for b in mag_bins}
+    b_bins = {b: np.zeros(n_gamma) for b in mag_bins}
+    n_bins = {b: 0 for b in mag_bins}
+
+    for j_idx, img in enumerate(image_names):
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+
+        sidx    = d['sidx']
+        use_mem = d['use_for_fit'] & member_mask[sidx]
+        if not use_mem.any():
+            continue
+
+        chip = _chip_from_image(img)
+        if chip is None:
+            continue
+
+        mag = d.get('mag_inst')
+        if mag is None:
+            continue
+
+        p    = cte_zero[chip]
+        Y_c  = d['Y_c']
+        spi_df = filtered_spi.get(img) if filtered_spi else None
+        if (spi_df is not None and 'Y_orig' in spi_df.columns
+                and len(spi_df) == len(mag)):
+            y_raw = spi_df['Y_orig'].to_numpy(float)
+        else:
+            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+
+        cs  = j_idx * nr
+        r_j = r_current[cs:cs + nr]
+        X   = d['X_mat']
+        xys = d.get('xys_orig', d['xys'])
+
+        x_pred  = np.einsum('nkl,l->nk', X, r_j)
+        x_resid = xys - x_pred
+
+        Cs     = solver._compute_Cs(img, r_j)
+        Cs_inv = np.linalg.inv(Cs)
+
+        hst_yr    = float(_ATime(float(solver.images[img]['hst_time_mjd']),
+                                  format='mjd').jyear)
+        dt_scalar = hst_yr - t_launch_yr
+
+        xt  = d['X_c'] / 2048.0
+        yt  = (y_raw - p.y_readout_raw) / 2048.0
+        ok  = np.isfinite(mag) & np.isfinite(y_raw)
+        f1  = np.where(ok, func1_mag(mag), 0.0)
+        PsiB = (dt_scalar * f1)[:, None] * cte_basis(xt, yt)
+
+        cx, cy = (0, 5) if chip == 'hi' else (10, 15)
+        R_j    = r_j[:4].reshape(2, 2)
+        n_det  = len(sidx)
+        G = np.zeros((n_det, 2, n_gamma))
+        G[ok, :, cx:cx+5] = PsiB[ok, None, :] * R_j[None, :, 0:1]
+        G[ok, :, cy:cy+5] = PsiB[ok, None, :] * R_j[None, :, 1:2]
+
+        for b in mag_bins:
+            mag_lo, mag_hi = b
+            in_bin = use_mem & (mag >= mag_lo) & (mag < mag_hi) & ok
+            if not in_bin.any():
+                continue
+            H_bins[b] += np.einsum('nki,nkl,nlj->ij',
+                                   G[in_bin], Cs_inv[in_bin], G[in_bin])
+            b_bins[b] += np.einsum('nki,nkl,nl->i',
+                                   G[in_bin], Cs_inv[in_bin], x_resid[in_bin])
+            n_bins[b] += int(in_bin.sum())
+
+    gamma_bins = {}
+    for b in mag_bins:
+        H = H_bins[b]
+        if np.abs(np.diag(H)).max() < 1e-30:
+            gamma_bins[b] = np.zeros(n_gamma)
+            continue
+        gamma_bins[b] = np.linalg.solve(H + regularize_gamma * np.eye(n_gamma),
+                                        b_bins[b])
+
+    print(f"  CTE γ per mag bin (direct regression, n_mem={len(member_sidx)}):")
+    for b in mag_bins:
+        g = gamma_bins[b]
+        print(f"    mag {b[0]:4.0f}-{b[1]:<4.0f}: n={n_bins[b]:7d}  "
+              f"γ_y_hi[0]={g[5]:+.4e}  γ_y_lo[0]={g[15]:+.4e}  "
+              f"|γ_y_hi|={np.linalg.norm(g[5:10]):.3e}  "
+              f"|γ_y_lo|={np.linalg.norm(g[15:20]):.3e}")
+
+    if output_dir is not None:
+        _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label)
+
+    return gamma_bins
+
+
+def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warmstart'):
+    """Plot γ_y per magnitude bin for CTE diagnostic."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    plot_dir = Path(output_dir) / 'plots'
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    centers = [0.5 * (b[0] + b[1]) for b in mag_bins]
+    gy_hi0  = [float(gamma_bins[b][5])  for b in mag_bins]
+    gy_lo0  = [float(gamma_bins[b][15]) for b in mag_bins]
+    gyn_hi  = [float(np.linalg.norm(gamma_bins[b][5:10]))  for b in mag_bins]
+    gyn_lo  = [float(np.linalg.norm(gamma_bins[b][15:20])) for b in mag_bins]
+    counts  = [n_bins[b] for b in mag_bins]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    for ax, vals, title, ylabel in [
+        (axes[0, 0], gy_hi0, 'γ_y_hi[0] vs mag bin', 'γ_y_hi[0]'),
+        (axes[0, 1], gy_lo0, 'γ_y_lo[0] vs mag bin', 'γ_y_lo[0]'),
+        (axes[1, 0], gyn_hi, '|γ_y_hi| vs mag bin',  '|γ_y_hi|'),
+        (axes[1, 1], gyn_lo, '|γ_y_lo| vs mag bin',  '|γ_y_lo|'),
+    ]:
+        ax.plot(centers, vals, 'o-', lw=2, ms=8)
+        ax.axhline(0, color='k', lw=0.8, ls='--')
+        for xc, yv, nc in zip(centers, vals, counts):
+            ax.text(xc, yv, f'  {nc//1000:.0f}k', fontsize=8, va='bottom')
+        ax.set_xlabel('F814W magnitude')
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+
+    fig.suptitle(f'CTE γ by magnitude bin — direct regression ({label})',
+                 fontsize=12)
+    fig.tight_layout()
+    fname = f'cte_gamma_by_magbin_{label}.png'
+    fig.savefig(plot_dir / fname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved: plots/{fname}")
+
+
 def warm_start_cte(
     solver,
     image_names: list[str],
@@ -1229,6 +1398,15 @@ def warm_start_cte(
     print("  CTE warm start: linear solve for γ with r_init and μ_pop_prior...")
     cte_zero = default_cte_params()
 
+    # Per-magnitude-bin direct regression diagnostic (bypasses Schur complement)
+    gamma_bins = _diagnose_cte_by_magbin(
+        solver, image_names, filtered_spi, t_launch_yr,
+        member_sidx_init, r_init,
+        regularize_gamma=regularize_gamma,
+        output_dir=output_dir,
+        label='warmstart',
+    )
+
     result = _joint_solve_cte(
         solver, image_names, cte_zero, t_launch_yr, filtered_spi,
         member_sidx_init, sigma_pm, plx_pop, sigma_plx_tot,
@@ -1242,7 +1420,7 @@ def warm_start_cte(
     gy_hi = float(np.linalg.norm(gamma_warm[5:10]))
     gy_lo = float(np.linalg.norm(gamma_warm[15:20]))
     gyx0  = float(gamma_warm[5])
-    print(f"  Warm-start γ: γ_y_hi[0]={gyx0:+.4e}  "
+    print(f"  Warm-start γ (joint solve): γ_y_hi[0]={gyx0:+.4e}  "
           f"|γ_y_hi|={gy_hi:.3e}  |γ_y_lo|={gy_lo:.3e}")
     if gyx0 > 0:
         print("  WARNING: warm-start γ_y_hi[0] > 0 (expected negative for ACS CTE)")
@@ -2481,7 +2659,6 @@ def _run_joint_cte_loop(
         pmdec_cat = gaia_catalog['pmdec_xmatch'].to_numpy(float)
         mu_ra, mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
         eligible = (np.isfinite(pmra_cat) & np.isfinite(pmdec_cat)
-                    & (~hst_only_mask)
                     & (np.abs(pmra_cat  - mu_ra)  < init_pm_window)
                     & (np.abs(pmdec_cat - mu_dec) < init_pm_window)
                     & (n_hst >= 1))
@@ -3253,7 +3430,6 @@ def run_alignment_joint_cte(
         _pmdec_cat = gaia_catalog['pmdec_xmatch'].to_numpy(float)
         _mu_ra, _mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
         _elig = (np.isfinite(_pmra_cat) & np.isfinite(_pmdec_cat)
-                 & (~hst_only_mask)
                  & (np.abs(_pmra_cat  - _mu_ra)  < _init_pm_window)
                  & (np.abs(_pmdec_cat - _mu_dec) < _init_pm_window)
                  & (_n_hst_init >= 1))
