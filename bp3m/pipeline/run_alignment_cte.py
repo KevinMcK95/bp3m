@@ -586,11 +586,15 @@ def _joint_solve_cte(
     h_all[member_sidx, 4]   += sigma_plx_inv_sq * plx_pop
 
     # ── Shared-parameter precision and data accumulations ─────────────────────
-    H_rr       = np.zeros((n_r, n_r))
-    H_gamma    = np.zeros((n_gamma, n_gamma))
-    P_rg       = np.zeros((n_r, n_gamma))      # X^T Cs^{-1} G, align ∩ member
-    GCs_xresid = np.zeros(n_gamma)             # G^T Cs^{-1} x_resid, member stars
-    Q_total    = np.zeros((n_stars, N_V, n_gamma))  # summed JUT_Cs @ G per member star
+    H_rr        = np.zeros((n_r, n_r))
+    H_gamma     = np.zeros((n_gamma, n_gamma))
+    P_rg        = np.zeros((n_r, n_gamma))      # X^T Cs^{-1} G, all fitting stars
+    GCs_xresid  = np.zeros(n_gamma)             # G^T Cs^{-1} x_resid, all active stars
+    # Q_total_mem: summed JUT_Cs @ G for member stars only (μ_pop Schur coupling)
+    # Q_total_all: summed JUT_Cs @ G for ALL active stars ((γ,γ) and (r,γ) Schur)
+    Q_total_mem = np.zeros((n_stars, N_V, n_gamma))
+    Q_total_all = np.zeros((n_stars, N_V, n_gamma))
+    active_glob = np.zeros(n_stars, dtype=bool)  # tracks which stars were active
 
     K_img      = {}
     Q_img      = {}
@@ -604,16 +608,18 @@ def _joint_solve_cte(
             Q_img[img] = None
             continue
 
-        sidx       = d["sidx"]
-        use_align  = d["use_for_fit"] & member_mask[sidx]
-        use_astrom = ((d.get("use_for_astrom", d["use_for_fit"])
-                       if getattr(solver, '_use_two_tier', False) else d["use_for_fit"])
-                      & member_mask[sidx])
-        use_any    = use_align | use_astrom
-        use_member = use_any   # all active stars are members by construction
+        sidx         = d["sidx"]
+        # All fitting stars (no member restriction) — constrain r and γ
+        use_fit      = d["use_for_fit"]
+        use_astrom_f = (d.get("use_for_astrom", d["use_for_fit"])
+                        if getattr(solver, '_use_two_tier', False) else d["use_for_fit"])
+        use_any      = use_fit | use_astrom_f          # all active (Gaia + HST-only)
+        # Member stars get tight population PM prior
+        use_member   = use_any & member_mask[sidx]
 
-        sidx_any   = sidx[use_any]
-        sidx_align = sidx[use_align]
+        sidx_any = sidx[use_any]
+        sidx_fit = sidx[use_fit]
+        active_glob[sidx_any] = True
 
         JU  = d["JU"]
         X   = d["X_mat"]
@@ -635,17 +641,18 @@ def _joint_solve_cte(
                   np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
         np.subtract.at(h_all, sidx_any,
                        np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
-        np.subtract.at(h_align, sidx_align,
-                       np.einsum('nik,nk->ni', JUT_Cs[use_align], x_resid[use_align]))
+        np.subtract.at(h_align, sidx_fit,
+                       np.einsum('nik,nk->ni', JUT_Cs[use_fit], x_resid[use_fit]))
 
         K = np.einsum('nik,nkl->nil', JUT_Cs, X)   # (n, 5, N_R)
         K_img[img] = K
 
+        # H_rr and XCs_xresid use all fitting stars (not just members)
         XCsX = np.einsum('nki,nkl,nlj->ij',
-                         X[use_align], Cs_inv[use_align], X[use_align])
+                         X[use_fit], Cs_inv[use_fit], X[use_fit])
         H_rr[cs:cs+nr, cs:cs+nr] += XCsX + d["C_r_prior_inv"]
         XCs_xresid[img] = np.einsum('nki,nkl,nl->ni',
-                                    X[use_align], Cs_inv[use_align], x_resid[use_align])
+                                    X[use_fit], Cs_inv[use_fit], x_resid[use_fit])
 
         # ── CTE design matrix G ────────────────────────────────────────────────
         chip = _chip_from_image(img)
@@ -692,17 +699,22 @@ def _joint_solve_cte(
         Q = np.einsum('nik,nkl->nil', JUT_Cs, G)   # (n, 5, n_gamma)
         Q_img[img] = Q
 
-        if use_member.any():
+        # H_gamma and GCs_xresid accumulate over ALL active stars (not just members)
+        if use_any.any():
             H_gamma    += np.einsum('nki,nkl,nlj->ij',
-                                    G[use_member], Cs_inv[use_member], G[use_member])
+                                    G[use_any], Cs_inv[use_any], G[use_any])
             GCs_xresid += np.einsum('nki,nkl,nl->i',
-                                    G[use_member], Cs_inv[use_member], x_resid[use_member])
-            np.add.at(Q_total, sidx[use_member], Q[use_member])
+                                    G[use_any], Cs_inv[use_any], x_resid[use_any])
+            np.add.at(Q_total_all, sidx[use_any], Q[use_any])
 
-            # use_align already restricted to members, so use_al_mem = use_align
-            if use_align.any():
-                P_rg[cs:cs+nr] += np.einsum('nki,nkl,nlj->ij',
-                                            X[use_align], Cs_inv[use_align], G[use_align])
+        # Q_total_mem only for member stars (needed for (γ,μ) Schur coupling)
+        if use_member.any():
+            np.add.at(Q_total_mem, sidx[use_member], Q[use_member])
+
+        # P_rg couples r and γ for all fitting stars
+        if use_fit.any():
+            P_rg[cs:cs+nr] += np.einsum('nki,nkl,nlj->ij',
+                                         X[use_fit], Cs_inv[use_fit], G[use_fit])
 
     # ── Invert H_vv → C_vT, stellar posteriors ───────────────────────────────
     C_vT    = np.linalg.inv(H_vv)
@@ -742,23 +754,30 @@ def _joint_solve_cte(
     rhs[idx_mu]  = C_pop_prior_inv @ (mu_pop_prior - mu_pop_current)
     rhs[idx_mu] -= sigma_pm_inv_sq * float(len(member_sidx)) * mu_pop_current
 
-    # ── Global Schur corrections from member stars (γ and μ blocks) ───────────
+    # ── Global Schur corrections for γ block (all active stars) ─────────────
+    all_active_sidx = np.where(active_glob)[0]
+    if len(all_active_sidx) > 0:
+        Qt_all    = Q_total_all[all_active_sidx]               # (n_act, 5, n_gamma)
+        Cv_all    = C_vT[all_active_sidx]                      # (n_act, 5, 5)
+        CvT_Q_all = np.einsum('nij,njk->nik', Cv_all, Qt_all) # (n_act, 5, n_gamma)
+
+        # (γ, γ) Schur: -Q_all^T C_vT Q_all  (over all active stars)
+        Lambda[idx_gam, idx_gam] -= np.einsum('nji,njk->ik', Qt_all, CvT_Q_all)
+        # γ rhs: +Q_all^T a  (over all active stars)
+        rhs[idx_gam]             += np.einsum('nji,nj->i',   Qt_all, a[all_active_sidx])
+
+    # ── Global Schur corrections for μ block (member stars only) ─────────────
     if len(member_sidx) > 0:
-        Qt_m     = Q_total[member_sidx]                            # (n_mem, 5, 20)
+        Qt_m     = Q_total_mem[member_sidx]                        # (n_mem, 5, n_gamma)
         Cv_m     = C_vT[member_sidx]                               # (n_mem, 5, 5)
-        CvT_Q_m  = np.einsum('nij,njk->nik', Cv_m, Qt_m)          # (n_mem, 5, 20)
 
-        # (γ, γ) Schur: -Q_total^T C_vT Q_total
-        Lambda[idx_gam, idx_gam] -= np.einsum('nji,njk->ik', Qt_m, CvT_Q_m)
-        rhs[idx_gam]             += np.einsum('nji,nj->i',   Qt_m, a[member_sidx])
-
-        # (γ, μ) Schur: -σ^{-2} Q_total^T C_vT M
+        # (γ, μ) Schur: -σ^{-2} Q_mem^T C_vT M
         CvT_M_m  = Cv_m @ M                                        # (n_mem, 5, 2)
-        QT_CvT_M = np.einsum('nji,njk->ik', Qt_m, CvT_M_m)        # (20, 2)
+        QT_CvT_M = np.einsum('nji,njk->ik', Qt_m, CvT_M_m)        # (n_gamma, 2)
         Lambda[idx_gam, idx_mu] -= sigma_pm_inv_sq * QT_CvT_M
         Lambda[idx_mu, idx_gam] -= sigma_pm_inv_sq * QT_CvT_M.T
 
-        # (μ, μ) Schur: -σ^{-4} Σ_i C_vT_i[2:4, 2:4]  (= M^T C_vT M per star)
+        # (μ, μ) Schur: -σ^{-4} Σ_i C_vT_i[2:4, 2:4]
         Lambda[idx_mu, idx_mu] -= (sigma_pm_inv_sq**2
                                    * Cv_m[:, 2:4, 2:4].sum(axis=0))
 
@@ -771,59 +790,56 @@ def _joint_solve_cte(
         if d is None or K_img.get(img) is None:
             continue
 
-        cs         = j_idx * nr
-        sidx       = d["sidx"]
-        use_align  = d["use_for_fit"] & member_mask[sidx]
-        use_astrom = ((d.get("use_for_astrom", d["use_for_fit"])
-                       if getattr(solver, '_use_two_tier', False) else d["use_for_fit"])
-                      & member_mask[sidx])
-        use_any    = use_align | use_astrom
+        cs       = j_idx * nr
+        sidx     = d["sidx"]
+        # All fitting stars — no member restriction for (r,r) and (r,γ)
+        use_fit  = d["use_for_fit"]
+        use_fmem = use_fit & member_mask[sidx]   # fitting ∩ member for (r,μ)
 
-        sidx_al  = sidx[use_align]
-        K_al     = K_img[img][use_align]         # (n_al, 5, N_R)
-        Cv_al    = C_vT[sidx_al]                 # (n_al, 5, 5)
+        sidx_fit  = sidx[use_fit]
+        K_fit     = K_img[img][use_fit]          # (n_fit, 5, N_R)
+        Cv_fit    = C_vT[sidx_fit]               # (n_fit, 5, 5)
 
-        # (r, r) diagonal Schur block
-        CvT_K_al = np.einsum('nij,njk->nik', Cv_al, K_al)
-        Lambda[cs:cs+nr, cs:cs+nr] -= np.einsum('nji,njk->ik', K_al, CvT_K_al)
-        rhs[cs:cs+nr]              += np.einsum('nji,nj->i',   K_al, a_align[sidx_al])
+        # (r, r) diagonal Schur block — all fitting stars
+        CvT_K_fit = np.einsum('nij,njk->nik', Cv_fit, K_fit)
+        Lambda[cs:cs+nr, cs:cs+nr] -= np.einsum('nji,njk->ik', K_fit, CvT_K_fit)
+        rhs[cs:cs+nr]              += np.einsum('nji,nj->i',   K_fit, a_align[sidx_fit])
 
-        # (r, γ) Schur: K_al^T C_vT Q_total  (Q_total is 0 for non-members)
-        Qt_al    = Q_total[sidx_al]
-        CvT_Q_al = np.einsum('nij,njk->nik', Cv_al, Qt_al)
-        KT_CvT_Q = np.einsum('nji,njk->ik', K_al, CvT_Q_al)     # (N_R, 20)
+        # (r, γ) Schur: K_fit^T C_vT Q_total_all — all fitting stars
+        Qt_fit    = Q_total_all[sidx_fit]
+        CvT_Q_fit = np.einsum('nij,njk->nik', Cv_fit, Qt_fit)
+        KT_CvT_Q  = np.einsum('nji,njk->ik', K_fit, CvT_Q_fit)   # (N_R, n_gamma)
         Lambda[cs:cs+nr, idx_gam] -= KT_CvT_Q
         Lambda[idx_gam, cs:cs+nr] -= KT_CvT_Q.T
 
-        # (r, μ) Schur: -σ^{-2} K_{align∩member}^T C_vT M
-        # use_align already restricted to members, so use_al_mem = use_align
-        if use_align.any():
-            sidx_alm  = sidx_al
-            K_alm     = K_al
-            CvT_M_alm = C_vT[sidx_alm] @ M                        # (n_alm, 5, 2)
-            KT_CvT_M  = np.einsum('nji,njk->ik', K_alm, CvT_M_alm)  # (N_R, 2)
+        # (r, μ) Schur: -σ^{-2} K_{fit∩member}^T C_vT M
+        if use_fmem.any():
+            sidx_fmem = sidx[use_fmem]
+            K_fmem    = K_img[img][use_fmem]
+            CvT_M_fm  = C_vT[sidx_fmem] @ M                        # (n_fm, 5, 2)
+            KT_CvT_M  = np.einsum('nji,njk->ik', K_fmem, CvT_M_fm)  # (N_R, 2)
             Lambda[cs:cs+nr, idx_mu] -= sigma_pm_inv_sq * KT_CvT_M
             Lambda[idx_mu, cs:cs+nr] -= sigma_pm_inv_sq * KT_CvT_M.T
 
-        # (r, r) cross-image coupling (identical to solver._solve_one_pass)
+        # (r, r) cross-image coupling — all fitting stars (no member restriction)
         for j2_idx, img2 in enumerate(image_names):
             if j2_idx <= j_idx:
                 continue
             d2 = solver._img_data.get(img2)
             if d2 is None or K_img.get(img2) is None:
                 continue
-            sidx_d2 = d2["sidx"]
-            use2    = d2["use_for_fit"] & member_mask[sidx_d2]
-            sidx2   = sidx_d2[use2]
-            K2      = K_img[img2][use2]
+            sidx_d2  = d2["sidx"]
+            use2     = d2["use_for_fit"]    # all fitting, no member restriction
+            sidx2    = sidx_d2[use2]
+            K2       = K_img[img2][use2]
 
-            common, ix1, ix2 = np.intersect1d(sidx_al, sidx2,
+            common, ix1, ix2 = np.intersect1d(sidx_fit, sidx2,
                                                return_indices=True)
             if len(common) == 0:
                 continue
 
             CvT_K2 = np.einsum('nij,njk->nik', C_vT[common], K2[ix2])
-            block  = np.einsum('nji,njk->ik', K_al[ix1], CvT_K2)
+            block  = np.einsum('nji,njk->ik', K_fit[ix1], CvT_K2)
             cs2    = j2_idx * nr
             Lambda[cs:cs+nr,   cs2:cs2+nr] -= block
             Lambda[cs2:cs2+nr, cs:cs+nr]   -= block.T
