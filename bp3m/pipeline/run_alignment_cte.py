@@ -1321,13 +1321,18 @@ def _diagnose_cte_by_magbin(
         gamma_bins[b] = np.linalg.solve(H + regularize_gamma * np.eye(n_gamma),
                                         b_bins[b])
 
+    # Basis names: [yt, yt², xt·yt, xt²·yt, xt·yt²]
+    _basis_names = ['yt', 'yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
     print(f"  CTE γ per mag bin (direct regression, n_mem={len(member_sidx)}):")
+    print(f"  {'bin':>10}  {'n':>8}  "
+          + "  ".join(f"γ_yhi[{i}]({_basis_names[i]})" for i in range(5))
+          + "  "
+          + "  ".join(f"γ_ylo[{i}]" for i in range(5)))
     for b in mag_bins:
         g = gamma_bins[b]
-        print(f"    mag {b[0]:4.0f}-{b[1]:<4.0f}: n={n_bins[b]:7d}  "
-              f"γ_y_hi[0]={g[5]:+.4e}  γ_y_lo[0]={g[15]:+.4e}  "
-              f"|γ_y_hi|={np.linalg.norm(g[5:10]):.3e}  "
-              f"|γ_y_lo|={np.linalg.norm(g[15:20]):.3e}")
+        vals_hi = "  ".join(f"{g[5+i]:+.3e}" for i in range(5))
+        vals_lo = "  ".join(f"{g[15+i]:+.3e}" for i in range(5))
+        print(f"  mag {b[0]:4.0f}-{b[1]:<4.0f}: n={n_bins[b]:7d}  {vals_hi}  {vals_lo}")
 
     if output_dir is not None:
         _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label)
@@ -1344,31 +1349,42 @@ def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warms
     plot_dir = Path(output_dir) / 'plots'
     plot_dir.mkdir(parents=True, exist_ok=True)
 
+    basis_names = ['yt', 'yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
+    colors      = ['steelblue', 'tomato', 'forestgreen', 'darkorchid', 'darkorange']
     centers = [0.5 * (b[0] + b[1]) for b in mag_bins]
-    gy_hi0  = [float(gamma_bins[b][5])  for b in mag_bins]
-    gy_lo0  = [float(gamma_bins[b][15]) for b in mag_bins]
-    gyn_hi  = [float(np.linalg.norm(gamma_bins[b][5:10]))  for b in mag_bins]
-    gyn_lo  = [float(np.linalg.norm(gamma_bins[b][15:20])) for b in mag_bins]
     counts  = [n_bins[b] for b in mag_bins]
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    # (2 chips) × (5 basis functions + 1 norm) → 2 rows, 2 cols
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
 
-    for ax, vals, title, ylabel in [
-        (axes[0, 0], gy_hi0, 'γ_y_hi[0] vs mag bin', 'γ_y_hi[0]'),
-        (axes[0, 1], gy_lo0, 'γ_y_lo[0] vs mag bin', 'γ_y_lo[0]'),
-        (axes[1, 0], gyn_hi, '|γ_y_hi| vs mag bin',  '|γ_y_hi|'),
-        (axes[1, 1], gyn_lo, '|γ_y_lo| vs mag bin',  '|γ_y_lo|'),
-    ]:
-        ax.plot(centers, vals, 'o-', lw=2, ms=8)
-        ax.axhline(0, color='k', lw=0.8, ls='--')
-        for xc, yv, nc in zip(centers, vals, counts):
-            ax.text(xc, yv, f'  {nc//1000:.0f}k', fontsize=8, va='bottom')
-        ax.set_xlabel('F814W magnitude')
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
+    for col, (chip_label, offset) in enumerate([('hi', 5), ('lo', 15)]):
+        # Top row: all 5 y-direction coefficients on one axes
+        ax_coef = axes[0, col]
+        for i in range(5):
+            vals = [float(gamma_bins[b][offset + i]) for b in mag_bins]
+            ax_coef.plot(centers, vals, 'o-', color=colors[i], lw=1.8, ms=7,
+                         label=f'γ_y[{i}] ({basis_names[i]})')
+        ax_coef.axhline(0, color='k', lw=0.8, ls='--')
+        ax_coef.set_xlabel('F814W magnitude')
+        ax_coef.set_ylabel('γ_y coefficient')
+        ax_coef.set_title(f'γ_y_{chip_label}: all 5 basis coefficients vs mag bin')
+        ax_coef.legend(fontsize=8)
 
-    fig.suptitle(f'CTE γ by magnitude bin — direct regression ({label})',
-                 fontsize=12)
+        # Bottom row: |γ_y| norm + annotation of n per bin
+        ax_norm = axes[1, col]
+        norms = [float(np.linalg.norm([gamma_bins[b][offset + i] for i in range(5)]))
+                 for b in mag_bins]
+        ax_norm.plot(centers, norms, 's-', color='navy', lw=2, ms=8)
+        for xc, yv, nc in zip(centers, norms, counts):
+            ax_norm.text(xc, yv, f'  {nc//1000:.0f}k', fontsize=8, va='bottom')
+        ax_norm.axhline(0, color='k', lw=0.8, ls='--')
+        ax_norm.set_xlabel('F814W magnitude')
+        ax_norm.set_ylabel(f'|γ_y_{chip_label}|')
+        ax_norm.set_title(f'|γ_y_{chip_label}| norm vs mag bin')
+
+    fig.suptitle(f'CTE γ_y by magnitude bin — direct regression ({label})\n'
+                 f'basis: [{", ".join(basis_names)}]',
+                 fontsize=11)
     fig.tight_layout()
     fname = f'cte_gamma_by_magbin_{label}.png'
     fig.savefig(plot_dir / fname, dpi=150, bbox_inches='tight')
