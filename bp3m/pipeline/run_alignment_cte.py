@@ -3290,7 +3290,7 @@ def _save_warmstart_stellar_astrometry(
             if 'Gaia_id' in gaia_catalog.columns else np.zeros(len(gaia_catalog), np.int64)
         _gc_ra   = gaia_catalog['ra'].to_numpy(float)
         _gc_dec  = gaia_catalog['dec'].to_numpy(float)
-        _gmap    = {int(_gc_gids[i]): i for i in range(len(_gc_gids)) if int(_gc_gids[i]) > 0}
+        _gmap    = {int(_gc_gids[i]): i for i in range(len(_gc_gids))}
         for k, gid in enumerate(star_ids):
             if int(gid) in _gmap:
                 i = _gmap[int(gid)]
