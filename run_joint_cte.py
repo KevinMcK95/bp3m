@@ -70,6 +70,10 @@ def main():
     parser.add_argument('--full_run', action='store_true',
                         help='Proceed to full joint solve loop after warm start '
                              '(default: stop after warm start)')
+    parser.add_argument('--fit_cte_x', action='store_true',
+                        help='Also fit CTE x-displacement (gamma_x). Off by default: '
+                             'ACS CTE is primarily in the readout (y) direction and '
+                             'fitting gamma_x tends to absorb non-CTE x-systematics.')
     args = parser.parse_args()
 
     from bp3m.pipeline.run_alignment_cte import run_alignment_joint_cte
@@ -95,6 +99,7 @@ def main():
         plot_residuals=args.plot_residuals,
         use_sparse=args.use_sparse,
         warmstart_only=not args.full_run,
+        fit_cte_x=args.fit_cte_x,
     )
     print(f"\nDone. Results in: {output}")
 

@@ -623,6 +623,7 @@ def _joint_solve_cte(
     regularize_gamma: float = 1e-8,
     gamma_prior: np.ndarray | None = None,
     hst_prior_sidx: np.ndarray | None = None,
+    fit_cte_x: bool = True,
 ) -> tuple:
     """
     Joint Schur-complement solve for (r, γ_CTE, μ_pop) after marginalising
@@ -1007,6 +1008,10 @@ def _joint_solve_cte(
 
     r_hat      = r_current + delta[idx_r]
     gamma_hat  = delta[idx_gam]
+    if not fit_cte_x:
+        # gamma layout: [γx_hi(0:nb), γy_hi(nb:2nb), γx_lo(2nb:3nb), γy_lo(3nb:4nb)]
+        gamma_hat[0:nb]       = 0.0
+        gamma_hat[2*nb:3*nb]  = 0.0
     mu_pop_hat = mu_pop_current + delta[idx_mu]
     C_r        = C_shared[idx_r, idx_r]
 
@@ -1687,6 +1692,7 @@ def warm_start_cte(
     regularize_gamma: float = 1e-8,
     output_dir: Path | None = None,
     n_gaia_warmstart_iters: int = 3,
+    fit_cte_x: bool = True,
 ) -> tuple[dict[str, CTEChipParams], np.ndarray]:
     """
     Warm-start CTE in four phases:
@@ -1753,6 +1759,7 @@ def warm_start_cte(
             mu_ws, mu_pop_prior, C_pop_prior_inv, r_ws,
             regularize_gamma=regularize_gamma,
             hst_prior_sidx=None,
+            fit_cte_x=fit_cte_x,
         )
         r_ws, _, _, mu_ws, _, _, _, _ = _result_g
         solver._update_R(r_ws)
@@ -1778,6 +1785,7 @@ def warm_start_cte(
         mu_ws, mu_pop_prior, C_pop_prior_inv, r_ws,
         regularize_gamma=regularize_gamma,
         hst_prior_sidx=member_sidx_hst,
+        fit_cte_x=fit_cte_x,
     )
     _, _, gamma_warm, _, _, a_arr_ws, _, _ = result
     _dt = _wtime.time() - _t0
@@ -3007,6 +3015,7 @@ def _run_joint_cte_loop(
     init_pm_window: float = 2.0,
     member_sidx_init: np.ndarray | None = None,
     mu_pop_init: np.ndarray | None = None,
+    fit_cte_x: bool = True,
 ) -> tuple:
     """
     Outer Gauss-Newton loop for the joint (r, γ_CTE, μ_pop) solve.
@@ -3122,6 +3131,7 @@ def _run_joint_cte_loop(
             regularize_gamma=regularize_gamma,
             gamma_prior=gamma_prior,
             hst_prior_sidx=hst_prior_sidx,
+            fit_cte_x=fit_cte_x,
         )
         r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT = result
 
@@ -3815,6 +3825,7 @@ def run_alignment_joint_cte(
     det_chi2_threshold: float | None = None,
     bp3m_dir: Path | None = None,
     warmstart_only: bool = False,
+    fit_cte_x: bool = False,
 ) -> Path:
     """
     Joint CTE + population mean PM alignment.
@@ -4102,6 +4113,7 @@ def run_alignment_joint_cte(
         cte_template=cte_template,
         regularize_gamma=regularize_gamma,
         output_dir=output_dir_joint,
+        fit_cte_x=fit_cte_x,
     )
 
     # ── Warmstart CTE diagnostic plots ────────────────────────────────────────
@@ -4164,6 +4176,7 @@ def run_alignment_joint_cte(
         gaia_catalog=gaia_catalog,
         member_sidx_init=member_sidx_init,
         mu_pop_init=mu_pop_warm,
+        fit_cte_x=fit_cte_x,
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
     print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
