@@ -2802,19 +2802,19 @@ def _run_joint_cte_loop(
         use_any = d.get('use_for_astrom', d['use_for_fit'])
         np.add.at(n_hst, sidx[use_any], 1)
 
-    # Initial member selection from catalog PMs (same window used by warm_start_cte)
+    # Initial member selection: Gaia-only, 3σ circular cut (same floor as _select_members_from_a)
+    _init_radius = member_sigma_clip * max(sigma_pm, pm_sys_floor)
     if gaia_catalog is not None and 'pmra_xmatch' in gaia_catalog.columns:
         pmra_cat  = gaia_catalog['pmra_xmatch'].to_numpy(float)
         pmdec_cat = gaia_catalog['pmdec_xmatch'].to_numpy(float)
         mu_ra, mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
         eligible = (np.isfinite(pmra_cat) & np.isfinite(pmdec_cat)
-                    & (np.abs(pmra_cat  - mu_ra)  < init_pm_window)
-                    & (np.abs(pmdec_cat - mu_dec) < init_pm_window)
+                    & (np.hypot(pmra_cat - mu_ra, pmdec_cat - mu_dec) < _init_radius)
                     & (n_hst >= 1)
                     & (~hst_only_mask))   # Gaia-only: consistent with _select_members_from_a
         member_sidx = np.where(eligible)[0]
-        print(f"  Initial members from catalog PMs: {len(member_sidx)} "
-              f"(±{init_pm_window} mas/yr of ({mu_ra:+.3f},{mu_dec:+.3f}), Gaia only)")
+        print(f"  Initial members (Gaia catalog PMs, {member_sigma_clip}σ={_init_radius:.3f} mas/yr): "
+              f"{len(member_sidx)}")
     else:
         eligible_mask = (~hst_only_mask) & (n_hst >= 1)
         member_sidx   = np.where(eligible_mask)[0]
@@ -3612,21 +3612,21 @@ def run_alignment_joint_cte(
         _s  = _d['sidx']
         _ua = _d.get('use_for_astrom', _d['use_for_fit'])
         np.add.at(_n_hst_init, _s[_ua], 1)
-    _init_pm_window = 2.0
+    # 3σ circular cut using the same floor as _select_members_from_a
+    _init_radius = member_sigma_clip * max(sigma_pm, pm_sys_floor)
     if 'pmra_xmatch' in gaia_catalog.columns:
         _pmra_cat  = gaia_catalog['pmra_xmatch'].to_numpy(float)
         _pmdec_cat = gaia_catalog['pmdec_xmatch'].to_numpy(float)
         _mu_ra, _mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
         _elig = (np.isfinite(_pmra_cat) & np.isfinite(_pmdec_cat)
-                 & (np.abs(_pmra_cat  - _mu_ra)  < _init_pm_window)
-                 & (np.abs(_pmdec_cat - _mu_dec) < _init_pm_window)
+                 & (np.hypot(_pmra_cat - _mu_ra, _pmdec_cat - _mu_dec) < _init_radius)
                  & (_n_hst_init >= 1)
                  & (~hst_only_mask))   # Gaia-only: consistent with _select_members_from_a
         member_sidx_init = np.where(_elig)[0]
     else:
         member_sidx_init = np.where(
             (~hst_only_mask) & (_n_hst_init >= 1))[0]
-    print(f"  Initial members (catalog PMs, ±{_init_pm_window} mas/yr): "
+    print(f"  Initial members (Gaia catalog PMs, {member_sigma_clip}σ={_init_radius:.3f} mas/yr): "
           f"{len(member_sidx_init)} stars")
 
     # ── CTE warm start ─────────────────────────────────────────────────────────
