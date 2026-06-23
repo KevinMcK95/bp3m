@@ -60,21 +60,38 @@ class CTEChipParams:
     x0: float = 2048.0
     gamma_x: np.ndarray = field(default_factory=lambda: np.zeros(5))
     gamma_y: np.ndarray = field(default_factory=lambda: np.zeros(5))
+    mag_poly_order: int  = 0          # polynomial order; gamma size = 5*(order+1)
+    mag_norm_ref:   float = 0.0       # magnitude normalisation centre
+    mag_norm_scale: float = 1.0       # magnitude normalisation scale
 
     def copy(self) -> 'CTEChipParams':
         return CTEChipParams(chip=self.chip,
                              y_readout_raw=self.y_readout_raw,
                              x0=float(self.x0),
                              gamma_x=self.gamma_x.copy(),
-                             gamma_y=self.gamma_y.copy())
+                             gamma_y=self.gamma_y.copy(),
+                             mag_poly_order=self.mag_poly_order,
+                             mag_norm_ref=float(self.mag_norm_ref),
+                             mag_norm_scale=float(self.mag_norm_scale))
 
 
-def default_cte_params() -> dict[str, CTEChipParams]:
+def default_cte_params(mag_poly_order: int = 0,
+                       mag_norm_ref: float = 0.0,
+                       mag_norm_scale: float = 1.0) -> dict[str, CTEChipParams]:
+    n = 5 * (mag_poly_order + 1)
     return {
         'hi': CTEChipParams(chip='hi',
-                            y_readout_raw=_HI_Y_READOUT_RAW),
+                            y_readout_raw=_HI_Y_READOUT_RAW,
+                            gamma_x=np.zeros(n), gamma_y=np.zeros(n),
+                            mag_poly_order=mag_poly_order,
+                            mag_norm_ref=mag_norm_ref,
+                            mag_norm_scale=mag_norm_scale),
         'lo': CTEChipParams(chip='lo',
-                            y_readout_raw=_LO_Y_READOUT_RAW),
+                            y_readout_raw=_LO_Y_READOUT_RAW,
+                            gamma_x=np.zeros(n), gamma_y=np.zeros(n),
+                            mag_poly_order=mag_poly_order,
+                            mag_norm_ref=mag_norm_ref,
+                            mag_norm_scale=mag_norm_scale),
     }
 
 
@@ -92,8 +109,21 @@ def _chip_from_image(img: str) -> str | None:
 # ── Magnitude weighting ───────────────────────────────────────────────────────
 
 def func1_mag(mag: np.ndarray, mag_ref: float = _MAG_REF) -> np.ndarray:
-    """Fixed magnitude weighting: 10^{0.4*(mag - mag_ref)}. No free parameters."""
+    """Fixed magnitude weighting: 10^{0.4*(mag - mag_ref)}. No free parameters.
+    Used only by the non-joint (iterative) CTE pipeline."""
     return np.power(10.0, 0.4 * (np.asarray(mag, dtype=float) - mag_ref))
+
+
+def mag_poly_basis(mag: np.ndarray, order: int,
+                   mag_norm_ref: float = 0.0,
+                   mag_norm_scale: float = 1.0) -> np.ndarray:
+    """Polynomial basis in normalised magnitude: returns (n, order+1) array.
+
+    m_norm = (mag - mag_norm_ref) / mag_norm_scale
+    Columns: [1, m_norm, m_norm², ..., m_norm^order]
+    """
+    m = (np.asarray(mag, dtype=float) - mag_norm_ref) / mag_norm_scale
+    return np.stack([m**k for k in range(order + 1)], axis=1)
 
 
 # ── CTE basis function ────────────────────────────────────────────────────────
@@ -123,13 +153,16 @@ def compute_cte_displacement(
 
     Returns (n, 2) array of (δCTE_x, δCTE_y) in pixels.
     """
-    f1  = func1_mag(mag)
-    Psi = dt * f1                                   # (n,) time-magnitude weight
-    xt  = X_c / 2048.0                              # normalised x
-    yt  = (y_raw - chip_params.y_readout_raw) / 2048.0  # normalised y
-    B   = cte_basis(xt, yt)                         # (n, 5)
-    return np.stack([Psi * (B @ chip_params.gamma_x),
-                     Psi * (B @ chip_params.gamma_y)], axis=1)
+    xt  = X_c / 2048.0
+    yt  = (y_raw - chip_params.y_readout_raw) / 2048.0
+    B   = cte_basis(xt, yt)                           # (n, 5) spatial basis
+    MP  = mag_poly_basis(mag, chip_params.mag_poly_order,
+                         chip_params.mag_norm_ref,
+                         chip_params.mag_norm_scale)   # (n, order+1) mag basis
+    # Combined basis: (n, (order+1)*5)  via outer product flattened
+    PsiB = (dt[:, None] * (MP[:, :, None] * B[:, None, :]).reshape(len(mag), -1))
+    return np.stack([PsiB @ chip_params.gamma_x,
+                     PsiB @ chip_params.gamma_y], axis=1)
 
 
 # ── mag_inst injection ────────────────────────────────────────────────────────
@@ -498,7 +531,14 @@ def _joint_solve_cte(
     nr       = solver.N_R
     n_images = len(image_names)
     n_r      = nr * n_images
-    n_gamma  = 20
+    # n_gamma = 4 * nb, where nb = 5 * (mag_poly_order + 1)
+    # Read poly order from cte_params template (both chips must agree)
+    _ref_chip = cte_params.get('hi', cte_params.get('lo'))
+    mag_poly_order = _ref_chip.mag_poly_order
+    mag_norm_ref   = _ref_chip.mag_norm_ref
+    mag_norm_scale = _ref_chip.mag_norm_scale
+    nb       = 5 * (mag_poly_order + 1)    # coefficients per chip per direction
+    n_gamma  = 4 * nb                      # hi_x, hi_y, lo_x, lo_y
     N_V      = 5
     n_shared = n_r + n_gamma + 2
 
@@ -631,17 +671,21 @@ def _joint_solve_cte(
         xt  = d['X_c'] / 2048.0
         yt  = (y_raw - p.y_readout_raw) / 2048.0
         ok  = np.isfinite(mag) & np.isfinite(y_raw)
-        f1  = np.where(ok, func1_mag(mag), 0.0)
-        PsiB = (dt_scalar * f1)[:, None] * cte_basis(xt, yt)   # (n, 5)
+        # Combined basis: dt * mag_poly ⊗ spatial  → (n, nb)
+        MP  = np.where(ok[:, None],
+                       mag_poly_basis(mag, mag_poly_order,
+                                      mag_norm_ref, mag_norm_scale), 0.0)
+        PsiB = (dt_scalar * (MP[:, :, None] * cte_basis(xt, yt)[:, None, :])
+                ).reshape(n, nb)   # (n, nb)
 
-        cx, cy = (0, 5) if chip == 'hi' else (10, 15)
+        cx, cy = (0, nb) if chip == 'hi' else (2*nb, 3*nb)
         R_j    = r_j[:4].reshape(2, 2)   # [[a, b], [c, d]]
 
         G = np.zeros((n, 2, n_gamma))
-        G[ok, :, cx:cx+5] = PsiB[ok, None, :] * R_j[None, :, 0:1]
-        G[ok, :, cy:cy+5] = PsiB[ok, None, :] * R_j[None, :, 1:2]
+        G[ok, :, cx:cx+nb] = PsiB[ok, None, :] * R_j[None, :, 0:1]
+        G[ok, :, cy:cy+nb] = PsiB[ok, None, :] * R_j[None, :, 1:2]
 
-        Q = np.einsum('nik,nkl->nil', JUT_Cs, G)   # (n, 5, 20)
+        Q = np.einsum('nik,nkl->nil', JUT_Cs, G)   # (n, 5, n_gamma)
         Q_img[img] = Q
 
         if use_member.any():
@@ -802,17 +846,19 @@ def _joint_solve_cte(
 def _gamma_to_cte_params(gamma_hat: np.ndarray,
                          template: dict) -> dict:
     """
-    Convert the 20-vector gamma_hat from _joint_solve_cte into CTEChipParams.
+    Convert the gamma_hat vector from _joint_solve_cte into CTEChipParams.
 
     Layout (must match _joint_solve_cte):
-      hi_x[0:5], hi_y[5:10], lo_x[10:15], lo_y[15:20]
+      hi_x[0:nb], hi_y[nb:2nb], lo_x[2nb:3nb], lo_y[3nb:4nb]
+    where nb = 5 * (mag_poly_order + 1).
     """
     import copy
     params = copy.deepcopy(template)
-    params['hi'].gamma_x = gamma_hat[0:5].copy()
-    params['hi'].gamma_y = gamma_hat[5:10].copy()
-    params['lo'].gamma_x = gamma_hat[10:15].copy()
-    params['lo'].gamma_y = gamma_hat[15:20].copy()
+    nb = 5 * (params['hi'].mag_poly_order + 1)
+    params['hi'].gamma_x = gamma_hat[0*nb:1*nb].copy()
+    params['hi'].gamma_y = gamma_hat[1*nb:2*nb].copy()
+    params['lo'].gamma_x = gamma_hat[2*nb:3*nb].copy()
+    params['lo'].gamma_y = gamma_hat[3*nb:4*nb].copy()
     return params
 
 
@@ -1047,6 +1093,7 @@ def _select_members_from_a(
 def _plot_warmstart_cte(
     solver, image_names, filtered_spi, t_launch_yr,
     gamma_warm, member_sidx, r_init, output_dir,
+    cte_template=None,
 ) -> None:
     """
     Plot detection y-residuals (tangent-plane) vs y_raw before and after
@@ -1066,7 +1113,9 @@ def _plot_warmstart_cte(
     n_stars = solver.C_survey_inv.shape[0]
     member_mask = np.zeros(n_stars, dtype=bool)
     member_mask[member_sidx] = True
-    cte_w = _gamma_to_cte_params(gamma_warm, default_cte_params())
+    _tmpl = cte_template if cte_template is not None else default_cte_params()
+    cte_w = _gamma_to_cte_params(gamma_warm, _tmpl)
+    _nb   = 5 * (_tmpl['hi'].mag_poly_order + 1)
 
     rec = {c: {'y_raw': [], 'dy_b': [], 'dy_a': [], 'mag': []}
            for c in ('hi', 'lo')}
@@ -1109,12 +1158,16 @@ def _plot_warmstart_cte(
         xt   = d['X_c'] / 2048.0
         yt   = (y_raw - p.y_readout_raw) / 2048.0
         ok   = np.isfinite(mag) & np.isfinite(y_raw)
-        f1   = np.where(ok, func1_mag(mag), 0.0)
-        PsiB = (dt * f1)[:, None] * cte_basis(xt, yt)   # (n, 5)
+        MP   = np.where(ok[:, None],
+                        mag_poly_basis(mag, _tmpl['hi'].mag_poly_order,
+                                       _tmpl['hi'].mag_norm_ref,
+                                       _tmpl['hi'].mag_norm_scale), 0.0)
+        PsiB = (dt * (MP[:, :, None] * cte_basis(xt, yt)[:, None, :])
+                ).reshape(len(mag), _nb)
 
         R_j    = r_j[:4].reshape(2, 2)
-        cy     = 5 if chip == 'hi' else 15
-        dcte_y = (PsiB @ gamma_warm[cy:cy+5]) * float(R_j[1, 1])
+        cy     = _nb if chip == 'hi' else 3 * _nb
+        dcte_y = (PsiB @ gamma_warm[cy:cy + _nb]) * float(R_j[1, 1])
 
         ui = np.where(use)[0]
         ok_u = ok[ui]
@@ -1182,12 +1235,12 @@ def _plot_warmstart_cte(
                 ax.legend(fontsize=8)
                 clip_v = np.nanpercentile(np.abs(dy[ok]), 97) if ok.any() else 1.0
                 ax.set_ylim(-clip_v * 1.5, clip_v * 1.5)
-        gy_hi0 = float(gamma_warm[5])
+        gy_hi0 = float(gamma_warm[_nb])
         fig.suptitle(
             f'CTE warm-start diagnostic  '
             f'γ_y_hi[0]={gy_hi0:+.4e}  '
-            f'|γ_y_hi|={float(np.linalg.norm(gamma_warm[5:10])):.3e}  '
-            f'|γ_y_lo|={float(np.linalg.norm(gamma_warm[15:20])):.3e}',
+            f'|γ_y_hi|={float(np.linalg.norm(gamma_warm[_nb:2*_nb])):.3e}  '
+            f'|γ_y_lo|={float(np.linalg.norm(gamma_warm[3*_nb:4*_nb])):.3e}',
             fontsize=11)
         fig.tight_layout()
         fig.savefig(plot_dir / 'cte_warmstart_before_after.png',
@@ -1211,6 +1264,7 @@ def _diagnose_cte_by_magbin(
     regularize_gamma=1e-8,
     output_dir=None,
     label='warmstart',
+    cte_template=None,
 ):
     """
     Direct (no Schur) gamma regression per magnitude bin with fixed r.
@@ -1229,8 +1283,10 @@ def _diagnose_cte_by_magbin(
     member_mask[member_sidx] = True
 
     nr      = solver.N_R
-    n_gamma = 20
-    cte_zero = default_cte_params()
+    _tmpl   = cte_template if cte_template is not None else default_cte_params()
+    nb      = 5 * (_tmpl['hi'].mag_poly_order + 1)
+    n_gamma = 4 * nb
+    cte_zero = _tmpl
     _use_two_tier = getattr(solver, '_use_two_tier', False)
 
     # Auto-range magnitude bins from actual data if not provided
@@ -1315,15 +1371,19 @@ def _diagnose_cte_by_magbin(
         xt  = d['X_c'] / 2048.0
         yt  = (y_raw - p.y_readout_raw) / 2048.0
         ok  = np.isfinite(mag) & np.isfinite(y_raw)
-        f1  = np.where(ok, func1_mag(mag), 0.0)
-        PsiB = (dt_scalar * f1)[:, None] * cte_basis(xt, yt)
+        MP  = np.where(ok[:, None],
+                       mag_poly_basis(mag, _tmpl['hi'].mag_poly_order,
+                                      _tmpl['hi'].mag_norm_ref,
+                                      _tmpl['hi'].mag_norm_scale), 0.0)
+        PsiB = (dt_scalar * (MP[:, :, None] * cte_basis(xt, yt)[:, None, :])
+                ).reshape(len(sidx), nb)
 
-        cx, cy = (0, 5) if chip == 'hi' else (10, 15)
+        cx, cy = (0, nb) if chip == 'hi' else (2*nb, 3*nb)
         R_j    = r_j[:4].reshape(2, 2)
         n_det  = len(sidx)
         G = np.zeros((n_det, 2, n_gamma))
-        G[ok, :, cx:cx+5] = PsiB[ok, None, :] * R_j[None, :, 0:1]
-        G[ok, :, cy:cy+5] = PsiB[ok, None, :] * R_j[None, :, 1:2]
+        G[ok, :, cx:cx+nb] = PsiB[ok, None, :] * R_j[None, :, 0:1]
+        G[ok, :, cy:cy+nb] = PsiB[ok, None, :] * R_j[None, :, 1:2]
 
         for b in mag_bins:
             mag_lo, mag_hi = b
@@ -1345,26 +1405,31 @@ def _diagnose_cte_by_magbin(
         gamma_bins[b] = np.linalg.solve(H + regularize_gamma * np.eye(n_gamma),
                                         b_bins[b])
 
-    # Basis names: [yt, yt², xt·yt, xt²·yt, xt·yt²]
+    # Print constant-poly-term (k=0) spatial coefficients per bin
     _basis_names = ['yt', 'yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
-    print(f"  CTE γ per mag bin (direct regression, n_mem={len(member_sidx)}):")
+    print(f"  CTE γ per mag bin (direct regression, n_mem={len(member_sidx)}, nb={nb}):")
     print(f"  {'bin':>10}  {'n':>8}  "
           + "  ".join(f"γ_yhi[{i}]({_basis_names[i]})" for i in range(5))
-          + "  "
-          + "  ".join(f"γ_ylo[{i}]" for i in range(5)))
+          + "  |γ_yhi|"
+          + "  " + "  ".join(f"γ_ylo[{i}]" for i in range(5))
+          + "  |γ_ylo|")
     for b in mag_bins:
         g = gamma_bins[b]
-        vals_hi = "  ".join(f"{g[5+i]:+.3e}" for i in range(5))
-        vals_lo = "  ".join(f"{g[15+i]:+.3e}" for i in range(5))
-        print(f"  mag {b[0]:4.0f}-{b[1]:<4.0f}: n={n_bins[b]:7d}  {vals_hi}  {vals_lo}")
+        vals_hi = "  ".join(f"{g[nb+i]:+.3e}" for i in range(5))
+        vals_lo = "  ".join(f"{g[3*nb+i]:+.3e}" for i in range(5))
+        norm_hi = float(np.linalg.norm(g[nb:2*nb]))
+        norm_lo = float(np.linalg.norm(g[3*nb:4*nb]))
+        print(f"  mag {b[0]:5.1f}-{b[1]:<5.1f}: n={n_bins[b]:7d}"
+              f"  {vals_hi}  {norm_hi:.3e}"
+              f"  {vals_lo}  {norm_lo:.3e}")
 
     if output_dir is not None:
-        _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label)
+        _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label, nb=nb)
 
     return gamma_bins
 
 
-def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warmstart'):
+def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warmstart', nb=5):
     """Plot γ_y per magnitude bin for CTE diagnostic."""
     import matplotlib
     matplotlib.use('Agg')
@@ -1381,22 +1446,23 @@ def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warms
     # (2 chips) × (5 basis functions + 1 norm) → 2 rows, 2 cols
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
 
-    for col, (chip_label, offset) in enumerate([('hi', 5), ('lo', 15)]):
-        # Top row: all 5 y-direction coefficients on one axes
+    # hi y-block starts at nb; lo y-block starts at 3*nb
+    for col, (chip_label, y_off) in enumerate([('hi', nb), ('lo', 3*nb)]):
+        # Top row: first 5 y-direction coefficients (constant poly term) per bin
         ax_coef = axes[0, col]
         for i in range(5):
-            vals = [float(gamma_bins[b][offset + i]) for b in mag_bins]
+            vals = [float(gamma_bins[b][y_off + i]) for b in mag_bins]
             ax_coef.plot(centers, vals, 'o-', color=colors[i], lw=1.8, ms=7,
                          label=f'γ_y[{i}] ({basis_names[i]})')
         ax_coef.axhline(0, color='k', lw=0.8, ls='--')
         ax_coef.set_xlabel('F814W magnitude')
-        ax_coef.set_ylabel('γ_y coefficient')
-        ax_coef.set_title(f'γ_y_{chip_label}: all 5 basis coefficients vs mag bin')
+        ax_coef.set_ylabel('γ_y coefficient (const-poly term)')
+        ax_coef.set_title(f'γ_y_{chip_label}: 5 spatial coefficients vs mag bin')
         ax_coef.legend(fontsize=8)
 
-        # Bottom row: |γ_y| norm + annotation of n per bin
+        # Bottom row: |γ_y| norm (all nb coefficients) + annotation of n per bin
         ax_norm = axes[1, col]
-        norms = [float(np.linalg.norm([gamma_bins[b][offset + i] for i in range(5)]))
+        norms = [float(np.linalg.norm(gamma_bins[b][y_off:y_off + nb]))
                  for b in mag_bins]
         ax_norm.plot(centers, norms, 's-', color='navy', lw=2, ms=8)
         for xc, yv, nc in zip(centers, norms, counts):
@@ -1428,6 +1494,7 @@ def warm_start_cte(
     mu_pop_prior: np.ndarray,
     C_pop_prior_inv: np.ndarray,
     r_init: np.ndarray,
+    cte_template: dict | None = None,
     regularize_gamma: float = 1e-8,
     output_dir: Path | None = None,
 ) -> dict[str, CTEChipParams]:
@@ -1442,10 +1509,12 @@ def warm_start_cte(
     If output_dir is provided, saves cte_warmstart_before_after.png showing
     the y-direction detection residuals before and after applying γ_warm.
     """
+    if cte_template is None:
+        cte_template = default_cte_params()
+
     print("  CTE warm start: linear solve for γ with r_init and μ_pop_prior...")
     print(f"  Warm-start μ_pop_prior = ({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) mas/yr  "
           f"n_members={len(member_sidx_init)}")
-    cte_zero = default_cte_params()
 
     # Per-magnitude-bin direct regression diagnostic (bypasses Schur complement)
     gamma_bins = _diagnose_cte_by_magbin(
@@ -1454,21 +1523,23 @@ def warm_start_cte(
         regularize_gamma=regularize_gamma,
         output_dir=output_dir,
         label='warmstart',
+        cte_template=cte_template,
     )
 
     result = _joint_solve_cte(
-        solver, image_names, cte_zero, t_launch_yr, filtered_spi,
+        solver, image_names, cte_template, t_launch_yr, filtered_spi,
         member_sidx_init, sigma_pm, plx_pop, sigma_plx_tot,
         mu_pop_prior, mu_pop_prior, C_pop_prior_inv, r_init,
         regularize_gamma=regularize_gamma,
     )
     _, _, gamma_warm, _, _, _, _, _ = result
 
-    cte_warm = _gamma_to_cte_params(gamma_warm, cte_zero)
+    cte_warm = _gamma_to_cte_params(gamma_warm, cte_template)
 
-    gy_hi = float(np.linalg.norm(gamma_warm[5:10]))
-    gy_lo = float(np.linalg.norm(gamma_warm[15:20]))
-    gyx0  = float(gamma_warm[5])
+    nb    = 5 * (cte_template['hi'].mag_poly_order + 1)
+    gy_hi = float(np.linalg.norm(gamma_warm[nb:2*nb]))
+    gy_lo = float(np.linalg.norm(gamma_warm[3*nb:4*nb]))
+    gyx0  = float(gamma_warm[nb])   # first y-basis coefficient, hi chip
     print(f"  Warm-start γ (joint solve): γ_y_hi[0]={gyx0:+.4e}  "
           f"|γ_y_hi|={gy_hi:.3e}  |γ_y_lo|={gy_lo:.3e}")
     if gyx0 > 0:
@@ -1476,7 +1547,8 @@ def warm_start_cte(
 
     if output_dir is not None:
         _plot_warmstart_cte(solver, image_names, filtered_spi, t_launch_yr,
-                            gamma_warm, member_sidx_init, r_init, output_dir)
+                            gamma_warm, member_sidx_init, r_init, output_dir,
+                            cte_template=cte_template)
 
     return cte_warm
 
@@ -2721,7 +2793,8 @@ def _run_joint_cte_loop(
     # Output variables (initialised to sensible defaults)
     r_hat      = r_current.copy()
     C_r        = None
-    gamma_hat  = np.zeros(20)
+    _nb0 = 5 * (cte_params.get('hi', cte_params.get('lo')).mag_poly_order + 1)
+    gamma_hat  = np.zeros(4 * _nb0)
     mu_pop_hat = mu_pop_prior.copy()
     C_shared   = None
     a_arr      = None
@@ -2773,8 +2846,9 @@ def _run_joint_cte_loop(
         dr   = float(np.max(np.abs(r_hat - r_prev)))
         dg   = float(np.max(np.abs(gamma_hat - gamma_prev)))
         dmu  = float(np.max(np.abs(mu_pop_hat - mu_pop_prev)))
-        gy_hi = float(np.linalg.norm(gamma_hat[5:10]))
-        gy_lo = float(np.linalg.norm(gamma_hat[15:20]))
+        _nb = 5 * (cte_params.get('hi', cte_params.get('lo')).mag_poly_order + 1)
+        gy_hi = float(np.linalg.norm(gamma_hat[_nb:2*_nb]))
+        gy_lo = float(np.linalg.norm(gamma_hat[3*_nb:4*_nb]))
         print(f"  Joint iter {it+1:2d}: Δr={dr:.3e}  Δγ={dg:.3e}  Δμ={dmu:.4f}  "
               f"n_mem={len(member_sidx):5d}  "
               f"μ_pop=({mu_pop_hat[0]:+.3f},{mu_pop_hat[1]:+.3f})  "
@@ -3231,6 +3305,32 @@ def run_alignment_cte(
     return output_cte
 
 
+def _compute_mag_normalization(solver, image_names) -> tuple[float, float]:
+    """Return (mag_norm_ref, mag_norm_scale) from all finite instrumental mags.
+
+    ref   = median of 2nd-98th percentile values
+    scale = (98th - 2nd percentile) / 2  (half-range, robust to outliers)
+    """
+    mags = []
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        m = d.get('mag_inst')
+        if m is None:
+            continue
+        mf = m[np.isfinite(m)]
+        if len(mf):
+            mags.append(mf)
+    if not mags:
+        return 0.0, 1.0
+    all_m = np.concatenate(mags)
+    p2, p98 = np.percentile(all_m, [2, 98])
+    ref   = float(0.5 * (p2 + p98))
+    scale = float(max((p98 - p2) / 2.0, 1e-6))
+    return ref, scale
+
+
 # ── Joint CTE + population entry point ────────────────────────────────────────
 
 def run_alignment_joint_cte(
@@ -3246,6 +3346,8 @@ def run_alignment_joint_cte(
     member_sigma_clip: float = 3.0,
     regularize_gamma: float = 1e-8,
     pm_sys_floor: float = 0.2,
+    # CTE magnitude polynomial order
+    mag_poly_order: int = 3,
     # Standard alignment options (same defaults as run_alignment_cte)
     poly_order: int = 1,
     use_sparse: bool = False,
@@ -3380,6 +3482,13 @@ def run_alignment_joint_cte(
 
     _inject_mag_inst(solver, image_names, filtered_spi, gaia_catalog)
 
+    # ── CTE template (magnitude polynomial normalization) ─────────────────────
+    _mag_norm_ref, _mag_norm_scale = _compute_mag_normalization(solver, image_names)
+    cte_template = default_cte_params(mag_poly_order, _mag_norm_ref, _mag_norm_scale)
+    _nb = 5 * (mag_poly_order + 1)
+    print(f"  CTE mag poly order={mag_poly_order}  nb={_nb}  "
+          f"mag_norm: ref={_mag_norm_ref:.2f}  scale={_mag_norm_scale:.2f}")
+
     if hst_pm_sigma_diffuse != 100.0:
         hst_star_indices = np.where(hst_only_mask)[0]
         if len(hst_star_indices) > 0:
@@ -3497,6 +3606,7 @@ def run_alignment_joint_cte(
         member_sidx_init,
         sigma_pm, plx_pop, sigma_plx_tot,
         mu_pop_prior, C_pop_prior_inv, r_init_hat,
+        cte_template=cte_template,
         regularize_gamma=regularize_gamma,
         output_dir=output_dir_joint,
     )
@@ -3520,8 +3630,8 @@ def run_alignment_joint_cte(
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
     print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
-    print(f"  Final |γ_y_hi| = {np.linalg.norm(gamma_hat[5:10]):.4e}  "
-          f"|γ_y_lo| = {np.linalg.norm(gamma_hat[15:20]):.4e}")
+    print(f"  Final |γ_y_hi| = {np.linalg.norm(gamma_hat[_nb:2*_nb]):.4e}  "
+          f"|γ_y_lo| = {np.linalg.norm(gamma_hat[3*_nb:4*_nb]):.4e}")
 
     # Use a_arr as the working stellar astrometry estimate (matches solver.fit convention)
     v_hat = a_arr
@@ -3540,10 +3650,14 @@ def run_alignment_joint_cte(
     cte_out['gamma_hat']         = gamma_hat
     cte_out['mu_pop_prior']      = mu_pop_prior
     cte_out['mu_pop_prior_sigma'] = np.array([mu_pop_prior_sigma])
+    cte_out['mag_poly_order']    = np.array([mag_poly_order])
+    cte_out['mag_norm_ref']      = np.array([_mag_norm_ref])
+    cte_out['mag_norm_scale']    = np.array([_mag_norm_scale])
     if C_shared is not None:
-        n_r = C_shared.shape[0] - 22  # n_shared = n_r + n_gamma(20) + n_mu(2)
+        _n_gamma = 4 * _nb
+        n_r = C_shared.shape[0] - _n_gamma - 2  # n_shared = n_r + n_gamma + n_mu(2)
         cte_out['C_mu_pop'] = C_shared[-2:, -2:]
-        cte_out['C_gamma']  = C_shared[n_r:n_r + 20, n_r:n_r + 20]
+        cte_out['C_gamma']  = C_shared[n_r:n_r + _n_gamma, n_r:n_r + _n_gamma]
     np.savez(output_dir_joint / 'cte_params.npz', **cte_out)
     print(f"  Saved: cte_params.npz")
 

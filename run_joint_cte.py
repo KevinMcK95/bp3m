@@ -55,6 +55,9 @@ def main():
                         help='Diagonal regularisation on H_gamma')
     parser.add_argument('--pm_sys_floor', type=float, default=0.2,
                         help='Systematic PM floor for membership sigma-clipping (mas/yr)')
+    # CTE magnitude polynomial
+    parser.add_argument('--cte_mag_poly_order', type=int, default=3,
+                        help='Polynomial order for CTE magnitude dependence (default 3)')
     # Alignment options
     parser.add_argument('--poly_order', type=int, default=1)
     parser.add_argument('--hst_max_pm_unc', type=float, default=5.0)
@@ -79,6 +82,7 @@ def main():
         member_sigma_clip=args.member_sigma_clip,
         regularize_gamma=args.regularize_gamma,
         pm_sys_floor=args.pm_sys_floor,
+        mag_poly_order=args.cte_mag_poly_order,
         poly_order=args.poly_order,
         hst_max_pm_unc=args.hst_max_pm_unc,
         hst_max_per_image=args.hst_max_per_image,
