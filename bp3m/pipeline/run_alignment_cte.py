@@ -496,6 +496,7 @@ def _joint_solve_cte(
     C_pop_prior_inv: np.ndarray,
     r_current: np.ndarray,
     regularize_gamma: float = 1e-8,
+    gamma_prior: np.ndarray | None = None,
 ) -> tuple:
     """
     Joint Schur-complement solve for (r, γ_CTE, μ_pop) after marginalising
@@ -518,6 +519,8 @@ def _joint_solve_cte(
     r_current        : (n_r,) current image-parameter iterate, stacked over
                        image_names in order
     regularize_gamma : small ridge added to H_γγ
+    gamma_prior      : if provided, regularise toward this value instead of
+                       zero (prevents r–γ oscillation in degenerate directions)
 
     Returns
     -------
@@ -746,6 +749,11 @@ def _joint_solve_cte(
         if img in XCs_xresid:
             rhs[cs:cs+nr] += XCs_xresid[img].sum(axis=0)
     rhs[idx_gam] = GCs_xresid
+    # γ prior: regularise toward gamma_prior (warmstart) instead of zero.
+    # This prevents the r–γ degeneracy from causing gamma to oscillate away
+    # from the warmstart value across Newton iterations.
+    if gamma_prior is not None:
+        rhs[idx_gam] += regularize_gamma * gamma_prior
     # μ_pop rhs: prior gradient + linearisation of population prior at v=0.
     # The population prior ½σ⁻²(v−μ_pop_current−Δμ)² has gradient w.r.t. Δμ of
     # −σ⁻²(v−μ_pop_current−Δμ) which at v=0, Δμ=0 gives +σ⁻²·μ_pop_current.
@@ -2823,7 +2831,19 @@ def _run_joint_cte_loop(
     r_hat      = r_current.copy()
     C_r        = None
     _nb0 = 5 * (cte_params.get('hi', cte_params.get('lo')).mag_poly_order + 1)
-    gamma_hat  = np.zeros(4 * _nb0)
+    # Initialise gamma from warmstart cte_params (not zeros) and use as prior
+    # to prevent the r–γ degeneracy from causing oscillatory blow-up.
+    _p = cte_params.get('hi', cte_params.get('lo', None))
+    if _p is not None and len(getattr(_p, 'gamma_x', [])) == _nb0:
+        gamma_hat = np.concatenate([
+            cte_params['hi'].gamma_x if 'hi' in cte_params else np.zeros(_nb0),
+            cte_params['hi'].gamma_y if 'hi' in cte_params else np.zeros(_nb0),
+            cte_params['lo'].gamma_x if 'lo' in cte_params else np.zeros(_nb0),
+            cte_params['lo'].gamma_y if 'lo' in cte_params else np.zeros(_nb0),
+        ])
+    else:
+        gamma_hat = np.zeros(4 * _nb0)
+    gamma_prior = gamma_hat.copy()   # warmstart gamma as regularisation anchor
     mu_pop_hat = mu_pop_prior.copy()
     C_shared   = None
     a_arr      = None
@@ -2843,6 +2863,7 @@ def _run_joint_cte_loop(
             member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
             mu_pop_current, mu_pop_prior, C_pop_prior_inv, r_current,
             regularize_gamma=regularize_gamma,
+            gamma_prior=gamma_prior,
         )
         r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT = result
 
