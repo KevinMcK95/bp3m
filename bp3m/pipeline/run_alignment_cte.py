@@ -560,12 +560,13 @@ def _joint_solve_cte(
             Q_img[img] = None
             continue
 
-        use_align  = d["use_for_fit"]
-        use_astrom = (d.get("use_for_astrom", use_align)
-                      if getattr(solver, '_use_two_tier', False) else use_align)
-        use_any    = use_align | use_astrom
         sidx       = d["sidx"]
-        use_member = use_any & member_mask[sidx]
+        use_align  = d["use_for_fit"] & member_mask[sidx]
+        use_astrom = ((d.get("use_for_astrom", d["use_for_fit"])
+                       if getattr(solver, '_use_two_tier', False) else d["use_for_fit"])
+                      & member_mask[sidx])
+        use_any    = use_align | use_astrom
+        use_member = use_any   # all active stars are members by construction
 
         sidx_any   = sidx[use_any]
         sidx_align = sidx[use_align]
@@ -650,10 +651,10 @@ def _joint_solve_cte(
                                     G[use_member], Cs_inv[use_member], x_resid[use_member])
             np.add.at(Q_total, sidx[use_member], Q[use_member])
 
-            use_al_mem = use_align & member_mask[sidx]
-            if use_al_mem.any():
+            # use_align already restricted to members, so use_al_mem = use_align
+            if use_align.any():
                 P_rg[cs:cs+nr] += np.einsum('nki,nkl,nlj->ij',
-                                            X[use_al_mem], Cs_inv[use_al_mem], G[use_al_mem])
+                                            X[use_align], Cs_inv[use_align], G[use_align])
 
     # ── Invert H_vv → C_vT, stellar posteriors ───────────────────────────────
     C_vT    = np.linalg.inv(H_vv)
@@ -724,9 +725,10 @@ def _joint_solve_cte(
 
         cs         = j_idx * nr
         sidx       = d["sidx"]
-        use_align  = d["use_for_fit"]
-        use_astrom = (d.get("use_for_astrom", use_align)
-                      if getattr(solver, '_use_two_tier', False) else use_align)
+        use_align  = d["use_for_fit"] & member_mask[sidx]
+        use_astrom = ((d.get("use_for_astrom", d["use_for_fit"])
+                       if getattr(solver, '_use_two_tier', False) else d["use_for_fit"])
+                      & member_mask[sidx])
         use_any    = use_align | use_astrom
 
         sidx_al  = sidx[use_align]
@@ -746,10 +748,10 @@ def _joint_solve_cte(
         Lambda[idx_gam, cs:cs+nr] -= KT_CvT_Q.T
 
         # (r, μ) Schur: -σ^{-2} K_{align∩member}^T C_vT M
-        use_al_mem = use_align & member_mask[sidx]
-        if use_al_mem.any():
-            sidx_alm  = sidx[use_al_mem]
-            K_alm     = K_img[img][use_al_mem]
+        # use_align already restricted to members, so use_al_mem = use_align
+        if use_align.any():
+            sidx_alm  = sidx_al
+            K_alm     = K_al
             CvT_M_alm = C_vT[sidx_alm] @ M                        # (n_alm, 5, 2)
             KT_CvT_M  = np.einsum('nji,njk->ik', K_alm, CvT_M_alm)  # (N_R, 2)
             Lambda[cs:cs+nr, idx_mu] -= sigma_pm_inv_sq * KT_CvT_M
@@ -762,9 +764,10 @@ def _joint_solve_cte(
             d2 = solver._img_data.get(img2)
             if d2 is None or K_img.get(img2) is None:
                 continue
-            use2   = d2["use_for_fit"]
-            sidx2  = d2["sidx"][use2]
-            K2     = K_img[img2][use2]
+            sidx_d2 = d2["sidx"]
+            use2    = d2["use_for_fit"] & member_mask[sidx_d2]
+            sidx2   = sidx_d2[use2]
+            K2      = K_img[img2][use2]
 
             common, ix1, ix2 = np.intersect1d(sidx_al, sidx2,
                                                return_indices=True)
@@ -1041,7 +1044,217 @@ def _select_members_from_a(
 
 # ── Warm start ────────────────────────────────────────────────────────────────
 
+def _plot_warmstart_cte(
+    solver, image_names, filtered_spi, t_launch_yr,
+    gamma_warm, member_sidx, r_init, output_dir,
+) -> None:
+    """
+    Plot detection y-residuals (tangent-plane) vs y_raw before and after
+    applying gamma_warm, for member stars.  Saved to output_dir/plots/.
+    """
+    import warnings
+    warnings.filterwarnings('ignore')
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from astropy.time import Time
+
+    plot_dir = Path(output_dir) / 'plots'
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    nr = solver.N_R
+    n_stars = solver.C_survey_inv.shape[0]
+    member_mask = np.zeros(n_stars, dtype=bool)
+    member_mask[member_sidx] = True
+    cte_w = _gamma_to_cte_params(gamma_warm, default_cte_params())
+
+    rec = {c: {'y_raw': [], 'dy_b': [], 'dy_a': [], 'mag': []}
+           for c in ('hi', 'lo')}
+
+    for j_idx, img in enumerate(image_names):
+        chip = _chip_from_image(img)
+        if chip is None:
+            continue
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        sidx = d['sidx']
+        use_f = d['use_for_fit'] & member_mask[sidx]
+        use_a = ((d.get('use_for_astrom', d['use_for_fit'])
+                  if getattr(solver, '_use_two_tier', False) else d['use_for_fit'])
+                 & member_mask[sidx])
+        use = use_f | use_a
+        if not use.any():
+            continue
+
+        r_j  = r_init[j_idx * nr:(j_idx + 1) * nr]
+        xys  = d.get('xys_orig', d['xys'])
+        X    = d['X_mat']
+        x_pred = np.einsum('nkl,l->nk', X, r_j)
+
+        mag = d.get('mag_inst')
+        if mag is None:
+            continue
+        Y_c = d['Y_c']
+        p   = cte_w[chip]
+        sdf = filtered_spi.get(img) if filtered_spi else None
+        if sdf is not None and 'Y_orig' in sdf.columns and len(sdf) == len(mag):
+            y_raw = sdf['Y_orig'].to_numpy(float)
+        else:
+            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+
+        hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
+                            format='mjd').jyear)
+        dt   = hst_yr - t_launch_yr
+        xt   = d['X_c'] / 2048.0
+        yt   = (y_raw - p.y_readout_raw) / 2048.0
+        ok   = np.isfinite(mag) & np.isfinite(y_raw)
+        f1   = np.where(ok, func1_mag(mag), 0.0)
+        PsiB = (dt * f1)[:, None] * cte_basis(xt, yt)   # (n, 5)
+
+        R_j    = r_j[:4].reshape(2, 2)
+        cy     = 5 if chip == 'hi' else 15
+        dcte_y = (PsiB @ gamma_warm[cy:cy+5]) * float(R_j[1, 1])
+
+        ui = np.where(use)[0]
+        ok_u = ok[ui]
+        ui   = ui[ok_u]
+        if len(ui) == 0:
+            continue
+
+        rec[chip]['y_raw'].append(y_raw[ui])
+        rec[chip]['dy_b'].append(xys[ui, 1] - x_pred[ui, 1])
+        rec[chip]['dy_a'].append(xys[ui, 1] - x_pred[ui, 1] - dcte_y[ui])
+        rec[chip]['mag'].append(mag[ui])
+
+    for chip in ('hi', 'lo'):
+        for k in rec[chip]:
+            arr = rec[chip][k]
+            rec[chip][k] = np.concatenate(arr) if arr else np.array([])
+
+    def _binned(x, y, n_bins=15):
+        ok = np.isfinite(x) & np.isfinite(y)
+        if ok.sum() < n_bins:
+            return np.array([]), np.array([])
+        xo, yo = x[ok], y[ok]
+        order  = np.argsort(xo)
+        chunks = np.array_split(order, n_bins)
+        xm, ym = [], []
+        for ch in chunks:
+            if len(ch) < 3:
+                continue
+            xm.append(xo[ch].mean()); ym.append(yo[ch].mean())
+        return np.array(xm), np.array(ym)
+
+    chip_labels = {'hi': 'hi chip (ext=1)', 'lo': 'lo chip (ext=4)'}
+    try:
+        fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+        for row, chip in enumerate(('hi', 'lo')):
+            y_r = rec[chip]['y_raw']
+            m   = rec[chip]['mag']
+            for col, (dy, panel_lbl) in enumerate(
+                    [(rec[chip]['dy_b'], 'before CTE warm-start'),
+                     (rec[chip]['dy_a'], 'after CTE warm-start')]):
+                ax = axes[row, col]
+                if len(y_r) == 0:
+                    ax.set_visible(False)
+                    continue
+                ok = np.isfinite(y_r) & np.isfinite(dy) & np.isfinite(m)
+                if ok.sum() == 0:
+                    continue
+                pcts = np.nanpercentile(m[ok], [0, 50, 100])
+                for mlo, mhi, c, bl in [
+                        (pcts[0], pcts[1], 'steelblue', 'bright'),
+                        (pcts[1], pcts[2], 'firebrick', 'faint')]:
+                    mask = ok & (m >= mlo) & (m < mhi)
+                    if mask.sum() < 5:
+                        continue
+                    ax.scatter(y_r[mask], dy[mask], s=1, alpha=0.08,
+                               color=c, linewidths=0, rasterized=True)
+                    xm, ym = _binned(y_r[mask], dy[mask])
+                    if len(xm):
+                        ax.plot(xm, ym, color=c, lw=2,
+                                label=f'{bl} ({mask.sum():,})')
+                ax.axhline(0, color='k', lw=0.8, ls='--', alpha=0.6)
+                ax.set_xlabel('y_raw (detector px)', fontsize=10)
+                ax.set_ylabel('y residual (tangent-plane px)', fontsize=10)
+                ax.set_title(f'{chip_labels[chip]} — {panel_lbl}', fontsize=10)
+                ax.legend(fontsize=8)
+                clip_v = np.nanpercentile(np.abs(dy[ok]), 97) if ok.any() else 1.0
+                ax.set_ylim(-clip_v * 1.5, clip_v * 1.5)
+        gy_hi0 = float(gamma_warm[5])
+        fig.suptitle(
+            f'CTE warm-start diagnostic  '
+            f'γ_y_hi[0]={gy_hi0:+.4e}  '
+            f'|γ_y_hi|={float(np.linalg.norm(gamma_warm[5:10])):.3e}  '
+            f'|γ_y_lo|={float(np.linalg.norm(gamma_warm[15:20])):.3e}',
+            fontsize=11)
+        fig.tight_layout()
+        fig.savefig(plot_dir / 'cte_warmstart_before_after.png',
+                    dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print("  Saved: plots/cte_warmstart_before_after.png")
+    except Exception as exc:
+        import traceback
+        print(f"  WARNING: cte_warmstart_before_after.png failed — {exc}")
+        traceback.print_exc()
+
+
 def warm_start_cte(
+    solver,
+    image_names: list[str],
+    filtered_spi: dict | None,
+    t_launch_yr: float,
+    member_sidx_init: np.ndarray,
+    sigma_pm: float,
+    plx_pop: float,
+    sigma_plx_tot: float,
+    mu_pop_prior: np.ndarray,
+    C_pop_prior_inv: np.ndarray,
+    r_init: np.ndarray,
+    regularize_gamma: float = 1e-8,
+    output_dir: Path | None = None,
+) -> dict[str, CTEChipParams]:
+    """
+    Warm-start CTE by solving for γ with r_init and μ_pop_prior fixed.
+
+    Runs one pass of _joint_solve_cte restricted to member stars, accepting
+    only the γ output (r and μ_pop remain at their initial values).  This
+    gives the optimal CTE parameters for the initial transformation, with the
+    correct sign guaranteed by the linear solve.
+
+    If output_dir is provided, saves cte_warmstart_before_after.png showing
+    the y-direction detection residuals before and after applying γ_warm.
+    """
+    print("  CTE warm start: linear solve for γ with r_init and μ_pop_prior...")
+    cte_zero = default_cte_params()
+
+    result = _joint_solve_cte(
+        solver, image_names, cte_zero, t_launch_yr, filtered_spi,
+        member_sidx_init, sigma_pm, plx_pop, sigma_plx_tot,
+        mu_pop_prior, mu_pop_prior, C_pop_prior_inv, r_init,
+        regularize_gamma=regularize_gamma,
+    )
+    _, _, gamma_warm, _, _, _, _, _ = result
+
+    cte_warm = _gamma_to_cte_params(gamma_warm, cte_zero)
+
+    gy_hi = float(np.linalg.norm(gamma_warm[5:10]))
+    gy_lo = float(np.linalg.norm(gamma_warm[15:20]))
+    gyx0  = float(gamma_warm[5])
+    print(f"  Warm-start γ: γ_y_hi[0]={gyx0:+.4e}  "
+          f"|γ_y_hi|={gy_hi:.3e}  |γ_y_lo|={gy_lo:.3e}")
+    if gyx0 > 0:
+        print("  WARNING: warm-start γ_y_hi[0] > 0 (expected negative for ACS CTE)")
+
+    if output_dir is not None:
+        _plot_warmstart_cte(solver, image_names, filtered_spi, t_launch_yr,
+                            gamma_warm, member_sidx_init, r_init, output_dir)
+
+    return cte_warm
+
+
+def _warm_start_cte_residuals(
     img_to_df: dict,
     solver,
     image_names: list[str],
@@ -1123,7 +1336,6 @@ def warm_start_cte(
     mean_pscale = {c: float(np.mean(v)) if v else 50.0 for c, v in chip_pscale.items()}
 
     # ── Collect per-detection data from img_to_df ─────────────────────────────
-    needed = {'y_raw', 'x_gdc', 'mag_gdc', 'pmra_xmatch', 'pmdec_xmatch'}
     _pm_window = 2.0   # mas/yr half-width membership pre-selection
 
     rows = []
@@ -1132,7 +1344,13 @@ def warm_start_cte(
         if chip is None or img not in img_to_df:
             continue
         df = img_to_df[img]
-        if not needed.issubset(df.columns):
+        # Accept either canonical or field-specific column names
+        y_col   = ('y_raw'   if 'y_raw'   in df.columns else
+                   'Y_orig'  if 'Y_orig'  in df.columns else None)
+        mag_col = ('mag_gdc' if 'mag_gdc' in df.columns else
+                   'mag'     if 'mag'     in df.columns else None)
+        needed_base = {'x_gdc', 'pmra_xmatch', 'pmdec_xmatch'}
+        if y_col is None or mag_col is None or not needed_base.issubset(df.columns):
             continue
 
         pmra_arr  = df['pmra_xmatch'].to_numpy(float)
@@ -1140,15 +1358,20 @@ def warm_start_cte(
         member_mask = (
             np.isfinite(pmra_arr)  & (np.abs(pmra_arr  - mean_pmra)  < _pm_window)
             & np.isfinite(pmdec_arr) & (np.abs(pmdec_arr - mean_pmdec) < _pm_window)
-            & df['y_raw'].notna().to_numpy()
-            & df['mag_gdc'].notna().to_numpy()
+            & df[y_col].notna().to_numpy()
+            & df[mag_col].notna().to_numpy()
         )
         if not member_mask.any():
             continue
 
         idx = df.index[member_mask]
-        tmp = df.loc[idx, ['y_raw', 'x_gdc', 'mag_gdc',
+        tmp = df.loc[idx, [y_col, 'x_gdc', mag_col,
                             'pmra_xmatch', 'pmdec_xmatch']].copy()
+        # Normalise to canonical column names for the aggregation step below
+        if y_col != 'y_raw':
+            tmp = tmp.rename(columns={y_col: 'y_raw'})
+        if mag_col != 'mag_gdc':
+            tmp = tmp.rename(columns={mag_col: 'mag_gdc'})
         tmp['chip']    = chip
 
         # Build sigma_pmdec: prefer master-catalog v2 fit uncertainty,
@@ -2200,6 +2423,8 @@ def _run_joint_cte_loop(
     member_sigma_clip: float = 3.0,
     regularize_gamma: float = 1e-8,
     pm_sys_floor: float = 0.2,
+    gaia_catalog=None,
+    init_pm_window: float = 2.0,
 ) -> tuple:
     """
     Outer Gauss-Newton loop for the joint (r, γ_CTE, μ_pop) solve.
@@ -2250,9 +2475,21 @@ def _run_joint_cte_loop(
         use_any = d.get('use_for_astrom', d['use_for_fit'])
         np.add.at(n_hst, sidx[use_any], 1)
 
-    # Initial member selection: all eligible Gaia stars (broad; refined after iter 1)
-    eligible_mask = (~hst_only_mask) & (n_hst >= 1)
-    member_sidx   = np.where(eligible_mask)[0]
+    # Initial member selection from catalog PMs (same window used by warm_start_cte)
+    if gaia_catalog is not None and 'pmra_xmatch' in gaia_catalog.columns:
+        pmra_cat  = gaia_catalog['pmra_xmatch'].to_numpy(float)
+        pmdec_cat = gaia_catalog['pmdec_xmatch'].to_numpy(float)
+        mu_ra, mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
+        eligible = (np.isfinite(pmra_cat) & np.isfinite(pmdec_cat)
+                    & (np.abs(pmra_cat  - mu_ra)  < init_pm_window)
+                    & (np.abs(pmdec_cat - mu_dec) < init_pm_window)
+                    & (n_hst >= 1))
+        member_sidx = np.where(eligible)[0]
+        print(f"  Initial members from catalog PMs: {len(member_sidx)} "
+              f"(±{init_pm_window} mas/yr of ({mu_ra:+.3f},{mu_dec:+.3f}))")
+    else:
+        eligible_mask = (~hst_only_mask) & (n_hst >= 1)
+        member_sidx   = np.where(eligible_mask)[0]
 
     # Output variables (initialised to sensible defaults)
     r_hat      = r_current.copy()
@@ -2550,7 +2787,7 @@ def run_alignment_cte(
     # inflate γ₀, and subsequent iterations converge to this biased warm start.
     _ws_field_pm = _compute_warmstart_field_pm(data_root, field_name)
     print(f"\n  CTE warm start (field_mean_pm={_ws_field_pm})...")
-    cte_params = warm_start_cte(
+    cte_params = _warm_start_cte_residuals(
         img_to_df, solver, image_names, r_init_hat, t_launch_yr,
         field_mean_pm=_ws_field_pm)
 
@@ -2997,11 +3234,44 @@ def run_alignment_joint_cte(
     print(f"  μ_pop prior: ({mu_pop_prior[0]:+.3f}, {mu_pop_prior[1]:+.3f}) ± "
           f"{mu_pop_prior_sigma:.2f} mas/yr")
 
+    # ── Initial member selection from catalog PMs ──────────────────────────────
+    # Used by both warm_start_cte and _run_joint_cte_loop (iter 0).
+    # Only stars with catalog PM within ±2 mas/yr of mu_pop_prior and ≥1 HST
+    # detection are included.  HST-only stars use their v2 BP3M PM estimate.
+    _n_hst_init = np.zeros(solver.C_survey_inv.shape[0], dtype=int)
+    for _img in image_names:
+        _d = solver._img_data.get(_img)
+        if _d is None:
+            continue
+        _s  = _d['sidx']
+        _ua = _d.get('use_for_astrom', _d['use_for_fit'])
+        np.add.at(_n_hst_init, _s[_ua], 1)
+    _init_pm_window = 2.0
+    if 'pmra_xmatch' in gaia_catalog.columns:
+        _pmra_cat  = gaia_catalog['pmra_xmatch'].to_numpy(float)
+        _pmdec_cat = gaia_catalog['pmdec_xmatch'].to_numpy(float)
+        _mu_ra, _mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
+        _elig = (np.isfinite(_pmra_cat) & np.isfinite(_pmdec_cat)
+                 & (np.abs(_pmra_cat  - _mu_ra)  < _init_pm_window)
+                 & (np.abs(_pmdec_cat - _mu_dec) < _init_pm_window)
+                 & (_n_hst_init >= 1))
+        member_sidx_init = np.where(_elig)[0]
+    else:
+        member_sidx_init = np.where(
+            (~hst_only_mask) & (_n_hst_init >= 1))[0]
+    print(f"  Initial members (catalog PMs, ±{_init_pm_window} mas/yr): "
+          f"{len(member_sidx_init)} stars")
+
     # ── CTE warm start ─────────────────────────────────────────────────────────
     print("\n  CTE warm start...")
     cte_params = warm_start_cte(
-        img_to_df, solver, image_names, r_init_hat, t_launch_yr,
-        field_mean_pm=_ws_field_pm)
+        solver, image_names, filtered_spi, t_launch_yr,
+        member_sidx_init,
+        sigma_pm, plx_pop, sigma_plx_tot,
+        mu_pop_prior, C_pop_prior_inv, r_init_hat,
+        regularize_gamma=regularize_gamma,
+        output_dir=output_dir_joint,
+    )
 
     # ── Joint solve loop ───────────────────────────────────────────────────────
     print(f"\n  Starting joint (r, γ, μ_pop) loop ({n_iter_joint} iterations)...")
@@ -3017,6 +3287,8 @@ def run_alignment_joint_cte(
         member_sigma_clip=member_sigma_clip,
         regularize_gamma=regularize_gamma,
         pm_sys_floor=pm_sys_floor,
+        gaia_catalog=gaia_catalog,
+        init_pm_window=_init_pm_window,
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
     print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
