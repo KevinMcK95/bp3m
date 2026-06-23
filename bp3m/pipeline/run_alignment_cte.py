@@ -1062,6 +1062,24 @@ def _joint_solve_cte(
         a[_all_prior] += sigma_pm_inv_sq * np.einsum(
             'nij,j->ni', C_vT[_all_prior, :, 2:4], delta_mu)
 
+    # ── Inflate C_vT to include μ_pop uncertainty propagation ─────────────────
+    # C_vT = H_vv^{-1} is conditioned on fixed (r, γ, μ_pop).  The marginal
+    # posterior over μ_pop adds:
+    #   C_v_marginal[i,2:4,2:4] += (σ⁻² C_vT[i,2:4,2:4]) @ C_μ @ (σ⁻² C_vT[i,2:4,2:4])
+    # For well-measured members, C_vT[i,2,2] ≈ σ_pm² so the weight factor
+    # σ⁻² C_vT[i,2,2] ≈ 1, and the extra variance ≈ C_μ[0,0] = σ(μ_pop)².
+    # This ensures the minimum PM uncertainty floor is σ(μ_pop) ≈ 0.02 mas/yr,
+    # not just σ_pm = 0.0076 mas/yr.
+    if len(_all_prior) > 0:
+        C_mu = C_shared[idx_mu, idx_mu]   # (2, 2) posterior covariance of μ_pop
+        # weight_i = σ_pm^{-2} C_vT[i, 2:4, 2:4]  (2×2 for each star)
+        W = sigma_pm_inv_sq * C_vT[_all_prior, 2:4, 2:4]    # (n_prior, 2, 2)
+        # extra_cov[i, 2:4, 2:4] = W[i] @ C_mu @ W[i]
+        WC  = np.einsum('nij,jk->nik', W, C_mu)              # (n_prior, 2, 2)
+        WCW = np.einsum('nij,nkj->nik', WC, W)               # (n_prior, 2, 2)
+        C_vT = C_vT.copy()
+        C_vT[_all_prior, 2:4, 2:4] += WCW
+
     return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a, K_img, C_vT
 
 
