@@ -539,6 +539,66 @@ def _update_image_alpha(
         d["C_hst"]         = alpha_j**2 * C_hst_orig
 
 
+def _apply_cte_to_residual_arrays(
+    out_arrays: dict,
+    image_names: list[str],
+    cte_params: dict,
+    t_launch_yr: float,
+    solver,
+    filtered_spi: dict | None = None,
+) -> dict:
+    """
+    Subtract CTE displacement from pre-computed GDC residual arrays.
+
+    For a linear transformation (poly_order=1):
+        dy_gdc_corrected = dy_gdc_before - delta_CTE_y
+    This converts "residuals with joint r_hat, original positions" into
+    "residuals with joint r_hat, CTE-corrected positions".
+
+    Returns a new dict; does not modify the input.
+    """
+    from astropy.time import Time
+    result = {k: (v.copy() if isinstance(v, np.ndarray) else v)
+              for k, v in out_arrays.items()}
+
+    for img in image_names:
+        chip = _chip_from_image(img)
+        if chip is None or chip not in cte_params:
+            continue
+        X_c_key = f'{img}_X_c'; dx_key = f'{img}_dx_gdc'; dy_key = f'{img}_dy_gdc'
+        mag_key = f'{img}_mag_inst'; Y_c_key = f'{img}_Y_c'
+        if dx_key not in result:
+            continue
+        X_c = result[X_c_key].astype(float)
+        Y_c = result[Y_c_key].astype(float)
+        mag = result[mag_key].astype(float)
+        # y_raw: prefer stored value, then filtered_spi, then GDC approximation
+        y_raw_key = f'{img}_y_raw'
+        if y_raw_key in result:
+            y_raw = result[y_raw_key].astype(float)
+        elif filtered_spi is not None and img in filtered_spi:
+            spi_df = filtered_spi[img]
+            if 'Y_orig' in spi_df.columns and len(spi_df) == len(X_c):
+                y_raw = spi_df['Y_orig'].to_numpy(float)
+            else:
+                y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+        else:
+            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+
+        hst_yr    = float(Time(float(solver.images[img]['hst_time_mjd']), format='mjd').jyear)
+        dt_scalar = hst_yr - t_launch_yr
+        dt        = np.full(len(mag), dt_scalar)
+        ok = np.isfinite(mag) & np.isfinite(y_raw)
+        if not ok.any():
+            continue
+        delta_cte = np.zeros((len(mag), 2))
+        delta_cte[ok] = compute_cte_displacement(
+            X_c[ok], y_raw[ok], mag[ok], dt[ok], cte_params[chip])
+        result[dx_key] = (result[dx_key].astype(float) - delta_cte[:, 0]).astype(np.float32)
+        result[dy_key] = (result[dy_key].astype(float) - delta_cte[:, 1]).astype(np.float32)
+    return result
+
+
 # ── Joint Schur-complement solve for (r, γ_CTE, μ_pop) ───────────────────────
 
 def _joint_solve_cte(
@@ -1637,9 +1697,11 @@ def warm_start_cte(
 
     Returns
     -------
-    (cte_warm, mu_pop_warm)
-        cte_warm   : dict[str, CTEChipParams] with warm-started γ coefficients
+    (cte_warm, mu_pop_warm, r_ws, a_arr_ws)
+        cte_warm    : dict[str, CTEChipParams] with warm-started γ coefficients
         mu_pop_warm : (2,) population mean PM refined from Gaia members
+        r_ws        : (n_r,) image parameters from phase [2/4] Gaia-only refinement
+        a_arr_ws    : (n_stars, 5) stellar astrometry from phase [3/4] joint solve
     """
     if cte_template is None:
         cte_template = default_cte_params()
@@ -1712,7 +1774,7 @@ def warm_start_cte(
         regularize_gamma=regularize_gamma,
         hst_prior_sidx=member_sidx_hst,
     )
-    _, _, gamma_warm, _, _, _, _, _ = result
+    _, _, gamma_warm, _, _, a_arr_ws, _, _ = result
     _dt = _wtime.time() - _t0
 
     cte_warm = _gamma_to_cte_params(gamma_warm, cte_template)
@@ -1737,7 +1799,7 @@ def warm_start_cte(
     print(f"\n  {'─'*56}")
     print(f"  CTE warm start complete.  μ_pop_warm = ({mu_ws[0]:+.4f}, {mu_ws[1]:+.4f}) mas/yr")
     print(f"  {'─'*56}\n")
-    return cte_warm, mu_ws
+    return cte_warm, mu_ws, r_ws, a_arr_ws
 
 
 def _warm_start_cte_residuals(
@@ -2035,7 +2097,9 @@ def _save_cte_convergence(output_dir: Path, outer_iter: int,
 
 def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                           before_npz: Path, after_npz: Path,
-                          image_names: list[str], solver) -> None:
+                          image_names: list[str], solver,
+                          file_prefix: str = '',
+                          astrom_csv: Path | None = None) -> None:
     """
     Create CTE diagnostic figures:
       1. cte_amplitude.png   — δCTE_y amplitude vs Y_c for mag bins, per chip
@@ -2182,9 +2246,9 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
         fig.suptitle('CTE correction amplitude (converged parameters, raw detector frame)',
                      fontsize=11)
         fig.tight_layout()
-        fig.savefig(plot_dir / 'cte_amplitude.png', dpi=150, bbox_inches='tight')
+        fig.savefig(plot_dir / f'{file_prefix}cte_amplitude.png', dpi=150, bbox_inches='tight')
         plt.close(fig)
-        print(f"  Saved: plots/cte_amplitude.png")
+        print(f"  Saved: plots/{file_prefix}cte_amplitude.png")
     except Exception as exc:
         print(f"  WARNING: cte_amplitude.png failed — {exc}")
 
@@ -2289,9 +2353,9 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                          'solid = before CTE correction   dashed = after CTE correction',
                          fontsize=12)
             fig.tight_layout()
-            fig.savefig(plot_dir / 'cte_before_after.png', dpi=150, bbox_inches='tight')
+            fig.savefig(plot_dir / f'{file_prefix}cte_before_after.png', dpi=150, bbox_inches='tight')
             plt.close(fig)
-            print(f"  Saved: plots/cte_before_after.png")
+            print(f"  Saved: plots/{file_prefix}cte_before_after.png")
         except Exception as exc:
             print(f"  WARNING: cte_before_after.png failed — {exc}")
 
@@ -2367,9 +2431,9 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                          r'CTE signal: |slope| increases with magnitude, sign set by readout direction',
                          fontsize=10)
             fig.tight_layout()
-            fig.savefig(plot_dir / 'cte_slope_vs_mag.png', dpi=150, bbox_inches='tight')
+            fig.savefig(plot_dir / f'{file_prefix}cte_slope_vs_mag.png', dpi=150, bbox_inches='tight')
             plt.close(fig)
-            print(f"  Saved: plots/cte_slope_vs_mag.png")
+            print(f"  Saved: plots/{file_prefix}cte_slope_vs_mag.png")
         except Exception as exc:
             print(f"  WARNING: cte_slope_vs_mag.png failed — {exc}")
 
@@ -2433,10 +2497,10 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                 ax.set_title(f'_{chip} chip — {label} CTE correction')
             fig.suptitle(f'2D detector map of dy_gdc ({label} CTE)', fontsize=11)
             fig.tight_layout()
-            out_path = plot_dir / f'cte_2d_map_{label}.png'
+            out_path = plot_dir / f'{file_prefix}cte_2d_map_{label}.png'
             fig.savefig(out_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
-            print(f"  Saved: plots/cte_2d_map_{label}.png")
+            print(f"  Saved: plots/{file_prefix}cte_2d_map_{label}.png")
         except Exception as exc:
             print(f"  WARNING: cte_2d_map_{label}.png failed — {exc}")
 
@@ -2457,7 +2521,8 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
         field_dir  = output_dir.parent
         hst_root   = field_dir / 'HST' / 'mastDownload' / 'HST'
         master_csv = field_dir / 'hst_xmatch' / 'master_combined_v2.csv'
-        astrom_csv = output_dir / 'stellar_astrometry.csv'
+        if astrom_csv is None:
+            astrom_csv = output_dir / 'stellar_astrometry.csv'
         if not master_csv.exists():
             raise FileNotFoundError(f'master_combined_v2.csv not found: {master_csv}')
 
@@ -2729,12 +2794,12 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
             f'faint   ({mag_pcts[2]:.1f}–{mag_pcts[3]:.1f})',
         ]
 
-        fig = plt.figure(figsize=(14, 22))
-        gs  = fig.add_gridspec(4, 2, hspace=0.42, wspace=0.32,
-                               left=0.08, right=0.96, top=0.94, bottom=0.05)
+        fig = plt.figure(figsize=(14, 27))
+        gs  = fig.add_gridspec(5, 2, hspace=0.40, wspace=0.32,
+                               left=0.08, right=0.96, top=0.95, bottom=0.04)
         clip_pm = 0.35  # mas/yr
 
-        # Proxy artist legend for rows 1–2
+        # Proxy artist legend for rows 2–3
         proxy_handles = (
             [_Line2D([0], [0], color=c, lw=2.5, label=lbl)
              for c, lbl in zip(bin_colors, bin_labels)]
@@ -2742,13 +2807,33 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                _Line2D([0], [0], color='gray', lw=2, ls='--', label=f'after CTE   N={has_after_s.sum():,}')]
         )
 
-        # ── Row 0: 2D detector map, before (left) and after (right) ──────────
+        # ── Row 0: 2D detector map coloured by Δpmra, before (left) and after (right) ─
+        for col_i, (lbl, res_ra_s, n_lbl) in enumerate([
+                ('before CTE', res_ra_b_s, len(rows_with_pos)),
+                ('after CTE',  np.where(has_after_s, res_ra_a_s, np.nan),
+                 int(has_after_s.sum())),
+        ]):
+            ax = fig.add_subplot(gs[0, col_i])
+            norm = _TSN(vcenter=0, vmin=-clip_pm, vmax=clip_pm)
+            for cmask, marker, clbl in zip(chip_masks, ['o', 's'], chip_titles):
+                sc = ax.scatter(x_raw[cmask], y_raw[cmask], c=res_ra_s[cmask],
+                                cmap='RdBu_r', norm=norm, s=4, alpha=0.6,
+                                linewidths=0, rasterized=True, marker=marker, label=clbl)
+            cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            cb.set_label(r'$\Delta\mu_{\alpha*}$ (mas yr$^{-1}$)', fontsize=9)
+            ax.set_xlabel('Raw detector X (px)', fontsize=11)
+            ax.set_ylabel('Raw detector Y (px)', fontsize=11)
+            ax.set_title(f'{lbl}  —  Δpmra  (N={n_lbl:,})', fontsize=11)
+            ax.legend(fontsize=8, loc='upper right')
+            ax.axhline(0, color='k', lw=0.8, ls=':', alpha=0.5)
+
+        # ── Row 1: 2D detector map coloured by Δpmdec, before (left) and after (right) ─
         for col_i, (lbl, res_dec_s, n_lbl) in enumerate([
                 ('before CTE', res_dec_b_s, len(rows_with_pos)),
                 ('after CTE',  np.where(has_after_s, res_dec_a_s, np.nan),
                  int(has_after_s.sum())),
         ]):
-            ax = fig.add_subplot(gs[0, col_i])
+            ax = fig.add_subplot(gs[1, col_i])
             norm = _TSN(vcenter=0, vmin=-clip_pm, vmax=clip_pm)
             for cmask, marker, clbl in zip(chip_masks, ['o', 's'], chip_titles):
                 sc = ax.scatter(x_raw[cmask], y_raw[cmask], c=res_dec_s[cmask],
@@ -2809,7 +2894,7 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                             fontsize=7, color='0.4', style='italic', ha=ha)
 
         for chip_row, (cmask, chip_lbl) in enumerate(zip(chip_masks, chip_titles)):
-            row = 1 + chip_row
+            row = 2 + chip_row
             for col_i, (res_b, w_b, res_a, w_a, pm_lbl) in enumerate([
                     (res_ra_b_s,  w_ra_b_s,  res_ra_a_s,  w_ra_a_s,
                      r'$\Delta\mu_{\alpha*}$ (mas yr$^{-1}$)'),
@@ -2836,7 +2921,7 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                 (res_dec_b_s, w_dec_b_s, res_dec_a_s, w_dec_a_s,
                  r'slope $\Delta\mu_\delta$ (μas yr$^{-1}$ px$^{-1}$)'),
         ]):
-            ax = fig.add_subplot(gs[3, col_i])
+            ax = fig.add_subplot(gs[4, col_i])
             ax.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
 
             for cmask, style in zip(chip_masks, chip_styles):
@@ -2884,9 +2969,9 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
             f'Leo I — CTE diagnostic  ({best_root},  N_before={len(rows_with_pos):,}'
             f'  N_after={int(has_after_s.sum()):,} members)',
             fontsize=13, y=0.97)
-        fig.savefig(plot_dir / 'cte_pm_vs_detector.png', dpi=150, bbox_inches='tight')
+        fig.savefig(plot_dir / f'{file_prefix}cte_pm_vs_detector.png', dpi=150, bbox_inches='tight')
         plt.close(fig)
-        print(f"  Saved: plots/cte_pm_vs_detector.png")
+        print(f"  Saved: plots/{file_prefix}cte_pm_vs_detector.png")
     except Exception as exc:
         import traceback
         print(f"  WARNING: cte_pm_vs_detector.png failed — {exc}")
@@ -3009,6 +3094,9 @@ def _run_joint_cte_loop(
     solver._update_R(r_current)
     solver._update_geometry(r_current, solver.v_survey)
 
+    gamma_history   = [gamma_hat.copy()]     # index 0 = warmstart
+    mu_pop_history  = [mu_pop_current.copy()]
+
     import time as _jtime
     for it in range(n_iter):
         r_prev      = r_current.copy()
@@ -3034,6 +3122,8 @@ def _run_joint_cte_loop(
         cte_params     = _gamma_to_cte_params(gamma_hat, cte_params)
         mu_pop_current = mu_pop_hat
         r_current      = r_hat
+        gamma_history.append(gamma_hat.copy())
+        mu_pop_history.append(mu_pop_hat.copy())
 
         # Update solver geometry for next iteration
         solver._update_R(r_hat)
@@ -3085,7 +3175,138 @@ def _run_joint_cte_loop(
             print(f"  Converged at iteration {it + 1}")
             break
 
-    return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT, cte_params
+    return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT, cte_params, gamma_history, mu_pop_history
+
+
+def _plot_joint_convergence(
+    gamma_history: list,
+    mu_pop_history: list,
+    cte_template: dict,
+    output_dir: Path,
+    file_prefix: str = '',
+) -> None:
+    """
+    Plot per-iteration evolution of CTE parameters and population mean PM.
+    Index 0 is the warmstart initialisation; subsequent indices are joint iterations.
+    """
+    import warnings; warnings.filterwarnings('ignore')
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    plot_dir = Path(output_dir) / 'plots'
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    _nb = 5 * (cte_template['hi'].mag_poly_order + 1) - 1
+    n_iter = len(gamma_history) - 1   # warmstart is index 0
+    iters  = np.arange(len(gamma_history))
+    iter_labels = ['ws'] + [str(i+1) for i in range(n_iter)]
+
+    gamma_arr  = np.array(gamma_history)    # (n_iter+1, n_gamma)
+    mu_arr     = np.array(mu_pop_history)   # (n_iter+1, 2)
+
+    gx_hi = np.linalg.norm(gamma_arr[:, 0*_nb:1*_nb], axis=1)
+    gy_hi = np.linalg.norm(gamma_arr[:, 1*_nb:2*_nb], axis=1)
+    gx_lo = np.linalg.norm(gamma_arr[:, 2*_nb:3*_nb], axis=1)
+    gy_lo = np.linalg.norm(gamma_arr[:, 3*_nb:4*_nb], axis=1)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    # Panel 1: μ_pop
+    ax = axes[0]
+    ax.plot(iters, mu_arr[:, 0], 'o-', color='steelblue', label=r'$\mu_{\alpha*}$')
+    ax.plot(iters, mu_arr[:, 1], 's-', color='firebrick',  label=r'$\mu_\delta$')
+    ax.axvline(0.5, color='gray', lw=0.8, ls='--', alpha=0.5)
+    ax.set_xlabel('Iteration (0 = warmstart)')
+    ax.set_ylabel('mas/yr')
+    ax.set_title(r'Population mean PM ($\mu_{\rm pop}$)')
+    ax.set_xticks(iters); ax.set_xticklabels(iter_labels)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: |γ| norms
+    ax = axes[1]
+    ax.plot(iters, gy_hi, 'o-', color='steelblue',  label=r'|$\gamma_y$ hi|')
+    ax.plot(iters, gy_lo, 's-', color='darkorange',  label=r'|$\gamma_y$ lo|')
+    ax.plot(iters, gx_hi, 'o--', color='steelblue', alpha=0.5, label=r'|$\gamma_x$ hi|')
+    ax.plot(iters, gx_lo, 's--', color='darkorange', alpha=0.5, label=r'|$\gamma_x$ lo|')
+    ax.axvline(0.5, color='gray', lw=0.8, ls='--', alpha=0.5)
+    ax.set_xlabel('Iteration (0 = warmstart)')
+    ax.set_ylabel('|γ| norm')
+    ax.set_title('CTE amplitude (γ norms)')
+    ax.set_xticks(iters); ax.set_xticklabels(iter_labels)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 3: first γ_y coefficient of each chip
+    ax = axes[2]
+    ax.plot(iters, gamma_arr[:, 1*_nb], 'o-', color='steelblue',  label=r'$\gamma_{y,\rm hi}[0]$ (yt²)')
+    ax.plot(iters, gamma_arr[:, 3*_nb], 's-', color='darkorange',  label=r'$\gamma_{y,\rm lo}[0]$ (yt²)')
+    ax.axvline(0.5, color='gray', lw=0.8, ls='--', alpha=0.5)
+    ax.axhline(0, color='k', lw=0.8, ls=':', alpha=0.4)
+    ax.set_xlabel('Iteration (0 = warmstart)')
+    ax.set_ylabel(r'$\gamma_{y}[0]$ (yt² coefficient)')
+    ax.set_title(r'Leading $\gamma_y$ coefficient evolution')
+    ax.set_xticks(iters); ax.set_xticklabels(iter_labels)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle('Joint CTE solve: per-iteration convergence  (iter 0 = warmstart)', fontsize=13)
+    fig.tight_layout()
+    out_name = f'{file_prefix}cte_convergence_history.png'
+    fig.savefig(plot_dir / out_name, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved: plots/{out_name}")
+
+
+def _save_warmstart_stellar_astrometry(
+    a_arr_ws: np.ndarray,
+    solver,
+    gaia_catalog: 'pd.DataFrame',
+    output_dir: Path,
+) -> None:
+    """
+    Save warmstart stellar astrometry as stellar_astrometry_warmstart.csv.
+    Uses uniform 1 mas/yr uncertainties since C_vT is not returned from warmstart.
+    """
+    import pandas as _pd
+
+    n_stars = a_arr_ws.shape[0]
+    # Build star ID → row index mapping
+    star_ids  = np.array(list(solver.star_id_to_idx.keys()), dtype=np.int64)
+    star_rows = np.array(list(solver.star_id_to_idx.values()), dtype=int)
+    order     = np.argsort(star_rows)
+    star_ids  = star_ids[order]   # sorted by internal solver row index
+
+    pmra   = a_arr_ws[star_rows[order], 2]
+    pmdec  = a_arr_ws[star_rows[order], 3]
+
+    # Get ra, dec from gaia_catalog where available
+    ra_arr  = np.full(len(star_ids), np.nan)
+    dec_arr = np.full(len(star_ids), np.nan)
+    if gaia_catalog is not None and 'ra' in gaia_catalog.columns:
+        _gc_gids = gaia_catalog['Gaia_id'].to_numpy(np.int64) \
+            if 'Gaia_id' in gaia_catalog.columns else np.zeros(len(gaia_catalog), np.int64)
+        _gc_ra   = gaia_catalog['ra'].to_numpy(float)
+        _gc_dec  = gaia_catalog['dec'].to_numpy(float)
+        _gmap    = {int(_gc_gids[i]): i for i in range(len(_gc_gids)) if int(_gc_gids[i]) > 0}
+        for k, gid in enumerate(star_ids):
+            if int(gid) in _gmap:
+                i = _gmap[int(gid)]
+                ra_arr[k]  = _gc_ra[i]
+                dec_arr[k] = _gc_dec[i]
+
+    df = _pd.DataFrame({
+        'Gaia_id':         star_ids,
+        'ra':              ra_arr,
+        'dec':             dec_arr,
+        'pmra_bp3m':       pmra,
+        'pmdec_bp3m':      pmdec,
+        'sigma_pmra_bp3m': np.ones(len(star_ids)),   # uniform uncertainty
+        'sigma_pmdec_bp3m': np.ones(len(star_ids)),
+    })
+    out_path = Path(output_dir) / 'stellar_astrometry_warmstart.csv'
+    df.to_csv(out_path, index=False)
+    print(f"  Saved: stellar_astrometry_warmstart.csv  ({len(df):,} stars)")
 
 
 # ── Main function ──────────────────────────────────────────────────────────────
@@ -3866,7 +4087,7 @@ def run_alignment_joint_cte(
 
     # ── CTE warm start ─────────────────────────────────────────────────────────
     print("\n  CTE warm start...")
-    cte_params, mu_pop_warm = warm_start_cte(
+    cte_params, mu_pop_warm, r_ws_diag, a_arr_ws = warm_start_cte(
         solver, image_names, filtered_spi, t_launch_yr,
         member_sidx_gaia, member_sidx_hst,
         sigma_pm, plx_pop, sigma_plx_tot,
@@ -3875,6 +4096,43 @@ def run_alignment_joint_cte(
         regularize_gamma=regularize_gamma,
         output_dir=output_dir_joint,
     )
+
+    # ── Warmstart CTE diagnostic plots ────────────────────────────────────────
+    if not no_plots and img_to_df is not None:
+        print("\n  Computing warmstart CTE diagnostic residuals...")
+        _bp3m_gids_ws = set(int(g) for g in solver.star_id_to_idx.keys() if int(g) > 0)
+        _ws_before = _compute_full_catalog_residuals_from_df(
+            img_to_df, _bp3m_gids_ws, solver, image_names, r_ws_diag)
+        _ws_after  = _apply_cte_to_residual_arrays(
+            _ws_before, image_names, cte_params, t_launch_yr, solver, filtered_spi)
+        np.savez(output_dir_joint / 'detections_catalog_ws_r.npz', **_ws_before)
+        np.savez(output_dir_joint / 'detections_catalog_ws_cte.npz', **_ws_after)
+        try:
+            _plot_cte_diagnostics(
+                output_dir_joint, cte_params,
+                before_npz=output_dir_joint / 'detections_catalog_ws_r.npz',
+                after_npz=output_dir_joint / 'detections_catalog_ws_cte.npz',
+                image_names=image_names,
+                solver=solver,
+                file_prefix='warmstart_',
+            )
+        except Exception as _exc:
+            print(f"  WARNING: warmstart CTE diagnostics failed — {_exc}")
+        # Warmstart cte_pm_vs_detector using warmstart stellar astrometry
+        try:
+            _save_warmstart_stellar_astrometry(
+                a_arr_ws, solver, gaia_catalog, output_dir_joint)
+            _plot_cte_diagnostics(
+                output_dir_joint, cte_params,
+                before_npz=None,
+                after_npz=None,
+                image_names=image_names,
+                solver=solver,
+                file_prefix='warmstart_',
+                astrom_csv=output_dir_joint / 'stellar_astrometry_warmstart.csv',
+            )
+        except Exception as _exc:
+            print(f"  WARNING: warmstart pm_vs_detector failed — {_exc}")
 
     if warmstart_only:
         print("\n  warmstart_only=True — stopping after warm start. "
@@ -3886,7 +4144,8 @@ def run_alignment_joint_cte(
     t0 = _time.time()
 
     (r_hat, C_r, gamma_hat, mu_pop_hat, C_shared,
-     a_arr, K_img, C_vT, cte_params) = _run_joint_cte_loop(
+     a_arr, K_img, C_vT, cte_params,
+     _gamma_hist, _mu_pop_hist) = _run_joint_cte_loop(
         solver, image_names, cte_params, t_launch_yr, filtered_spi,
         hst_only_mask,
         sigma_pm, plx_pop, sigma_plx_tot,
@@ -3965,20 +4224,24 @@ def run_alignment_joint_cte(
         print(f"  WARNING: star influence computation failed — {_exc}")
 
     # ── Post-CTE full-catalog residuals ───────────────────────────────────────
-    print("\n  Saving post-CTE full-catalog residuals...")
-    # Joint solve: gamma satisfies G@gamma ≈ +x_resid, so correction subtracts
-    # (standalone pipeline uses opposite sign convention: A@gamma ≈ -dy, adds)
+    # Compute "before CTE" (joint r_hat, original positions) and
+    # "after CTE" (joint r_hat, CTE-corrected positions) for proper comparison.
     apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
                         filtered_spi=filtered_spi, subtract=True)
     bp3m_gaia_ids = set(int(g) for g in solver.star_id_to_idx.keys() if int(g) > 0)
-    out_arrays = _compute_full_catalog_residuals_from_df(
+    print("\n  Saving post-CTE full-catalog residuals...")
+    _before_arrays = _compute_full_catalog_residuals_from_df(
         img_to_df, bp3m_gaia_ids, solver, image_names, r_hat)
-    if out_arrays:
-        np.savez(output_dir_joint / 'detections_catalog_cte.npz', **out_arrays)
-        n_imgs  = sum(1 for k in out_arrays if k.endswith('_X_c'))
-        n_total = sum(len(v) for k, v in out_arrays.items() if k.endswith('_X_c'))
-        print(f"  Saved detections_catalog_cte.npz: {n_imgs} images, "
-              f"{n_total:,} detections")
+    _after_arrays  = _apply_cte_to_residual_arrays(
+        _before_arrays, image_names, cte_params, t_launch_yr, solver, filtered_spi)
+    out_arrays = _after_arrays  # backwards compat for any downstream uses
+    if _before_arrays:
+        np.savez(output_dir_joint / 'detections_catalog_joint_r.npz', **_before_arrays)
+        np.savez(output_dir_joint / 'detections_catalog_cte.npz', **_after_arrays)
+        n_imgs  = sum(1 for k in _before_arrays if k.endswith('_X_c'))
+        n_total = sum(len(v) for k, v in _before_arrays.items() if k.endswith('_X_c'))
+        print(f"  Saved detections_catalog_joint_r.npz + detections_catalog_cte.npz: "
+              f"{n_imgs} images, {n_total:,} detections")
 
     # ── Standard BP3M diagnostic plots ────────────────────────────────────────
     if not no_plots:
@@ -3992,7 +4255,7 @@ def run_alignment_joint_cte(
         except Exception as exc:
             print(f"  WARNING: standard plots failed — {exc}")
 
-        before_npz = data_root / field_name / "BP3M_v2_results" / "detections_catalog.npz"
+        before_npz = output_dir_joint / "detections_catalog_joint_r.npz"
         after_npz  = output_dir_joint / "detections_catalog_cte.npz"
         try:
             _plot_cte_diagnostics(
@@ -4004,6 +4267,11 @@ def run_alignment_joint_cte(
             )
         except Exception as exc:
             print(f"  WARNING: CTE diagnostic plots failed — {exc}")
+
+        try:
+            _plot_joint_convergence(_gamma_hist, _mu_pop_hist, cte_template, output_dir_joint)
+        except Exception as exc:
+            print(f"  WARNING: convergence history plot failed — {exc}")
 
     print(f"\n  Joint CTE results written to: {output_dir_joint}")
     return output_dir_joint
