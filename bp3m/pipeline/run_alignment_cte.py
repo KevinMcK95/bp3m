@@ -1403,6 +1403,8 @@ def warm_start_cte(
     the y-direction detection residuals before and after applying γ_warm.
     """
     print("  CTE warm start: linear solve for γ with r_init and μ_pop_prior...")
+    print(f"  Warm-start μ_pop_prior = ({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) mas/yr  "
+          f"n_members={len(member_sidx_init)}")
     cte_zero = default_cte_params()
 
     # Per-magnitude-bin direct regression diagnostic (bypasses Schur complement)
