@@ -2788,6 +2788,7 @@ def _run_joint_cte_loop(
     pm_sys_floor: float = 0.2,
     gaia_catalog=None,
     init_pm_window: float = 2.0,
+    member_sidx_init: np.ndarray | None = None,
 ) -> tuple:
     """
     Outer Gauss-Newton loop for the joint (r, γ_CTE, μ_pop) solve.
@@ -2838,22 +2839,14 @@ def _run_joint_cte_loop(
         use_any = d.get('use_for_astrom', d['use_for_fit'])
         np.add.at(n_hst, sidx[use_any], 1)
 
-    # Initial member selection: Gaia-only, 3σ circular cut (same floor as _select_members_from_a)
-    _init_radius = member_sigma_clip * max(sigma_pm, pm_sys_floor)
-    if gaia_catalog is not None and 'pmra_xmatch' in gaia_catalog.columns:
-        pmra_cat  = gaia_catalog['pmra_xmatch'].to_numpy(float)
-        pmdec_cat = gaia_catalog['pmdec_xmatch'].to_numpy(float)
-        mu_ra, mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
-        eligible = (np.isfinite(pmra_cat) & np.isfinite(pmdec_cat)
-                    & (np.hypot(pmra_cat - mu_ra, pmdec_cat - mu_dec) < _init_radius)
-                    & (n_hst >= 1)
-                    & (~hst_only_mask))   # Gaia-only: consistent with _select_members_from_a
-        member_sidx = np.where(eligible)[0]
-        print(f"  Initial members (Gaia catalog PMs, {member_sigma_clip}σ={_init_radius:.3f} mas/yr): "
-              f"{len(member_sidx)}")
+    # Use the member set passed in from the caller (computed once in
+    # run_alignment_joint_cte with the same CSV-based PM cuts used by warm_start_cte).
+    # Fallback: all Gaia stars if not provided.
+    if member_sidx_init is not None:
+        member_sidx = member_sidx_init.copy()
     else:
-        eligible_mask = (~hst_only_mask) & (n_hst >= 1)
-        member_sidx   = np.where(eligible_mask)[0]
+        member_sidx = np.where(~hst_only_mask)[0]
+    print(f"  Initial members for joint loop: {len(member_sidx)}")
 
     # Output variables (initialised to sensible defaults)
     r_hat      = r_current.copy()
@@ -3757,6 +3750,7 @@ def run_alignment_joint_cte(
         regularize_gamma=regularize_gamma,
         pm_sys_floor=pm_sys_floor,
         gaia_catalog=gaia_catalog,
+        member_sidx_init=member_sidx_init,
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
     print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
