@@ -1443,8 +1443,12 @@ def _diagnose_cte_by_magbin(
         if np.abs(np.diag(H)).max() < 1e-30:
             gamma_bins[b] = np.zeros(n_gamma)
             continue
-        gamma_bins[b] = np.linalg.solve(H + regularize_gamma * np.eye(n_gamma),
-                                        b_bins[b])
+        H_reg = H + regularize_gamma * np.eye(n_gamma)
+        d_sc  = np.sqrt(np.maximum(np.abs(np.diag(H_reg)), 1e-30))
+        d_inv = 1.0 / d_sc
+        gamma_bins[b] = np.linalg.solve(
+            d_inv[:, None] * H_reg * d_inv[None, :],
+            d_inv * b_bins[b]) * d_inv
 
     # Print spatial coefficients per bin (1×yt excluded as degenerate)
     _basis_names = ['yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
