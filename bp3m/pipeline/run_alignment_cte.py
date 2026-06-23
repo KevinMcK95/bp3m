@@ -60,7 +60,7 @@ class CTEChipParams:
     x0: float = 2048.0
     gamma_x: np.ndarray = field(default_factory=lambda: np.zeros(5))
     gamma_y: np.ndarray = field(default_factory=lambda: np.zeros(5))
-    mag_poly_order: int  = 0          # polynomial order; gamma size = 5*(order+1)
+    mag_poly_order: int  = 0          # polynomial order; gamma size = 5*(order+1)-1
     mag_norm_ref:   float = 0.0       # magnitude normalisation centre
     mag_norm_scale: float = 1.0       # magnitude normalisation scale
 
@@ -78,7 +78,8 @@ class CTEChipParams:
 def default_cte_params(mag_poly_order: int = 0,
                        mag_norm_ref: float = 0.0,
                        mag_norm_scale: float = 1.0) -> dict[str, CTEChipParams]:
-    n = 5 * (mag_poly_order + 1)
+    # nb = 5*(order+1)-1: the degenerate constant-mag×yt term is excluded
+    n = 5 * (mag_poly_order + 1) - 1
     return {
         'hi': CTEChipParams(chip='hi',
                             y_readout_raw=_HI_Y_READOUT_RAW,
@@ -159,8 +160,9 @@ def compute_cte_displacement(
     MP  = mag_poly_basis(mag, chip_params.mag_poly_order,
                          chip_params.mag_norm_ref,
                          chip_params.mag_norm_scale)   # (n, order+1) mag basis
-    # Combined basis: (n, (order+1)*5)  via outer product flattened
-    PsiB = (dt[:, None] * (MP[:, :, None] * B[:, None, :]).reshape(len(mag), -1))
+    # Combined basis: drop 1×yt column (degenerate with per-image y-plate-scale)
+    _full = (MP[:, :, None] * B[:, None, :]).reshape(len(mag), -1)
+    PsiB = dt[:, None] * _full[:, 1:]
     return np.stack([PsiB @ chip_params.gamma_x,
                      PsiB @ chip_params.gamma_y], axis=1)
 
@@ -448,14 +450,14 @@ def update_cte_params(
         xt  = X_c / 2048.0
         yt  = (y_raw - p.y_readout_raw) / 2048.0
         f1  = func1_mag(mag)
-        Psi = dt * f1              # (n,)
-        B   = cte_basis(xt, yt)   # (n, 5)
-        A   = Psi[:, None] * B    # (n, 5) design matrix
+        Psi = dt * f1                        # (n,)
+        B   = cte_basis(xt, yt)[:, 1:]      # (n, 4): drop degenerate 1×yt
+        A   = Psi[:, None] * B              # (n, 4) design matrix
 
         col_scale = np.std(A, axis=0).clip(min=1e-30)
         A_s = A / col_scale
 
-        AtWA = (A_s * z[:, None]).T @ A_s + regularize * np.eye(5)
+        AtWA = (A_s * z[:, None]).T @ A_s + regularize * np.eye(4)
         try:
             AtWr_y = (A_s * z[:, None]).T @ (-dy)
             p.gamma_y = np.linalg.solve(AtWA, AtWr_y) / col_scale
@@ -538,13 +540,13 @@ def _joint_solve_cte(
     nr       = solver.N_R
     n_images = len(image_names)
     n_r      = nr * n_images
-    # n_gamma = 4 * nb, where nb = 5 * (mag_poly_order + 1)
+    # n_gamma = 4 * nb, where nb = 5 * (mag_poly_order + 1) - 1
     # Read poly order from cte_params template (both chips must agree)
     _ref_chip = cte_params.get('hi', cte_params.get('lo'))
     mag_poly_order = _ref_chip.mag_poly_order
     mag_norm_ref   = _ref_chip.mag_norm_ref
     mag_norm_scale = _ref_chip.mag_norm_scale
-    nb       = 5 * (mag_poly_order + 1)    # coefficients per chip per direction
+    nb       = 5 * (mag_poly_order + 1) - 1    # coefficients per chip per direction
     n_gamma  = 4 * nb                      # hi_x, hi_y, lo_x, lo_y
     N_V      = 5
     n_shared = n_r + n_gamma + 2
@@ -685,12 +687,12 @@ def _joint_solve_cte(
         xt  = d['X_c'] / 2048.0
         yt  = (y_raw - p.y_readout_raw) / 2048.0
         ok  = np.isfinite(mag) & np.isfinite(y_raw)
-        # Combined basis: dt * mag_poly ⊗ spatial  → (n, nb)
+        # Combined basis: dt * mag_poly ⊗ spatial, drop 1×yt → (n, nb)
         MP  = np.where(ok[:, None],
                        mag_poly_basis(mag, mag_poly_order,
                                       mag_norm_ref, mag_norm_scale), 0.0)
         PsiB = (dt_scalar * (MP[:, :, None] * cte_basis(xt, yt)[:, None, :])
-                ).reshape(n, nb)   # (n, nb)
+                ).reshape(n, nb + 1)[:, 1:]   # (n, nb); drop degenerate 1×yt
 
         cx, cy = (0, nb) if chip == 'hi' else (2*nb, 3*nb)
         R_j    = r_j[:4].reshape(2, 2)   # [[a, b], [c, d]]
@@ -878,11 +880,11 @@ def _gamma_to_cte_params(gamma_hat: np.ndarray,
 
     Layout (must match _joint_solve_cte):
       hi_x[0:nb], hi_y[nb:2nb], lo_x[2nb:3nb], lo_y[3nb:4nb]
-    where nb = 5 * (mag_poly_order + 1).
+    where nb = 5 * (mag_poly_order + 1) - 1.
     """
     import copy
     params = copy.deepcopy(template)
-    nb = 5 * (params['hi'].mag_poly_order + 1)
+    nb = 5 * (params['hi'].mag_poly_order + 1) - 1
     params['hi'].gamma_x = gamma_hat[0*nb:1*nb].copy()
     params['hi'].gamma_y = gamma_hat[1*nb:2*nb].copy()
     params['lo'].gamma_x = gamma_hat[2*nb:3*nb].copy()
@@ -1143,7 +1145,7 @@ def _plot_warmstart_cte(
     member_mask[member_sidx] = True
     _tmpl = cte_template if cte_template is not None else default_cte_params()
     cte_w = _gamma_to_cte_params(gamma_warm, _tmpl)
-    _nb   = 5 * (_tmpl['hi'].mag_poly_order + 1)
+    _nb   = 5 * (_tmpl['hi'].mag_poly_order + 1) - 1
 
     rec = {c: {'y_raw': [], 'dy_b': [], 'dy_a': [], 'mag': []}
            for c in ('hi', 'lo')}
@@ -1191,7 +1193,7 @@ def _plot_warmstart_cte(
                                        _tmpl['hi'].mag_norm_ref,
                                        _tmpl['hi'].mag_norm_scale), 0.0)
         PsiB = (dt * (MP[:, :, None] * cte_basis(xt, yt)[:, None, :])
-                ).reshape(len(mag), _nb)
+                ).reshape(len(mag), _nb + 1)[:, 1:]   # drop degenerate 1×yt
 
         R_j    = r_j[:4].reshape(2, 2)
         cy     = _nb if chip == 'hi' else 3 * _nb
@@ -1266,7 +1268,7 @@ def _plot_warmstart_cte(
         gy_hi0 = float(gamma_warm[_nb])
         fig.suptitle(
             f'CTE warm-start diagnostic  '
-            f'γ_y_hi[0]={gy_hi0:+.4e}  '
+            f'γ_y_hi[0](yt²)={gy_hi0:+.4e}  '
             f'|γ_y_hi|={float(np.linalg.norm(gamma_warm[_nb:2*_nb])):.3e}  '
             f'|γ_y_lo|={float(np.linalg.norm(gamma_warm[3*_nb:4*_nb])):.3e}',
             fontsize=11)
@@ -1311,12 +1313,13 @@ def _diagnose_cte_by_magbin(
     member_mask[member_sidx] = True
 
     nr      = solver.N_R
-    # Diagnostic always uses K=0: fit 5 spatial coefficients per bin.
+    # Diagnostic always uses K=0: fit 4 spatial coefficients per bin.
     # Polynomial magnitude dependence within a bin is meaningless because
     # stars in a narrow bin all have similar magnitudes (collinear columns).
+    # nb=4 because the degenerate 1×yt term is excluded (see default_cte_params).
     _tmpl   = default_cte_params(0)
-    nb      = 5
-    n_gamma = 20
+    nb      = 4
+    n_gamma = 16
     cte_zero = _tmpl
     _use_two_tier = getattr(solver, '_use_two_tier', False)
 
@@ -1407,7 +1410,7 @@ def _diagnose_cte_by_magbin(
                                       _tmpl['hi'].mag_norm_ref,
                                       _tmpl['hi'].mag_norm_scale), 0.0)
         PsiB = (dt_scalar * (MP[:, :, None] * cte_basis(xt, yt)[:, None, :])
-                ).reshape(len(sidx), nb)
+                ).reshape(len(sidx), 5)[:, 1:]   # (n, nb=4); drop degenerate 1×yt
 
         cx, cy = (0, nb) if chip == 'hi' else (2*nb, 3*nb)
         R_j    = r_j[:4].reshape(2, 2)
@@ -1436,18 +1439,18 @@ def _diagnose_cte_by_magbin(
         gamma_bins[b] = np.linalg.solve(H + regularize_gamma * np.eye(n_gamma),
                                         b_bins[b])
 
-    # Print constant-poly-term (k=0) spatial coefficients per bin
-    _basis_names = ['yt', 'yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
+    # Print spatial coefficients per bin (1×yt excluded as degenerate)
+    _basis_names = ['yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
     print(f"  CTE γ per mag bin (direct regression, n_mem={len(member_sidx)}, nb={nb}):")
     print(f"  {'bin':>10}  {'n':>8}  "
-          + "  ".join(f"γ_yhi[{i}]({_basis_names[i]})" for i in range(5))
+          + "  ".join(f"γ_yhi[{i}]({_basis_names[i]})" for i in range(4))
           + "  |γ_yhi|"
-          + "  " + "  ".join(f"γ_ylo[{i}]" for i in range(5))
+          + "  " + "  ".join(f"γ_ylo[{i}]" for i in range(4))
           + "  |γ_ylo|")
     for b in mag_bins:
         g = gamma_bins[b]
-        vals_hi = "  ".join(f"{g[nb+i]:+.3e}" for i in range(5))
-        vals_lo = "  ".join(f"{g[3*nb+i]:+.3e}" for i in range(5))
+        vals_hi = "  ".join(f"{g[nb+i]:+.3e}" for i in range(4))
+        vals_lo = "  ".join(f"{g[3*nb+i]:+.3e}" for i in range(4))
         norm_hi = float(np.linalg.norm(g[nb:2*nb]))
         norm_lo = float(np.linalg.norm(g[3*nb:4*nb]))
         print(f"  mag {b[0]:5.1f}-{b[1]:<5.1f}: n={n_bins[b]:7d}"
@@ -1460,7 +1463,7 @@ def _diagnose_cte_by_magbin(
     return gamma_bins
 
 
-def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warmstart', nb=5):
+def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warmstart', nb=4):
     """Plot γ_y per magnitude bin for CTE diagnostic."""
     import matplotlib
     matplotlib.use('Agg')
@@ -1469,26 +1472,28 @@ def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warms
     plot_dir = Path(output_dir) / 'plots'
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    basis_names = ['yt', 'yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
-    colors      = ['steelblue', 'tomato', 'forestgreen', 'darkorchid', 'darkorange']
+    # basis_names matches the non-degenerate basis (yt excluded)
+    _all_basis_names = ['yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
+    basis_names = _all_basis_names[:nb]
+    colors      = ['tomato', 'forestgreen', 'darkorchid', 'darkorange'][:nb]
     centers = [0.5 * (b[0] + b[1]) for b in mag_bins]
     counts  = [n_bins[b] for b in mag_bins]
 
-    # (2 chips) × (5 basis functions + 1 norm) → 2 rows, 2 cols
+    # (2 chips) × (nb basis functions + 1 norm) → 2 rows, 2 cols
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
 
     # hi y-block starts at nb; lo y-block starts at 3*nb
     for col, (chip_label, y_off) in enumerate([('hi', nb), ('lo', 3*nb)]):
-        # Top row: first 5 y-direction coefficients (constant poly term) per bin
+        # Top row: nb y-direction coefficients (constant poly term) per bin
         ax_coef = axes[0, col]
-        for i in range(5):
+        for i in range(nb):
             vals = [float(gamma_bins[b][y_off + i]) for b in mag_bins]
             ax_coef.plot(centers, vals, 'o-', color=colors[i], lw=1.8, ms=7,
                          label=f'γ_y[{i}] ({basis_names[i]})')
         ax_coef.axhline(0, color='k', lw=0.8, ls='--')
         ax_coef.set_xlabel('F814W magnitude')
         ax_coef.set_ylabel('γ_y coefficient (const-poly term)')
-        ax_coef.set_title(f'γ_y_{chip_label}: 5 spatial coefficients vs mag bin')
+        ax_coef.set_title(f'γ_y_{chip_label}: {nb} spatial coefficients vs mag bin')
         ax_coef.legend(fontsize=8)
 
         # Bottom row: |γ_y| norm (all nb coefficients) + annotation of n per bin
@@ -1567,14 +1572,12 @@ def warm_start_cte(
 
     cte_warm = _gamma_to_cte_params(gamma_warm, cte_template)
 
-    nb    = 5 * (cte_template['hi'].mag_poly_order + 1)
+    nb    = 5 * (cte_template['hi'].mag_poly_order + 1) - 1
     gy_hi = float(np.linalg.norm(gamma_warm[nb:2*nb]))
     gy_lo = float(np.linalg.norm(gamma_warm[3*nb:4*nb]))
-    gyx0  = float(gamma_warm[nb])   # first y-basis coefficient, hi chip
-    print(f"  Warm-start γ (joint solve): γ_y_hi[0]={gyx0:+.4e}  "
+    gyx0  = float(gamma_warm[nb])   # first y-basis coefficient (yt²), hi chip
+    print(f"  Warm-start γ (joint solve): γ_y_hi[0](yt²)={gyx0:+.4e}  "
           f"|γ_y_hi|={gy_hi:.3e}  |γ_y_lo|={gy_lo:.3e}")
-    if gyx0 > 0:
-        print("  WARNING: warm-start γ_y_hi[0] > 0 (expected negative for ACS CTE)")
 
     if output_dir is not None:
         _plot_warmstart_cte(solver, image_names, filtered_spi, t_launch_yr,
@@ -1782,13 +1785,13 @@ def _warm_start_cte_residuals(
         phi = func1_mag(mag)
         xt  = X_c / 2048.0
         yt  = (y_raw - p.y_readout_raw) / 2048.0
-        B   = cte_basis(xt, yt)
+        B   = cte_basis(xt, yt)[:, 1:]  # 4 non-degenerate terms: [yt², xt·yt, xt²·yt, xt·yt²]
 
         w   = 1.0 / sigma**2
         sqw = np.sqrt(w)
 
         # y-CTE: dpm_dec ≈ pscale·d·phi·B @ gamma_y (+ intercept)
-        Ay_phys = pscale * d_coef * phi[:, None] * B   # (n, 5) physical units (mas/yr)
+        Ay_phys = pscale * d_coef * phi[:, None] * B   # (n, 4) physical units (mas/yr)
         col_scale_y = np.std(Ay_phys, axis=0).clip(min=1e-30)
         A_y = np.column_stack([np.ones(len(sub)), Ay_phys / col_scale_y])
         try:
@@ -1797,20 +1800,16 @@ def _warm_start_cte_residuals(
             params[chip].gamma_y = coeffs_y[1:] / col_scale_y
         except np.linalg.LinAlgError:
             print(f"    {chip}: y-CTE WLS failed")
-            coeffs_y = np.zeros(6)
+            coeffs_y = np.zeros(5)
 
         pred_y = A_y @ coeffs_y
         rms_y  = float(np.sqrt(np.average((dpm_dec - pred_y)**2, weights=w)))
-        med_phi = float(np.median(phi))
-        med_yp  = float(np.median(np.abs(yt)))   # normalised
-        cte_mas_yr = abs(pscale * d_coef * med_phi * med_yp * params[chip].gamma_y[0])
-        print(f"    {chip} y-CTE: γ_y[0]={params[chip].gamma_y[0]:.3e}  "
-              f"CTE@med={cte_mas_yr:.3f} mas/yr  "
+        print(f"    {chip} y-CTE: γ_y[0](yt²)={params[chip].gamma_y[0]:.3e}  "
               f"intercept={coeffs_y[0]:+.3f} mas/yr  "
               f"rms={rms_y:.3f} mas/yr  n={len(sub):,}")
 
         # x-CTE: dpm_ra ≈ pscale·a·phi·B @ gamma_x (+ intercept)
-        Ax_phys = pscale * a_coef * phi[:, None] * B   # (n, 5) physical units (mas/yr)
+        Ax_phys = pscale * a_coef * phi[:, None] * B   # (n, 4) physical units (mas/yr)
         col_scale_x = np.std(Ax_phys, axis=0).clip(min=1e-30)
         A_x = np.column_stack([np.ones(len(sub)), Ax_phys / col_scale_x])
         try:
@@ -1819,11 +1818,11 @@ def _warm_start_cte_residuals(
             params[chip].gamma_x = coeffs_x[1:] / col_scale_x
         except np.linalg.LinAlgError:
             print(f"    {chip}: x-CTE WLS failed")
-            coeffs_x = np.zeros(6)
+            coeffs_x = np.zeros(5)
 
         pred_x = A_x @ coeffs_x
         rms_x  = float(np.sqrt(np.average((dpm_ra - pred_x)**2, weights=w)))
-        print(f"    {chip} x-CTE: γ_x[0]={params[chip].gamma_x[0]:.3e}  "
+        print(f"    {chip} x-CTE: γ_x[0](yt²)={params[chip].gamma_x[0]:.3e}  "
               f"intercept={coeffs_x[0]:+.3f} mas/yr  "
               f"rms={rms_x:.3f} mas/yr")
 
@@ -2007,7 +2006,7 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                 y_raw_grid = np.linspace(p.y_readout_raw, 2039, 500)
             X_c_grid   = np.zeros_like(y_raw_grid)   # at X centre of chip
 
-            _nb  = len(p.gamma_y)    # 5*(K+1) for the polynomial model
+            _nb  = len(p.gamma_y)    # 5*(K+1)-1 after degenerate term removal
             _n   = len(y_raw_grid)
             xt_g = X_c_grid / 2048.0
             yt_g = (y_raw_grid - p.y_readout_raw) / 2048.0
@@ -2015,7 +2014,7 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
             for mag_v, col, lbl in mag_bins:
                 MP_v  = mag_poly_basis(np.full(_n, mag_v), p.mag_poly_order,
                                        p.mag_norm_ref, p.mag_norm_scale)  # (n, K+1)
-                PsiB  = (MP_v[:, :, None] * B_g[:, None, :]).reshape(_n, _nb)
+                PsiB  = (MP_v[:, :, None] * B_g[:, None, :]).reshape(_n, _nb + 1)[:, 1:]
                 dcte  = dt_max * (PsiB @ p.gamma_y)
                 ax.plot(y_raw_grid, dcte, color=col, lw=1.8, label=lbl)
 
@@ -2830,7 +2829,7 @@ def _run_joint_cte_loop(
     # Output variables (initialised to sensible defaults)
     r_hat      = r_current.copy()
     C_r        = None
-    _nb0 = 5 * (cte_params.get('hi', cte_params.get('lo')).mag_poly_order + 1)
+    _nb0 = 5 * (cte_params.get('hi', cte_params.get('lo')).mag_poly_order + 1) - 1
     # Initialise gamma from warmstart cte_params (not zeros) and use as prior
     # to prevent the r–γ degeneracy from causing oscillatory blow-up.
     _p = cte_params.get('hi', cte_params.get('lo', None))
@@ -2896,7 +2895,7 @@ def _run_joint_cte_loop(
         dr   = float(np.max(np.abs(r_hat - r_prev)))
         dg   = float(np.max(np.abs(gamma_hat - gamma_prev)))
         dmu  = float(np.max(np.abs(mu_pop_hat - mu_pop_prev)))
-        _nb = 5 * (cte_params.get('hi', cte_params.get('lo')).mag_poly_order + 1)
+        _nb = 5 * (cte_params.get('hi', cte_params.get('lo')).mag_poly_order + 1) - 1
         gy_hi = float(np.linalg.norm(gamma_hat[_nb:2*_nb]))
         gy_lo = float(np.linalg.norm(gamma_hat[3*_nb:4*_nb]))
         print(f"  Joint iter {it+1:2d}: Δr={dr:.3e}  Δγ={dg:.3e}  Δμ={dmu:.4f}  "
@@ -3535,7 +3534,7 @@ def run_alignment_joint_cte(
     # ── CTE template (magnitude polynomial normalization) ─────────────────────
     _mag_norm_ref, _mag_norm_scale = _compute_mag_normalization(solver, image_names)
     cte_template = default_cte_params(mag_poly_order, _mag_norm_ref, _mag_norm_scale)
-    _nb = 5 * (mag_poly_order + 1)
+    _nb = 5 * (mag_poly_order + 1) - 1
     print(f"  CTE mag poly order={mag_poly_order}  nb={_nb}  "
           f"mag_norm: ref={_mag_norm_ref:.2f}  scale={_mag_norm_scale:.2f}")
 
