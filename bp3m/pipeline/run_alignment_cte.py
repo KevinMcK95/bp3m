@@ -500,10 +500,19 @@ def _joint_solve_cte(
     r_current: np.ndarray,
     regularize_gamma: float = 1e-8,
     gamma_prior: np.ndarray | None = None,
+    hst_prior_sidx: np.ndarray | None = None,
 ) -> tuple:
     """
     Joint Schur-complement solve for (r, γ_CTE, μ_pop) after marginalising
     stellar astrometry {v_i}, mirroring solver._solve_one_pass.
+
+    member_sidx     : Gaia-matched member stars — drive μ_pop AND receive the
+                      population prior.
+    hst_prior_sidx  : HST-only member stars — receive the population prior
+                      (PM regularisation) but do NOT contribute to the μ_pop
+                      Schur correction.  Pass the fixed HST-only member set
+                      from run_alignment_joint_cte so their PMs are
+                      regularised without biasing the population mean.
 
     Parameters
     ----------
@@ -574,22 +583,29 @@ def _joint_solve_cte(
     H_vv = solver.C_survey_inv.copy()
     H_vv[:, np.arange(N_V), np.arange(N_V)] += solver._C_VG_inv_per_star
 
-    H_vv[member_sidx, 2, 2] += sigma_pm_inv_sq    # population PM prior (μ_α*)
-    H_vv[member_sidx, 3, 3] += sigma_pm_inv_sq    # population PM prior (μ_δ)
-    H_vv[member_sidx, 4, 4] += sigma_plx_inv_sq   # LVD parallax prior
+    # All stars that receive the population prior (Gaia members + fixed HST-only).
+    # member_sidx alone drives μ_pop (Schur correction below).
+    if hst_prior_sidx is not None and len(hst_prior_sidx) > 0:
+        _all_prior = np.concatenate([member_sidx, hst_prior_sidx])
+    else:
+        _all_prior = member_sidx
+
+    H_vv[_all_prior, 2, 2] += sigma_pm_inv_sq    # population PM prior (μ_α*)
+    H_vv[_all_prior, 3, 3] += sigma_pm_inv_sq    # population PM prior (μ_δ)
+    H_vv[_all_prior, 4, 4] += sigma_plx_inv_sq   # LVD parallax prior
 
     h_align = solver.C_survey_inv_dot_v.copy()
     h_all   = solver.C_survey_inv_dot_v.copy()
 
-    # Prior information term: σ_pm^{-2} M μ_pop_current for member stars
-    h_align[member_sidx, 2] += sigma_pm_inv_sq * mu_pop_current[0]
-    h_align[member_sidx, 3] += sigma_pm_inv_sq * mu_pop_current[1]
-    h_all[member_sidx, 2]   += sigma_pm_inv_sq * mu_pop_current[0]
-    h_all[member_sidx, 3]   += sigma_pm_inv_sq * mu_pop_current[1]
+    # Prior information term: σ_pm^{-2} M μ_pop_current for all prior stars
+    h_align[_all_prior, 2] += sigma_pm_inv_sq * mu_pop_current[0]
+    h_align[_all_prior, 3] += sigma_pm_inv_sq * mu_pop_current[1]
+    h_all[_all_prior, 2]   += sigma_pm_inv_sq * mu_pop_current[0]
+    h_all[_all_prior, 3]   += sigma_pm_inv_sq * mu_pop_current[1]
 
     # LVD parallax prior information: σ_plx^{-2} * plx_pop
-    h_align[member_sidx, 4] += sigma_plx_inv_sq * plx_pop
-    h_all[member_sidx, 4]   += sigma_plx_inv_sq * plx_pop
+    h_align[_all_prior, 4] += sigma_plx_inv_sq * plx_pop
+    h_all[_all_prior, 4]   += sigma_plx_inv_sq * plx_pop
 
     # ── Shared-parameter precision and data accumulations ─────────────────────
     H_rr        = np.zeros((n_r, n_r))
@@ -1066,6 +1082,7 @@ def _select_members_from_a(
     min_members: int = 5,
     init_window_masyr: float = 2.0,
     pm_sys_floor: float = 0.2,
+    eligible_sidx: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Sigma-clip on PM distance from mu_pop to identify likely cluster members.
@@ -1074,26 +1091,28 @@ def _select_members_from_a(
     the astrometry solution are eligible (HST-only stars have unconstrained PMs
     and should not drive the population prior).
 
-    An initial ±init_window_masyr cut around mu_pop bootstraps the sigma
-    estimate before iterative clipping, preventing background stars from
-    dominating the MAD when they outnumber members.
-
     Parameters
     ----------
-    a_arr       : (n_stars, 5) posterior stellar astrometry from _joint_solve_cte
-    mu_pop      : (2,) current population mean PM (mas/yr)
+    a_arr         : (n_stars, 5) posterior stellar astrometry from _joint_solve_cte
+    mu_pop        : (2,) current population mean PM (mas/yr)
     hst_only_mask : (n_stars,) True for HST-only stars
-    n_hst       : (n_stars,) count of contributing HST detections per star
-    sigma_clip  : number of robust sigmas for membership cut
-    n_iter      : max sigma-clipping iterations
-    min_members : minimum members to keep; returns all eligible if below
+    n_hst         : (n_stars,) count of contributing HST detections per star
+    sigma_clip    : number of robust sigmas for membership cut
+    n_iter        : max sigma-clipping iterations
+    min_members   : minimum members to keep; returns all eligible if below
     init_window_masyr : initial PM distance window to seed sigma estimate
+    eligible_sidx : if provided, restrict candidates to this index set (can
+                    only drop members, never add stars not in the initial set)
 
     Returns
     -------
     (n_mem,) array of global star indices into the solver star array
     """
-    eligible    = (~hst_only_mask) & (n_hst >= 1)
+    eligible = (~hst_only_mask) & (n_hst >= 1)
+    if eligible_sidx is not None:
+        _init_mask = np.zeros(len(hst_only_mask), bool)
+        _init_mask[eligible_sidx] = True
+        eligible = eligible & _init_mask
     eidx        = np.where(eligible)[0]
     if len(eidx) < min_members:
         return eidx
@@ -1534,7 +1553,8 @@ def warm_start_cte(
     image_names: list[str],
     filtered_spi: dict | None,
     t_launch_yr: float,
-    member_sidx_init: np.ndarray,
+    member_sidx_gaia: np.ndarray,
+    member_sidx_hst: np.ndarray,
     sigma_pm: float,
     plx_pop: float,
     sigma_plx_tot: float,
@@ -1544,21 +1564,30 @@ def warm_start_cte(
     cte_template: dict | None = None,
     regularize_gamma: float = 1e-8,
     output_dir: Path | None = None,
-) -> dict[str, CTEChipParams]:
+    n_gaia_warmstart_iters: int = 3,
+) -> tuple[dict[str, CTEChipParams], np.ndarray]:
     """
-    Warm-start CTE by solving for γ with r_init and μ_pop_prior fixed.
+    Warm-start CTE in four phases:
 
-    Runs one pass of _joint_solve_cte restricted to member stars, accepting
-    only the γ output (r and μ_pop remain at their initial values).  This
-    gives the optimal CTE parameters for the initial transformation, with the
-    correct sign guaranteed by the linear solve.
+    [1/4] K=0 magnitude-bin diagnostic (all members, direct regression).
+    [2/4] Gaia-only joint (r, μ_pop) refinement — isolates the reference
+          frame from CTE-distorted HST-only PMs.  Updates solver._r_hat_current
+          so the full joint loop inherits the cleaner alignment.
+    [3/4] Full-member CTE warmstart — Gaia drives μ_pop, HST-only stars
+          receive the population prior for PM regularisation but do not
+          contribute to the μ_pop Schur correction.  Extracts γ_warm.
+    [4/4] Diagnostic plots.
 
-    If output_dir is provided, saves cte_warmstart_before_after.png showing
-    the y-direction detection residuals before and after applying γ_warm.
+    Returns
+    -------
+    (cte_warm, mu_pop_warm)
+        cte_warm   : dict[str, CTEChipParams] with warm-started γ coefficients
+        mu_pop_warm : (2,) population mean PM refined from Gaia members
     """
     if cte_template is None:
         cte_template = default_cte_params()
 
+    member_sidx_init = np.concatenate([member_sidx_gaia, member_sidx_hst])
     _mag_order = cte_template['hi'].mag_poly_order
     nb = 5 * (_mag_order + 1) - 1
     print(f"\n  {'─'*56}")
@@ -1566,10 +1595,10 @@ def warm_start_cte(
           f"(mag_poly_order={_mag_order}  nb={nb}  n_images={len(image_names)})")
     print(f"  {'─'*56}")
     print(f"  μ_pop_prior = ({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) mas/yr  "
-          f"n_members={len(member_sidx_init)}")
+          f"n_gaia={len(member_sidx_gaia)}  n_hst={len(member_sidx_hst)}")
 
     # ── Phase 1: per-magnitude-bin diagnostic (bypasses Schur complement) ──────
-    print(f"\n  [1/3] Magnitude-bin CTE diagnostic (K=0 direct regression)...")
+    print(f"\n  [1/4] Magnitude-bin CTE diagnostic (K=0 direct regression)...")
     import time as _wtime
     _t0 = _wtime.time()
     gamma_bins = _diagnose_cte_by_magbin(
@@ -1580,43 +1609,70 @@ def warm_start_cte(
         label='warmstart',
         cte_template=cte_template,
     )
-    print(f"  [1/3] done ({_wtime.time()-_t0:.1f}s)")
+    print(f"  [1/4] done ({_wtime.time()-_t0:.1f}s)")
 
-    # ── Phase 2: full joint (r, γ, μ_pop) Schur solve ─────────────────────────
-    print(f"\n  [2/3] Joint (r, γ, μ_pop) Schur warm solve...")
+    # ── Phase 2: Gaia-only (r, μ_pop) refinement ─────────────────────────────
+    # Use only Gaia-matched members (well-constrained individual PMs) to refine
+    # the reference frame before the CTE fit.  HST-only stars are excluded here
+    # because their PMs are derived from HST positions, which are CTE-distorted.
+    print(f"\n  [2/4] Gaia-only (r, μ_pop) refinement "
+          f"({n_gaia_warmstart_iters} iter, {len(member_sidx_gaia)} stars)...")
+    _t0 = _wtime.time()
+    r_ws  = r_init.copy()
+    mu_ws = mu_pop_prior.copy()
+    for _ws_it in range(n_gaia_warmstart_iters):
+        _result_g = _joint_solve_cte(
+            solver, image_names, cte_template, t_launch_yr, filtered_spi,
+            member_sidx_gaia, sigma_pm, plx_pop, sigma_plx_tot,
+            mu_ws, mu_pop_prior, C_pop_prior_inv, r_ws,
+            regularize_gamma=regularize_gamma,
+            hst_prior_sidx=None,
+        )
+        r_ws, _, _, mu_ws, _, _, _, _ = _result_g
+        solver._update_R(r_ws)
+        solver._update_geometry(r_ws, solver.v_survey)
+    print(f"  [2/4] done ({_wtime.time()-_t0:.1f}s)  "
+          f"μ_pop = ({mu_ws[0]:+.4f}, {mu_ws[1]:+.4f}) mas/yr")
+
+    # ── Phase 3: full-member CTE warmstart (two-tier) ─────────────────────────
+    # Gaia members drive μ_pop; HST-only members get the population prior
+    # (PM regularisation) but do not pull μ_pop.
+    print(f"\n  [3/4] Joint CTE warmstart ({len(member_sidx_gaia)} Gaia + "
+          f"{len(member_sidx_hst)} HST-only, two-tier)...")
     _t0 = _wtime.time()
     result = _joint_solve_cte(
         solver, image_names, cte_template, t_launch_yr, filtered_spi,
-        member_sidx_init, sigma_pm, plx_pop, sigma_plx_tot,
-        mu_pop_prior, mu_pop_prior, C_pop_prior_inv, r_init,
+        member_sidx_gaia, sigma_pm, plx_pop, sigma_plx_tot,
+        mu_ws, mu_pop_prior, C_pop_prior_inv, r_ws,
         regularize_gamma=regularize_gamma,
+        hst_prior_sidx=member_sidx_hst,
     )
     _, _, gamma_warm, _, _, _, _, _ = result
     _dt = _wtime.time() - _t0
 
     cte_warm = _gamma_to_cte_params(gamma_warm, cte_template)
 
-    gy_hi = float(np.linalg.norm(gamma_warm[nb:2*nb]))
-    gy_lo = float(np.linalg.norm(gamma_warm[3*nb:4*nb]))
-    gyx0  = float(gamma_warm[nb])   # first y-basis coeff (yt²), hi chip
-    gyx0_lo = float(gamma_warm[3*nb])  # same for lo chip
-    print(f"  [2/3] done ({_dt:.1f}s)")
+    gy_hi   = float(np.linalg.norm(gamma_warm[nb:2*nb]))
+    gy_lo   = float(np.linalg.norm(gamma_warm[3*nb:4*nb]))
+    gyx0    = float(gamma_warm[nb])
+    gyx0_lo = float(gamma_warm[3*nb])
+    print(f"  [3/4] done ({_dt:.1f}s)")
     print(f"  γ_y_hi[0](yt²) = {gyx0:+.4e}   |γ_y_hi| = {gy_hi:.3e}")
     print(f"  γ_y_lo[0](yt²) = {gyx0_lo:+.4e}   |γ_y_lo| = {gy_lo:.3e}")
 
-    # ── Phase 3: diagnostic plots ──────────────────────────────────────────────
+    # ── Phase 4: diagnostic plots ──────────────────────────────────────────────
     if output_dir is not None:
-        print(f"\n  [3/3] Saving warmstart diagnostic plots...")
+        print(f"\n  [4/4] Saving warmstart diagnostic plots...")
         _t0 = _wtime.time()
         _plot_warmstart_cte(solver, image_names, filtered_spi, t_launch_yr,
-                            gamma_warm, member_sidx_init, r_init, output_dir,
+                            gamma_warm, member_sidx_init, r_ws, output_dir,
                             cte_template=cte_template)
-        print(f"  [3/3] done ({_wtime.time()-_t0:.1f}s)")
+        print(f"  [4/4] done ({_wtime.time()-_t0:.1f}s)")
 
     print(f"\n  {'─'*56}")
-    print(f"  CTE warm start complete.")
+    print(f"  CTE warm start complete.  μ_pop_warm = ({mu_ws[0]:+.4f}, {mu_ws[1]:+.4f}) mas/yr")
     print(f"  {'─'*56}\n")
-    return cte_warm
+    return cte_warm, mu_ws
 
 
 def _warm_start_cte_residuals(
@@ -2793,6 +2849,7 @@ def _run_joint_cte_loop(
     gaia_catalog=None,
     init_pm_window: float = 2.0,
     member_sidx_init: np.ndarray | None = None,
+    mu_pop_init: np.ndarray | None = None,
 ) -> tuple:
     """
     Outer Gauss-Newton loop for the joint (r, γ_CTE, μ_pop) solve.
@@ -2830,7 +2887,8 @@ def _run_joint_cte_loop(
     # r_current from the most recent _update_R call (set by caller before entry)
     r_current = solver._r_hat_current.copy()
 
-    mu_pop_current = mu_pop_prior.copy()
+    # mu_pop_init overrides mu_pop_prior as the starting point (warmstart provides it)
+    mu_pop_current = mu_pop_init.copy() if mu_pop_init is not None else mu_pop_prior.copy()
 
     # Count contributing HST detections per star for member eligibility
     n_stars = solver.C_survey_inv.shape[0]
@@ -2843,14 +2901,22 @@ def _run_joint_cte_loop(
         use_any = d.get('use_for_astrom', d['use_for_fit'])
         np.add.at(n_hst, sidx[use_any], 1)
 
-    # Use the member set passed in from the caller (computed once in
-    # run_alignment_joint_cte with the same CSV-based PM cuts used by warm_start_cte).
-    # Fallback: all Gaia stars if not provided.
+    # Split initial member set into:
+    #   mu_member_sidx  — Gaia-only: drive μ_pop, re-selected each iteration
+    #                     (can only lose stars, never gain new ones)
+    #   hst_prior_sidx  — HST-only: fixed, receive population prior for PM
+    #                     regularisation but do NOT contribute to μ_pop Schur
     if member_sidx_init is not None:
-        member_sidx = member_sidx_init.copy()
+        _hst_init_mask  = hst_only_mask[member_sidx_init]
+        hst_prior_sidx  = member_sidx_init[_hst_init_mask]    # fixed throughout
+        mu_member_sidx  = member_sidx_init[~_hst_init_mask]   # Gaia, re-selected
     else:
-        member_sidx = np.where(~hst_only_mask)[0]
-    print(f"  Initial members for joint loop: {len(member_sidx)}")
+        hst_prior_sidx = np.array([], dtype=int)
+        mu_member_sidx = np.where(~hst_only_mask)[0]
+    # Keep the initial Gaia set as the ceiling — no new stars can join
+    _mu_member_sidx_init = mu_member_sidx.copy()
+    print(f"  Initial members: {len(mu_member_sidx)} Gaia (drives μ_pop) + "
+          f"{len(hst_prior_sidx)} HST-only (fixed prior)")
 
     # Output variables (initialised to sensible defaults)
     r_hat      = r_current.copy()
@@ -2884,16 +2950,18 @@ def _run_joint_cte_loop(
         gamma_prev  = gamma_hat.copy()
         mu_pop_prev = mu_pop_current.copy()
 
+        _n_total = len(mu_member_sidx) + len(hst_prior_sidx)
         print(f"\n  ── Joint iter {it+1}/{n_iter}  "
-              f"n_mem={len(member_sidx)}  "
+              f"n_gaia={len(mu_member_sidx)}  n_hst_prior={len(hst_prior_sidx)}  "
               f"μ=({mu_pop_current[0]:+.4f},{mu_pop_current[1]:+.4f}) ──")
         _t_iter = _jtime.time()
         result = _joint_solve_cte(
             solver, image_names, cte_params, t_launch_yr, filtered_spi,
-            member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
+            mu_member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
             mu_pop_current, mu_pop_prior, C_pop_prior_inv, r_current,
             regularize_gamma=regularize_gamma,
             gamma_prior=gamma_prior,
+            hst_prior_sidx=hst_prior_sidx,
         )
         r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT = result
 
@@ -2916,12 +2984,14 @@ def _run_joint_cte_loop(
             use_any = d.get('use_for_astrom', d['use_for_fit'])
             np.add.at(n_hst, sidx[use_any], 1)
 
-        # Refine member selection from posterior PMs
-        print(f"  Refining member selection...")
-        member_sidx = _select_members_from_a(
+        # Re-select Gaia members from posterior PMs.
+        # Restricted to the initial Gaia set: can only drop members, never add.
+        print(f"  Refining Gaia member selection...")
+        mu_member_sidx = _select_members_from_a(
             a_arr, mu_pop_current, hst_only_mask, n_hst,
             sigma_clip=member_sigma_clip,
-            pm_sys_floor=pm_sys_floor)
+            pm_sys_floor=pm_sys_floor,
+            eligible_sidx=_mu_member_sidx_init)
 
         # Convergence diagnostics
         dr   = float(np.max(np.abs(r_hat - r_prev)))
@@ -2935,7 +3005,7 @@ def _run_joint_cte_loop(
         print(f"  → Δr={dr:.3e}  Δγ={dg:.3e}  Δμ={dmu:.4f}  "
               f"({_jtime.time()-_t_iter:.1f}s)")
         print(f"  → μ_pop=({mu_pop_hat[0]:+.4f},{mu_pop_hat[1]:+.4f}) mas/yr  "
-              f"n_mem_new={len(member_sidx)}")
+              f"n_gaia_new={len(mu_member_sidx)}  (HST fixed: {len(hst_prior_sidx)})")
         print(f"  → |γ_y| hi={gy_hi:.3e} lo={gy_lo:.3e}  "
               f"|γ_x| hi={gx_hi:.3e} lo={gx_lo:.3e}")
 
@@ -3724,9 +3794,9 @@ def run_alignment_joint_cte(
 
     # ── CTE warm start ─────────────────────────────────────────────────────────
     print("\n  CTE warm start...")
-    cte_params = warm_start_cte(
+    cte_params, mu_pop_warm = warm_start_cte(
         solver, image_names, filtered_spi, t_launch_yr,
-        member_sidx_init,
+        member_sidx_gaia, member_sidx_hst,
         sigma_pm, plx_pop, sigma_plx_tot,
         mu_pop_prior, C_pop_prior_inv, r_init_hat,
         cte_template=cte_template,
@@ -3755,6 +3825,7 @@ def run_alignment_joint_cte(
         pm_sys_floor=pm_sys_floor,
         gaia_catalog=gaia_catalog,
         member_sidx_init=member_sidx_init,
+        mu_pop_init=mu_pop_warm,
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
     print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
