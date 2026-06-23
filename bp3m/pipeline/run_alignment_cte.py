@@ -591,11 +591,16 @@ def _apply_cte_to_residual_arrays(
         ok = np.isfinite(mag) & np.isfinite(y_raw)
         if not ok.any():
             continue
-        delta_cte = np.zeros((len(mag), 2))
-        delta_cte[ok] = compute_cte_displacement(
+        delta_cte_raw = np.zeros((len(mag), 2))
+        delta_cte_raw[ok] = compute_cte_displacement(
             X_c[ok], y_raw[ok], mag[ok], dt[ok], cte_params[chip])
-        result[dx_key] = (result[dx_key].astype(float) - delta_cte[:, 0]).astype(np.float32)
-        result[dy_key] = (result[dy_key].astype(float) - delta_cte[:, 1]).astype(np.float32)
+        # Rotate chip-local displacement to GDC frame, identical to apply_cte_to_solver.
+        # R_j[1,1] < 0 for the hi chip (y-axis is flipped between chip-local and GDC),
+        # so skipping this rotation inverts the correction sign for that chip.
+        R_j = np.asarray(solver.R[img])           # (2, 2)
+        delta_cte_gdc = delta_cte_raw @ R_j.T     # (n, 2) in GDC frame
+        result[dx_key] = (result[dx_key].astype(float) - delta_cte_gdc[:, 0]).astype(np.float32)
+        result[dy_key] = (result[dy_key].astype(float) - delta_cte_gdc[:, 1]).astype(np.float32)
     return result
 
 
