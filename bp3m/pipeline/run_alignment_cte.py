@@ -3632,9 +3632,8 @@ def run_alignment_joint_cte(
     if _mcat_path.exists():
         _mcat = pd.read_csv(_mcat_path,
                             usecols=['gaia_source_id', 'pmra_xmatch', 'pmdec_xmatch'],
+                            dtype={'gaia_source_id': np.int64},
                             low_memory=False)
-        _mcat['gaia_source_id'] = pd.to_numeric(
-            _mcat['gaia_source_id'], errors='coerce').fillna(0).astype(np.int64)
         _gaia_pm = (_mcat[_mcat['gaia_source_id'] > 0]
                     .drop_duplicates('gaia_source_id')
                     .set_index('gaia_source_id'))
