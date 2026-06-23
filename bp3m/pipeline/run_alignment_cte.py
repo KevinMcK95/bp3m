@@ -1239,13 +1239,20 @@ def _diagnose_cte_by_magbin(
     b_bins = {b: np.zeros(n_gamma) for b in mag_bins}
     n_bins = {b: 0 for b in mag_bins}
 
+    _use_two_tier = getattr(solver, '_use_two_tier', False)
+
     for j_idx, img in enumerate(image_names):
         d = solver._img_data.get(img)
         if d is None:
             continue
 
-        sidx    = d['sidx']
-        use_mem = d['use_for_fit'] & member_mask[sidx]
+        sidx      = d['sidx']
+        use_align = d['use_for_fit'] & member_mask[sidx]
+        if _use_two_tier:
+            use_astrom_fl = d.get('use_for_astrom', d['use_for_fit'])
+        else:
+            use_astrom_fl = d['use_for_fit']
+        use_mem = use_align | (use_astrom_fl & member_mask[sidx])
         if not use_mem.any():
             continue
 
@@ -3399,6 +3406,7 @@ def run_alignment_joint_cte(
     )
     solver._r_hat_current = r_init_hat
     _v2cb(solver, it_outer=1)   # transition: enables hst-only stars with n_det >= 2
+    solver._use_two_tier = True  # honour use_for_astrom in _joint_solve_cte
 
     # ── Population mean PM prior from Gaia cross-match ────────────────────────
     _ws_field_pm = _compute_warmstart_field_pm(data_root, field_name)
