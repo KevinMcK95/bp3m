@@ -482,6 +482,63 @@ def update_cte_params(
     return new_params, info
 
 
+# ── Per-image alpha (uncertainty inflation) update ───────────────────────────
+
+def _update_image_alpha(
+    solver,
+    image_names: list[str],
+    r_hat: np.ndarray,
+    a_arr: np.ndarray,
+) -> None:
+    """
+    Re-estimate the per-image HST position-uncertainty inflation factor (alpha)
+    from the current joint-solve residuals and update C_hst = alpha^2 * C_hst_orig.
+
+    Must be called AFTER apply_cte_to_solver (subtract=True) so that
+    solver._img_data[img]['xys'] contains CTE-corrected positions, and AFTER
+    solver._update_R(r_hat) so that solver.R[img] is current.
+
+    alpha is measured against C_hst_orig (the un-inflated covariance stored at
+    solver initialisation), so it is an absolute factor — no multiplication with
+    the previous alpha is needed.  Values below 1.0 are clamped to 1.0.
+    """
+    _MEDIAN_CHI2_2 = 2.0 * np.log(2.0)   # median of chi2(2 dof) distribution
+    nr = solver.N_R
+    for j_idx, img in enumerate(image_names):
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        C_hst_orig = d.get("C_hst_orig")
+        if C_hst_orig is None:
+            continue
+        use_fit = np.asarray(d["use_for_fit"], bool)
+        if use_fit.sum() < 4:
+            continue
+
+        cs    = j_idx * nr
+        r_j   = r_hat[cs:cs + nr]
+        sidx  = d["sidx"]
+        xys   = d["xys"]       # CTE-corrected positions
+        X_mat = d["X_mat"]
+        JU    = d["JU"]
+
+        # resid = x_obs - (X r_j - JU v)  [same sign convention as solver]
+        pred  = (np.einsum('nij,j->ni', X_mat, r_j)
+                 - np.einsum('nij,nj->ni', JU, a_arr[sidx]))
+        resid = xys - pred                  # (n, 2)
+
+        # chi2 per detection vs C_hst_orig (un-inflated)
+        R_j      = solver.R[img]            # (2, 2) current rotation
+        C_s_orig = np.einsum('ij,njk,lk->nil', R_j, C_hst_orig, R_j)
+        C_s_inv  = np.linalg.inv(C_s_orig[use_fit])
+        chi2     = np.einsum('ni,nij,nj->n',
+                             resid[use_fit], C_s_inv, resid[use_fit])
+
+        alpha_j = float(max(1.0, np.sqrt(float(np.median(chi2)) / _MEDIAN_CHI2_2)))
+        d["alpha_applied"] = alpha_j
+        d["C_hst"]         = alpha_j**2 * C_hst_orig
+
+
 # ── Joint Schur-complement solve for (r, γ_CTE, μ_pop) ───────────────────────
 
 def _joint_solve_cte(
@@ -1620,6 +1677,8 @@ def warm_start_cte(
     _t0 = _wtime.time()
     r_ws  = r_init.copy()
     mu_ws = mu_pop_prior.copy()
+    _r_prev_ws  = r_ws.copy()
+    _mu_prev_ws = mu_ws.copy()
     for _ws_it in range(n_gaia_warmstart_iters):
         _result_g = _joint_solve_cte(
             solver, image_names, cte_template, t_launch_yr, filtered_spi,
@@ -1631,8 +1690,14 @@ def warm_start_cte(
         r_ws, _, _, mu_ws, _, _, _, _ = _result_g
         solver._update_R(r_ws)
         solver._update_geometry(r_ws, solver.v_survey)
-    print(f"  [2/4] done ({_wtime.time()-_t0:.1f}s)  "
-          f"μ_pop = ({mu_ws[0]:+.4f}, {mu_ws[1]:+.4f}) mas/yr")
+        _dr_ws  = float(np.max(np.abs(r_ws  - _r_prev_ws)))
+        _dmu_ws = float(np.max(np.abs(mu_ws - _mu_prev_ws)))
+        print(f"    iter {_ws_it+1}/{n_gaia_warmstart_iters}: "
+              f"Δr={_dr_ws:.3e}  Δμ={_dmu_ws:.4f}  "
+              f"μ_pop=({mu_ws[0]:+.4f}, {mu_ws[1]:+.4f}) mas/yr")
+        _r_prev_ws  = r_ws.copy()
+        _mu_prev_ws = mu_ws.copy()
+    print(f"  [2/4] done ({_wtime.time()-_t0:.1f}s)")
 
     # ── Phase 3: full-member CTE warmstart (two-tier) ─────────────────────────
     # Gaia members drive μ_pop; HST-only members get the population prior
@@ -2973,6 +3038,13 @@ def _run_joint_cte_loop(
         # Update solver geometry for next iteration
         solver._update_R(r_hat)
         solver._update_geometry(r_hat, solver.v_survey)
+
+        # Apply current CTE model then update per-image alpha (uncertainty inflation).
+        # Must be done after _update_R so solver.R[img] is current, and after
+        # apply_cte_to_solver so d["xys"] contains CTE-corrected positions.
+        apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
+                            filtered_spi=filtered_spi, subtract=True)
+        _update_image_alpha(solver, image_names, r_hat, a_arr)
 
         # Refresh n_hst counts (use_for_astrom flags may have changed)
         n_hst[:] = 0
