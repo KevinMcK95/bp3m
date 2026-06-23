@@ -1016,16 +1016,24 @@ def _joint_solve_cte(
     C_r        = C_shared[idx_r, idx_r]
 
     # ── Schur coupling corrections for stellar astrometry ─────────────────────
-    # Without these, a = C_vT @ h_all reflects residuals at (r_current, gamma=0),
-    # not the solved (r_hat, gamma_hat).  The correct posterior is:
-    #   v_posterior = a - C_vT @ Q_total @ gamma_hat - C_vT @ K^T @ delta_r
-    # The gamma correction is the most important: it removes the CTE signal from
-    # stellar PM estimates that was attributed to CTE by the joint solve.
+    # Without these, a = C_vT @ h_all reflects residuals at (r_current, gamma=0,
+    # mu_pop_current), not the solved (r_hat, gamma_hat, mu_pop_hat).
+    # The correct posterior is:
+    #   v_i = a_i
+    #         - C_vT_i @ Q_total_i @ gamma_hat          (CTE correction)
+    #         - C_vT_i @ K_j_i^T @ delta_r_j (sum_j)   (per-image transform)
+    #         + sigma_pm^{-2} C_vT_i[:,2:4] @ delta_mu  (pop-PM prior update)
+    # The gamma correction is most important: it removes the CTE component from
+    # stellar PM estimates.  The mu_pop correction keeps the posterior consistent
+    # with the updated population mean.
+
+    # 1. Gamma correction (all active stars)
     if len(all_active_sidx) > 0:
         Qt = Q_total_all[all_active_sidx]          # (n_act, 5, n_gamma)
         Cv = C_vT[all_active_sidx]                 # (n_act, 5, 5)
         a[all_active_sidx] -= np.einsum('nij,njk,k->ni', Cv, Qt, gamma_hat)
 
+    # 2. Per-image transform correction (all active stars)
     for j_idx, img in enumerate(image_names):
         d_img = solver._img_data.get(img)
         if d_img is None or K_img.get(img) is None:
@@ -1034,8 +1042,8 @@ def _joint_solve_cte(
         delta_r_j = delta[cs:cs + nr]
         if np.allclose(delta_r_j, 0):
             continue
-        K_j    = K_img[img]                           # (n_in_img, 5, N_R)
-        sidx   = d_img['sidx']
+        K_j     = K_img[img]                          # (n_in_img, 5, N_R)
+        sidx    = d_img['sidx']
         use_any = d_img.get('use_for_astrom', d_img['use_for_fit'])
         if not use_any.any():
             continue
@@ -1043,6 +1051,15 @@ def _joint_solve_cte(
         np.subtract.at(a, s_idx,
                        np.einsum('nij,njk,k->ni',
                                  C_vT[s_idx], K_j[use_any], delta_r_j))
+
+    # 3. Population-PM prior correction (all prior stars: Gaia members + HST-only members)
+    # h_all was built with mu_pop_current; the prior update from delta_mu must be
+    # propagated through C_vT to keep stellar PMs consistent with mu_pop_hat.
+    delta_mu = delta[idx_mu]
+    if len(_all_prior) > 0 and np.any(delta_mu != 0):
+        # a[i, :] += sigma_pm_inv_sq * C_vT[i, :, 2:4] @ delta_mu
+        a[_all_prior] += sigma_pm_inv_sq * np.einsum(
+            'nij,j->ni', C_vT[_all_prior, :, 2:4], delta_mu)
 
     return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a, K_img, C_vT
 
