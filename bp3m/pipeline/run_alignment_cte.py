@@ -1062,23 +1062,70 @@ def _joint_solve_cte(
         a[_all_prior] += sigma_pm_inv_sq * np.einsum(
             'nij,j->ni', C_vT[_all_prior, :, 2:4], delta_mu)
 
-    # ── Inflate C_vT to include μ_pop uncertainty propagation ─────────────────
+    # ── Full marginalisation over all shared parameters (r, γ, μ_pop) ─────────
     # C_vT = H_vv^{-1} is conditioned on fixed (r, γ, μ_pop).  The marginal
-    # posterior over μ_pop adds:
-    #   C_v_marginal[i,2:4,2:4] += (σ⁻² C_vT[i,2:4,2:4]) @ C_μ @ (σ⁻² C_vT[i,2:4,2:4])
-    # For well-measured members, C_vT[i,2,2] ≈ σ_pm² so the weight factor
-    # σ⁻² C_vT[i,2,2] ≈ 1, and the extra variance ≈ C_μ[0,0] = σ(μ_pop)².
-    # This ensures the minimum PM uncertainty floor is σ(μ_pop) ≈ 0.02 mas/yr,
-    # not just σ_pm = 0.0076 mas/yr.
-    if len(_all_prior) > 0:
-        C_mu = C_shared[idx_mu, idx_mu]   # (2, 2) posterior covariance of μ_pop
-        # weight_i = σ_pm^{-2} C_vT[i, 2:4, 2:4]  (2×2 for each star)
-        W = sigma_pm_inv_sq * C_vT[_all_prior, 2:4, 2:4]    # (n_prior, 2, 2)
-        # extra_cov[i, 2:4, 2:4] = W[i] @ C_mu @ W[i]
-        WC  = np.einsum('nij,jk->nik', W, C_mu)              # (n_prior, 2, 2)
-        WCW = np.einsum('nij,nkj->nik', WC, W)               # (n_prior, 2, 2)
+    # posterior including uncertainty in every shared parameter is:
+    #
+    #   C_v_marginal[i] = C_vT[i] + P[i] @ C_shared @ P[i]^T
+    #
+    # where P[i] = C_vT[i] @ J_i and J_i = [J_r[i] | J_γ[i] | J_μ[i]]
+    #   J_r[i]     = Σ_j K_j[i]             at columns idx_r    (alignment)
+    #   J_γ[i]     = Q_total_all[i]          at columns idx_gam  (CTE)
+    #   J_μ[i]     = −σ_pm⁻² M              at columns idx_mu   (pop-PM prior)
+    #
+    # Processing in batches of BATCH stars to keep peak memory ≲ 200 MB.
+    if len(all_active_sidx) > 0:
         C_vT = C_vT.copy()
-        C_vT[_all_prior, 2:4, 2:4] += WCW
+
+        # Map global star index → position in all_active_sidx (−1 if inactive)
+        _act_map = np.full(n_stars, -1, dtype=int)
+        _act_map[all_active_sidx] = np.arange(len(all_active_sidx))
+        n_act_total = len(all_active_sidx)
+
+        BATCH = 500
+        for b0 in range(0, n_act_total, BATCH):
+            b1    = min(b0 + BATCH, n_act_total)
+            b_act = all_active_sidx[b0:b1]   # global star indices in this batch
+            n_b   = b1 - b0
+
+            # Assemble P_b[i] = C_vT[i] @ J_i  for each star in batch
+            P_b = np.zeros((n_b, 5, n_shared))
+
+            # (a) Alignment (r): C_vT[i] @ K_j[i], accumulated over all images
+            for j_idx, img in enumerate(image_names):
+                d_img = solver._img_data.get(img)
+                if d_img is None or K_img.get(img) is None:
+                    continue
+                cs   = j_idx * nr
+                sidx = d_img['sidx']
+                use  = d_img.get('use_for_astrom', d_img['use_for_fit'])
+                s_g  = sidx[use]           # global indices, active in this image
+                li   = _act_map[s_g]       # position in all_active_sidx
+                in_b = (li >= b0) & (li < b1)
+                if not in_b.any():
+                    continue
+                li_b = li[in_b] - b0       # index within batch
+                K_j  = K_img[img][use][in_b]            # (m, 5, N_R)
+                CK   = np.einsum('nij,njk->nik',
+                                 C_vT[s_g[in_b]], K_j)  # (m, 5, N_R)
+                np.add.at(P_b, (li_b, slice(None), slice(cs, cs + nr)), CK)
+
+            # (b) CTE (γ): C_vT[i] @ Q_total[i]
+            P_b[:, :, idx_gam] = np.einsum(
+                'nij,njk->nik', C_vT[b_act], Q_total_all[b_act])
+
+            # (c) Pop-PM prior (μ): −σ⁻² C_vT[i, :, 2:4]  (member stars only)
+            _ip_raw = _act_map[_all_prior]           # positions in active array
+            _ip = _ip_raw[(_ip_raw >= b0) & (_ip_raw < b1)]  # in this batch
+            if len(_ip) > 0:
+                _lb = _ip - b0
+                P_b[_lb, :, idx_mu] = (
+                    -sigma_pm_inv_sq * C_vT[all_active_sidx[_ip], :, 2:4])
+
+            # C_v_extra = P_b @ C_shared @ P_b^T  (n_b, 5, 5)
+            PC = (P_b.reshape(n_b * 5, n_shared) @ C_shared
+                  ).reshape(n_b, 5, n_shared)
+            C_vT[b_act] += np.einsum('nij,nkj->nik', PC, P_b)
 
     return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a, K_img, C_vT
 
