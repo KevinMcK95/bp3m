@@ -67,8 +67,9 @@ def main():
     parser.add_argument('--no_plots', action='store_true')
     parser.add_argument('--plot_residuals', action='store_true')
     parser.add_argument('--use_sparse', action='store_true')
-    parser.add_argument('--warmstart_only', action='store_true',
-                        help='Stop after warm start (before joint solve loop)')
+    parser.add_argument('--full_run', action='store_true',
+                        help='Proceed to full joint solve loop after warm start '
+                             '(default: stop after warm start)')
     args = parser.parse_args()
 
     from bp3m.pipeline.run_alignment_cte import run_alignment_joint_cte
@@ -93,7 +94,7 @@ def main():
         no_plots=args.no_plots,
         plot_residuals=args.plot_residuals,
         use_sparse=args.use_sparse,
-        warmstart_only=args.warmstart_only,
+        warmstart_only=not args.full_run,
     )
     print(f"\nDone. Results in: {output}")
 
