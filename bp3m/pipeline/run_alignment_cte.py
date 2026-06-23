@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm as _tqdm
 
 # ── ACS/WFC chip geometry constants ──────────────────────────────────────────
 # GDC-frame: Y_c = y_gdc − 2048 (centred on detector)
@@ -606,7 +607,8 @@ def _joint_solve_cte(
     XCs_xresid = {}
 
     # ── Per-image first pass: H_vv, h, K, G, Q, H_rr, H_gamma ───────────────
-    for j_idx, img in enumerate(image_names):
+    for j_idx, img in enumerate(_tqdm(image_names, desc="  joint_solve", unit="img",
+                                      ncols=90, leave=False)):
         d = solver._img_data.get(img)
         if d is None:
             K_img[img] = None
@@ -1150,7 +1152,8 @@ def _plot_warmstart_cte(
     rec = {c: {'y_raw': [], 'dy_b': [], 'dy_a': [], 'mag': []}
            for c in ('hi', 'lo')}
 
-    for j_idx, img in enumerate(image_names):
+    for j_idx, img in enumerate(_tqdm(image_names, desc="  warmstart plot",
+                                      unit="img", ncols=90, leave=False)):
         chip = _chip_from_image(img)
         if chip is None:
             continue
@@ -1356,7 +1359,10 @@ def _diagnose_cte_by_magbin(
     b_bins = {b: np.zeros(n_gamma) for b in mag_bins}
     n_bins = {b: 0 for b in mag_bins}
 
-    for j_idx, img in enumerate(image_names):
+    print(f"  Accumulating CTE signal across {len(image_names)} images "
+          f"({len(mag_bins)} mag bins, {len(member_sidx)} member stars)...")
+    for j_idx, img in enumerate(_tqdm(image_names, desc="  mag-bin diag", unit="img",
+                                      ncols=90, leave=False)):
         d = solver._img_data.get(img)
         if d is None:
             continue
@@ -1549,11 +1555,19 @@ def warm_start_cte(
     if cte_template is None:
         cte_template = default_cte_params()
 
-    print("  CTE warm start: linear solve for γ with r_init and μ_pop_prior...")
-    print(f"  Warm-start μ_pop_prior = ({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) mas/yr  "
+    _mag_order = cte_template['hi'].mag_poly_order
+    nb = 5 * (_mag_order + 1) - 1
+    print(f"\n  {'─'*56}")
+    print(f"  CTE warm start  "
+          f"(mag_poly_order={_mag_order}  nb={nb}  n_images={len(image_names)})")
+    print(f"  {'─'*56}")
+    print(f"  μ_pop_prior = ({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) mas/yr  "
           f"n_members={len(member_sidx_init)}")
 
-    # Per-magnitude-bin direct regression diagnostic (bypasses Schur complement)
+    # ── Phase 1: per-magnitude-bin diagnostic (bypasses Schur complement) ──────
+    print(f"\n  [1/3] Magnitude-bin CTE diagnostic (K=0 direct regression)...")
+    import time as _wtime
+    _t0 = _wtime.time()
     gamma_bins = _diagnose_cte_by_magbin(
         solver, image_names, filtered_spi, t_launch_yr,
         member_sidx_init, r_init,
@@ -1562,7 +1576,11 @@ def warm_start_cte(
         label='warmstart',
         cte_template=cte_template,
     )
+    print(f"  [1/3] done ({_wtime.time()-_t0:.1f}s)")
 
+    # ── Phase 2: full joint (r, γ, μ_pop) Schur solve ─────────────────────────
+    print(f"\n  [2/3] Joint (r, γ, μ_pop) Schur warm solve...")
+    _t0 = _wtime.time()
     result = _joint_solve_cte(
         solver, image_names, cte_template, t_launch_yr, filtered_spi,
         member_sidx_init, sigma_pm, plx_pop, sigma_plx_tot,
@@ -1570,21 +1588,30 @@ def warm_start_cte(
         regularize_gamma=regularize_gamma,
     )
     _, _, gamma_warm, _, _, _, _, _ = result
+    _dt = _wtime.time() - _t0
 
     cte_warm = _gamma_to_cte_params(gamma_warm, cte_template)
 
-    nb    = 5 * (cte_template['hi'].mag_poly_order + 1) - 1
     gy_hi = float(np.linalg.norm(gamma_warm[nb:2*nb]))
     gy_lo = float(np.linalg.norm(gamma_warm[3*nb:4*nb]))
-    gyx0  = float(gamma_warm[nb])   # first y-basis coefficient (yt²), hi chip
-    print(f"  Warm-start γ (joint solve): γ_y_hi[0](yt²)={gyx0:+.4e}  "
-          f"|γ_y_hi|={gy_hi:.3e}  |γ_y_lo|={gy_lo:.3e}")
+    gyx0  = float(gamma_warm[nb])   # first y-basis coeff (yt²), hi chip
+    gyx0_lo = float(gamma_warm[3*nb])  # same for lo chip
+    print(f"  [2/3] done ({_dt:.1f}s)")
+    print(f"  γ_y_hi[0](yt²) = {gyx0:+.4e}   |γ_y_hi| = {gy_hi:.3e}")
+    print(f"  γ_y_lo[0](yt²) = {gyx0_lo:+.4e}   |γ_y_lo| = {gy_lo:.3e}")
 
+    # ── Phase 3: diagnostic plots ──────────────────────────────────────────────
     if output_dir is not None:
+        print(f"\n  [3/3] Saving warmstart diagnostic plots...")
+        _t0 = _wtime.time()
         _plot_warmstart_cte(solver, image_names, filtered_spi, t_launch_yr,
                             gamma_warm, member_sidx_init, r_init, output_dir,
                             cte_template=cte_template)
+        print(f"  [3/3] done ({_wtime.time()-_t0:.1f}s)")
 
+    print(f"\n  {'─'*56}")
+    print(f"  CTE warm start complete.")
+    print(f"  {'─'*56}\n")
     return cte_warm
 
 
@@ -1673,7 +1700,8 @@ def _warm_start_cte_residuals(
     _pm_window = 2.0   # mas/yr half-width membership pre-selection
 
     rows = []
-    for img in image_names:
+    for img in _tqdm(image_names, desc="  collecting detections", unit="img",
+                     ncols=90, leave=False):
         chip = _chip_from_image(img)
         if chip is None or img not in img_to_df:
             continue
@@ -2853,11 +2881,16 @@ def _run_joint_cte_loop(
     solver._update_R(r_current)
     solver._update_geometry(r_current, solver.v_survey)
 
+    import time as _jtime
     for it in range(n_iter):
         r_prev      = r_current.copy()
         gamma_prev  = gamma_hat.copy()
         mu_pop_prev = mu_pop_current.copy()
 
+        print(f"\n  ── Joint iter {it+1}/{n_iter}  "
+              f"n_mem={len(member_sidx)}  "
+              f"μ=({mu_pop_current[0]:+.4f},{mu_pop_current[1]:+.4f}) ──")
+        _t_iter = _jtime.time()
         result = _joint_solve_cte(
             solver, image_names, cte_params, t_launch_yr, filtered_spi,
             member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
@@ -2887,6 +2920,7 @@ def _run_joint_cte_loop(
             np.add.at(n_hst, sidx[use_any], 1)
 
         # Refine member selection from posterior PMs
+        print(f"  Refining member selection...")
         member_sidx = _select_members_from_a(
             a_arr, mu_pop_current, hst_only_mask, n_hst,
             sigma_clip=member_sigma_clip,
@@ -2899,10 +2933,14 @@ def _run_joint_cte_loop(
         _nb = 5 * (cte_params.get('hi', cte_params.get('lo')).mag_poly_order + 1) - 1
         gy_hi = float(np.linalg.norm(gamma_hat[_nb:2*_nb]))
         gy_lo = float(np.linalg.norm(gamma_hat[3*_nb:4*_nb]))
-        print(f"  Joint iter {it+1:2d}: Δr={dr:.3e}  Δγ={dg:.3e}  Δμ={dmu:.4f}  "
-              f"n_mem={len(member_sidx):5d}  "
-              f"μ_pop=({mu_pop_hat[0]:+.3f},{mu_pop_hat[1]:+.3f})  "
-              f"|γ_y|=hi:{gy_hi:.3e} lo:{gy_lo:.3e}")
+        gx_hi = float(np.linalg.norm(gamma_hat[:_nb]))
+        gx_lo = float(np.linalg.norm(gamma_hat[2*_nb:3*_nb]))
+        print(f"  → Δr={dr:.3e}  Δγ={dg:.3e}  Δμ={dmu:.4f}  "
+              f"({_jtime.time()-_t_iter:.1f}s)")
+        print(f"  → μ_pop=({mu_pop_hat[0]:+.4f},{mu_pop_hat[1]:+.4f}) mas/yr  "
+              f"n_mem_new={len(member_sidx)}")
+        print(f"  → |γ_y| hi={gy_hi:.3e} lo={gy_lo:.3e}  "
+              f"|γ_x| hi={gx_hi:.3e} lo={gx_lo:.3e}")
 
         if it >= 2 and dr < 1e-6 and dg < 1e-8 and dmu < 1e-4:
             print(f"  Converged at iteration {it + 1}")
