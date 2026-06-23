@@ -1283,9 +1283,12 @@ def _diagnose_cte_by_magbin(
     member_mask[member_sidx] = True
 
     nr      = solver.N_R
-    _tmpl   = cte_template if cte_template is not None else default_cte_params()
-    nb      = 5 * (_tmpl['hi'].mag_poly_order + 1)
-    n_gamma = 4 * nb
+    # Diagnostic always uses K=0: fit 5 spatial coefficients per bin.
+    # Polynomial magnitude dependence within a bin is meaningless because
+    # stars in a narrow bin all have similar magnitudes (collinear columns).
+    _tmpl   = default_cte_params(0)
+    nb      = 5
+    n_gamma = 20
     cte_zero = _tmpl
     _use_two_tier = getattr(solver, '_use_two_tier', False)
 
