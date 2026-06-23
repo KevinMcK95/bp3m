@@ -3661,34 +3661,69 @@ def run_alignment_joint_cte(
           f"{mu_pop_prior_sigma:.2f} mas/yr")
 
     # ── Initial member selection from catalog PMs ──────────────────────────────
-    # gaia_catalog['pmra_xmatch'] is NaN for real Gaia rows: gaia_real is loaded
-    # from *_gaia.csv (Gaia catalog files), not master_combined_v2.csv, so
-    # pmra_xmatch is never merged in. Read it directly from the master CSV,
-    # same approach as _compute_warmstart_field_pm.
-    _mcat_path = data_root / field_name / 'hst_xmatch' / 'master_combined_v2.csv'
+    # Gaia rows: read pmra_xmatch from master CSV (NaN in gaia_catalog in memory).
+    # HST-only rows: pmra_xmatch is already in gaia_catalog; read sigma_pmdec_xmatch
+    # from master CSV via rounded-PM key lookup for the quality cut.
+    _mcat_path   = data_root / field_name / 'hst_xmatch' / 'master_combined_v2.csv'
     _init_radius = member_sigma_clip * max(sigma_pm, pm_sys_floor)
+    _mu_ra, _mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
     if _mcat_path.exists():
+        _want_cols = {'gaia_source_id', 'pmra_xmatch', 'pmdec_xmatch',
+                      'sigma_pmdec_xmatch'}
         _mcat = pd.read_csv(_mcat_path,
-                            usecols=['gaia_source_id', 'pmra_xmatch', 'pmdec_xmatch'],
+                            usecols=lambda c: c in _want_cols,
                             dtype={'gaia_source_id': np.int64},
                             low_memory=False)
-        _gaia_pm = (_mcat[_mcat['gaia_source_id'] > 0]
-                    .drop_duplicates('gaia_source_id')
-                    .set_index('gaia_source_id'))
-        _mu_ra, _mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
+
+        # ── Gaia members (pmra_xmatch from CSV keyed by gaia_source_id) ──────
+        _mcat_gaia = (_mcat[_mcat['gaia_source_id'] > 0]
+                      .drop_duplicates('gaia_source_id')
+                      .set_index('gaia_source_id'))
         _gaia_idxs = np.where(~hst_only_mask)[0]
         _gaia_ids  = gaia_catalog.iloc[_gaia_idxs]['Gaia_id'].to_numpy(np.int64)
-        _pmra  = np.array([float(_gaia_pm.loc[g, 'pmra_xmatch'])
-                           if g in _gaia_pm.index else np.nan for g in _gaia_ids])
-        _pmdec = np.array([float(_gaia_pm.loc[g, 'pmdec_xmatch'])
-                           if g in _gaia_pm.index else np.nan for g in _gaia_ids])
-        _ok = (np.isfinite(_pmra) & np.isfinite(_pmdec)
-               & (np.hypot(_pmra - _mu_ra, _pmdec - _mu_dec) < _init_radius))
-        member_sidx_init = _gaia_idxs[_ok]
+        _g_pmra  = np.array([float(_mcat_gaia.loc[g, 'pmra_xmatch'])
+                             if g in _mcat_gaia.index else np.nan for g in _gaia_ids])
+        _g_pmdec = np.array([float(_mcat_gaia.loc[g, 'pmdec_xmatch'])
+                             if g in _mcat_gaia.index else np.nan for g in _gaia_ids])
+        _ok_gaia = (np.isfinite(_g_pmra) & np.isfinite(_g_pmdec)
+                    & (np.hypot(_g_pmra - _mu_ra, _g_pmdec - _mu_dec) < _init_radius))
+        member_sidx_gaia = _gaia_idxs[_ok_gaia]
+
+        # ── HST-only members ─────────────────────────────────────────────────
+        # pmra_xmatch is populated in gaia_catalog for HST-only rows.
+        # sigma_pmdec_xmatch: build lookup from CSV HST rows (gaia_source_id==0)
+        # keyed by rounded (pmra, pmdec) pair — same approach as _warm_start_cte_residuals.
+        _hst_idxs  = np.where(hst_only_mask)[0]
+        _h_pmra  = gaia_catalog.iloc[_hst_idxs]['pmra_xmatch'].to_numpy(float)
+        _h_pmdec = gaia_catalog.iloc[_hst_idxs]['pmdec_xmatch'].to_numpy(float)
+
+        _h_sigma = np.full(len(_hst_idxs), np.nan)
+        if 'sigma_pmdec_xmatch' in _mcat.columns:
+            _mhst = _mcat[(_mcat['gaia_source_id'] == 0)
+                          & _mcat['pmra_xmatch'].notna()
+                          & _mcat['sigma_pmdec_xmatch'].notna()].copy()
+            _sig_keys = (_mhst['pmra_xmatch'].round(6).astype(str) + '_'
+                         + _mhst['pmdec_xmatch'].round(6).astype(str))
+            _sig_lookup = dict(zip(_sig_keys, _mhst['sigma_pmdec_xmatch']))
+            _hkeys = (pd.Series(_h_pmra).round(6).astype(str) + '_'
+                      + pd.Series(_h_pmdec).round(6).astype(str))
+            _h_sigma = np.array([_sig_lookup.get(k, np.nan) for k in _hkeys])
+
+        _ok_hst = (
+            np.isfinite(_h_pmra) & np.isfinite(_h_pmdec)
+            & (np.hypot(_h_pmra - _mu_ra, _h_pmdec - _mu_dec) < _init_radius)
+            & (np.hypot(_h_pmra, _h_pmdec) < 3.0)       # |PM| < 3 mas/yr
+            & np.isfinite(_h_sigma) & (_h_sigma < 1.0)  # σ_PM < 1 mas/yr
+        )
+        member_sidx_hst  = _hst_idxs[_ok_hst]
+        member_sidx_init = np.concatenate([member_sidx_gaia, member_sidx_hst])
     else:
-        member_sidx_init = np.where(~hst_only_mask)[0]
-    print(f"  Initial members (Gaia catalog PMs, {member_sigma_clip}σ={_init_radius:.3f} mas/yr): "
-          f"{len(member_sidx_init)} stars")
+        member_sidx_gaia = np.where(~hst_only_mask)[0]
+        member_sidx_hst  = np.array([], dtype=int)
+        member_sidx_init = member_sidx_gaia
+    print(f"  Initial members ({member_sigma_clip}σ={_init_radius:.3f} mas/yr): "
+          f"{len(member_sidx_gaia)} Gaia + {len(member_sidx_hst)} HST-only "
+          f"= {len(member_sidx_init)} total")
 
     # ── CTE warm start ─────────────────────────────────────────────────────────
     print("\n  CTE warm start...")
