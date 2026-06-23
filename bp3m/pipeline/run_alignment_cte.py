@@ -22,10 +22,10 @@ For chip c (hi/lo), detection k in image j (epoch t_j):
 Parameters: 10 total per chip: γ_x(5) + γ_y(5) (two chips → 20 params).
 
 Note on y_raw coordinate system: py1pass stores pixel y in a unified global frame
-(0..~4096). lo chip occupies y_raw ∈ [8, 2039]; hi chip occupies y_raw ∈ [2056, 4087].
-Both chips read AWAY from the gap (CTE trails toward high y_raw), so dy_gdc > 0 and
-increases with yt for both chips. 5-term basis spans the full 2D (xt, yt) space while
-preserving the boundary condition CTE=0 at the readout register.
+(0..~4096). _hi images (chip_ext=1) occupy y_raw ∈ [8, 2039] (LOW y; readout at y≈0);
+_lo images (chip_ext=4) occupy y_raw ∈ [2057, 4087] (HIGH y; readout at gap edge y≈2048).
+Both chips trail CTE toward HIGH y_raw, giving yt = (y_raw − y_readout)/2048 ∈ [0,1].
+5-term basis spans the full 2D (xt, yt) space while preserving CTE=0 at the readout.
 """
 
 from __future__ import annotations
@@ -38,16 +38,15 @@ import numpy as np
 from tqdm import tqdm as _tqdm
 
 # ── ACS/WFC chip geometry constants ──────────────────────────────────────────
-# GDC-frame: Y_c = y_gdc − 2048 (centred on detector)
-_HI_Y_READOUT = +2047.0   # readout register for _hi chip in GDC-centred frame
-_LO_Y_READOUT = -2048.0   # readout register for _lo chip in GDC-centred frame
-# Raw-frame: py1pass stores y in a unified global frame (0..~4096).
-# lo chip: y_raw ∈ [8, 2039]; readout at the gap edge → y_readout_raw ≈ 0
-# hi chip: y_raw ∈ [2056, 4087]; readout at the gap edge → y_readout_raw ≈ 2048
-# Both chips read AWAY from the gap (CTE trails toward high y_raw).
-# Empirically confirmed: dy_gdc > 0 and increasing with y_raw for both chips.
-_HI_Y_READOUT_RAW = 2048.0
-_LO_Y_READOUT_RAW = 0.0
+# py1pass unified y frame (0..~4096):
+#   _hi images (chip_ext=1): y_raw ∈ [8, 2039]   — LOW y, readout at outer edge y≈0
+#   _lo images (chip_ext=4): y_raw ∈ [2057, 4087] — HIGH y, readout at gap edge y≈2048
+# Both chips trail CTE toward HIGH y_raw; yt = (y_raw − y_readout_raw)/2048 ∈ [0, 1].
+# GDC-frame: Y_c = y_gdc − 2048.  Readout positions in GDC frame:
+_HI_Y_READOUT = -2048.0   # _hi chip readout: y_raw≈0 → Y_c = 0−2048 = −2048
+_LO_Y_READOUT =  0.0      # _lo chip readout: y_raw≈2048 → Y_c = 2048−2048 = 0
+_HI_Y_READOUT_RAW = 0.0      # _hi images (y∈[8,2039]):   yt = y/2048 ∈ [0,1]
+_LO_Y_READOUT_RAW = 2048.0   # _lo images (y∈[2057,4087]): yt = (y−2048)/2048 ∈ [0,1]
 _ACS_LAUNCH_YR = 2002.165   # ACS launch 2002-03-01; used as CTE time origin
 _MAG_REF      = -15.0   # just below the brightest instrumental mag (~-14.5)
 
@@ -581,9 +580,9 @@ def _apply_cte_to_residual_arrays(
             if 'Y_orig' in spi_df.columns and len(spi_df) == len(X_c):
                 y_raw = spi_df['Y_orig'].to_numpy(float)
             else:
-                y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+                y_raw = Y_c + 2048.0   # Y_c = y_raw − 2048 for both chips
         else:
-            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+            y_raw = Y_c + 2048.0       # Y_c = y_raw − 2048 for both chips
 
         hst_yr    = float(Time(float(solver.images[img]['hst_time_mjd']), format='mjd').jyear)
         dt_scalar = hst_yr - t_launch_yr
@@ -2344,11 +2343,8 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
             ax  = axes[col_i]
             p   = cte_params[chip]
             # y_raw grids in the py1pass global frame
-            # lo chip: y_raw ∈ [0, 2039]; hi chip: y_raw ∈ [2048, 4087]
-            if chip == 'hi':
-                y_raw_grid = np.linspace(p.y_readout_raw, p.y_readout_raw + 2039, 500)
-            else:
-                y_raw_grid = np.linspace(p.y_readout_raw, 2039, 500)
+            # _hi chip: y_raw ∈ [8, 2039] (readout at 0); _lo chip: y_raw ∈ [2057, 4087] (readout at 2048)
+            y_raw_grid = np.linspace(p.y_readout_raw, p.y_readout_raw + 2039, 500)
             X_c_grid   = np.zeros_like(y_raw_grid)   # at X centre of chip
 
             _nb  = len(p.gamma_y)    # 5*(K+1)-1 after degenerate term removal
