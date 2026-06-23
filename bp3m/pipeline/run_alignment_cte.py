@@ -1015,6 +1015,35 @@ def _joint_solve_cte(
     mu_pop_hat = mu_pop_current + delta[idx_mu]
     C_r        = C_shared[idx_r, idx_r]
 
+    # ── Schur coupling corrections for stellar astrometry ─────────────────────
+    # Without these, a = C_vT @ h_all reflects residuals at (r_current, gamma=0),
+    # not the solved (r_hat, gamma_hat).  The correct posterior is:
+    #   v_posterior = a - C_vT @ Q_total @ gamma_hat - C_vT @ K^T @ delta_r
+    # The gamma correction is the most important: it removes the CTE signal from
+    # stellar PM estimates that was attributed to CTE by the joint solve.
+    if len(all_active_sidx) > 0:
+        Qt = Q_total_all[all_active_sidx]          # (n_act, 5, n_gamma)
+        Cv = C_vT[all_active_sidx]                 # (n_act, 5, 5)
+        a[all_active_sidx] -= np.einsum('nij,njk,k->ni', Cv, Qt, gamma_hat)
+
+    for j_idx, img in enumerate(image_names):
+        d_img = solver._img_data.get(img)
+        if d_img is None or K_img.get(img) is None:
+            continue
+        cs = j_idx * nr
+        delta_r_j = delta[cs:cs + nr]
+        if np.allclose(delta_r_j, 0):
+            continue
+        K_j    = K_img[img]                           # (n_in_img, 5, N_R)
+        sidx   = d_img['sidx']
+        use_any = d_img.get('use_for_astrom', d_img['use_for_fit'])
+        if not use_any.any():
+            continue
+        s_idx = sidx[use_any]
+        np.subtract.at(a, s_idx,
+                       np.einsum('nij,njk,k->ni',
+                                 C_vT[s_idx], K_j[use_any], delta_r_j))
+
     return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a, K_img, C_vT
 
 
