@@ -3409,6 +3409,7 @@ def run_alignment_joint_cte(
     pos_err_floor: float = 5e-3,
     det_chi2_threshold: float | None = None,
     bp3m_dir: Path | None = None,
+    warmstart_only: bool = False,
 ) -> Path:
     """
     Joint CTE + population mean PM alignment.
@@ -3622,31 +3623,33 @@ def run_alignment_joint_cte(
           f"{mu_pop_prior_sigma:.2f} mas/yr")
 
     # ── Initial member selection from catalog PMs ──────────────────────────────
-    # Used by both warm_start_cte and _run_joint_cte_loop (iter 0).
-    # Only stars with catalog PM within ±2 mas/yr of mu_pop_prior and ≥1 HST
-    # detection are included.  HST-only stars use their v2 BP3M PM estimate.
-    _n_hst_init = np.zeros(solver.C_survey_inv.shape[0], dtype=int)
-    for _img in image_names:
-        _d = solver._img_data.get(_img)
-        if _d is None:
-            continue
-        _s  = _d['sidx']
-        _ua = _d.get('use_for_astrom', _d['use_for_fit'])
-        np.add.at(_n_hst_init, _s[_ua], 1)
-    # 3σ circular cut using the same floor as _select_members_from_a
+    # gaia_catalog['pmra_xmatch'] is NaN for real Gaia rows: gaia_real is loaded
+    # from *_gaia.csv (Gaia catalog files), not master_combined_v2.csv, so
+    # pmra_xmatch is never merged in. Read it directly from the master CSV,
+    # same approach as _compute_warmstart_field_pm.
+    _mcat_path = data_root / field_name / 'hst_xmatch' / 'master_combined_v2.csv'
     _init_radius = member_sigma_clip * max(sigma_pm, pm_sys_floor)
-    if 'pmra_xmatch' in gaia_catalog.columns:
-        _pmra_cat  = gaia_catalog['pmra_xmatch'].to_numpy(float)
-        _pmdec_cat = gaia_catalog['pmdec_xmatch'].to_numpy(float)
+    if _mcat_path.exists():
+        _mcat = pd.read_csv(_mcat_path,
+                            usecols=['gaia_source_id', 'pmra_xmatch', 'pmdec_xmatch'],
+                            low_memory=False)
+        _mcat['gaia_source_id'] = pd.to_numeric(
+            _mcat['gaia_source_id'], errors='coerce').fillna(0).astype(np.int64)
+        _gaia_pm = (_mcat[_mcat['gaia_source_id'] > 0]
+                    .drop_duplicates('gaia_source_id')
+                    .set_index('gaia_source_id'))
         _mu_ra, _mu_dec = float(mu_pop_prior[0]), float(mu_pop_prior[1])
-        _elig = (np.isfinite(_pmra_cat) & np.isfinite(_pmdec_cat)
-                 & (np.hypot(_pmra_cat - _mu_ra, _pmdec_cat - _mu_dec) < _init_radius)
-                 & (_n_hst_init >= 1)
-                 & (~hst_only_mask))   # Gaia-only: consistent with _select_members_from_a
-        member_sidx_init = np.where(_elig)[0]
+        _gaia_idxs = np.where(~hst_only_mask)[0]
+        _gaia_ids  = gaia_catalog.iloc[_gaia_idxs]['Gaia_id'].to_numpy(np.int64)
+        _pmra  = np.array([float(_gaia_pm.loc[g, 'pmra_xmatch'])
+                           if g in _gaia_pm.index else np.nan for g in _gaia_ids])
+        _pmdec = np.array([float(_gaia_pm.loc[g, 'pmdec_xmatch'])
+                           if g in _gaia_pm.index else np.nan for g in _gaia_ids])
+        _ok = (np.isfinite(_pmra) & np.isfinite(_pmdec)
+               & (np.hypot(_pmra - _mu_ra, _pmdec - _mu_dec) < _init_radius))
+        member_sidx_init = _gaia_idxs[_ok]
     else:
-        member_sidx_init = np.where(
-            (~hst_only_mask) & (_n_hst_init >= 1))[0]
+        member_sidx_init = np.where(~hst_only_mask)[0]
     print(f"  Initial members (Gaia catalog PMs, {member_sigma_clip}σ={_init_radius:.3f} mas/yr): "
           f"{len(member_sidx_init)} stars")
 
@@ -3661,6 +3664,11 @@ def run_alignment_joint_cte(
         regularize_gamma=regularize_gamma,
         output_dir=output_dir_joint,
     )
+
+    if warmstart_only:
+        print("\n  warmstart_only=True — stopping after warm start. "
+              f"Results in: {output_dir_joint}")
+        return output_dir_joint
 
     # ── Joint solve loop ───────────────────────────────────────────────────────
     print(f"\n  Starting joint (r, γ, μ_pop) loop ({n_iter_joint} iterations)...")
