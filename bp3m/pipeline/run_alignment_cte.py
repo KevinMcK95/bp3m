@@ -1344,6 +1344,7 @@ def _diagnose_cte_by_magbin(
             _all_mags.append(mf[np.isfinite(mf)])
         if _all_mags:
             _all_mags = np.concatenate(_all_mags)
+        if len(_all_mags) > 2:
             lo, hi = np.percentile(_all_mags, [2, 98])
             edges = np.linspace(lo, hi, 7)   # 6 bins
             mag_bins = [(float(edges[i]), float(edges[i+1])) for i in range(len(edges)-1)]
