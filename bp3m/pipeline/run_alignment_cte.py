@@ -2519,12 +2519,11 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
         except Exception as exc:
             print(f"  WARNING: cte_2d_map_{label}.png failed — {exc}")
 
-    # ── Figure 6: PM residuals of member stars vs raw detector position ────────
-    # Faithfully replicates cte_diagnostic_leo_i.py with before/after overlay.
-    # Member selection uses master_combined_v2.csv + Mahalanobis distance,
-    # identical to cte_diagnostic_leo_i.py.
-    # "Before" = pmra_xmatch from master_combined_v2.csv (all members)
-    # "After"  = pmra_bp3m  from stellar_astrometry.csv (matched subset)
+    # ── Figure 6: PM residuals of CTE fitting members vs raw detector position ──
+    # "Before" = pmra_xmatch from master_combined_v2.csv (uncorrected v2 PM)
+    # "After"  = pmra_bp3m  from stellar_astrometry.csv (CTE-corrected PM)
+    # Membership is defined by which stars appear in the stellar astrometry CSV —
+    # only stars that were actually used in the CTE fit are shown.
     try:
         import pandas as _pd
         from astropy.io import fits as _afits
@@ -2540,6 +2539,28 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
             astrom_csv = output_dir / 'stellar_astrometry.csv'
         if not master_csv.exists():
             raise FileNotFoundError(f'master_combined_v2.csv not found: {master_csv}')
+        if not Path(astrom_csv).exists():
+            print(f"  pm_vs_detector: {Path(astrom_csv).name} not found — skipping")
+            raise RuntimeError("astrom_csv_missing")
+
+        # ── Load stellar astrometry CSV (defines CTE fitting membership) ──────
+        astrom = _pd.read_csv(astrom_csv)
+        _has_bp3m = (astrom['pmra_bp3m'].notna() & astrom['pmdec_bp3m'].notna() &
+                     astrom['sigma_pmra_bp3m'].notna())
+        astrom = astrom[_has_bp3m].copy().reset_index(drop=True)
+        if len(astrom) < 10:
+            print(f"  pm_vs_detector: too few CTE members ({len(astrom)}) — skipping")
+            raise RuntimeError("astrom_csv_missing")
+
+        _astrom_gids  = astrom['Gaia_id'].to_numpy(np.int64)
+        _pmra_a       = astrom['pmra_bp3m'].to_numpy(float)
+        _pmdec_a      = astrom['pmdec_bp3m'].to_numpy(float)
+        _sig_ra_a     = np.maximum(astrom['sigma_pmra_bp3m'].to_numpy(float),  0.001)
+        _sig_dec_a    = np.maximum(astrom['sigma_pmdec_bp3m'].to_numpy(float), 0.001)
+        _a_ra_astrom  = astrom['ra'].to_numpy(float) if 'ra' in astrom.columns \
+                        else np.full(len(astrom), np.nan)
+        _a_dec_astrom = astrom['dec'].to_numpy(float) if 'dec' in astrom.columns \
+                        else np.full(len(astrom), np.nan)
 
         # ── Load master catalog ───────────────────────────────────────────────
         master = _pd.read_csv(master_csv, low_memory=False)
@@ -2557,137 +2578,100 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                master['corr_pmra_pmdec_xmatch'].notna())
         master = master[_ok].copy().reset_index(drop=True)
 
+        # ── Match master to CTE fitting members (astrom_csv defines membership) ─
+        _master_gids = master['gaia_source_id'].to_numpy(np.int64) \
+            if 'gaia_source_id' in master.columns \
+            else np.zeros(len(master), dtype=np.int64)
+        _astrom_gid_to_row = {int(_astrom_gids[i]): i
+                              for i in range(len(_astrom_gids))
+                              if int(_astrom_gids[i]) > 0}
+        _in_cte = np.zeros(len(master), dtype=bool)
+        _astrom_row = np.full(len(master), -1, dtype=int)
+
+        # Step 1: Gaia ID match
+        for mi in range(len(master)):
+            gid = int(_master_gids[mi])
+            if gid > 0 and gid in _astrom_gid_to_row:
+                _in_cte[mi]    = True
+                _astrom_row[mi] = _astrom_gid_to_row[gid]
+
+        # Step 2: positional cross-match for HST-only master rows
+        _unmatched = ~_in_cte
+        _a_ra_ok = np.isfinite(_a_ra_astrom) & np.isfinite(_a_dec_astrom)
+        if _unmatched.any() and _a_ra_ok.any():
+            _tree = _KDT(np.column_stack([_a_ra_astrom[_a_ra_ok],
+                                          _a_dec_astrom[_a_ra_ok]]))
+            _m_ra  = master['ra_xmatch'].to_numpy(float) \
+                if 'ra_xmatch' in master.columns else np.full(len(master), np.nan)
+            _m_dec = master['dec_xmatch'].to_numpy(float) \
+                if 'dec_xmatch' in master.columns else np.full(len(master), np.nan)
+            _q_ok = _unmatched & np.isfinite(_m_ra) & np.isfinite(_m_dec)
+            if _q_ok.any():
+                _dists, _near = _tree.query(
+                    np.column_stack([_m_ra[_q_ok], _m_dec[_q_ok]]))
+                _a_ok_idx = np.where(_a_ra_ok)[0]
+                _tol = 0.5 / 3600.0
+                for mi, dist, ni in zip(np.where(_q_ok)[0], _dists, _near):
+                    if dist < _tol:
+                        ai = int(_a_ok_idx[ni])
+                        _in_cte[mi]    = True
+                        _astrom_row[mi] = ai
+
+        # ── Restrict master to CTE fitting members only ───────────────────────
+        master      = master[_in_cte].copy().reset_index(drop=True)
+        _astrom_row = _astrom_row[_in_cte]
+        print(f"  Figure 6: {len(master):,} CTE fitting members (from stellar_astrometry)")
+
+        # ── Extract before/after PM data ──────────────────────────────────────
         pmra_b  = master['pmra_xmatch'].to_numpy(float)
         pmdec_b = master['pmdec_xmatch'].to_numpy(float)
         s_ra    = master['sigma_pmra_xmatch'].to_numpy(float)
         s_dec   = master['sigma_pmdec_xmatch'].to_numpy(float)
         rho     = master['corr_pmra_pmdec_xmatch'].to_numpy(float)
+        cov_det = s_ra**2 * s_dec**2 * (1.0 - rho**2)
 
-        # ── Mahalanobis membership (identical to cte_diagnostic_leo_i.py) ────
-        _LIT_PMRA  = -0.063
-        _LIT_PMDEC = -0.111
-        dpmra_lit  = pmra_b  - _LIT_PMRA
-        dpmdec_lit = pmdec_b - _LIT_PMDEC
-        _floor   = 0.05 ** 2
-        t_ra2    = s_ra**2  + _floor
-        t_dec2   = s_dec**2 + _floor
-        t_cov    = s_ra * s_dec * rho
-        test_det = t_ra2 * t_dec2 - t_cov**2
-        mahal2   = np.where(test_det > 0,
-            (t_dec2*dpmra_lit**2 - 2*t_cov*dpmra_lit*dpmdec_lit + t_ra2*dpmdec_lit**2)
-            / test_det, np.nan)
-        cov_det  = s_ra**2 * s_dec**2 * (1.0 - rho**2)
-        geom_unc = cov_det**0.25
-        member   = (geom_unc < 1.0) & (mahal2 < 4.0)
-        master   = master[member].copy().reset_index(drop=True)
-        pmra_b   = pmra_b[member];  pmdec_b = pmdec_b[member]
-        s_ra     = s_ra[member];    s_dec   = s_dec[member]
-        rho      = rho[member];     cov_det = cov_det[member]
-        print(f"  Figure 6: {len(master):,} member stars (Mahalanobis)")
+        # All CTE members have "after" data (they're all in astrom_csv)
+        has_after = np.ones(len(master), dtype=bool)
+        pmra_a_m  = _pmra_a[_astrom_row]
+        pmdec_a_m = _pmdec_a[_astrom_row]
+        w_ra_a    = 1.0 / _sig_ra_a[_astrom_row]**2
+        w_dec_a   = 1.0 / _sig_dec_a[_astrom_row]**2
 
-        # ── Precision-weighted field mean for "before" (full covariance) ─────
-        _W00  = s_dec**2 / cov_det;  _W11 = s_ra**2 / cov_det
-        _W01  = -rho * s_ra * s_dec / cov_det
-        _S00  = _W00.sum();  _S11 = _W11.sum();  _S01 = _W01.sum()
-        _detS = _S00*_S11 - _S01**2
-        _rhs0 = (_W00*pmra_b + _W01*pmdec_b).sum()
-        _rhs1 = (_W01*pmra_b + _W11*pmdec_b).sum()
-        mean_pmra_b  = float((_S11*_rhs0 - _S01*_rhs1) / _detS)
-        mean_pmdec_b = float((-_S01*_rhs0 + _S00*_rhs1) / _detS)
+        # ── Precision-weighted field mean for "before" ────────────────────────
+        _W00  = s_dec**2 / np.where(cov_det > 0, cov_det, 1.0)
+        _W11  = s_ra**2  / np.where(cov_det > 0, cov_det, 1.0)
+        _W01  = -rho * s_ra * s_dec / np.where(cov_det > 0, cov_det, 1.0)
+        _ok_w = cov_det > 0
+        if _ok_w.sum() >= 5:
+            _S00 = _W00[_ok_w].sum(); _S11 = _W11[_ok_w].sum(); _S01 = _W01[_ok_w].sum()
+            _detS = _S00*_S11 - _S01**2
+            if abs(_detS) > 0:
+                _rhs0 = (_W00[_ok_w]*pmra_b[_ok_w] + _W01[_ok_w]*pmdec_b[_ok_w]).sum()
+                _rhs1 = (_W01[_ok_w]*pmra_b[_ok_w] + _W11[_ok_w]*pmdec_b[_ok_w]).sum()
+                mean_pmra_b  = float((_S11*_rhs0 - _S01*_rhs1) / _detS)
+                mean_pmdec_b = float((-_S01*_rhs0 + _S00*_rhs1) / _detS)
+            else:
+                mean_pmra_b  = float(np.nanmean(pmra_b))
+                mean_pmdec_b = float(np.nanmean(pmdec_b))
+        else:
+            mean_pmra_b  = float(np.nanmean(pmra_b))
+            mean_pmdec_b = float(np.nanmean(pmdec_b))
         res_ra_b  = pmra_b  - mean_pmra_b
         res_dec_b = pmdec_b - mean_pmdec_b
-        w_ra_b  = _W11   # per-star weight for pmra
-        w_dec_b = _W00   # per-star weight for pmdec
+        w_ra_b  = _W11
+        w_dec_b = _W00
         print(f"  Before field mean: μ_α*={mean_pmra_b:+.4f}  μ_δ={mean_pmdec_b:+.4f} mas/yr")
 
-        # ── Load stellar_astrometry.csv and match to members for "after" ─────
-        # Gaia-matched members: match by gaia_source_id (int64) == Gaia_id.
-        # HST-only members: positional cross-match on (ra_xmatch, dec_xmatch).
-        has_after = np.zeros(len(master), dtype=bool)
-        res_ra_a  = np.full(len(master), np.nan)
-        res_dec_a = np.full(len(master), np.nan)
-        w_ra_a    = np.zeros(len(master))
-        w_dec_a   = np.zeros(len(master))
-        mean_pmra_a = mean_pmra_b   # fallback
-        mean_pmdec_a = mean_pmdec_b
-
-        if astrom_csv.exists():
-            astrom = _pd.read_csv(astrom_csv)
-            _has_bp3m = (astrom['pmra_bp3m'].notna() & astrom['pmdec_bp3m'].notna() &
-                         astrom['sigma_pmra_bp3m'].notna())
-            astrom = astrom[_has_bp3m].copy().reset_index(drop=True)
-
-            # Pre-extract Gaia_id as int64 (never use iterrows for Gaia IDs)
-            _astrom_gids = astrom['Gaia_id'].to_numpy(np.int64)
-            _pmra_a  = astrom['pmra_bp3m'].to_numpy(float)
-            _pmdec_a = astrom['pmdec_bp3m'].to_numpy(float)
-            _sig_ra_a  = np.maximum(astrom['sigma_pmra_bp3m'].to_numpy(float),  0.001)
-            _sig_dec_a = np.maximum(astrom['sigma_pmdec_bp3m'].to_numpy(float), 0.001)
-
-            # Step 1: match by gaia_source_id for Gaia-matched master rows
-            _master_gids = master['gaia_source_id'].to_numpy(np.int64) \
-                if 'gaia_source_id' in master.columns \
-                else np.zeros(len(master), dtype=np.int64)
-            _astrom_gid_to_row = {int(_astrom_gids[i]): i
-                                  for i in range(len(_astrom_gids))
-                                  if int(_astrom_gids[i]) > 0}
-            for mi in range(len(master)):
-                gid = int(_master_gids[mi])
-                if gid > 0 and gid in _astrom_gid_to_row:
-                    ai = _astrom_gid_to_row[gid]
-                    has_after[mi] = True
-                    res_ra_a[mi]  = _pmra_a[ai]
-                    res_dec_a[mi] = _pmdec_a[ai]
-                    w_ra_a[mi]    = 1.0 / _sig_ra_a[ai]**2
-                    w_dec_a[mi]   = 1.0 / _sig_dec_a[ai]**2
-
-            # Step 2: positional cross-match for HST-only master rows
-            _unmatched = ~has_after
-            if _unmatched.any() and 'ra' in astrom.columns:
-                _a_ra  = astrom['ra'].to_numpy(float)
-                _a_dec = astrom['dec'].to_numpy(float)
-                _a_ok  = np.isfinite(_a_ra) & np.isfinite(_a_dec)
-                if _a_ok.any():
-                    _tree = _KDT(np.column_stack([_a_ra[_a_ok], _a_dec[_a_ok]]))
-                    _m_ra  = master['ra_xmatch'].to_numpy(float) \
-                        if 'ra_xmatch' in master.columns \
-                        else np.full(len(master), np.nan)
-                    _m_dec = master['dec_xmatch'].to_numpy(float) \
-                        if 'dec_xmatch' in master.columns \
-                        else np.full(len(master), np.nan)
-                    _q_ok  = _unmatched & np.isfinite(_m_ra) & np.isfinite(_m_dec)
-                    if _q_ok.any():
-                        _dists, _near = _tree.query(
-                            np.column_stack([_m_ra[_q_ok], _m_dec[_q_ok]]))
-                        _a_ok_idx = np.where(_a_ok)[0]
-                        _tol = 0.5 / 3600.0
-                        for mi, dist, ni in zip(np.where(_q_ok)[0], _dists, _near):
-                            if dist < _tol:
-                                ai = int(_a_ok_idx[ni])
-                                has_after[mi] = True
-                                res_ra_a[mi]  = _pmra_a[ai]
-                                res_dec_a[mi] = _pmdec_a[ai]
-                                w_ra_a[mi]    = 1.0 / _sig_ra_a[ai]**2
-                                w_dec_a[mi]   = 1.0 / _sig_dec_a[ai]**2
-
-            n_after = int(has_after.sum())
-            print(f"  Matched {n_after:,}/{len(master):,} members to stellar_astrometry")
-
-            # Precision-weighted field mean for "after" (matched subset)
-            if n_after >= 5:
-                _wa = w_ra_a[has_after]
-                _pmra_sub  = res_ra_a[has_after]
-                _pmdec_sub = res_dec_a[has_after]
-                mean_pmra_a  = float(np.sum(_wa * _pmra_sub)  / np.sum(_wa))
-                mean_pmdec_a = float(np.sum(w_dec_a[has_after] * _pmdec_sub)
-                                     / np.sum(w_dec_a[has_after]))
-                res_ra_a[has_after]  -= mean_pmra_a
-                res_dec_a[has_after] -= mean_pmdec_a
-                print(f"  After  field mean: μ_α*={mean_pmra_a:+.4f}  "
-                      f"μ_δ={mean_pmdec_a:+.4f} mas/yr")
-        else:
-            n_after = 0
-            print("  stellar_astrometry.csv not found — showing before only")
+        # ── Precision-weighted field mean for "after" ─────────────────────────
+        _wa = w_ra_a
+        mean_pmra_a  = float(np.sum(_wa * pmra_a_m)  / np.sum(_wa)) if np.sum(_wa) > 0 \
+                       else mean_pmra_b
+        mean_pmdec_a = float(np.sum(w_dec_a * pmdec_a_m) / np.sum(w_dec_a)) \
+                       if np.sum(w_dec_a) > 0 else mean_pmdec_b
+        res_ra_a  = pmra_a_m  - mean_pmra_a
+        res_dec_a = pmdec_a_m - mean_pmdec_a
+        print(f"  After  field mean: μ_α*={mean_pmra_a:+.4f}  "
+              f"μ_δ={mean_pmdec_a:+.4f} mas/yr")
 
         # ── Parse hst_indices to find best image ──────────────────────────────
         _hst_idx_cols = [c for c in master.columns if c.startswith('hst_indices_')]
@@ -2981,12 +2965,15 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                     fontsize=8, color='0.45', style='italic')
 
         fig.suptitle(
-            f'Leo I — CTE diagnostic  ({best_root},  N_before={len(rows_with_pos):,}'
-            f'  N_after={int(has_after_s.sum()):,} members)',
+            f'Leo I — CTE diagnostic  ({best_root},  N={len(rows_with_pos):,} CTE members)',
             fontsize=13, y=0.97)
         fig.savefig(plot_dir / f'{file_prefix}cte_pm_vs_detector.png', dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"  Saved: plots/{file_prefix}cte_pm_vs_detector.png")
+    except RuntimeError as exc:
+        if "astrom_csv_missing" not in str(exc):
+            import traceback; traceback.print_exc()
+            print(f"  WARNING: cte_pm_vs_detector.png failed — {exc}")
     except Exception as exc:
         import traceback
         print(f"  WARNING: cte_pm_vs_detector.png failed — {exc}")
