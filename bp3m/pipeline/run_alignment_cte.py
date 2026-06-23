@@ -2129,8 +2129,10 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
     npz_before = _load_npz(before_npz)
     npz_after  = _load_npz(after_npz)
 
-    if npz_before is None and npz_after is None:
-        print("  _plot_cte_diagnostics: no residual arrays found — skipping plots")
+    _has_residuals = (npz_before is not None or npz_after is not None)
+    _has_astrom    = (astrom_csv is not None and Path(astrom_csv).exists())
+    if not _has_residuals and not _has_astrom:
+        print("  _plot_cte_diagnostics: no residual arrays or stellar astrometry found — skipping")
         return
 
     # Build combined per-chip arrays from npz, annotated with chip/epoch/dt
