@@ -4162,6 +4162,12 @@ def run_alignment_joint_cte(
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
     print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
+    if C_shared is not None:
+        _C_mu = C_shared[-2:, -2:]
+        _sig_ra  = float(np.sqrt(_C_mu[0, 0]))
+        _sig_dec = float(np.sqrt(_C_mu[1, 1]))
+        print(f"  σ(μ_pop)  = ({_sig_ra:.4f}, {_sig_dec:.4f}) mas/yr  "
+              f"[posterior, including prior]")
     print(f"  Final |γ_y_hi| = {np.linalg.norm(gamma_hat[_nb:2*_nb]):.4e}  "
           f"|γ_y_lo| = {np.linalg.norm(gamma_hat[3*_nb:4*_nb]):.4e}")
 
@@ -4209,6 +4215,8 @@ def run_alignment_joint_cte(
             "mu_pop_prior":        mu_pop_prior.tolist(),
             "mu_pop_prior_sigma":  mu_pop_prior_sigma,
             "mu_pop_hat":          mu_pop_hat.tolist(),
+            "sigma_mu_pop":        (np.sqrt(np.diag(C_shared[-2:, -2:])).tolist()
+                                    if C_shared is not None else None),
             "n_iter_joint":        n_iter_joint,
             "poly_order":      poly_order,
             "t_epoch0_yr":     t_epoch0_yr,
