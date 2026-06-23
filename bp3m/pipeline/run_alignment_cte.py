@@ -1016,22 +1016,23 @@ def _joint_solve_cte(
     C_r        = C_shared[idx_r, idx_r]
 
     # ── Schur coupling corrections for stellar astrometry ─────────────────────
-    # Without these, a = C_vT @ h_all reflects residuals at (r_current, gamma=0,
-    # mu_pop_current), not the solved (r_hat, gamma_hat, mu_pop_hat).
-    # The correct posterior is:
-    #   v_i = a_i
-    #         - C_vT_i @ Q_total_i @ gamma_hat          (CTE correction)
-    #         - C_vT_i @ K_j_i^T @ delta_r_j (sum_j)   (per-image transform)
-    #         + sigma_pm^{-2} C_vT_i[:,2:4] @ delta_mu  (pop-PM prior update)
-    # The gamma correction is most important: it removes the CTE component from
-    # stellar PM estimates.  The mu_pop correction keeps the posterior consistent
-    # with the updated population mean.
+    # BP3M stores JU = -J (opposite sign Jacobian), so the loss is
+    #   ½‖x_resid − J v − G γ‖² = ½‖x_resid + JU v − G γ‖²
+    # and h_all = prior − JU^T C⁻¹ x_resid = prior + J^T C⁻¹ x_resid (correct RHS).
+    # The coupling corrections that account for the solved (γ_hat, Δr, Δμ) are:
+    #
+    #   v_posterior = a + C_vT @ Q @ γ_hat          (γ: Q = JU^T C⁻¹ G = -J^T C⁻¹ G < 0)
+    #               + C_vT @ K @ Δr                  (Δr: K = JU^T C⁻¹ X = -J^T C⁻¹ X < 0)
+    #               + σ_pm⁻² C_vT[:,2:4] @ Δμ        (Δμ: prior mean update, sign +)
+    #
+    # All three use PLUS.  Q and K are negative (because JU = -J), so +C_vT@Q@γ
+    # still gives a negative correction for positive γ (correct: CTE reduces PMra).
 
     # 1. Gamma correction (all active stars)
     if len(all_active_sidx) > 0:
         Qt = Q_total_all[all_active_sidx]          # (n_act, 5, n_gamma)
         Cv = C_vT[all_active_sidx]                 # (n_act, 5, 5)
-        a[all_active_sidx] -= np.einsum('nij,njk,k->ni', Cv, Qt, gamma_hat)
+        a[all_active_sidx] += np.einsum('nij,njk,k->ni', Cv, Qt, gamma_hat)
 
     # 2. Per-image transform correction (all active stars)
     for j_idx, img in enumerate(image_names):
@@ -1048,9 +1049,9 @@ def _joint_solve_cte(
         if not use_any.any():
             continue
         s_idx = sidx[use_any]
-        np.subtract.at(a, s_idx,
-                       np.einsum('nij,njk,k->ni',
-                                 C_vT[s_idx], K_j[use_any], delta_r_j))
+        np.add.at(a, s_idx,
+                  np.einsum('nij,njk,k->ni',
+                            C_vT[s_idx], K_j[use_any], delta_r_j))
 
     # 3. Population-PM prior correction (all prior stars: Gaia members + HST-only members)
     # h_all was built with mu_pop_current; the prior update from delta_mu must be
