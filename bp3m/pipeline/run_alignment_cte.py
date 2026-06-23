@@ -22,9 +22,9 @@ For chip c (hi/lo), detection k in image j (epoch t_j):
 Parameters: 10 total per chip: γ_x(5) + γ_y(5) (two chips → 20 params).
 
 Note on y_raw coordinate system: py1pass stores pixel y in a unified global frame
-(0..~4096). _hi images (chip_ext=1) occupy y_raw ∈ [8, 2039] (LOW y; readout at y≈0);
-_lo images (chip_ext=4) occupy y_raw ∈ [2057, 4087] (HIGH y; readout at gap edge y≈2048).
-Both chips trail CTE toward HIGH y_raw, giving yt = (y_raw − y_readout)/2048 ∈ [0,1].
+(0..~4096). _hi images (chip_ext=1) occupy y_raw ∈ [2057, 4087] (HIGH y; readout at gap
+edge y≈2048). _lo images (chip_ext=4) occupy y_raw ∈ [8, 2039] (LOW y; readout at outer
+edge y≈0). Both chips trail CTE toward HIGH y_raw, giving yt = (y_raw−y_readout)/2048 ∈ [0,1].
 5-term basis spans the full 2D (xt, yt) space while preserving CTE=0 at the readout.
 """
 
@@ -39,14 +39,14 @@ from tqdm import tqdm as _tqdm
 
 # ── ACS/WFC chip geometry constants ──────────────────────────────────────────
 # py1pass unified y frame (0..~4096):
-#   _hi images (chip_ext=1): y_raw ∈ [8, 2039]   — LOW y, readout at outer edge y≈0
-#   _lo images (chip_ext=4): y_raw ∈ [2057, 4087] — HIGH y, readout at gap edge y≈2048
+#   _hi images (chip_ext=1): y_raw ∈ [2057, 4087] — HIGH y, readout at gap edge y≈2048
+#   _lo images (chip_ext=4): y_raw ∈ [8, 2039]    — LOW y,  readout at outer edge y≈0
 # Both chips trail CTE toward HIGH y_raw; yt = (y_raw − y_readout_raw)/2048 ∈ [0, 1].
 # GDC-frame: Y_c = y_gdc − 2048.  Readout positions in GDC frame:
-_HI_Y_READOUT = -2048.0   # _hi chip readout: y_raw≈0 → Y_c = 0−2048 = −2048
-_LO_Y_READOUT =  0.0      # _lo chip readout: y_raw≈2048 → Y_c = 2048−2048 = 0
-_HI_Y_READOUT_RAW = 0.0      # _hi images (y∈[8,2039]):   yt = y/2048 ∈ [0,1]
-_LO_Y_READOUT_RAW = 2048.0   # _lo images (y∈[2057,4087]): yt = (y−2048)/2048 ∈ [0,1]
+_HI_Y_READOUT =  0.0      # _hi chip readout: y_raw≈2048 → Y_c = 2048−2048 = 0
+_LO_Y_READOUT = -2048.0   # _lo chip readout: y_raw≈0    → Y_c = 0−2048 = −2048
+_HI_Y_READOUT_RAW = 2048.0   # _hi images (y∈[2057,4087]): yt = (y−2048)/2048 ∈ [0,1]
+_LO_Y_READOUT_RAW = 0.0      # _lo images (y∈[8,2039]):    yt = y/2048 ∈ [0,1]
 _ACS_LAUNCH_YR = 2002.165   # ACS launch 2002-03-01; used as CTE time origin
 _MAG_REF      = -15.0   # just below the brightest instrumental mag (~-14.5)
 
