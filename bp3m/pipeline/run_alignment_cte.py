@@ -1999,11 +1999,16 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                 y_raw_grid = np.linspace(p.y_readout_raw, 2039, 500)
             X_c_grid   = np.zeros_like(y_raw_grid)   # at X centre of chip
 
+            _nb  = len(p.gamma_y)    # 5*(K+1) for the polynomial model
+            _n   = len(y_raw_grid)
+            xt_g = X_c_grid / 2048.0
+            yt_g = (y_raw_grid - p.y_readout_raw) / 2048.0
+            B_g  = cte_basis(xt_g, yt_g)           # (n, 5)
             for mag_v, col, lbl in mag_bins:
-                f1   = float(func1_mag(np.array([mag_v]))[0])
-                yt_g = (y_raw_grid - p.y_readout_raw) / 2048.0
-                B_g  = cte_basis(X_c_grid, yt_g)  # X_c_grid already 0 → xt=0
-                dcte = dt_max * f1 * (B_g @ p.gamma_y)
+                MP_v  = mag_poly_basis(np.full(_n, mag_v), p.mag_poly_order,
+                                       p.mag_norm_ref, p.mag_norm_scale)  # (n, K+1)
+                PsiB  = (MP_v[:, :, None] * B_g[:, None, :]).reshape(_n, _nb)
+                dcte  = dt_max * (PsiB @ p.gamma_y)
                 ax.plot(y_raw_grid, dcte, color=col, lw=1.8, label=lbl)
 
             ax.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
