@@ -3677,7 +3677,6 @@ def run_alignment_joint_cte(
         regularize_gamma=regularize_gamma,
         pm_sys_floor=pm_sys_floor,
         gaia_catalog=gaia_catalog,
-        init_pm_window=_init_pm_window,
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
     print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
