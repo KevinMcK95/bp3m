@@ -2810,10 +2810,11 @@ def _run_joint_cte_loop(
         eligible = (np.isfinite(pmra_cat) & np.isfinite(pmdec_cat)
                     & (np.abs(pmra_cat  - mu_ra)  < init_pm_window)
                     & (np.abs(pmdec_cat - mu_dec) < init_pm_window)
-                    & (n_hst >= 1))
+                    & (n_hst >= 1)
+                    & (~hst_only_mask))   # Gaia-only: consistent with _select_members_from_a
         member_sidx = np.where(eligible)[0]
         print(f"  Initial members from catalog PMs: {len(member_sidx)} "
-              f"(±{init_pm_window} mas/yr of ({mu_ra:+.3f},{mu_dec:+.3f}))")
+              f"(±{init_pm_window} mas/yr of ({mu_ra:+.3f},{mu_dec:+.3f}), Gaia only)")
     else:
         eligible_mask = (~hst_only_mask) & (n_hst >= 1)
         member_sidx   = np.where(eligible_mask)[0]
@@ -3619,7 +3620,8 @@ def run_alignment_joint_cte(
         _elig = (np.isfinite(_pmra_cat) & np.isfinite(_pmdec_cat)
                  & (np.abs(_pmra_cat  - _mu_ra)  < _init_pm_window)
                  & (np.abs(_pmdec_cat - _mu_dec) < _init_pm_window)
-                 & (_n_hst_init >= 1))
+                 & (_n_hst_init >= 1)
+                 & (~hst_only_mask))   # Gaia-only: consistent with _select_members_from_a
         member_sidx_init = np.where(_elig)[0]
     else:
         member_sidx_init = np.where(
