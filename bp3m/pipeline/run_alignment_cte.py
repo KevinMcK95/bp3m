@@ -358,6 +358,97 @@ def apply_cte_to_solver(
             d['xys'] = d['xys_orig'] + delta_cte_pseudo
 
 
+# ── Multi-filter catalog loader ───────────────────────────────────────────────
+
+def _load_full_catalog_df_all_filters(data_root, field_name: str):
+    """
+    Load and merge all detections_{filter}.csv + master_combined_v2.csv.
+
+    Replaces run_alignment_v2._load_full_catalog_df so that residual maps are
+    generated for every image in the solver, not just F814W images.
+    master_combined_v2 has hst_indices_{filter} for every filter present, with
+    the same 'sub_name:catalog_index,...' format, so the same HST-only join logic
+    works for each filter.
+
+    Returns dict {sub_name: DataFrame} or None if required files are missing.
+    """
+    import pandas as pd
+    from pathlib import Path as _Path
+
+    xmatch_dir = _Path(data_root) / field_name / 'hst_xmatch'
+    mcat_path  = xmatch_dir / 'master_combined_v2.csv'
+    det_files  = sorted(xmatch_dir.glob('detections_*.csv'))
+
+    if not mcat_path.exists() or not det_files:
+        return None
+
+    mcat = pd.read_csv(mcat_path, dtype={'gaia_source_id': np.int64}, low_memory=False)
+
+    star_cols = ['ra_xmatch', 'dec_xmatch', 'pmra_xmatch', 'pmdec_xmatch',
+                 'parallax_xmatch', 'epoch_ref_xmatch']
+
+    mcat_gaia = (mcat[mcat['gaia_source_id'] != 0]
+                 [['gaia_source_id'] + star_cols].copy())
+
+    all_dfs = []
+    for det_path in det_files:
+        filt = det_path.stem.replace('detections_', '')   # e.g. 'F814W'
+        hst_idx_col = f'hst_indices_{filt}'
+
+        det = pd.read_csv(det_path, dtype={'gaia_source_id': np.int64})
+
+        # Columns to keep from detection file (filter/instrument/detector are
+        # constant per sub_name so safe to carry through for title annotation)
+        det_pos_cols = ['sub_name', 'gaia_source_id', 'catalog_index',
+                        'x_gdc', 'y_gdc', 'mag_gdc']
+        for _col in ('filter', 'instrument', 'detector'):
+            if _col in det.columns:
+                det_pos_cols.append(_col)
+
+        # Gaia-matched detections — astrometry is filter-independent
+        det_gaia = det[det['gaia_source_id'].to_numpy(np.int64) != 0][
+                       det_pos_cols].copy()
+        det_gaia_m = det_gaia.merge(mcat_gaia, on='gaia_source_id', how='inner')
+        all_dfs.append(det_gaia_m)
+
+        # HST-only detections — use this filter's index column in master
+        if hst_idx_col not in mcat.columns:
+            continue
+
+        mcat_hst_src = mcat[mcat[hst_idx_col].notna()][
+                           [hst_idx_col] + star_cols].copy().reset_index(drop=True)
+        mcat_hst_src['_entries'] = (mcat_hst_src[hst_idx_col]
+                                    .str.replace(';', ',', regex=False)
+                                    .str.split(','))
+        mcat_exploded = mcat_hst_src.explode('_entries')
+        mcat_exploded = mcat_exploded[
+            mcat_exploded['_entries'].str.contains(':', na=False)].copy()
+        entry_parts = mcat_exploded['_entries'].str.split(':', expand=True)
+        mcat_exploded['sub_name']      = entry_parts[0]
+        mcat_exploded['catalog_index'] = entry_parts[1].astype(np.int64)
+        rev_idx = (mcat_exploded[['sub_name', 'catalog_index'] + star_cols]
+                   .reset_index(drop=True))
+
+        det_hst = det[det['gaia_source_id'].to_numpy(np.int64) == 0][
+                      det_pos_cols].copy()
+        det_hst['catalog_index'] = det_hst['catalog_index'].astype(np.int64)
+        det_hst_m = det_hst.merge(rev_idx, on=['sub_name', 'catalog_index'], how='inner')
+        all_dfs.append(det_hst_m)
+
+    if not all_dfs:
+        return None
+
+    det_all = pd.concat(all_dfs, ignore_index=True)
+    n_total = len(det_all)
+    n_gaia  = (det_all['gaia_source_id'].to_numpy(np.int64) != 0).sum()
+    n_imgs  = det_all['sub_name'].nunique()
+    print(f"    Loaded {n_total:,} detections across {n_imgs} images "
+          f"({n_gaia:,} Gaia-matched + {n_total - n_gaia:,} HST-only) "
+          f"from {len(det_files)} filter(s)")
+    return {img: grp.reset_index(drop=True)
+            for img, grp in det_all.groupby('sub_name', sort=False)}
+
+
 # ── Residual collection ───────────────────────────────────────────────────────
 
 def collect_cte_residuals(
@@ -1974,14 +2065,19 @@ def warm_start_cte(
             hst_prior_sidx=None,
             fit_cte_x=fit_cte_x,
         )
-        r_ws, _, _, mu_ws, _, _, _, _ = _result_g
+        r_ws, _, _, mu_ws, _C_shared_ws, _, _, _ = _result_g
         solver._update_R(r_ws)
         solver._update_geometry(r_ws, solver.v_survey)
         _dr_ws  = float(np.max(np.abs(r_ws  - _r_prev_ws)))
         _dmu_ws = float(np.max(np.abs(mu_ws - _mu_prev_ws)))
+        _C_mu_ws   = _C_shared_ws[-2:, -2:]
+        _sig_ra_ws = float(np.sqrt(_C_mu_ws[0, 0]))
+        _sig_de_ws = float(np.sqrt(_C_mu_ws[1, 1]))
+        _rho_ws    = float(_C_mu_ws[0, 1] / (_sig_ra_ws * _sig_de_ws + 1e-30))
         print(f"    iter {_ws_it+1}/{n_gaia_warmstart_iters}: "
               f"Δr={_dr_ws:.3e}  Δμ={_dmu_ws:.4f}  "
-              f"μ_pop=({mu_ws[0]:+.4f}, {mu_ws[1]:+.4f}) mas/yr")
+              f"μ_pop=({mu_ws[0]:+.4f}±{_sig_ra_ws:.4f}, "
+              f"{mu_ws[1]:+.4f}±{_sig_de_ws:.4f}) mas/yr  ρ={_rho_ws:+.3f}")
         _r_prev_ws  = r_ws.copy()
         _mu_prev_ws = mu_ws.copy()
     print(f"  [2/4] done ({_wtime.time()-_t0:.1f}s)")
@@ -2023,7 +2119,9 @@ def warm_start_cte(
         print(f"  [4/4] done ({_wtime.time()-_t0:.1f}s)")
 
     print(f"\n  {'─'*56}")
-    print(f"  CTE warm start complete.  μ_pop_warm = ({mu_ws[0]:+.4f}, {mu_ws[1]:+.4f}) mas/yr")
+    print(f"  CTE warm start complete.")
+    print(f"  μ_pop_warm = ({mu_ws[0]:+.4f}±{_sig_ra_ws:.4f}, "
+          f"{mu_ws[1]:+.4f}±{_sig_de_ws:.4f}) mas/yr  ρ={_rho_ws:+.3f}")
     print(f"  {'─'*56}\n")
     return cte_warm, mu_ws, r_ws, a_arr_ws
 
@@ -2410,11 +2508,16 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
     mag_ref = _MAG_REF
 
     # ── Figure 1: CTE amplitude vs raw y for mag bins ────────────────────────
-    # Use raw chip-local y (0..2047) for each chip — physically correct range.
-    # hi chip: readout at raw row 2047 (top), so Y' = y_raw - 2047 ∈ [-2047, 0]
-    # lo chip: readout at raw row 0     (bottom), so Y' = y_raw ∈ [0, 2047]
+    # Row 0 (always): δCTE_y — hi chip | lo chip
+    # Row 1 (if fit_cte_x): δCTE_x — hi chip | lo chip
     try:
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        _has_cte_x = any(
+            np.any(cte_params[c].gamma_x != 0) for c in ('hi', 'lo')
+            if c in cte_params
+        )
+        n_rows = 2 if _has_cte_x else 1
+        fig, axes = plt.subplots(n_rows, 2, figsize=(13, 5 * n_rows),
+                                 squeeze=False)
 
         all_mjds  = [float(solver.images[img]['hst_time_mjd'])
                      for img in image_names if img in solver.images]
@@ -2441,37 +2544,43 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                     (mag_p50, 'green',     f'med   (p50={mag_p50:.1f})'),
                     (mag_p90, 'firebrick', f'faint (p90={mag_p90:.1f})')]
 
-        for col_i, chip in enumerate(('hi', 'lo')):
-            ax  = axes[col_i]
-            p   = cte_params[chip]
-            # y_raw grids in the py1pass global frame
-            # _hi chip (WFC1): y_raw ∈ [2057, 4087], readout at outer top (y≈4096)
-            # _lo chip (WFC2): y_raw ∈ [8, 2039],    readout at outer bottom (y≈0)
-            if p.y_readout_raw > 2000:   # hi chip
-                y_raw_grid = np.linspace(2048.0, 4096.0, 500)
-            else:                        # lo chip
-                y_raw_grid = np.linspace(0.0, 2048.0, 500)
-            X_c_grid   = np.zeros_like(y_raw_grid)   # at X centre of chip
+        # Rows: 0 = y-CTE, 1 = x-CTE (if fit)
+        components = [('gamma_y', 'δCTE_y')]
+        if _has_cte_x:
+            components.append(('gamma_x', 'δCTE_x'))
 
-            _nb  = len(p.gamma_y)    # 5*(K+1)-1 after degenerate term removal
-            _n   = len(y_raw_grid)
-            xt_g = X_c_grid / 2048.0
-            yt_g = np.abs(y_raw_grid - p.y_readout_raw) / 2048.0
-            B_g  = cte_basis(xt_g, yt_g)           # (n, 5)
-            for mag_v, col, lbl in mag_bins:
-                MP_v  = mag_poly_basis(np.full(_n, mag_v), p.mag_poly_order,
-                                       p.mag_norm_ref, p.mag_norm_scale)  # (n, K+1)
-                PsiB  = (MP_v[:, :, None] * B_g[:, None, :]).reshape(_n, _nb + 1)[:, 1:]
-                dcte  = dt_max * (PsiB @ p.gamma_y)
-                ax.plot(y_raw_grid, dcte, color=col, lw=1.8, label=lbl)
+        for row_i, (gamma_attr, cte_lbl) in enumerate(components):
+            for col_i, chip in enumerate(('hi', 'lo')):
+                ax = axes[row_i, col_i]
+                p  = cte_params[chip]
+                if p.y_readout_raw > 2000:   # hi chip
+                    y_raw_grid = np.linspace(2048.0, 4096.0, 500)
+                else:                        # lo chip
+                    y_raw_grid = np.linspace(0.0, 2048.0, 500)
+                X_c_grid = np.zeros_like(y_raw_grid)
 
-            ax.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
-            ax.axvline(p.y_readout_raw, color='k', lw=0.8, ls=':', alpha=0.5,
-                       label=f'readout (y={p.y_readout_raw:.0f})')
-            ax.set_xlabel('Raw global y (px, py1pass frame)')
-            ax.set_ylabel('δCTE_y (px)' if col_i == 0 else '')
-            ax.set_title(f'_{chip} chip — CTE_y amplitude (Δt={dt_max:.1f} yr, X_c=0)')
-            ax.legend(fontsize=9)
+                _nb  = len(p.gamma_y)
+                _n   = len(y_raw_grid)
+                xt_g = X_c_grid / 2048.0
+                yt_g = np.abs(y_raw_grid - p.y_readout_raw) / 2048.0
+                B_g  = cte_basis(xt_g, yt_g)
+                gamma_vec = getattr(p, gamma_attr)
+                for mag_v, col, lbl in mag_bins:
+                    MP_v = mag_poly_basis(np.full(_n, mag_v), p.mag_poly_order,
+                                          p.mag_norm_ref, p.mag_norm_scale)
+                    PsiB = (MP_v[:, :, None] * B_g[:, None, :]).reshape(_n, _nb + 1)[:, 1:]
+                    dcte = dt_max * (PsiB @ gamma_vec)
+                    ax.plot(y_raw_grid, dcte, color=col, lw=1.8, label=lbl)
+
+                ax.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
+                ax.axvline(p.y_readout_raw, color='k', lw=0.8, ls=':', alpha=0.5,
+                           label=f'readout (y={p.y_readout_raw:.0f})')
+                ax.set_xlabel('Raw global y (px, py1pass frame)')
+                ax.set_ylabel(f'{cte_lbl} (px)' if col_i == 0 else '')
+                ax.set_title(f'_{chip} chip — {cte_lbl} amplitude (Δt={dt_max:.1f} yr, X_c=0)')
+                if row_i == 0 or col_i == 0:
+                    ax.legend(fontsize=9)
+
         fig.suptitle('CTE correction amplitude (converged parameters, raw detector frame)',
                      fontsize=11)
         fig.tight_layout()
@@ -3382,9 +3491,14 @@ def _run_joint_cte_loop(
         gy_lo = float(np.linalg.norm(gamma_hat[3*_nb:4*_nb]))
         gx_hi = float(np.linalg.norm(gamma_hat[:_nb]))
         gx_lo = float(np.linalg.norm(gamma_hat[2*_nb:3*_nb]))
+        _C_mu_it   = C_shared[-2:, -2:]
+        _sig_ra_it = float(np.sqrt(_C_mu_it[0, 0]))
+        _sig_de_it = float(np.sqrt(_C_mu_it[1, 1]))
+        _rho_it    = float(_C_mu_it[0, 1] / (_sig_ra_it * _sig_de_it + 1e-30))
         print(f"  → Δr={dr:.3e}  Δγ={dg:.3e}  Δμ={dmu:.4f}  "
               f"({_jtime.time()-_t_iter:.1f}s)")
-        print(f"  → μ_pop=({mu_pop_hat[0]:+.4f},{mu_pop_hat[1]:+.4f}) mas/yr  "
+        print(f"  → μ_pop=({mu_pop_hat[0]:+.4f}±{_sig_ra_it:.4f}, "
+              f"{mu_pop_hat[1]:+.4f}±{_sig_de_it:.4f}) mas/yr  ρ={_rho_it:+.3f}  "
               f"n_gaia_new={len(mu_member_sidx)}  (HST fixed: {len(hst_prior_sidx)})")
         print(f"  → |γ_y| hi={gy_hi:.3e} lo={gy_lo:.3e}  "
               f"|γ_x| hi={gx_hi:.3e} lo={gx_lo:.3e}")
@@ -3490,62 +3604,108 @@ def _plot_per_image_detector_residuals(
     stage_labels: tuple = ("bp3m v2", "post-r/μ_pop", "post-CTE"),
     prefix: str = 'warmstart',
     vclip: float | None = None,
+    img_meta: dict | None = None,
 ) -> None:
     """
-    Per-image 3×2 detector residual maps.
+    Per-visit 3×2 detector residual maps combining both chips (hi+lo).
 
     Rows: 3 stages (stage1=v2, stage2=post-r/mu_pop, stage3=post-CTE).
     Cols: dx_gdc (col 0) and dy_gdc (col 1).
-    Axes: raw pixel coordinates (X_orig, Y_orig) from filtered_spi.
+    Axes: raw pixel coordinates covering the full detector (y_raw 0–4096).
     Color: GDC-frame residual in pixels.
 
-    Saves one PNG per image to output_dir/f'{prefix}_{img}.png'.
+    Images are grouped by visit rootname (stripping _hi/_lo suffix) so both
+    chips appear in the same figure.  Saves one PNG per visit to
+    output_dir/f'{prefix}_{root}.png'.
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from astropy.time import Time as _Time
     from pathlib import Path as _Path
+    from collections import defaultdict as _defaultdict
 
     output_dir = _Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    saved = 0
+    # ── Group images by visit rootname (strip _hi / _lo) ─────────────────────
+    visit_groups = _defaultdict(list)
     for img in image_names:
-        spi = filtered_spi.get(img)
-        if spi is None or len(spi) == 0:
+        if img.endswith('_hi') or img.endswith('_lo'):
+            root = img[:-3]
+        else:
+            root = img
+        visit_groups[root].append(img)
+
+    stages_arrs = [arrays_stage1, arrays_stage2, arrays_stage3]
+    saved = 0
+
+    for root, imgs in visit_groups.items():
+        # ── Accumulate data from all chips in this visit ──────────────────────
+        xr_by_stage  = [[] for _ in range(3)]
+        yr_by_stage  = [[] for _ in range(3)]
+        dx_by_stage  = [[] for _ in range(3)]
+        dy_by_stage  = [[] for _ in range(3)]
+        total_n = 0
+        years   = []
+
+        for img in imgs:
+            spi = filtered_spi.get(img)
+            if spi is None or len(spi) == 0:
+                continue
+            xc_key = f'{img}_X_c'
+            if xc_key not in arrays_stage1:
+                continue
+
+            xc_all = arrays_stage1[xc_key].astype(float)
+            yc_all = arrays_stage1[f'{img}_Y_c'].astype(float)
+            xc_spi = spi['X'].to_numpy(float) - 2048.0
+            yc_spi = spi['Y'].to_numpy(float) - 2048.0
+
+            pos_dict = {(round(float(x), 2), round(float(y), 2)): k
+                        for k, (x, y) in enumerate(zip(xc_all, yc_all))}
+            match_idx = np.array([
+                pos_dict.get((round(float(x), 2), round(float(y), 2)), -1)
+                for x, y in zip(xc_spi, yc_spi)
+            ])
+            valid = match_idx >= 0
+            if not valid.any():
+                continue
+
+            m_idx = match_idx[valid]
+            x_raw = (spi['X_orig'].to_numpy(float)[valid]
+                     if 'X_orig' in spi.columns else xc_spi[valid] + 2048.0)
+            y_raw = (spi['Y_orig'].to_numpy(float)[valid]
+                     if 'Y_orig' in spi.columns else yc_spi[valid] + 2048.0)
+
+            for si, arr in enumerate(stages_arrs):
+                dxk = f'{img}_dx_gdc'
+                dyk = f'{img}_dy_gdc'
+                dx = arr[dxk][m_idx].astype(float) if dxk in arr else np.zeros(m_idx.size)
+                dy = arr[dyk][m_idx].astype(float) if dyk in arr else np.zeros(m_idx.size)
+                xr_by_stage[si].append(x_raw)
+                yr_by_stage[si].append(y_raw)
+                dx_by_stage[si].append(dx)
+                dy_by_stage[si].append(dy)
+
+            total_n += int(valid.sum())
+            hst_yr = float(_Time(float(solver.images[img]['hst_time_mjd']),
+                                 format='mjd').jyear)
+            years.append(hst_yr)
+
+        if total_n == 0:
             continue
-        xc_key = f'{img}_X_c'
-        if xc_key not in arrays_stage1:
-            continue
 
-        # ── Match filtered_spi stars → out_arrays by rounded GDC position ──────
-        xc_all = arrays_stage1[xc_key].astype(float)
-        yc_all = arrays_stage1[f'{img}_Y_c'].astype(float)
-        xc_spi = spi['X'].to_numpy(float) - 2048.0
-        yc_spi = spi['Y'].to_numpy(float) - 2048.0
+        # Concatenate across chips
+        for si in range(3):
+            xr_by_stage[si] = np.concatenate(xr_by_stage[si]) if xr_by_stage[si] else np.array([])
+            yr_by_stage[si] = np.concatenate(yr_by_stage[si]) if yr_by_stage[si] else np.array([])
+            dx_by_stage[si] = np.concatenate(dx_by_stage[si]) if dx_by_stage[si] else np.array([])
+            dy_by_stage[si] = np.concatenate(dy_by_stage[si]) if dy_by_stage[si] else np.array([])
 
-        pos_dict = {(round(float(x), 2), round(float(y), 2)): k
-                    for k, (x, y) in enumerate(zip(xc_all, yc_all))}
-        match_idx = np.array([
-            pos_dict.get((round(float(x), 2), round(float(y), 2)), -1)
-            for x, y in zip(xc_spi, yc_spi)
-        ])
-        valid = match_idx >= 0
-        if not valid.any():
-            continue
-
-        m_idx  = match_idx[valid]
-        x_raw  = (spi['X_orig'].to_numpy(float)[valid]
-                  if 'X_orig' in spi.columns else xc_spi[valid] + 2048.0)
-        y_raw  = (spi['Y_orig'].to_numpy(float)[valid]
-                  if 'Y_orig' in spi.columns else yc_spi[valid] + 2048.0)
-
-        # ── Determine symmetric colour limit ─────────────────────────────────
-        dx1 = arrays_stage1.get(f'{img}_dx_gdc', np.zeros(len(xc_all)))
-        dy1 = arrays_stage1.get(f'{img}_dy_gdc', np.zeros(len(xc_all)))
+        # ── Colour limit from stage-1 residuals ───────────────────────────────
         if vclip is None:
-            _vals1 = np.concatenate([np.abs(dx1[m_idx]), np.abs(dy1[m_idx])])
+            _vals1 = np.concatenate([np.abs(dx_by_stage[0]), np.abs(dy_by_stage[0])])
             _finite = _vals1[np.isfinite(_vals1)]
             _vc = float(np.percentile(_finite, 97)) if len(_finite) > 0 else 0.3
             _vc = max(_vc, 0.05)
@@ -3553,24 +3713,22 @@ def _plot_per_image_detector_residuals(
             _vc = float(vclip)
 
         # ── Build figure ──────────────────────────────────────────────────────
-        stages   = [arrays_stage1, arrays_stage2, arrays_stage3]
-        col_keys = [f'{img}_dx_gdc', f'{img}_dy_gdc']
-        col_lbls = ['dx_gdc (px)', 'dy_gdc (px)']
-
         fig, axes = plt.subplots(3, 2, figsize=(12, 9),
                                  sharex=True, sharey=True,
                                  gridspec_kw={'hspace': 0.08, 'wspace': 0.06})
 
-        for row_i, (arr, stage_lbl) in enumerate(zip(stages, stage_labels)):
-            for col_i, (ckey, clbl) in enumerate(zip(col_keys, col_lbls)):
-                ax   = axes[row_i, col_i]
-                vals = (arr[ckey][m_idx].astype(float)
-                        if ckey in arr else np.zeros(m_idx.size))
-                sc   = ax.scatter(x_raw, y_raw, c=vals,
-                                  cmap='RdBu_r', vmin=-_vc, vmax=_vc,
-                                  s=1.5, alpha=0.6, linewidths=0,
-                                  rasterized=True)
-                cb   = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+        for row_i, stage_lbl in enumerate(stage_labels):
+            x_d = xr_by_stage[row_i]
+            y_d = yr_by_stage[row_i]
+            for col_i, (vals, clbl) in enumerate(
+                    zip([dx_by_stage[row_i], dy_by_stage[row_i]],
+                        ['dx_gdc (px)', 'dy_gdc (px)'])):
+                ax = axes[row_i, col_i]
+                sc = ax.scatter(x_d, y_d, c=vals,
+                                cmap='RdBu_r', vmin=-_vc, vmax=_vc,
+                                s=1.5, alpha=0.6, linewidths=0,
+                                rasterized=True)
+                cb = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
                 cb.ax.tick_params(labelsize=7)
                 if row_i == 0:
                     ax.set_title(clbl, fontsize=10, pad=4)
@@ -3584,20 +3742,31 @@ def _plot_per_image_detector_residuals(
                 if row_i == 2:
                     ax.set_xlabel('x_raw (px)', fontsize=8)
 
-        hst_yr = float(_Time(float(solver.images[img]['hst_time_mjd']),
-                             format='mjd').jyear)
-        fig.suptitle(
-            f'{img}   obs {hst_yr:.3f} yr   n={valid.sum()} stars   '
-            f'colour ±{_vc:.3f} px',
-            fontsize=10,
-        )
+        unique_yrs = sorted(set(round(y, 3) for y in years))
+        yr_str = '/'.join(f'{y:.3f}' for y in unique_yrs)
 
-        out_path = output_dir / f'{prefix}_{img}.png'
+        # Collect filter/instrument/detector across chips in this visit
+        _inst_parts = []
+        for _img in imgs:
+            _m = (img_meta or {}).get(_img)
+            if _m:
+                _inst_parts.append(
+                    f"{_m.get('filter','?')} {_m.get('instrument','?')}/{_m.get('detector','?')}"
+                )
+        _inst_str = '  |  '.join(dict.fromkeys(_inst_parts))   # unique, order-preserving
+
+        _title = f'{root}   obs {yr_str} yr   n={total_n} stars   colour ±{_vc:.3f} px'
+        if _inst_str:
+            _title = f'{_inst_str}\n{_title}'
+        fig.suptitle(_title, fontsize=10)
+
+        out_path = output_dir / f'{prefix}_{root}.png'
         fig.savefig(out_path, dpi=120, bbox_inches='tight')
         plt.close(fig)
         saved += 1
 
-    print(f"  Saved {saved}/{len(image_names)} per-image residual maps → {output_dir}")
+    n_visits = len(visit_groups)
+    print(f"  Saved {saved}/{n_visits} per-visit residual maps → {output_dir}")
 
 
 def _save_warmstart_stellar_astrometry(
@@ -3710,7 +3879,7 @@ def run_alignment_cte(
 
     from .data_loader_master import load_master_v2
     from .run_alignment_v2 import (
-        V2AlignmentCallback, _load_full_catalog_df,
+        V2AlignmentCallback,
         _compute_full_catalog_residuals_from_df,
         _plot_soft_weights,
     )
@@ -3754,11 +3923,11 @@ def run_alignment_cte(
           f"Images: {len(image_names)}")
 
     # ── Load full-catalog detection DataFrame (cached for all CTE iterations) ──
-    print("\n  Loading full-catalog detection data (cached for CTE iterations)...")
-    img_to_df = _load_full_catalog_df(data_root, field_name)
+    print("\n  Loading full-catalog detection data (all filters, cached for CTE iterations)...")
+    img_to_df = _load_full_catalog_df_all_filters(data_root, field_name)
     if img_to_df is None:
         raise RuntimeError(
-            "detections_F814W.csv or master_combined_v2.csv not found. "
+            "No detections_*.csv or master_combined_v2.csv not found. "
             "Run hst_catalog_crossmatch first.")
 
     # ── Reference epoch: first exposure ───────────────────────────────────────
@@ -4142,7 +4311,7 @@ def run_alignment_joint_cte(
     poly_order: int = 1,
     use_sparse: bool = False,
     no_plots: bool = False,
-    plot_residuals: bool = False,
+    plot_residuals: bool = True,
     hst_max_pm_unc: float = 5.0,
     hst_max_per_image: int = 100_000,
     hst_pm_sigma_diffuse: float = 100.0,
@@ -4150,7 +4319,7 @@ def run_alignment_joint_cte(
     det_chi2_threshold: float | None = None,
     bp3m_dir: Path | None = None,
     warmstart_only: bool = False,
-    fit_cte_x: bool = False,
+    fit_cte_x: bool = True,
 ) -> Path:
     """
     Joint CTE + population mean PM alignment.
@@ -4195,7 +4364,6 @@ def run_alignment_joint_cte(
     from .data_loader_master import load_master_v2
     from .run_alignment_v2 import (
         V2AlignmentCallback,
-        _load_full_catalog_df,
         _compute_full_catalog_residuals_from_df,
     )
     from .run_alignment import _save_results
@@ -4232,11 +4400,23 @@ def run_alignment_joint_cte(
           f"({int((~hst_only_mask).sum())} Gaia + {int(hst_only_mask.sum())} HST-only)  "
           f"Images: {len(image_names)}")
 
-    img_to_df = _load_full_catalog_df(data_root, field_name)
+    img_to_df = _load_full_catalog_df_all_filters(data_root, field_name)
     if img_to_df is None:
         raise RuntimeError(
-            "detections_F814W.csv or master_combined_v2.csv not found. "
+            "No detections_*.csv or master_combined_v2.csv not found. "
             "Run hst_catalog_crossmatch first.")
+
+    # Per-image filter/instrument/detector metadata for residual figure titles
+    _img_meta = {}
+    for _img, _df in img_to_df.items():
+        if len(_df) == 0:
+            continue
+        _r = _df.iloc[0]
+        _img_meta[_img] = {
+            'filter':     str(_r['filter'])     if 'filter'     in _df.columns else '?',
+            'instrument': str(_r['instrument']) if 'instrument' in _df.columns else '?',
+            'detector':   str(_r['detector'])   if 'detector'   in _df.columns else '?',
+        }
 
     all_mjds     = [float(images[img]['hst_time_mjd']) for img in image_names
                     if img in images]
@@ -4501,6 +4681,7 @@ def run_alignment_joint_cte(
                                   "post-r/μ_pop warmstart",
                                   "post-CTE warmstart"),
                     prefix='warmstart',
+                    img_meta=_img_meta,
                 )
             except Exception as _exc:
                 import traceback
@@ -4533,13 +4714,15 @@ def run_alignment_joint_cte(
         fit_cte_x=fit_cte_x,
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
-    print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
     if C_shared is not None:
-        _C_mu = C_shared[-2:, -2:]
+        _C_mu    = C_shared[-2:, -2:]
         _sig_ra  = float(np.sqrt(_C_mu[0, 0]))
         _sig_dec = float(np.sqrt(_C_mu[1, 1]))
-        print(f"  σ(μ_pop)  = ({_sig_ra:.4f}, {_sig_dec:.4f}) mas/yr  "
-              f"[posterior, including prior]")
+        _rho_fin = float(_C_mu[0, 1] / (_sig_ra * _sig_dec + 1e-30))
+        print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}±{_sig_ra:.4f}, "
+              f"{mu_pop_hat[1]:+.4f}±{_sig_dec:.4f}) mas/yr  ρ={_rho_fin:+.3f}")
+    else:
+        print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr")
     print(f"  Final |γ_y_hi| = {np.linalg.norm(gamma_hat[_nb:2*_nb]):.4e}  "
           f"|γ_y_lo| = {np.linalg.norm(gamma_hat[3*_nb:4*_nb]):.4e}")
 
@@ -4668,6 +4851,7 @@ def run_alignment_joint_cte(
                                   "post-joint r/μ_pop",
                                   "post-CTE (final)"),
                     prefix='final',
+                    img_meta=_img_meta,
                 )
             except Exception as exc:
                 print(f"  WARNING: final per-image residual maps failed — {exc}")

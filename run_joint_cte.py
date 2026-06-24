@@ -12,6 +12,10 @@ Usage
       --mu_pop_prior_sigma 0.5 \
       --n_iter 20
 
+Defaults: CTE x fitting ON, mag_poly_order=3, residual plots ON.
+Suppress with: --no_fit_cte_x, --cte_mag_poly_order 0, --no_residual_plots.
+Add --full_run to proceed past warm start.
+
 LVD parameters for common targets
 -----------------------------------
 Leo I  : d=254 kpc, σ_LOS=9.2 km/s
@@ -65,15 +69,14 @@ def main():
     parser.add_argument('--hst_pm_sigma_diffuse', type=float, default=100.0)
     parser.add_argument('--pos_err_floor', type=float, default=5e-3)
     parser.add_argument('--no_plots', action='store_true')
-    parser.add_argument('--plot_residuals', action='store_true')
+    parser.add_argument('--no_residual_plots', action='store_true',
+                        help='Suppress per-image residual figures (produced by default)')
     parser.add_argument('--use_sparse', action='store_true')
     parser.add_argument('--full_run', action='store_true',
                         help='Proceed to full joint solve loop after warm start '
                              '(default: stop after warm start)')
-    parser.add_argument('--fit_cte_x', action='store_true',
-                        help='Also fit CTE x-displacement (gamma_x). Off by default: '
-                             'ACS CTE is primarily in the readout (y) direction and '
-                             'fitting gamma_x tends to absorb non-CTE x-systematics.')
+    parser.add_argument('--no_fit_cte_x', action='store_true',
+                        help='Disable CTE x-displacement fitting (enabled by default)')
     args = parser.parse_args()
 
     from bp3m.pipeline.run_alignment_cte import run_alignment_joint_cte
@@ -96,10 +99,10 @@ def main():
         hst_pm_sigma_diffuse=args.hst_pm_sigma_diffuse,
         pos_err_floor=args.pos_err_floor,
         no_plots=args.no_plots,
-        plot_residuals=args.plot_residuals,
+        plot_residuals=not args.no_residual_plots,
         use_sparse=args.use_sparse,
         warmstart_only=not args.full_run,
-        fit_cte_x=args.fit_cte_x,
+        fit_cte_x=not args.no_fit_cte_x,
     )
     print(f"\nDone. Results in: {output}")
 
