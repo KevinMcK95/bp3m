@@ -12,8 +12,8 @@ Usage
       --mu_pop_prior_sigma 0.5 \
       --n_iter 20
 
-Defaults: CTE x fitting ON, mag_poly_order=3, residual plots ON.
-Suppress with: --no_fit_cte_x, --cte_mag_poly_order 0, --no_residual_plots.
+Defaults: CTE x fitting ON, mag_poly_order=3, spatial_order=2, residual plots ON.
+Suppress with: --no_fit_cte_x, --cte_mag_poly_order 0, --cte_spatial_order 1, --no_residual_plots.
 Add --full_run to proceed past warm start.
 
 LVD parameters for common targets
@@ -59,9 +59,12 @@ def main():
                         help='Diagonal regularisation on H_gamma')
     parser.add_argument('--pm_sys_floor', type=float, default=0.2,
                         help='Systematic PM floor for membership sigma-clipping (mas/yr)')
-    # CTE magnitude polynomial
+    # CTE polynomial orders
     parser.add_argument('--cte_mag_poly_order', type=int, default=3,
                         help='Polynomial order for CTE magnitude dependence (default 3)')
+    parser.add_argument('--cte_spatial_order', type=int, default=2,
+                        help='Inner spatial polynomial order: 1=[yt,xt·yt] 2=+[yt³,xt·yt²,xt²·yt] '
+                             '3=+[yt⁴,...] (default 2)')
     # Alignment options
     parser.add_argument('--poly_order', type=int, default=1)
     parser.add_argument('--hst_max_pm_unc', type=float, default=5.0)
@@ -93,6 +96,7 @@ def main():
         regularize_gamma=args.regularize_gamma,
         pm_sys_floor=args.pm_sys_floor,
         mag_poly_order=args.cte_mag_poly_order,
+        spatial_order=args.cte_spatial_order,
         poly_order=args.poly_order,
         hst_max_pm_unc=args.hst_max_pm_unc,
         hst_max_per_image=args.hst_max_per_image,
