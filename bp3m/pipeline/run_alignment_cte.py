@@ -16,15 +16,17 @@ For chip c (hi/lo), detection k in image j (epoch t_j):
   f1(mag) = 10^{0.4·(mag − mag_ref)}   (fixed, no free parameters)
   b = [yt, yt², xt·yt, xt²·yt, xt·yt²]  (5 terms, unified x/y basis)
   xt = (x_raw − 2048) / 2048  (normalised x)
-  yt = (y_raw − y_readout_raw) / 2048  (normalised distance from readout)
+  yt = |y_raw − y_readout_raw| / 2048  (normalised distance from readout, ∈ [0,1])
   γ_x_c: (5,) coefficients;  γ_y_c: (5,) coefficients
 
 Parameters: 10 total per chip: γ_x(5) + γ_y(5) (two chips → 20 params).
 
 Note on y_raw coordinate system: py1pass stores pixel y in a unified global frame
-(0..~4096). _hi images (chip_ext=1) occupy y_raw ∈ [2057, 4087] (HIGH y; readout at gap
-edge y≈2048). _lo images (chip_ext=4) occupy y_raw ∈ [8, 2039] (LOW y; readout at outer
-edge y≈0). Both chips trail CTE toward HIGH y_raw, giving yt = (y_raw−y_readout)/2048 ∈ [0,1].
+(0..~4096). Each chip reads toward its OUTER edge (away from the central gap):
+  _hi images (WFC1/SCI,2): y_raw ∈ [2057, 4087], readout at outer top y≈4096.
+  _lo images (WFC2/SCI,1): y_raw ∈ [8, 2039],    readout at outer bottom y≈0.
+CTE trails toward the gap: _hi trails toward LOW y_raw, _lo toward HIGH y_raw.
+yt = |y_raw − y_readout_raw| / 2048 ∈ [0,1]; yt=0 at readout, yt=1 near gap.
 5-term basis spans the full 2D (xt, yt) space while preserving CTE=0 at the readout.
 """
 
@@ -39,13 +41,16 @@ from tqdm import tqdm as _tqdm
 
 # ── ACS/WFC chip geometry constants ──────────────────────────────────────────
 # py1pass unified y frame (0..~4096):
-#   _hi images (chip_ext=1): y_raw ∈ [2057, 4087] — HIGH y, readout at gap edge y≈2048
-#   _lo images (chip_ext=4): y_raw ∈ [8, 2039]    — LOW y,  readout at outer edge y≈0
-# Both chips trail CTE toward HIGH y_raw; yt = (y_raw − y_readout_raw)/2048 ∈ [0, 1].
+#   _hi images (WFC1/SCI,2): y_raw ∈ [2057, 4087] — readout at OUTER TOP edge y≈4096
+#   _lo images (WFC2/SCI,1): y_raw ∈ [8, 2039]    — readout at OUTER BOTTOM edge y≈0
+# Each chip reads toward its outer edge (away from the central gap):
+#   _hi (WFC1): transfer direction upward (+y), trail toward LOW y_raw (toward gap).
+#   _lo (WFC2): transfer direction downward (−y), trail toward HIGH y_raw (toward gap).
+# yt = |y_raw − y_readout_raw| / 2048 ∈ [0, 1]; yt=0 at readout, yt=1 near gap.
 # GDC-frame: Y_c = y_gdc − 2048.  Readout positions in GDC frame:
-_HI_Y_READOUT =  0.0      # _hi chip readout: y_raw≈2048 → Y_c = 2048−2048 = 0
+_HI_Y_READOUT =  2048.0   # _hi chip readout: y_raw≈4096 → Y_c = 4096−2048 = 2048
 _LO_Y_READOUT = -2048.0   # _lo chip readout: y_raw≈0    → Y_c = 0−2048 = −2048
-_HI_Y_READOUT_RAW = 2048.0   # _hi images (y∈[2057,4087]): yt = (y−2048)/2048 ∈ [0,1]
+_HI_Y_READOUT_RAW = 4096.0   # _hi images (y∈[2057,4087]): yt = (4096−y)/2048 ∈ [0,1]
 _LO_Y_READOUT_RAW = 0.0      # _lo images (y∈[8,2039]):    yt = y/2048 ∈ [0,1]
 _ACS_LAUNCH_YR = 2002.165   # ACS launch 2002-03-01; used as CTE time origin
 _MAG_REF      = -15.0   # just below the brightest instrumental mag (~-14.5)
@@ -133,29 +138,84 @@ def cte_basis(xt: np.ndarray, yt: np.ndarray) -> np.ndarray:
     """Unified 5-term CTE basis: [yt, yt², xt·yt, xt²·yt, xt·yt²].
 
     All terms contain yt, so CTE = 0 at yt = 0 (readout register).
-    (xt, yt) should be normalised: xt = (x_raw − 2048)/2048, yt = (y_raw − y_readout)/2048.
+    (xt, yt) should be normalised: xt = (x_raw − 2048)/2048, yt = |y_raw − y_readout|/2048.
     """
     return np.stack([yt, yt**2, xt*yt, xt**2*yt, xt*yt**2], axis=1)
+
+
+# ── GDC Jacobian: raw pixel → GDC pixel ──────────────────────────────────────
+
+def _fit_gdc_jacobian_coeffs(spi_df) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Fit a 2nd-order bivariate polynomial from raw pixel → GDC pixel for one image.
+
+    Uses all stars in spi_df that have valid X_orig, Y_orig (raw) and X, Y (GDC).
+
+    Returns (coeffs_x, coeffs_y) each shape (6,) for the polynomial:
+        x_gdc ≈ c[0] + c[1]*x + c[2]*y + c[3]*x² + c[4]*x*y + c[5]*y²
+    where (x, y) = (X_orig, Y_orig).  Returns None if unavailable.
+    """
+    if spi_df is None:
+        return None
+    for col in ('X_orig', 'Y_orig', 'X', 'Y'):
+        if col not in spi_df.columns:
+            return None
+    x_raw = spi_df['X_orig'].to_numpy(float)
+    y_raw = spi_df['Y_orig'].to_numpy(float)
+    x_gdc = spi_df['X'].to_numpy(float)
+    y_gdc = spi_df['Y'].to_numpy(float)
+    ok = np.isfinite(x_raw) & np.isfinite(y_raw) & np.isfinite(x_gdc) & np.isfinite(y_gdc)
+    if ok.sum() < 6:
+        return None
+    xr, yr = x_raw[ok], y_raw[ok]
+    A = np.column_stack([np.ones(ok.sum()), xr, yr, xr**2, xr*yr, yr**2])
+    cx, _, _, _ = np.linalg.lstsq(A, x_gdc[ok], rcond=None)
+    cy, _, _, _ = np.linalg.lstsq(A, y_gdc[ok], rcond=None)
+    return cx, cy
+
+
+def _eval_gdc_jacobian(coeffs, x_raw: np.ndarray, y_raw: np.ndarray) -> np.ndarray:
+    """
+    Evaluate per-star GDC Jacobian from polynomial coefficients.
+
+    coeffs : (coeffs_x, coeffs_y) from _fit_gdc_jacobian_coeffs, or None
+    Returns (n, 2, 2) array:
+        J[i] = [[∂x_gdc/∂x_raw, ∂x_gdc/∂y_raw],
+                 [∂y_gdc/∂x_raw, ∂y_gdc/∂y_raw]]
+    Falls back to identity if coeffs is None.
+    """
+    n = len(x_raw)
+    J = np.broadcast_to(np.eye(2), (n, 2, 2)).copy()
+    if coeffs is None:
+        return J
+    cx, cy = coeffs
+    # Derivatives of c[0]+c[1]*x+c[2]*y+c[3]*x²+c[4]*x*y+c[5]*y²
+    J[:, 0, 0] = cx[1] + 2.0*cx[3]*x_raw + cx[4]*y_raw   # ∂x_gdc/∂x_raw
+    J[:, 0, 1] = cx[2] + cx[4]*x_raw + 2.0*cx[5]*y_raw   # ∂x_gdc/∂y_raw
+    J[:, 1, 0] = cy[1] + 2.0*cy[3]*x_raw + cy[4]*y_raw   # ∂y_gdc/∂x_raw
+    J[:, 1, 1] = cy[2] + cy[4]*x_raw + 2.0*cy[5]*y_raw   # ∂y_gdc/∂y_raw
+    return J
 
 
 # ── CTE displacement computation ──────────────────────────────────────────────
 
 def compute_cte_displacement(
-    X_c: np.ndarray, y_raw: np.ndarray,
+    x_raw_c: np.ndarray, y_raw: np.ndarray,
     mag: np.ndarray, dt: np.ndarray,
     chip_params: CTEChipParams,
 ) -> np.ndarray:
     """
-    CTE displacement in GDC pixel frame.
+    CTE displacement in raw pixel frame.
 
-    X_c   : GDC-centred x coordinate [px] (= x_gdc − 2048)
-    y_raw : raw chip-local y coordinate [px]
-    dt    : years since ACS launch (t_obs − t_launch)
+    x_raw_c : raw x coordinate centred at chip centre [px] (= x_raw − 2048)
+    y_raw   : raw chip-local y coordinate [px]
+    dt      : years since ACS launch (t_obs − t_launch)
 
-    Returns (n, 2) array of (δCTE_x, δCTE_y) in pixels.
+    Returns (n, 2) array of (δCTE_x, δCTE_y) in raw pixel units.
+    Apply J_gdc to convert to GDC pixels before applying to residuals.
     """
-    xt  = X_c / 2048.0
-    yt  = (y_raw - chip_params.y_readout_raw) / 2048.0
+    xt  = x_raw_c / 2048.0
+    yt  = np.abs(y_raw - chip_params.y_readout_raw) / 2048.0
     B   = cte_basis(xt, yt)                           # (n, 5) spatial basis
     MP  = mag_poly_basis(mag, chip_params.mag_poly_order,
                          chip_params.mag_norm_ref,
@@ -260,24 +320,38 @@ def apply_cte_to_solver(
             if 'Y_orig' in spi_df.columns:
                 y_raw = spi_df['Y_orig'].to_numpy(float)
             else:
-                # Fallback: approximate from GDC
+                # Fallback: approximate from GDC (Y_c = y_raw - 2048 for both chips)
                 Y_c = d['Y_c']
-                y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+                y_raw = Y_c + 2048.0
         else:
             Y_c = d['Y_c']
-            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+            y_raw = Y_c + 2048.0
 
         # Guard against length mismatch (shouldn't happen but be safe)
         if len(y_raw) != len(mag):
             Y_c = d['Y_c']
-            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+            y_raw = Y_c + 2048.0
+
+        # x_raw: use X_orig if available, fall back to X_c + 2048 (≈ raw x)
+        spi_df = (filtered_spi[img] if filtered_spi is not None and img in filtered_spi
+                  else None)
+        if spi_df is not None and 'X_orig' in spi_df.columns and len(spi_df) == len(mag):
+            x_raw_for_jac = spi_df['X_orig'].to_numpy(float)
+        else:
+            x_raw_for_jac = X_c + 2048.0
 
         delta_cte_raw = np.zeros((len(mag), 2))
         delta_cte_raw[ok] = compute_cte_displacement(
-            X_c[ok], y_raw[ok], mag[ok], dt[ok], cte_params[chip])
+            (x_raw_for_jac[ok] - 2048.0), y_raw[ok], mag[ok], dt[ok], cte_params[chip])
 
-        R_j = solver.R[img]                             # (2, 2)
-        delta_cte_pseudo = delta_cte_raw @ R_j.T        # (n, 2)
+        # Propagate raw-pixel CTE displacement through GDC Jacobian → GDC pixels,
+        # then through the plate solution R_j → pseudo-image arcseconds.
+        jac_coeffs = _fit_gdc_jacobian_coeffs(spi_df)
+        J_gdc = _eval_gdc_jacobian(jac_coeffs, x_raw_for_jac, y_raw)  # (n, 2, 2)
+        delta_cte_gdc = np.einsum('nij,nj->ni', J_gdc, delta_cte_raw)  # (n, 2)
+
+        R_j = solver.R[img]                                    # (2, 2)
+        delta_cte_pseudo = delta_cte_gdc @ R_j.T               # (n, 2)
         if subtract:
             d['xys'] = d['xys_orig'] - delta_cte_pseudo
         else:
@@ -350,9 +424,9 @@ def collect_cte_residuals(
         if f'{img}_y_raw' in out_arrays:
             y_raw = out_arrays[f'{img}_y_raw'].astype(float)
         else:
-            # Fallback: approximate raw y from GDC
+            # Fallback: approximate raw y from GDC (Y_c = y_raw - 2048 for both chips)
             Y_c = out_arrays[f'{img}_Y_c'].astype(float)
-            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+            y_raw = Y_c + 2048.0
 
         ok = np.isfinite(dx) & np.isfinite(dy) & np.isfinite(mag) & np.isfinite(y_raw)
 
@@ -448,7 +522,7 @@ def update_cte_params(
 
         p   = new_params[chip]
         xt  = X_c / 2048.0
-        yt  = (y_raw - p.y_readout_raw) / 2048.0
+        yt  = np.abs(y_raw - p.y_readout_raw) / 2048.0
         f1  = func1_mag(mag)
         Psi = dt * f1                        # (n,)
         B   = cte_basis(xt, yt)[:, 1:]      # (n, 4): drop degenerate 1×yt
@@ -590,14 +664,21 @@ def _apply_cte_to_residual_arrays(
         ok = np.isfinite(mag) & np.isfinite(y_raw)
         if not ok.any():
             continue
+        # x_raw: use X_orig if available, fall back to X_c + 2048 (≈ raw x)
+        spi_for_jac = (filtered_spi.get(img) if filtered_spi is not None else None)
+        x_raw_for_jac = (spi_for_jac['X_orig'].to_numpy(float)
+                         if spi_for_jac is not None and 'X_orig' in spi_for_jac.columns
+                            and len(spi_for_jac) == len(X_c)
+                         else X_c + 2048.0)
         delta_cte_raw = np.zeros((len(mag), 2))
         delta_cte_raw[ok] = compute_cte_displacement(
-            X_c[ok], y_raw[ok], mag[ok], dt[ok], cte_params[chip])
-        # Rotate chip-local displacement to GDC frame, identical to apply_cte_to_solver.
-        # R_j[1,1] < 0 for the hi chip (y-axis is flipped between chip-local and GDC),
-        # so skipping this rotation inverts the correction sign for that chip.
-        R_j = np.asarray(solver.R[img])           # (2, 2)
-        delta_cte_gdc = delta_cte_raw @ R_j.T     # (n, 2) in GDC frame
+            (x_raw_for_jac[ok] - 2048.0), y_raw[ok], mag[ok], dt[ok], cte_params[chip])
+        # Propagate raw-pixel CTE displacement → GDC pixels via J_gdc.
+        # dx_gdc/dy_gdc are in GDC pixel units (from resid_pseudo @ R_j^{-T}),
+        # so we subtract the GDC-frame correction without any further R_j rotation.
+        jac_coeffs = _fit_gdc_jacobian_coeffs(spi_for_jac)
+        J_gdc = _eval_gdc_jacobian(jac_coeffs, x_raw_for_jac, y_raw)   # (n, 2, 2)
+        delta_cte_gdc = np.einsum('nij,nj->ni', J_gdc, delta_cte_raw)  # (n, 2) GDC pixels
         result[dx_key] = (result[dx_key].astype(float) - delta_cte_gdc[:, 0]).astype(np.float32)
         result[dy_key] = (result[dy_key].astype(float) - delta_cte_gdc[:, 1]).astype(np.float32)
     return result
@@ -816,7 +897,7 @@ def _joint_solve_cte(
                 and len(spi_df) == len(mag)):
             y_raw = spi_df['Y_orig'].to_numpy(float)
         else:
-            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+            y_raw = Y_c + 2048.0  # Y_c = y_raw - 2048 for both chips
 
         hst_yr    = float(Time(float(solver.images[img]['hst_time_mjd']),
                                format='mjd').jyear)
@@ -824,22 +905,34 @@ def _joint_solve_cte(
 
         p   = cte_params[chip]
         n   = len(sidx)
-        xt  = d['X_c'] / 2048.0
-        yt  = (y_raw - p.y_readout_raw) / 2048.0
         ok  = np.isfinite(mag) & np.isfinite(y_raw)
+
+        cx, cy = (0, nb) if chip == 'hi' else (2*nb, 3*nb)
+        R_j    = r_j[:4].reshape(2, 2)   # [[a, b], [c, d]]
+
+        # Include GDC Jacobian: raw-pixel CTE → GDC pixels → pseudo-image arcseconds.
+        # R_eff[i] = R_j @ J_gdc[i] maps raw-pixel displacement to pseudo-image.
+        if spi_df is not None and 'X_orig' in spi_df.columns and len(spi_df) == n:
+            x_raw_jac = spi_df['X_orig'].to_numpy(float)
+        else:
+            x_raw_jac = d['X_c'] + 2048.0
+
+        # Use raw coordinates for the CTE spatial basis
+        xt  = (x_raw_jac - 2048.0) / 2048.0
+        yt  = np.abs(y_raw - p.y_readout_raw) / 2048.0
         # Combined basis: dt * mag_poly ⊗ spatial, drop 1×yt → (n, nb)
         MP  = np.where(ok[:, None],
                        mag_poly_basis(mag, mag_poly_order,
                                       mag_norm_ref, mag_norm_scale), 0.0)
         PsiB = (dt_scalar * (MP[:, :, None] * cte_basis(xt, yt)[:, None, :])
                 ).reshape(n, nb + 1)[:, 1:]   # (n, nb); drop degenerate 1×yt
-
-        cx, cy = (0, nb) if chip == 'hi' else (2*nb, 3*nb)
-        R_j    = r_j[:4].reshape(2, 2)   # [[a, b], [c, d]]
+        jac_coeffs = _fit_gdc_jacobian_coeffs(spi_df)
+        J_gdc  = _eval_gdc_jacobian(jac_coeffs, x_raw_jac, y_raw)    # (n, 2, 2)
+        R_eff  = np.einsum('ij,njk->nik', R_j, J_gdc)                 # (n, 2, 2)
 
         G = np.zeros((n, 2, n_gamma))
-        G[ok, :, cx:cx+nb] = PsiB[ok, None, :] * R_j[None, :, 0:1]
-        G[ok, :, cy:cy+nb] = PsiB[ok, None, :] * R_j[None, :, 1:2]
+        G[ok, :, cx:cx+nb] = R_eff[ok, :, 0:1] * PsiB[ok, None, :]  # raw-x CTE
+        G[ok, :, cy:cy+nb] = R_eff[ok, :, 1:2] * PsiB[ok, None, :]  # raw-y CTE
 
         Q = np.einsum('nik,nkl->nil', JUT_Cs, G)   # (n, 5, n_gamma)
         Q_img[img] = Q
@@ -1440,13 +1533,15 @@ def _plot_warmstart_cte(
         if sdf is not None and 'Y_orig' in sdf.columns and len(sdf) == len(mag):
             y_raw = sdf['Y_orig'].to_numpy(float)
         else:
-            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+            y_raw = Y_c + 2048.0  # Y_c = y_raw - 2048 for both chips
 
         hst_yr = float(Time(float(solver.images[img]['hst_time_mjd']),
                             format='mjd').jyear)
         dt   = hst_yr - t_launch_yr
-        xt   = d['X_c'] / 2048.0
-        yt   = (y_raw - p.y_readout_raw) / 2048.0
+        _x_raw_plt = (sdf['X_orig'].to_numpy(float) if sdf is not None and 'X_orig' in sdf.columns
+                      and len(sdf) == len(mag) else d['X_c'] + 2048.0)
+        xt   = (_x_raw_plt - 2048.0) / 2048.0
+        yt   = np.abs(y_raw - p.y_readout_raw) / 2048.0
         ok   = np.isfinite(mag) & np.isfinite(y_raw)
         MP   = np.where(ok[:, None],
                         mag_poly_basis(mag, _tmpl['hi'].mag_poly_order,
@@ -1649,7 +1744,7 @@ def _diagnose_cte_by_magbin(
                 and len(spi_df) == len(mag)):
             y_raw = spi_df['Y_orig'].to_numpy(float)
         else:
-            y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+            y_raw = Y_c + 2048.0  # Y_c = y_raw - 2048 for both chips
 
         cs  = j_idx * nr
         r_j = r_current[cs:cs + nr]
@@ -1666,22 +1761,29 @@ def _diagnose_cte_by_magbin(
                                   format='mjd').jyear)
         dt_scalar = hst_yr - t_launch_yr
 
-        xt  = d['X_c'] / 2048.0
-        yt  = (y_raw - p.y_readout_raw) / 2048.0
         ok  = np.isfinite(mag) & np.isfinite(y_raw)
+        cx, cy = (0, nb) if chip == 'hi' else (2*nb, 3*nb)
+        R_j    = r_j[:4].reshape(2, 2)
+        n_det  = len(sidx)
+        if spi_df is not None and 'X_orig' in spi_df.columns and len(spi_df) == n_det:
+            x_raw_jac = spi_df['X_orig'].to_numpy(float)
+        else:
+            x_raw_jac = d['X_c'] + 2048.0
+        # Use raw coordinates for the CTE spatial basis
+        xt  = (x_raw_jac - 2048.0) / 2048.0
+        yt  = np.abs(y_raw - p.y_readout_raw) / 2048.0
         MP  = np.where(ok[:, None],
                        mag_poly_basis(mag, _tmpl['hi'].mag_poly_order,
                                       _tmpl['hi'].mag_norm_ref,
                                       _tmpl['hi'].mag_norm_scale), 0.0)
         PsiB = (dt_scalar * (MP[:, :, None] * cte_basis(xt, yt)[:, None, :])
                 ).reshape(len(sidx), 5)[:, 1:]   # (n, nb=4); drop degenerate 1×yt
-
-        cx, cy = (0, nb) if chip == 'hi' else (2*nb, 3*nb)
-        R_j    = r_j[:4].reshape(2, 2)
-        n_det  = len(sidx)
+        _jac_coeffs = _fit_gdc_jacobian_coeffs(spi_df)
+        _J_gdc  = _eval_gdc_jacobian(_jac_coeffs, x_raw_jac, y_raw)  # (n, 2, 2)
+        _R_eff  = np.einsum('ij,njk->nik', R_j, _J_gdc)              # (n, 2, 2)
         G = np.zeros((n_det, 2, n_gamma))
-        G[ok, :, cx:cx+nb] = PsiB[ok, None, :] * R_j[None, :, 0:1]
-        G[ok, :, cy:cy+nb] = PsiB[ok, None, :] * R_j[None, :, 1:2]
+        G[ok, :, cx:cx+nb] = _R_eff[ok, :, 0:1] * PsiB[ok, None, :]
+        G[ok, :, cy:cy+nb] = _R_eff[ok, :, 1:2] * PsiB[ok, None, :]
 
         for b in mag_bins:
             mag_lo, mag_hi = b
@@ -2123,8 +2225,8 @@ def _warm_start_cte_residuals(
         sigma   = sub['sigma_pmdec'].to_numpy(float).clip(0.01)
 
         phi = func1_mag(mag)
-        xt  = X_c / 2048.0
-        yt  = (y_raw - p.y_readout_raw) / 2048.0
+        xt  = X_c / 2048.0   # approx: x_raw ≈ x_gdc; x_raw unavailable in PM-agg data
+        yt  = np.abs(y_raw - p.y_readout_raw) / 2048.0
         B   = cte_basis(xt, yt)[:, 1:]  # 4 non-degenerate terms: [yt², xt·yt, xt²·yt, xt·yt²]
 
         w   = 1.0 / sigma**2
@@ -2282,7 +2384,7 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
             if f'{img}_y_raw' in npz:
                 y_raw = npz[f'{img}_y_raw'].astype(float)
             else:
-                y_raw = (Y_c + 1.0) if chip == 'hi' else (Y_c + 2048.0)
+                y_raw = Y_c + 2048.0  # Y_c = y_raw - 2048 for both chips
             ok  = np.isfinite(dx) & np.isfinite(dy) & np.isfinite(mag) & np.isfinite(y_raw)
             n   = ok.sum()
             if n == 0:
@@ -2343,14 +2445,18 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
             ax  = axes[col_i]
             p   = cte_params[chip]
             # y_raw grids in the py1pass global frame
-            # _hi chip: y_raw ∈ [8, 2039] (readout at 0); _lo chip: y_raw ∈ [2057, 4087] (readout at 2048)
-            y_raw_grid = np.linspace(p.y_readout_raw, p.y_readout_raw + 2039, 500)
+            # _hi chip (WFC1): y_raw ∈ [2057, 4087], readout at outer top (y≈4096)
+            # _lo chip (WFC2): y_raw ∈ [8, 2039],    readout at outer bottom (y≈0)
+            if p.y_readout_raw > 2000:   # hi chip
+                y_raw_grid = np.linspace(2048.0, 4096.0, 500)
+            else:                        # lo chip
+                y_raw_grid = np.linspace(0.0, 2048.0, 500)
             X_c_grid   = np.zeros_like(y_raw_grid)   # at X centre of chip
 
             _nb  = len(p.gamma_y)    # 5*(K+1)-1 after degenerate term removal
             _n   = len(y_raw_grid)
             xt_g = X_c_grid / 2048.0
-            yt_g = (y_raw_grid - p.y_readout_raw) / 2048.0
+            yt_g = np.abs(y_raw_grid - p.y_readout_raw) / 2048.0
             B_g  = cte_basis(xt_g, yt_g)           # (n, 5)
             for mag_v, col, lbl in mag_bins:
                 MP_v  = mag_poly_basis(np.full(_n, mag_v), p.mag_poly_order,
@@ -3241,12 +3347,12 @@ def _run_joint_cte_loop(
         solver._update_R(r_hat)
         solver._update_geometry(r_hat, solver.v_survey)
 
-        # Apply current CTE model then update per-image alpha (uncertainty inflation).
-        # Must be done after _update_R so solver.R[img] is current, and after
-        # apply_cte_to_solver so d["xys"] contains CTE-corrected positions.
+        # Apply current CTE model.  Alpha (per-image uncertainty inflation) is
+        # intentionally NOT updated here: keeping Cs constant across Newton
+        # iterations makes the effective problem linear → converges in 1-2 steps.
+        # Alpha is updated once after the loop with the final converged solution.
         apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
                             filtered_spi=filtered_spi, subtract=True)
-        _update_image_alpha(solver, image_names, r_hat, a_arr)
 
         # Refresh n_hst counts (use_for_astrom flags may have changed)
         n_hst[:] = 0
@@ -3286,6 +3392,9 @@ def _run_joint_cte_loop(
         if it >= 2 and dr < 1e-6 and dg < 1e-8 and dmu < 1e-4:
             print(f"  Converged at iteration {it + 1}")
             break
+
+    # Single post-convergence alpha update with the final CTE+transform solution.
+    _update_image_alpha(solver, image_names, r_hat, a_arr)
 
     return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT, cte_params, gamma_history, mu_pop_history
 
