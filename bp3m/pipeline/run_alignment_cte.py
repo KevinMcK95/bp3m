@@ -1793,13 +1793,12 @@ def _diagnose_cte_by_magbin(
     member_mask[member_sidx] = True
 
     nr      = solver.N_R
-    # Diagnostic always uses K=0: fit 4 spatial coefficients per bin.
-    # Polynomial magnitude dependence within a bin is meaningless because
-    # stars in a narrow bin all have similar magnitudes (collinear columns).
-    # nb=4 because the degenerate 1×yt term is excluded (see default_cte_params).
-    _tmpl   = default_cte_params(0)
-    nb      = 4
-    n_gamma = 16
+    # Diagnostic always uses K=0: one coefficient per spatial term per bin.
+    # Polynomial magnitude dependence within a bin is meaningless (collinear columns).
+    _spatial_order = cte_template['hi'].spatial_order if cte_template is not None else 2
+    _tmpl   = default_cte_params(0, spatial_order=_spatial_order)
+    nb      = _tmpl['hi'].gamma_y.shape[0]  # _cte_n_spatial(spatial_order) - 1
+    n_gamma = 4 * nb
     cte_zero = _tmpl
     _use_two_tier = getattr(solver, '_use_two_tier', False)
 
@@ -1935,17 +1934,18 @@ def _diagnose_cte_by_magbin(
             d_inv * b_bins[b]) * d_inv
 
     # Print spatial coefficients per bin (1×yt excluded as degenerate)
-    _basis_names = ['yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
+    _basis_names = _cte_basis_labels(_spatial_order)[1:]  # drop the degenerate yt term
+    _n_print = min(nb, 4)  # cap columns for readability
     print(f"  CTE γ per mag bin (direct regression, n_mem={len(member_sidx)}, nb={nb}):")
     print(f"  {'bin':>10}  {'n':>8}  "
-          + "  ".join(f"γ_yhi[{i}]({_basis_names[i]})" for i in range(4))
+          + "  ".join(f"γ_yhi[{i}]({_basis_names[i]})" for i in range(_n_print))
           + "  |γ_yhi|"
-          + "  " + "  ".join(f"γ_ylo[{i}]" for i in range(4))
+          + "  " + "  ".join(f"γ_ylo[{i}]" for i in range(_n_print))
           + "  |γ_ylo|")
     for b in mag_bins:
         g = gamma_bins[b]
-        vals_hi = "  ".join(f"{g[nb+i]:+.3e}" for i in range(4))
-        vals_lo = "  ".join(f"{g[3*nb+i]:+.3e}" for i in range(4))
+        vals_hi = "  ".join(f"{g[nb+i]:+.3e}" for i in range(_n_print))
+        vals_lo = "  ".join(f"{g[3*nb+i]:+.3e}" for i in range(_n_print))
         norm_hi = float(np.linalg.norm(g[nb:2*nb]))
         norm_lo = float(np.linalg.norm(g[3*nb:4*nb]))
         print(f"  mag {b[0]:5.1f}-{b[1]:<5.1f}: n={n_bins[b]:7d}"
