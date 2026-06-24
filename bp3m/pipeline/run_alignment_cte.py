@@ -1953,12 +1953,14 @@ def _diagnose_cte_by_magbin(
               f"  {vals_lo}  {norm_lo:.3e}")
 
     if output_dir is not None:
-        _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label, nb=nb)
+        _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label, nb=nb,
+                              basis_names=_basis_names)
 
     return gamma_bins
 
 
-def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warmstart', nb=4):
+def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warmstart', nb=4,
+                          basis_names=None):
     """Plot γ_y per magnitude bin for CTE diagnostic."""
     import matplotlib
     matplotlib.use('Agg')
@@ -1967,10 +1969,9 @@ def _plot_gamma_vs_magbin(gamma_bins, mag_bins, n_bins, output_dir, label='warms
     plot_dir = Path(output_dir) / 'plots'
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    # basis_names matches the non-degenerate basis (yt excluded)
-    _all_basis_names = ['yt²', 'xt·yt', 'xt²·yt', 'xt·yt²']
-    basis_names = _all_basis_names[:nb]
-    colors      = ['tomato', 'forestgreen', 'darkorchid', 'darkorange'][:nb]
+    if basis_names is None:
+        basis_names = [f'coef{i}' for i in range(nb)]
+    colors = plt.cm.tab10(np.linspace(0, 0.9, max(nb, 1)))
     centers = [0.5 * (b[0] + b[1]) for b in mag_bins]
     counts  = [n_bins[b] for b in mag_bins]
 
