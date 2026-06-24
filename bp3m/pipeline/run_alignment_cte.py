@@ -2700,7 +2700,7 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                     y_raw_grid = np.linspace(0.0, 2048.0, 500)
                 X_c_grid = np.zeros_like(y_raw_grid)
 
-                _nb  = len(p.gamma_y)
+                _nb_raw = _cte_n_spatial(p.spatial_order) * (p.mag_poly_order + 1)  # (K+1)*n_sp
                 _n   = len(y_raw_grid)
                 xt_g = X_c_grid / 2048.0
                 yt_g = np.abs(y_raw_grid - p.y_readout_raw) / 2048.0
@@ -2709,8 +2709,12 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
                 for mag_v, col, lbl in mag_bins:
                     MP_v = mag_poly_basis(np.full(_n, mag_v), p.mag_poly_order,
                                           p.mag_norm_ref, p.mag_norm_scale)
-                    PsiB = (MP_v[:, :, None] * B_g[:, None, :]).reshape(_n, _nb + 1)[:, 1:]
-                    dcte = dt_max * (PsiB @ gamma_vec)
+                    _basis = (MP_v[:, :, None] * B_g[:, None, :]).reshape(_n, _nb_raw)[:, 1:]
+                    if p.time_poly_order == 0:
+                        PsiB = dt_max * _basis
+                    else:
+                        PsiB = np.concatenate([_basis, dt_max * _basis], axis=1)
+                    dcte = PsiB @ gamma_vec
                     ax.plot(y_raw_grid, dcte, color=col, lw=1.8, label=lbl)
 
                 ax.axhline(0, color='k', lw=0.8, ls='--', alpha=0.5)
