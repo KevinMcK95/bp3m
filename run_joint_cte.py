@@ -80,9 +80,15 @@ def main():
                              '(default: stop after warm start)')
     parser.add_argument('--no_fit_cte_x', action='store_true',
                         help='Disable CTE x-displacement fitting (enabled by default)')
+    parser.add_argument('--lib_dir', default=None,
+                        help='Path to bp3m library directory containing STDGDCs/ '
+                             '(for exact GDC Jacobian via pypass). Default: None '
+                             '(falls back to polynomial fit).')
     args = parser.parse_args()
 
-    from bp3m.pipeline.run_alignment_cte import run_alignment_joint_cte
+    from bp3m.pipeline.run_alignment_cte import run_alignment_joint_cte, _init_gdc_loader
+    hst_root = Path(args.data_root) / args.field / 'HST' / 'mastDownload' / 'HST'
+    _init_gdc_loader(args.lib_dir, hst_root)
 
     output = run_alignment_joint_cte(
         output_dir=Path(args.data_root),

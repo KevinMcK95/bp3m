@@ -400,8 +400,19 @@ def _load_all_detections(field_dir: Path,
                    if 'is_star_candidate' in tbl.dtype.names else \
                    np.ones(len(tbl), bool)
 
-        # Select sources for this sub-image (hi/lo chip split)
-        if suffix == '_hi':
+        # Select sources for this sub-image using chip_ext (preferred) or y_raw threshold
+        if suffix in ('_hi', '_lo') and 'chip_ext' in tbl.dtype.names:
+            _cat_chip_ext = np.asarray(tbl['chip_ext'], int)
+            _unique_exts  = np.unique(_cat_chip_ext[_cat_chip_ext > 0])
+            if len(_unique_exts) >= 2:
+                # Lower sci_ext index = lower y position = lo chip; higher = hi chip
+                _lo_ext = int(_unique_exts.min())
+                _hi_ext = int(_unique_exts.max())
+                mask = (_cat_chip_ext == _hi_ext) if suffix == '_hi' else (_cat_chip_ext == _lo_ext)
+            else:
+                # Single chip or missing values — fall back to y_raw threshold
+                mask = (cat_y_raw > y_split) if suffix == '_hi' else (cat_y_raw <= y_split)
+        elif suffix == '_hi':
             mask = cat_y_raw > y_split
         elif suffix == '_lo':
             mask = cat_y_raw <= y_split

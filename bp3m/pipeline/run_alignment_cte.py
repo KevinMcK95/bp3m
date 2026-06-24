@@ -56,6 +56,84 @@ _LO_Y_READOUT_RAW = 0.0      # _lo images (y∈[8,2039]):    yt = y/2048 ∈ [0,
 _ACS_LAUNCH_YR = 2002.165   # ACS launch 2002-03-01; used as CTE time origin
 _MAG_REF      = -15.0   # just below the brightest instrumental mag (~-14.5)
 
+# ── Module-level GDC loader (set via _init_gdc_loader before running) ─────────
+_GDC_LIB_DIR: str | None = None      # path to bp3m lib directory (contains STDGDCs/)
+_GDC_HST_ROOT: str | None = None     # path to HST observations root directory
+_GDC_CACHE: dict = {}                 # flc_path → pypass gdc dict (or None on miss)
+
+
+def _init_gdc_loader(lib_dir, hst_root) -> None:
+    """Set module-level GDC state. Call once before running the CTE pipeline."""
+    global _GDC_LIB_DIR, _GDC_HST_ROOT, _GDC_CACHE
+    _GDC_LIB_DIR  = str(lib_dir)  if lib_dir  else None
+    _GDC_HST_ROOT = str(hst_root) if hst_root else None
+    _GDC_CACHE.clear()
+
+
+def _get_gdc_for_img(img: str):
+    """
+    Load and cache the pypass STDGDC dict for image `img` (e.g. 'j9gz04tsq_hi').
+    Uses module-level _GDC_LIB_DIR and _GDC_HST_ROOT.
+    Returns the gdc dict on success, None if unavailable.
+    """
+    if _GDC_LIB_DIR is None or _GDC_HST_ROOT is None:
+        return None
+    base = img.replace('_hi', '').replace('_lo', '')
+    flc_path = str(Path(_GDC_HST_ROOT) / base / f'{base}_flc.fits')
+    if flc_path in _GDC_CACHE:
+        return _GDC_CACHE[flc_path]
+    try:
+        from astropy.io import fits as _afits
+        from pypass.io import find_gdc, load_stdgdc, _DETECTOR_PREFIX
+        if not Path(flc_path).exists():
+            _GDC_CACHE[flc_path] = None
+            return None
+        with _afits.open(flc_path, memmap=False) as hdul:
+            hdr = hdul[0].header
+        instrume   = hdr.get('INSTRUME', '').strip().upper()
+        detector   = hdr.get('DETECTOR', '').strip().upper()
+        det_prefix = _DETECTOR_PREFIX.get((instrume, detector))
+        if det_prefix is None:
+            _GDC_CACHE[flc_path] = None
+            return None
+        gdc_dir  = str(Path(_GDC_LIB_DIR) / 'STDGDCs' / det_prefix)
+        gdc_path = find_gdc(gdc_dir, hdr)
+        if gdc_path and Path(gdc_path).exists():
+            gdc = load_stdgdc(gdc_path)
+            _GDC_CACHE[flc_path] = gdc
+            return gdc
+    except Exception:
+        pass
+    _GDC_CACHE[flc_path] = None
+    return None
+
+
+def _compute_gdc_jacobian(img: str, x_raw: np.ndarray, y_raw: np.ndarray,
+                           spi_df=None) -> np.ndarray:
+    """
+    Per-star GDC Jacobian J[i] = [[dx_gdc/dx_raw, dx_gdc/dy_raw],
+                                   [dy_gdc/dx_raw, dy_gdc/dy_raw]].
+
+    Priority:
+      1. pypass _gdc_jacobian_batch (central differences on STDGDC table) — exact.
+      2. Polynomial fit to spi_df's (X_orig,Y_orig)→(X,Y) — fallback if pypass unavailable.
+      3. Identity — last resort.
+
+    Returns (n, 2, 2) array.
+    """
+    gdc = _get_gdc_for_img(img)
+    if gdc is not None:
+        from pypass.io import _gdc_jacobian_batch
+        J = _gdc_jacobian_batch(np.asarray(x_raw, dtype=float),
+                                np.asarray(y_raw, dtype=float), gdc)
+        bad = ~np.isfinite(J).all(axis=(1, 2))
+        if bad.any():
+            J[bad] = np.eye(2)
+        return J
+    # Fallback: polynomial fit
+    coeffs = _fit_gdc_jacobian_coeffs(spi_df) if spi_df is not None else None
+    return _eval_gdc_jacobian(coeffs, x_raw, y_raw)
+
 
 # ── CTE parameter dataclass ───────────────────────────────────────────────────
 
@@ -380,8 +458,7 @@ def apply_cte_to_solver(
 
         # Propagate raw-pixel CTE displacement through GDC Jacobian → GDC pixels,
         # then through the plate solution R_j → pseudo-image arcseconds.
-        jac_coeffs = _fit_gdc_jacobian_coeffs(spi_df)
-        J_gdc = _eval_gdc_jacobian(jac_coeffs, x_raw_for_jac, y_raw)  # (n, 2, 2)
+        J_gdc = _compute_gdc_jacobian(img, x_raw_for_jac, y_raw, spi_df)  # (n, 2, 2)
         delta_cte_gdc = np.einsum('nij,nj->ni', J_gdc, delta_cte_raw)  # (n, 2)
 
         R_j = solver.R[img]                                    # (2, 2)
@@ -801,8 +878,7 @@ def _apply_cte_to_residual_arrays(
         # Propagate raw-pixel CTE displacement → GDC pixels via J_gdc.
         # dx_gdc/dy_gdc are in GDC pixel units (from resid_pseudo @ R_j^{-T}),
         # so we subtract the GDC-frame correction without any further R_j rotation.
-        jac_coeffs = _fit_gdc_jacobian_coeffs(spi_for_jac)
-        J_gdc = _eval_gdc_jacobian(jac_coeffs, x_raw_for_jac, y_raw)   # (n, 2, 2)
+        J_gdc = _compute_gdc_jacobian(img, x_raw_for_jac, y_raw, spi_for_jac)   # (n, 2, 2)
         delta_cte_gdc = np.einsum('nij,nj->ni', J_gdc, delta_cte_raw)  # (n, 2) GDC pixels
         result[dx_key] = (result[dx_key].astype(float) - delta_cte_gdc[:, 0]).astype(np.float32)
         result[dy_key] = (result[dy_key].astype(float) - delta_cte_gdc[:, 1]).astype(np.float32)
@@ -1051,8 +1127,7 @@ def _joint_solve_cte(
                                       mag_norm_ref, mag_norm_scale), 0.0)
         PsiB = (dt_scalar * (MP[:, :, None] * cte_basis(xt, yt, spatial_order)[:, None, :])
                 ).reshape(n, nb + 1)[:, 1:]   # (n, nb); drop degenerate 1×yt
-        jac_coeffs = _fit_gdc_jacobian_coeffs(spi_df)
-        J_gdc  = _eval_gdc_jacobian(jac_coeffs, x_raw_jac, y_raw)    # (n, 2, 2)
+        J_gdc  = _compute_gdc_jacobian(img, x_raw_jac, y_raw, spi_df)  # (n, 2, 2)
         R_eff  = np.einsum('ij,njk->nik', R_j, J_gdc)                 # (n, 2, 2)
 
         G = np.zeros((n, 2, n_gamma))
@@ -1709,7 +1784,7 @@ def _plot_warmstart_cte(
             xm.append(xo[ch].mean()); ym.append(yo[ch].mean())
         return np.array(xm), np.array(ym)
 
-    chip_labels = {'hi': 'hi chip (ext=1)', 'lo': 'lo chip (ext=4)'}
+    chip_labels = {'hi': 'hi chip (ext=4)', 'lo': 'lo chip (ext=1)'}
     try:
         fig, axes = plt.subplots(2, 2, figsize=(13, 9))
         for row, chip in enumerate(('hi', 'lo')):
@@ -1902,9 +1977,8 @@ def _diagnose_cte_by_magbin(
                                       _tmpl['hi'].mag_norm_scale), 0.0)
         PsiB = (dt_scalar * (MP[:, :, None] * cte_basis(xt, yt, _tmpl['hi'].spatial_order)[:, None, :])
                 ).reshape(len(sidx), nb + 1)[:, 1:]  # (n, nb); drop degenerate 1×yt
-        _jac_coeffs = _fit_gdc_jacobian_coeffs(spi_df)
-        _J_gdc  = _eval_gdc_jacobian(_jac_coeffs, x_raw_jac, y_raw)  # (n, 2, 2)
-        _R_eff  = np.einsum('ij,njk->nik', R_j, _J_gdc)              # (n, 2, 2)
+        _J_gdc  = _compute_gdc_jacobian(img, x_raw_jac, y_raw, spi_df)  # (n, 2, 2)
+        _R_eff  = np.einsum('ij,njk->nik', R_j, _J_gdc)               # (n, 2, 2)
         G = np.zeros((n_det, 2, n_gamma))
         G[ok, :, cx:cx+nb] = _R_eff[ok, :, 0:1] * PsiB[ok, None, :]
         G[ok, :, cy:cy+nb] = _R_eff[ok, :, 1:2] * PsiB[ok, None, :]
