@@ -2185,6 +2185,11 @@ def warm_start_cte(
     # Use only Gaia-matched members (well-constrained individual PMs) to refine
     # the reference frame before the CTE fit.  HST-only stars are excluded here
     # because their PMs are derived from HST positions, which are CTE-distorted.
+    # Use a minimal CTE template (K=0, time_poly_order=0) so the G matrix stays
+    # small — r and μ_pop are unaffected by n_gamma when gamma=0.
+    _cte_tmpl_gaia = default_cte_params(
+        0, cte_template['hi'].mag_norm_ref, cte_template['hi'].mag_norm_scale,
+        cte_template['hi'].spatial_order, time_poly_order=0)
     print(f"\n  [2/4] Gaia-only (r, μ_pop) refinement "
           f"({n_gaia_warmstart_iters} iter, {len(member_sidx_gaia)} stars)...")
     _t0 = _wtime.time()
@@ -2194,7 +2199,7 @@ def warm_start_cte(
     _mu_prev_ws = mu_ws.copy()
     for _ws_it in range(n_gaia_warmstart_iters):
         _result_g = _joint_solve_cte(
-            solver, image_names, cte_template, t_launch_yr, filtered_spi,
+            solver, image_names, _cte_tmpl_gaia, t_launch_yr, filtered_spi,
             member_sidx_gaia, sigma_pm, plx_pop, sigma_plx_tot,
             mu_ws, mu_pop_prior, C_pop_prior_inv, r_ws,
             regularize_gamma=regularize_gamma,
