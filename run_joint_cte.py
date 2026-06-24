@@ -65,6 +65,8 @@ def main():
     parser.add_argument('--cte_spatial_order', type=int, default=2,
                         help='Inner spatial polynomial order: 1=[yt,xt·yt] 2=+[yt³,xt·yt²,xt²·yt] '
                              '3=+[yt⁴,...] (default 2)')
+    parser.add_argument('--cte_time_poly_order', type=int, default=0,
+                        help='0=[dt only, current]; 1=[1,dt] adds constant-in-time CTE term (default 0)')
     # Alignment options
     parser.add_argument('--poly_order', type=int, default=1)
     parser.add_argument('--hst_max_pm_unc', type=float, default=5.0)
@@ -103,6 +105,7 @@ def main():
         pm_sys_floor=args.pm_sys_floor,
         mag_poly_order=args.cte_mag_poly_order,
         spatial_order=args.cte_spatial_order,
+        time_poly_order=args.cte_time_poly_order,
         poly_order=args.poly_order,
         hst_max_pm_unc=args.hst_max_pm_unc,
         hst_max_per_image=args.hst_max_per_image,

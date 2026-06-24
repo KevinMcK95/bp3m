@@ -148,6 +148,7 @@ class CTEChipParams:
     spatial_order:  int  = 2          # inner spatial polynomial order; nb = _cte_n_spatial(spatial_order)*(mag_poly_order+1)-1
     mag_norm_ref:   float = 0.0       # magnitude normalisation centre
     mag_norm_scale: float = 1.0       # magnitude normalisation scale
+    time_poly_order: int = 0          # 0=[dt only], 1=[1,dt] adds constant-in-time term; gamma size = nb*(time_poly_order+1)
 
     def copy(self) -> 'CTEChipParams':
         return CTEChipParams(chip=self.chip,
@@ -158,15 +159,19 @@ class CTEChipParams:
                              mag_poly_order=self.mag_poly_order,
                              spatial_order=self.spatial_order,
                              mag_norm_ref=float(self.mag_norm_ref),
-                             mag_norm_scale=float(self.mag_norm_scale))
+                             mag_norm_scale=float(self.mag_norm_scale),
+                             time_poly_order=self.time_poly_order)
 
 
 def default_cte_params(mag_poly_order: int = 0,
                        mag_norm_ref: float = 0.0,
                        mag_norm_scale: float = 1.0,
-                       spatial_order: int = 2) -> dict[str, CTEChipParams]:
+                       spatial_order: int = 2,
+                       time_poly_order: int = 0) -> dict[str, CTEChipParams]:
     # nb = _cte_n_spatial(spatial_order)*(mag_poly_order+1)-1; the degenerate 1×yt term is excluded
-    n = _cte_n_spatial(spatial_order) * (mag_poly_order + 1) - 1
+    # time_poly_order=0: only [dt] basis (current); =1: [1,dt] adds constant-in-time term
+    nb = _cte_n_spatial(spatial_order) * (mag_poly_order + 1) - 1
+    n = nb * (time_poly_order + 1)
     return {
         'hi': CTEChipParams(chip='hi',
                             y_readout_raw=_HI_Y_READOUT_RAW,
@@ -174,14 +179,16 @@ def default_cte_params(mag_poly_order: int = 0,
                             mag_poly_order=mag_poly_order,
                             spatial_order=spatial_order,
                             mag_norm_ref=mag_norm_ref,
-                            mag_norm_scale=mag_norm_scale),
+                            mag_norm_scale=mag_norm_scale,
+                            time_poly_order=time_poly_order),
         'lo': CTEChipParams(chip='lo',
                             y_readout_raw=_LO_Y_READOUT_RAW,
                             gamma_x=np.zeros(n), gamma_y=np.zeros(n),
                             mag_poly_order=mag_poly_order,
                             spatial_order=spatial_order,
                             mag_norm_ref=mag_norm_ref,
-                            mag_norm_scale=mag_norm_scale),
+                            mag_norm_scale=mag_norm_scale,
+                            time_poly_order=time_poly_order),
     }
 
 
@@ -333,8 +340,12 @@ def compute_cte_displacement(
                          chip_params.mag_norm_ref,
                          chip_params.mag_norm_scale)   # (n, order+1) mag basis
     # Combined basis: drop 1×yt column (degenerate with per-image y-plate-scale)
-    _full = (MP[:, :, None] * B[:, None, :]).reshape(len(mag), -1)
-    PsiB = dt[:, None] * _full[:, 1:]
+    _full_basis = (MP[:, :, None] * B[:, None, :]).reshape(len(mag), -1)[:, 1:]  # (n, nb)
+    if chip_params.time_poly_order == 0:
+        PsiB = dt[:, None] * _full_basis                                          # (n, nb)
+    else:
+        # [1, dt] basis: constant-in-time block followed by linear-in-time block
+        PsiB = np.concatenate([_full_basis, dt[:, None] * _full_basis], axis=1)  # (n, 2*nb)
     return np.stack([PsiB @ chip_params.gamma_x,
                      PsiB @ chip_params.gamma_y], axis=1)
 
@@ -960,8 +971,10 @@ def _joint_solve_cte(
     spatial_order  = _ref_chip.spatial_order
     mag_norm_ref   = _ref_chip.mag_norm_ref
     mag_norm_scale = _ref_chip.mag_norm_scale
-    nb       = _cte_n_spatial(spatial_order) * (mag_poly_order + 1) - 1  # per chip per direction
-    n_gamma  = 4 * nb                      # hi_x, hi_y, lo_x, lo_y
+    time_poly_order = _ref_chip.time_poly_order
+    nb       = _cte_n_spatial(spatial_order) * (mag_poly_order + 1) - 1  # spatial-mag basis size
+    nb_total = nb * (time_poly_order + 1)                                 # per chip per direction
+    n_gamma  = 4 * nb_total                # hi_x, hi_y, lo_x, lo_y
     N_V      = 5
     n_shared = n_r + n_gamma + 2
 
@@ -1108,7 +1121,7 @@ def _joint_solve_cte(
         n   = len(sidx)
         ok  = np.isfinite(mag) & np.isfinite(y_raw)
 
-        cx, cy = (0, nb) if chip == 'hi' else (2*nb, 3*nb)
+        cx, cy = (0, nb_total) if chip == 'hi' else (2*nb_total, 3*nb_total)
         R_j    = r_j[:4].reshape(2, 2)   # [[a, b], [c, d]]
 
         # Include GDC Jacobian: raw-pixel CTE → GDC pixels → pseudo-image arcseconds.
@@ -1121,18 +1134,22 @@ def _joint_solve_cte(
         # Use raw coordinates for the CTE spatial basis
         xt  = (x_raw_jac - 2048.0) / 2048.0
         yt  = np.abs(y_raw - p.y_readout_raw) / 2048.0
-        # Combined basis: dt * mag_poly ⊗ spatial, drop 1×yt → (n, nb)
+        # Spatial-mag basis; drop degenerate 1×yt column → (n, nb)
         MP  = np.where(ok[:, None],
                        mag_poly_basis(mag, mag_poly_order,
                                       mag_norm_ref, mag_norm_scale), 0.0)
-        PsiB = (dt_scalar * (MP[:, :, None] * cte_basis(xt, yt, spatial_order)[:, None, :])
-                ).reshape(n, nb + 1)[:, 1:]   # (n, nb); drop degenerate 1×yt
+        _full_basis = (MP[:, :, None] * cte_basis(xt, yt, spatial_order)[:, None, :]
+                       ).reshape(n, nb + 1)[:, 1:]                    # (n, nb)
+        if time_poly_order == 0:
+            PsiB = dt_scalar * _full_basis                             # (n, nb)
+        else:
+            PsiB = np.concatenate([_full_basis, dt_scalar * _full_basis], axis=1)  # (n, 2*nb)
         J_gdc  = _compute_gdc_jacobian(img, x_raw_jac, y_raw, spi_df)  # (n, 2, 2)
         R_eff  = np.einsum('ij,njk->nik', R_j, J_gdc)                 # (n, 2, 2)
 
         G = np.zeros((n, 2, n_gamma))
-        G[ok, :, cx:cx+nb] = R_eff[ok, :, 0:1] * PsiB[ok, None, :]  # raw-x CTE
-        G[ok, :, cy:cy+nb] = R_eff[ok, :, 1:2] * PsiB[ok, None, :]  # raw-y CTE
+        G[ok, :, cx:cx+nb_total] = R_eff[ok, :, 0:1] * PsiB[ok, None, :]  # raw-x CTE
+        G[ok, :, cy:cy+nb_total] = R_eff[ok, :, 1:2] * PsiB[ok, None, :]  # raw-y CTE
 
         Q = np.einsum('nik,nkl->nil', JUT_Cs, G)   # (n, 5, n_gamma)
         Q_img[img] = Q
@@ -1301,9 +1318,9 @@ def _joint_solve_cte(
     r_hat      = r_current + delta[idx_r]
     gamma_hat  = delta[idx_gam]
     if not fit_cte_x:
-        # gamma layout: [γx_hi(0:nb), γy_hi(nb:2nb), γx_lo(2nb:3nb), γy_lo(3nb:4nb)]
-        gamma_hat[0:nb]       = 0.0
-        gamma_hat[2*nb:3*nb]  = 0.0
+        # gamma layout: [γx_hi(0:nb_total), γy_hi(nb_total:2*nb_total), ...]
+        gamma_hat[0:nb_total]             = 0.0
+        gamma_hat[2*nb_total:3*nb_total]  = 0.0
     mu_pop_hat = mu_pop_current + delta[idx_mu]
     C_r        = C_shared[idx_r, idx_r]
 
@@ -1428,16 +1445,17 @@ def _gamma_to_cte_params(gamma_hat: np.ndarray,
     Convert the gamma_hat vector from _joint_solve_cte into CTEChipParams.
 
     Layout (must match _joint_solve_cte):
-      hi_x[0:nb], hi_y[nb:2nb], lo_x[2nb:3nb], lo_y[3nb:4nb]
-    where nb = _cte_n_spatial(spatial_order) * (mag_poly_order + 1) - 1.
+      hi_x[0:nb_total], hi_y[nb_total:2*nb_total], lo_x[2*nb_total:3*nb_total], lo_y[3*nb_total:4*nb_total]
+    where nb_total = (_cte_n_spatial(spatial_order) * (mag_poly_order + 1) - 1) * (time_poly_order + 1).
     """
     import copy
     params = copy.deepcopy(template)
-    nb = _cte_n_spatial(params['hi'].spatial_order) * (params['hi'].mag_poly_order + 1) - 1
-    params['hi'].gamma_x = gamma_hat[0*nb:1*nb].copy()
-    params['hi'].gamma_y = gamma_hat[1*nb:2*nb].copy()
-    params['lo'].gamma_x = gamma_hat[2*nb:3*nb].copy()
-    params['lo'].gamma_y = gamma_hat[3*nb:4*nb].copy()
+    nb       = _cte_n_spatial(params['hi'].spatial_order) * (params['hi'].mag_poly_order + 1) - 1
+    nb_total = nb * (params['hi'].time_poly_order + 1)
+    params['hi'].gamma_x = gamma_hat[0*nb_total:1*nb_total].copy()
+    params['hi'].gamma_y = gamma_hat[1*nb_total:2*nb_total].copy()
+    params['lo'].gamma_x = gamma_hat[2*nb_total:3*nb_total].copy()
+    params['lo'].gamma_y = gamma_hat[3*nb_total:4*nb_total].copy()
     return params
 
 
@@ -1698,6 +1716,7 @@ def _plot_warmstart_cte(
     _tmpl = cte_template if cte_template is not None else default_cte_params()
     cte_w = _gamma_to_cte_params(gamma_warm, _tmpl)
     _nb   = _cte_n_spatial(_tmpl['hi'].spatial_order) * (_tmpl['hi'].mag_poly_order + 1) - 1
+    _nb_total = _nb * (_tmpl['hi'].time_poly_order + 1)
 
     rec = {c: {'y_raw': [], 'dy_b': [], 'dy_a': [], 'mag': []}
            for c in ('hi', 'lo')}
@@ -1747,12 +1766,16 @@ def _plot_warmstart_cte(
                         mag_poly_basis(mag, _tmpl['hi'].mag_poly_order,
                                        _tmpl['hi'].mag_norm_ref,
                                        _tmpl['hi'].mag_norm_scale), 0.0)
-        PsiB = (dt * (MP[:, :, None] * cte_basis(xt, yt, _tmpl['hi'].spatial_order)[:, None, :])
-                ).reshape(len(mag), _nb + 1)[:, 1:]   # drop degenerate 1×yt
+        _full_b = (MP[:, :, None] * cte_basis(xt, yt, _tmpl['hi'].spatial_order)[:, None, :]
+                   ).reshape(len(mag), _nb + 1)[:, 1:]   # (n, nb); drop degenerate 1×yt
+        if _tmpl['hi'].time_poly_order == 0:
+            PsiB = dt * _full_b
+        else:
+            PsiB = np.concatenate([_full_b, dt * _full_b], axis=1)  # (n, nb_total)
 
         R_j    = r_j[:4].reshape(2, 2)
-        cy     = _nb if chip == 'hi' else 3 * _nb
-        dcte_y = (PsiB @ gamma_warm[cy:cy + _nb]) * float(R_j[1, 1])
+        cy     = _nb_total if chip == 'hi' else 3 * _nb_total
+        dcte_y = (PsiB @ gamma_warm[cy:cy + _nb_total]) * float(R_j[1, 1])
 
         ui = np.where(use)[0]
         ok_u = ok[ui]
@@ -2133,10 +2156,13 @@ def warm_start_cte(
     member_sidx_init = np.concatenate([member_sidx_gaia, member_sidx_hst])
     _mag_order  = cte_template['hi'].mag_poly_order
     _spat_order = cte_template['hi'].spatial_order
+    _time_order = cte_template['hi'].time_poly_order
     nb = _cte_n_spatial(_spat_order) * (_mag_order + 1) - 1
+    nb_total = nb * (_time_order + 1)
     print(f"\n  {'─'*56}")
     print(f"  CTE warm start  "
-          f"(mag_poly_order={_mag_order}  spatial_order={_spat_order}  nb={nb}  n_images={len(image_names)})")
+          f"(mag_poly_order={_mag_order}  spatial_order={_spat_order}  "
+          f"time_poly_order={_time_order}  nb={nb_total}  n_images={len(image_names)})")
     print(f"  {'─'*56}")
     print(f"  μ_pop_prior = ({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) mas/yr  "
           f"n_gaia={len(member_sidx_gaia)}  n_hst={len(member_sidx_hst)}")
@@ -2211,13 +2237,13 @@ def warm_start_cte(
 
     cte_warm = _gamma_to_cte_params(gamma_warm, cte_template)
 
-    gy_hi   = float(np.linalg.norm(gamma_warm[nb:2*nb]))
-    gy_lo   = float(np.linalg.norm(gamma_warm[3*nb:4*nb]))
-    gyx0    = float(gamma_warm[nb])
-    gyx0_lo = float(gamma_warm[3*nb])
+    gy_hi   = float(np.linalg.norm(gamma_warm[nb_total:2*nb_total]))
+    gy_lo   = float(np.linalg.norm(gamma_warm[3*nb_total:4*nb_total]))
+    gyx0    = float(gamma_warm[nb_total])        # first y-coefficient of hi chip
+    gyx0_lo = float(gamma_warm[3*nb_total])      # first y-coefficient of lo chip
     print(f"  [3/4] done ({_dt:.1f}s)")
-    print(f"  γ_y_hi[0](yt²) = {gyx0:+.4e}   |γ_y_hi| = {gy_hi:.3e}")
-    print(f"  γ_y_lo[0](yt²) = {gyx0_lo:+.4e}   |γ_y_lo| = {gy_lo:.3e}")
+    print(f"  γ_y_hi[0] = {gyx0:+.4e}   |γ_y_hi| = {gy_hi:.3e}")
+    print(f"  γ_y_lo[0] = {gyx0_lo:+.4e}   |γ_y_lo| = {gy_lo:.3e}")
 
     # ── Phase 4: diagnostic plots ──────────────────────────────────────────────
     if output_dir is not None:
@@ -3507,20 +3533,21 @@ def _run_joint_cte_loop(
     # Output variables (initialised to sensible defaults)
     r_hat      = r_current.copy()
     C_r        = None
-    _p0  = cte_params.get('hi', cte_params.get('lo'))
-    _nb0 = _cte_n_spatial(_p0.spatial_order) * (_p0.mag_poly_order + 1) - 1
+    _p0     = cte_params.get('hi', cte_params.get('lo'))
+    _nb0    = _cte_n_spatial(_p0.spatial_order) * (_p0.mag_poly_order + 1) - 1
+    _nb0_total = _nb0 * (_p0.time_poly_order + 1)
     # Initialise gamma from warmstart cte_params (not zeros) and use as prior
     # to prevent the r–γ degeneracy from causing oscillatory blow-up.
     _p = cte_params.get('hi', cte_params.get('lo', None))
-    if _p is not None and len(getattr(_p, 'gamma_x', [])) == _nb0:
+    if _p is not None and len(getattr(_p, 'gamma_x', [])) == _nb0_total:
         gamma_hat = np.concatenate([
-            cte_params['hi'].gamma_x if 'hi' in cte_params else np.zeros(_nb0),
-            cte_params['hi'].gamma_y if 'hi' in cte_params else np.zeros(_nb0),
-            cte_params['lo'].gamma_x if 'lo' in cte_params else np.zeros(_nb0),
-            cte_params['lo'].gamma_y if 'lo' in cte_params else np.zeros(_nb0),
+            cte_params['hi'].gamma_x if 'hi' in cte_params else np.zeros(_nb0_total),
+            cte_params['hi'].gamma_y if 'hi' in cte_params else np.zeros(_nb0_total),
+            cte_params['lo'].gamma_x if 'lo' in cte_params else np.zeros(_nb0_total),
+            cte_params['lo'].gamma_y if 'lo' in cte_params else np.zeros(_nb0_total),
         ])
     else:
-        gamma_hat = np.zeros(4 * _nb0)
+        gamma_hat = np.zeros(4 * _nb0_total)
     gamma_prior = gamma_hat.copy()   # warmstart gamma as regularisation anchor
     mu_pop_hat = mu_pop_prior.copy()
     C_shared   = None
@@ -3601,10 +3628,11 @@ def _run_joint_cte_loop(
         dmu  = float(np.max(np.abs(mu_pop_hat - mu_pop_prev)))
         _pc  = cte_params.get('hi', cte_params.get('lo'))
         _nb  = _cte_n_spatial(_pc.spatial_order) * (_pc.mag_poly_order + 1) - 1
-        gy_hi = float(np.linalg.norm(gamma_hat[_nb:2*_nb]))
-        gy_lo = float(np.linalg.norm(gamma_hat[3*_nb:4*_nb]))
-        gx_hi = float(np.linalg.norm(gamma_hat[:_nb]))
-        gx_lo = float(np.linalg.norm(gamma_hat[2*_nb:3*_nb]))
+        _nb_total = _nb * (_pc.time_poly_order + 1)
+        gy_hi = float(np.linalg.norm(gamma_hat[_nb_total:2*_nb_total]))
+        gy_lo = float(np.linalg.norm(gamma_hat[3*_nb_total:4*_nb_total]))
+        gx_hi = float(np.linalg.norm(gamma_hat[:_nb_total]))
+        gx_lo = float(np.linalg.norm(gamma_hat[2*_nb_total:3*_nb_total]))
         _C_mu_it   = C_shared[-2:, -2:]
         _sig_ra_it = float(np.sqrt(_C_mu_it[0, 0]))
         _sig_de_it = float(np.sqrt(_C_mu_it[1, 1]))
@@ -3655,6 +3683,7 @@ def _plot_joint_convergence(
 
     _ref    = cte_template['hi']
     _nb     = _cte_n_spatial(_ref.spatial_order) * (_ref.mag_poly_order + 1) - 1
+    _nb     = _nb * (_ref.time_poly_order + 1)   # total per chip per direction
     n_iter  = len(gamma_history) - 1
     iters   = np.arange(len(gamma_history))
     xlbls   = ['ws'] + [str(i+1) for i in range(n_iter)]
@@ -3668,28 +3697,34 @@ def _plot_joint_convergence(
 
     # ── Build coefficient labels for the nb-long block ────────────────────────
     sp_lbls = _cte_basis_labels(_ref.spatial_order)   # n_spatial labels, index 0 = degenerate yt
-    coef_labels = []
-    # mag_order=0: skip first spatial term (degenerate)
-    coef_labels += [f'1·{s}' for s in sp_lbls[1:]]
-    # mag_order=1..order: all spatial terms
+    _nb_mag = _cte_n_spatial(_ref.spatial_order) * (_ref.mag_poly_order + 1) - 1  # spatial-mag nb
+    _spat_mag_labels = []
+    _spat_mag_labels += [f'1·{s}' for s in sp_lbls[1:]]
     for k in range(1, _ref.mag_poly_order + 1):
         mp = f'm^{k}' if k > 1 else 'm'
-        coef_labels += [f'{mp}·{s}' for s in sp_lbls]
+        _spat_mag_labels += [f'{mp}·{s}' for s in sp_lbls]
+    # Prepend time prefix for time_poly_order>0
+    coef_labels = []
+    if _ref.time_poly_order == 0:
+        coef_labels = _spat_mag_labels
+    else:
+        coef_labels  = [f'c·{lbl}' for lbl in _spat_mag_labels]   # constant-in-time block
+        coef_labels += [f'l·{lbl}' for lbl in _spat_mag_labels]   # linear-in-time block
 
     # Build colormap: cycle through tab20 for nb coefficients
     cmap    = cm.get_cmap('tab20', max(_nb, 1))
     colors  = [cmap(i % 20) for i in range(_nb)]
-    # Linestyles by magnitude order (first n_spatial-1 terms are m^0)
+    # Linestyles by magnitude order (first n_spatial-1 terms are m^0); repeat for time blocks
     n_sp    = _cte_n_spatial(_ref.spatial_order)
     lstyles = []
     for i in range(_nb):
-        if i < n_sp - 1:               # mag_order=0
+        if i % _nb_mag < n_sp - 1:         # mag_order=0
             lstyles.append('solid')
-        elif i < 2 * n_sp - 1:         # mag_order=1
+        elif i % _nb_mag < 2 * n_sp - 1:   # mag_order=1
             lstyles.append('dashed')
-        elif i < 3 * n_sp - 1:         # mag_order=2
+        elif i % _nb_mag < 3 * n_sp - 1:   # mag_order=2
             lstyles.append('dotted')
-        else:                           # mag_order=3+
+        else:                               # mag_order=3+
             lstyles.append((0, (3, 1, 1, 1)))
 
     def _plot_gamma_block(ax, block, title):
@@ -4473,6 +4508,7 @@ def run_alignment_joint_cte(
     # CTE polynomial orders
     mag_poly_order: int = 3,
     spatial_order: int = 2,
+    time_poly_order: int = 0,
     # Standard alignment options (same defaults as run_alignment_cte)
     poly_order: int = 1,
     use_sparse: bool = False,
@@ -4622,9 +4658,12 @@ def run_alignment_joint_cte(
 
     # ── CTE template (magnitude polynomial normalization) ─────────────────────
     _mag_norm_ref, _mag_norm_scale = _compute_mag_normalization(solver, image_names)
-    cte_template = default_cte_params(mag_poly_order, _mag_norm_ref, _mag_norm_scale, spatial_order)
+    cte_template = default_cte_params(mag_poly_order, _mag_norm_ref, _mag_norm_scale,
+                                      spatial_order, time_poly_order)
     _nb = _cte_n_spatial(spatial_order) * (mag_poly_order + 1) - 1
-    print(f"  CTE spatial_order={spatial_order}  mag_poly_order={mag_poly_order}  nb={_nb}  "
+    _nb_total = _nb * (time_poly_order + 1)
+    print(f"  CTE spatial_order={spatial_order}  mag_poly_order={mag_poly_order}  "
+          f"time_poly_order={time_poly_order}  nb={_nb_total}  "
           f"mag_norm: ref={_mag_norm_ref:.2f}  scale={_mag_norm_scale:.2f}")
 
     if hst_pm_sigma_diffuse != 100.0:
@@ -4911,10 +4950,11 @@ def run_alignment_joint_cte(
     cte_out['mu_pop_prior_sigma'] = np.array([mu_pop_prior_sigma])
     cte_out['mag_poly_order']    = np.array([mag_poly_order])
     cte_out['spatial_order']     = np.array([spatial_order])
+    cte_out['time_poly_order']   = np.array([time_poly_order])
     cte_out['mag_norm_ref']      = np.array([_mag_norm_ref])
     cte_out['mag_norm_scale']    = np.array([_mag_norm_scale])
     if C_shared is not None:
-        _n_gamma = 4 * _nb
+        _n_gamma = 4 * _nb_total
         n_r = C_shared.shape[0] - _n_gamma - 2  # n_shared = n_r + n_gamma + n_mu(2)
         cte_out['C_mu_pop'] = C_shared[-2:, -2:]
         cte_out['C_gamma']  = C_shared[n_r:n_r + _n_gamma, n_r:n_r + _n_gamma]
@@ -4923,18 +4963,24 @@ def run_alignment_joint_cte(
 
     # ── Save per-iteration history ────────────────────────────────────────────
     _sp_lbls = _cte_basis_labels(spatial_order)
-    _coef_lbls = [f'1·{s}' for s in _sp_lbls[1:]]
+    _spat_mag_lbls = [f'1·{s}' for s in _sp_lbls[1:]]
     for k in range(1, mag_poly_order + 1):
-        _coef_lbls += [f'm^{k}·{s}' if k > 1 else f'm·{s}' for s in _sp_lbls]
+        _spat_mag_lbls += [f'm^{k}·{s}' if k > 1 else f'm·{s}' for s in _sp_lbls]
+    if time_poly_order == 0:
+        _coef_lbls = _spat_mag_lbls
+    else:
+        _coef_lbls  = [f'c·{lbl}' for lbl in _spat_mag_lbls]
+        _coef_lbls += [f'l·{lbl}' for lbl in _spat_mag_lbls]
     np.savez(output_dir_joint / 'cte_iteration_history.npz',
-             gamma_history  = np.array(_gamma_hist),    # (n_iter+1, 4*nb)
-             mu_pop_history = np.array(_mu_pop_hist),   # (n_iter+1, 2)
-             C_mu_history   = np.array(_C_mu_hist),     # (n_iter+1, 2, 2)
-             coef_labels    = np.array(_coef_lbls),     # (nb,) labels for one chip-direction block
-             spatial_order  = np.array([spatial_order]),
-             mag_poly_order = np.array([mag_poly_order]),
-             nb             = np.array([_nb]))
-    print(f"  Saved: cte_iteration_history.npz  ({len(_gamma_hist)} iters, nb={_nb})")
+             gamma_history   = np.array(_gamma_hist),    # (n_iter+1, 4*nb_total)
+             mu_pop_history  = np.array(_mu_pop_hist),   # (n_iter+1, 2)
+             C_mu_history    = np.array(_C_mu_hist),     # (n_iter+1, 2, 2)
+             coef_labels     = np.array(_coef_lbls),     # (nb_total,) labels for one chip-direction block
+             spatial_order   = np.array([spatial_order]),
+             mag_poly_order  = np.array([mag_poly_order]),
+             time_poly_order = np.array([time_poly_order]),
+             nb              = np.array([_nb_total]))
+    print(f"  Saved: cte_iteration_history.npz  ({len(_gamma_hist)} iters, nb={_nb_total})")
 
     # ── Analytic marginalised posteriors ──────────────────────────────────────
     print("  Computing analytic marginalised posteriors...")
