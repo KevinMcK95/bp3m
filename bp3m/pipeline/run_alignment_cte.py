@@ -3479,6 +3479,127 @@ def _plot_joint_convergence(
     print(f"  Saved: plots/{out_name}")
 
 
+def _plot_per_image_detector_residuals(
+    output_dir,
+    image_names: list[str],
+    solver,
+    filtered_spi: dict,
+    arrays_stage1: dict,
+    arrays_stage2: dict,
+    arrays_stage3: dict,
+    stage_labels: tuple = ("bp3m v2", "post-r/μ_pop", "post-CTE"),
+    prefix: str = 'warmstart',
+    vclip: float | None = None,
+) -> None:
+    """
+    Per-image 3×2 detector residual maps.
+
+    Rows: 3 stages (stage1=v2, stage2=post-r/mu_pop, stage3=post-CTE).
+    Cols: dx_gdc (col 0) and dy_gdc (col 1).
+    Axes: raw pixel coordinates (X_orig, Y_orig) from filtered_spi.
+    Color: GDC-frame residual in pixels.
+
+    Saves one PNG per image to output_dir/f'{prefix}_{img}.png'.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from astropy.time import Time as _Time
+    from pathlib import Path as _Path
+
+    output_dir = _Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+    for img in image_names:
+        spi = filtered_spi.get(img)
+        if spi is None or len(spi) == 0:
+            continue
+        xc_key = f'{img}_X_c'
+        if xc_key not in arrays_stage1:
+            continue
+
+        # ── Match filtered_spi stars → out_arrays by rounded GDC position ──────
+        xc_all = arrays_stage1[xc_key].astype(float)
+        yc_all = arrays_stage1[f'{img}_Y_c'].astype(float)
+        xc_spi = spi['X'].to_numpy(float) - 2048.0
+        yc_spi = spi['Y'].to_numpy(float) - 2048.0
+
+        pos_dict = {(round(float(x), 2), round(float(y), 2)): k
+                    for k, (x, y) in enumerate(zip(xc_all, yc_all))}
+        match_idx = np.array([
+            pos_dict.get((round(float(x), 2), round(float(y), 2)), -1)
+            for x, y in zip(xc_spi, yc_spi)
+        ])
+        valid = match_idx >= 0
+        if not valid.any():
+            continue
+
+        m_idx  = match_idx[valid]
+        x_raw  = (spi['X_orig'].to_numpy(float)[valid]
+                  if 'X_orig' in spi.columns else xc_spi[valid] + 2048.0)
+        y_raw  = (spi['Y_orig'].to_numpy(float)[valid]
+                  if 'Y_orig' in spi.columns else yc_spi[valid] + 2048.0)
+
+        # ── Determine symmetric colour limit ─────────────────────────────────
+        dx1 = arrays_stage1.get(f'{img}_dx_gdc', np.zeros(len(xc_all)))
+        dy1 = arrays_stage1.get(f'{img}_dy_gdc', np.zeros(len(xc_all)))
+        if vclip is None:
+            _vals1 = np.concatenate([np.abs(dx1[m_idx]), np.abs(dy1[m_idx])])
+            _finite = _vals1[np.isfinite(_vals1)]
+            _vc = float(np.percentile(_finite, 97)) if len(_finite) > 0 else 0.3
+            _vc = max(_vc, 0.05)
+        else:
+            _vc = float(vclip)
+
+        # ── Build figure ──────────────────────────────────────────────────────
+        stages   = [arrays_stage1, arrays_stage2, arrays_stage3]
+        col_keys = [f'{img}_dx_gdc', f'{img}_dy_gdc']
+        col_lbls = ['dx_gdc (px)', 'dy_gdc (px)']
+
+        fig, axes = plt.subplots(3, 2, figsize=(12, 9),
+                                 sharex=True, sharey=True,
+                                 gridspec_kw={'hspace': 0.08, 'wspace': 0.06})
+
+        for row_i, (arr, stage_lbl) in enumerate(zip(stages, stage_labels)):
+            for col_i, (ckey, clbl) in enumerate(zip(col_keys, col_lbls)):
+                ax   = axes[row_i, col_i]
+                vals = (arr[ckey][m_idx].astype(float)
+                        if ckey in arr else np.zeros(m_idx.size))
+                sc   = ax.scatter(x_raw, y_raw, c=vals,
+                                  cmap='RdBu_r', vmin=-_vc, vmax=_vc,
+                                  s=1.5, alpha=0.6, linewidths=0,
+                                  rasterized=True)
+                cb   = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+                cb.ax.tick_params(labelsize=7)
+                if row_i == 0:
+                    ax.set_title(clbl, fontsize=10, pad=4)
+                ax.text(0.02, 0.97, stage_lbl, transform=ax.transAxes,
+                        va='top', ha='left', fontsize=8,
+                        bbox=dict(facecolor='white', alpha=0.75,
+                                  pad=2, edgecolor='none'))
+                ax.tick_params(labelsize=8)
+                if col_i == 0:
+                    ax.set_ylabel('y_raw (px)', fontsize=8)
+                if row_i == 2:
+                    ax.set_xlabel('x_raw (px)', fontsize=8)
+
+        hst_yr = float(_Time(float(solver.images[img]['hst_time_mjd']),
+                             format='mjd').jyear)
+        fig.suptitle(
+            f'{img}   obs {hst_yr:.3f} yr   n={valid.sum()} stars   '
+            f'colour ±{_vc:.3f} px',
+            fontsize=10,
+        )
+
+        out_path = output_dir / f'{prefix}_{img}.png'
+        fig.savefig(out_path, dpi=120, bbox_inches='tight')
+        plt.close(fig)
+        saved += 1
+
+    print(f"  Saved {saved}/{len(image_names)} per-image residual maps → {output_dir}")
+
+
 def _save_warmstart_stellar_astrometry(
     a_arr_ws: np.ndarray,
     solver,
@@ -4307,6 +4428,16 @@ def run_alignment_joint_cte(
           f"{len(member_sidx_gaia)} Gaia + {len(member_sidx_hst)} HST-only "
           f"= {len(member_sidx_init)} total")
 
+    # ── bp3m v2 residuals (BEFORE warm start, using r_init and current solver.R) ──
+    _ws_v2 = None
+    if not no_plots and img_to_df is not None:
+        _bp3m_gids_pre = set(int(g) for g in solver.star_id_to_idx.keys() if int(g) > 0)
+        try:
+            _ws_v2 = _compute_full_catalog_residuals_from_df(
+                img_to_df, _bp3m_gids_pre, solver, image_names, r_init_hat)
+        except Exception as _exc_v2:
+            print(f"  WARNING: v2 pre-warmstart residuals failed — {_exc_v2}")
+
     # ── CTE warm start ─────────────────────────────────────────────────────────
     print("\n  CTE warm start...")
     cte_params, mu_pop_warm, r_ws_diag, a_arr_ws = warm_start_cte(
@@ -4356,6 +4487,25 @@ def run_alignment_joint_cte(
             )
         except Exception as _exc:
             print(f"  WARNING: warmstart pm_vs_detector failed — {_exc}")
+
+        # ── Per-image detector residual maps (3 stages × dx/dy) ──────────────
+        if _ws_v2 is not None:
+            try:
+                _plot_per_image_detector_residuals(
+                    output_dir_joint / 'plots' / 'residuals',
+                    image_names, solver, filtered_spi,
+                    arrays_stage1=_ws_v2,
+                    arrays_stage2=_ws_before,
+                    arrays_stage3=_ws_after,
+                    stage_labels=("bp3m v2",
+                                  "post-r/μ_pop warmstart",
+                                  "post-CTE warmstart"),
+                    prefix='warmstart',
+                )
+            except Exception as _exc:
+                import traceback
+                print(f"  WARNING: per-image residual maps failed — {_exc}")
+                traceback.print_exc()
 
     if warmstart_only:
         print("\n  warmstart_only=True — stopping after warm start. "
@@ -4504,6 +4654,23 @@ def run_alignment_joint_cte(
             _plot_joint_convergence(_gamma_hist, _mu_pop_hist, cte_template, output_dir_joint)
         except Exception as exc:
             print(f"  WARNING: convergence history plot failed — {exc}")
+
+        # ── Per-image detector residual maps: v2 / post-joint-r / post-CTE ────
+        if _ws_v2 is not None and _before_arrays and _after_arrays:
+            try:
+                _plot_per_image_detector_residuals(
+                    output_dir_joint / 'plots' / 'residuals',
+                    image_names, solver, filtered_spi,
+                    arrays_stage1=_ws_v2,
+                    arrays_stage2=_before_arrays,
+                    arrays_stage3=_after_arrays,
+                    stage_labels=("bp3m v2",
+                                  "post-joint r/μ_pop",
+                                  "post-CTE (final)"),
+                    prefix='final',
+                )
+            except Exception as exc:
+                print(f"  WARNING: final per-image residual maps failed — {exc}")
 
     print(f"\n  Joint CTE results written to: {output_dir_joint}")
     return output_dir_joint
