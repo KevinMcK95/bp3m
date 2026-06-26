@@ -7,8 +7,8 @@ Usage
       --field Leo_I \
       --data_root /home/jupyter-kmckinnon/data_bootes/bp3m/GaiaHub_results \
       --sigma_pm 0.0076 \
-      --plx_pop 0.00394 \
-      --sigma_plx_tot 0.0001 \
+      --plx_pop 0.003873 \
+      --sigma_plx_tot 0.0001425 \
       --mu_pop_prior_sigma 0.5 \
       --n_iter 20
 
@@ -18,10 +18,10 @@ Add --full_run to proceed past warm start.
 
 LVD parameters for common targets
 -----------------------------------
-Leo I  : d=254 kpc, σ_LOS=9.2 km/s
-    sigma_pm      = 9.2 / (4.74047 * 254) = 0.0076  mas/yr
-    plx_pop       = 1000 / 254             = 3.94e-3  mas
-    sigma_plx_tot = 5% dist err            = 2e-4     mas
+Leo I  : d=258.23 kpc, σ_d=9.5 kpc, σ_LOS=9.2 km/s  (LVD)
+    sigma_pm      = 9.2 / (4.74047 * 258.23) = 0.0075  mas/yr
+    plx_pop       = 1000 / 258.23             = 3.873e-3 mas
+    sigma_plx_tot = 1000 * 9.5 / 258.23^2    = 1.425e-4 mas
 
 The mu_pop prior mean is warm-started automatically from the Gaia cross-match
 field PM estimate (master_combined_v2.csv).
