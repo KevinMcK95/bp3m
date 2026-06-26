@@ -6,7 +6,7 @@ Usage
   conda run -n bp3m-test python run_joint_cte.py \
       --field Leo_I \
       --data_root /home/jupyter-kmckinnon/data_bootes/bp3m/GaiaHub_results \
-      --sigma_pm 0.0076 \
+      --sigma_pm 0.0075 \
       --plx_pop 0.003873 \
       --sigma_plx_tot 0.0001425 \
       --mu_pop_prior_sigma 0.5 \
