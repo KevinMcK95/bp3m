@@ -3951,7 +3951,7 @@ def _plot_per_image_detector_residuals(
             _vc = max(_vc, 0.05)
         else:
             _vc = float(vclip)
-        _vc_sig = 3.0   # fixed ±3σ for sigma-scaled columns
+        _vc_sig = 2.0   # fixed ±2σ for sigma-scaled columns
 
         # ── Build figure ──────────────────────────────────────────────────────
         n_cols = 4 if has_sigma else 2
