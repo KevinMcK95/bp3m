@@ -2212,6 +2212,28 @@ def warm_start_cte(
         0, time_poly_order=0)  # spatial_order=0 ⟹ nb=0 ⟹ n_gamma=0
     print(f"\n  [2/4] Gaia-only (r, μ_pop) refinement "
           f"({n_gaia_warmstart_iters} iter, {len(member_sidx_gaia)} stars)...")
+
+    # ── Gaia-only weighted mean PM diagnostic ────────────────────────────────
+    # Compute the maximum-likelihood population mean PM using only Gaia catalog
+    # PM measurements (C_survey_inv[i,2:4,2:4]) for the 5p/6p member stars.
+    # This is the prior-free Gaia estimate — what Phase [2/4] should converge to.
+    _Cv_mem  = solver.C_survey_inv[member_sidx_gaia][:, 2:4, 2:4]   # (n,2,2)
+    _v_mem   = solver.v_survey[member_sidx_gaia, 2:4]                # (n,2)
+    _fiv_mask = _Cv_mem[:, 0, 0] > 0                                  # 5p/6p stars
+    if _fiv_mask.sum() > 1:
+        _H_g  = _Cv_mem[_fiv_mask].sum(axis=0)                        # (2,2)
+        _h_g  = (_Cv_mem[_fiv_mask] @ _v_mem[_fiv_mask, :, None]).squeeze(-1).sum(axis=0)
+        _C_g  = np.linalg.inv(_H_g)                                   # posterior cov
+        _mu_g = _C_g @ _h_g
+        _s_ra = float(np.sqrt(_C_g[0, 0]))
+        _s_de = float(np.sqrt(_C_g[1, 1]))
+        _rho_g = float(_C_g[0, 1] / (_s_ra * _s_de + 1e-30))
+        print(f"    Gaia-only weighted mean PM ({_fiv_mask.sum()} 5p/6p members): "
+              f"μ_α*=({_mu_g[0]:+.4f}±{_s_ra:.4f})  "
+              f"μ_δ=({_mu_g[1]:+.4f}±{_s_de:.4f})  ρ={_rho_g:+.3f} mas/yr")
+    else:
+        print(f"    WARNING: only {_fiv_mask.sum()} 5p/6p Gaia members — no weighted mean")
+
     _t0 = _wtime.time()
     r_ws  = r_init.copy()
     mu_ws = mu_pop_prior.copy()
