@@ -3872,6 +3872,8 @@ def _plot_per_image_detector_residuals(
         yr_by_stage  = [[] for _ in range(3)]
         dx_by_stage  = [[] for _ in range(3)]
         dy_by_stage  = [[] for _ in range(3)]
+        sx_all = []   # per-star GDC x uncertainty (alpha-inflated), same for all stages
+        sy_all = []
         total_n = 0
         years   = []
 
@@ -3914,6 +3916,13 @@ def _plot_per_image_detector_residuals(
                 dx_by_stage[si].append(dx)
                 dy_by_stage[si].append(dy)
 
+            # Per-star GDC uncertainties; scale by per-image inflation alpha if known
+            _img_d = getattr(solver, '_img_data', {}).get(img)
+            _alpha = float(_img_d.get("alpha_applied", 1.0)) if _img_d is not None else 1.0
+            if 'x_hst_err' in spi.columns and 'y_hst_err' in spi.columns:
+                sx_all.append(spi['x_hst_err'].to_numpy(float)[valid] * _alpha)
+                sy_all.append(spi['y_hst_err'].to_numpy(float)[valid] * _alpha)
+
             total_n += int(valid.sum())
             hst_yr = float(_Time(float(solver.images[img]['hst_time_mjd']),
                                  format='mjd').jyear)
@@ -3929,7 +3938,12 @@ def _plot_per_image_detector_residuals(
             dx_by_stage[si] = np.concatenate(dx_by_stage[si]) if dx_by_stage[si] else np.array([])
             dy_by_stage[si] = np.concatenate(dy_by_stage[si]) if dy_by_stage[si] else np.array([])
 
-        # ── Colour limit from stage-1 residuals ───────────────────────────────
+        sigma_x = np.concatenate(sx_all) if sx_all else None
+        sigma_y = np.concatenate(sy_all) if sy_all else None
+        has_sigma = (sigma_x is not None
+                     and np.any(np.isfinite(sigma_x) & (sigma_x > 0)))
+
+        # ── Colour limits ──────────────────────────────────────────────────────
         if vclip is None:
             _vals1 = np.concatenate([np.abs(dx_by_stage[0]), np.abs(dy_by_stage[0])])
             _finite = _vals1[np.isfinite(_vals1)]
@@ -3937,21 +3951,42 @@ def _plot_per_image_detector_residuals(
             _vc = max(_vc, 0.05)
         else:
             _vc = float(vclip)
+        _vc_sig = 3.0   # fixed ±3σ for sigma-scaled columns
 
         # ── Build figure ──────────────────────────────────────────────────────
-        fig, axes = plt.subplots(3, 2, figsize=(12, 9),
+        n_cols = 4 if has_sigma else 2
+        fig, axes = plt.subplots(3, n_cols, figsize=(n_cols * 5, 9),
                                  sharex=True, sharey=True,
                                  gridspec_kw={'hspace': 0.08, 'wspace': 0.06})
 
         for row_i, stage_lbl in enumerate(stage_labels):
             x_d = xr_by_stage[row_i]
             y_d = yr_by_stage[row_i]
-            for col_i, (vals, clbl) in enumerate(
-                    zip([dx_by_stage[row_i], dy_by_stage[row_i]],
-                        ['dx_gdc (px)', 'dy_gdc (px)'])):
+
+            # Raw pixel residuals (cols 0, 1)
+            raw_pairs = list(zip(
+                [dx_by_stage[row_i], dy_by_stage[row_i]],
+                ['dx_gdc (px)', 'dy_gdc (px)'],
+            ))
+            # Sigma-scaled residuals (cols 2, 3) — only when sigma available
+            if has_sigma:
+                _sx = np.where(sigma_x > 0, sigma_x, np.nan)
+                _sy = np.where(sigma_y > 0, sigma_y, np.nan)
+                sig_pairs = list(zip(
+                    [dx_by_stage[row_i] / _sx, dy_by_stage[row_i] / _sy],
+                    ['dx / σ_x', 'dy / σ_y'],
+                ))
+            else:
+                sig_pairs = []
+
+            all_pairs = raw_pairs + sig_pairs
+            clims     = [(-_vc, _vc)] * 2 + [(-_vc_sig, _vc_sig)] * len(sig_pairs)
+
+            for col_i, ((vals, clbl), (vmin, vmax)) in enumerate(
+                    zip(all_pairs, clims)):
                 ax = axes[row_i, col_i]
                 sc = ax.scatter(x_d, y_d, c=vals,
-                                cmap='RdBu_r', vmin=-_vc, vmax=_vc,
+                                cmap='RdBu_r', vmin=vmin, vmax=vmax,
                                 s=1.5, alpha=0.6, linewidths=0,
                                 rasterized=True)
                 cb = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
@@ -3981,7 +4016,7 @@ def _plot_per_image_detector_residuals(
                 )
         _inst_str = '  |  '.join(dict.fromkeys(_inst_parts))   # unique, order-preserving
 
-        _title = f'{root}   obs {yr_str} yr   n={total_n} stars   colour ±{_vc:.3f} px'
+        _title = f'{root}   obs {yr_str} yr   n={total_n} stars   px cols ±{_vc:.3f}   σ cols ±{_vc_sig:.0f}σ'
         if _inst_str:
             _title = f'{_inst_str}\n{_title}'
         fig.suptitle(_title, fontsize=10)
