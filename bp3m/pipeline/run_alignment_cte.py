@@ -1099,7 +1099,6 @@ def _joint_solve_cte(
         K = np.einsum('nik,nkl->nil', JUT_Cs, X)   # (n, 5, N_R)
         K_img[img] = K
 
-        # H_rr and XCs_xresid use all fitting stars (not just members)
         XCsX = np.einsum('nki,nkl,nlj->ij',
                          X[use_fit], Cs_inv[use_fit], X[use_fit])
         H_rr[cs:cs+nr, cs:cs+nr] += XCsX + d["C_r_prior_inv"]
@@ -2203,10 +2202,14 @@ def warm_start_cte(
     # the reference frame before the CTE fit.  HST-only stars are excluded here
     # because their PMs are derived from HST positions, which are CTE-distorted.
     # Use a minimal CTE template (K=0, time_poly_order=0) so the G matrix stays
-    # small — r and μ_pop are unaffected by n_gamma when gamma=0.
+    # spatial_order=0 → nb=0 → n_gamma=0: no gamma block in the Schur system.
+    # Gaia positions (xys_orig = plane_project) have no CTE distortion, so
+    # estimating gamma from Gaia-only residuals gives a spurious result that
+    # contaminates μ_pop through the (γ,μ) Schur cross-term.  Eliminating the
+    # gamma block makes Phase [2/4] a clean (r, μ_pop) joint solve.
     _cte_tmpl_gaia = default_cte_params(
         0, cte_template['hi'].mag_norm_ref, cte_template['hi'].mag_norm_scale,
-        cte_template['hi'].spatial_order, time_poly_order=0)
+        0, time_poly_order=0)  # spatial_order=0 ⟹ nb=0 ⟹ n_gamma=0
     print(f"\n  [2/4] Gaia-only (r, μ_pop) refinement "
           f"({n_gaia_warmstart_iters} iter, {len(member_sidx_gaia)} stars)...")
     _t0 = _wtime.time()
@@ -4262,6 +4265,14 @@ def run_alignment_cte(
         r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
                                       for img in image_names])
         solver._update_R(r_init_hat)
+        # Save observed positions BEFORE _update_geometry replaces d["xys"] with the
+        # Gaia-projected positions. xys_orig must hold the true HST observations so
+        # that x_resid = xys_orig - X@r carries the stellar-motion signal (≈ JU@v_survey)
+        # rather than being identically zero.
+        for _img in image_names:
+            _d = solver._img_data.get(_img)
+            if _d is not None and 'xys_orig' not in _d:
+                _d['xys_orig'] = _d['xys'].copy()
         solver._update_geometry(r_init_hat, solver.v_survey)
         print("\n  Phase 0: fixed-transform pre-filter (v1 BP3M posterior)")
 
@@ -4740,6 +4751,11 @@ def run_alignment_joint_cte(
         r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
                                       for img in image_names])
         solver._update_R(r_init_hat)
+        # Save observed positions BEFORE _update_geometry replaces d["xys"]
+        for _img in image_names:
+            _d = solver._img_data.get(_img)
+            if _d is not None and 'xys_orig' not in _d:
+                _d['xys_orig'] = _d['xys'].copy()
         solver._update_geometry(r_init_hat, solver.v_survey)
         print("\n  Phase 0: fixed-transform pre-filter")
         n_flag0 = 0
