@@ -993,12 +993,17 @@ def _joint_solve_cte(
     n_stars     = len(solver.C_survey_inv)
     member_mask = np.zeros(n_stars, dtype=bool)
     member_mask[member_sidx] = True
+    # all_member_mask: Gaia members + HST-only members (everyone receiving pop prior)
+    all_member_mask = member_mask.copy()
+    if hst_prior_sidx is not None and len(hst_prior_sidx) > 0:
+        all_member_mask[hst_prior_sidx] = True
 
     # ── Precision matrices and information vectors ────────────────────────────
-    # Start from solver's Gaia prior; add diagonal _C_VG_inv_per_star (HST-only
-    # PM dispersion 100 mas/yr) then add population and parallax priors for members.
+    # Start from solver's Gaia prior; population prior added for members below.
+    # _C_VG_inv_per_star (diffuse 100 mas/yr PM prior) is intentionally excluded:
+    # the population prior is the correct constraint for members, and non-member
+    # stars are not processed at all in this solve.
     H_vv = solver.C_survey_inv.copy()
-    H_vv[:, np.arange(N_V), np.arange(N_V)] += solver._C_VG_inv_per_star
 
     # All stars that receive the population prior (Gaia members + fixed HST-only).
     # member_sidx alone drives μ_pop (Schur correction below).
@@ -1007,6 +1012,12 @@ def _joint_solve_cte(
     else:
         _all_prior = member_sidx
 
+    # Flat position prior + population PM + LVD parallax for all member stars.
+    # Position (1e6 arcsec)^{-2} is negligible for Gaia 5p/2p (already pinned by
+    # C_survey_inv) but ensures well-posed H_vv for HST-only members (C_survey_inv=0).
+    _pos_inv_sq = (1e6)**-2
+    H_vv[_all_prior, 0, 0] += _pos_inv_sq        # Δα* (arcsec) — flat
+    H_vv[_all_prior, 1, 1] += _pos_inv_sq        # Δδ  (arcsec) — flat
     H_vv[_all_prior, 2, 2] += sigma_pm_inv_sq    # population PM prior (μ_α*)
     H_vv[_all_prior, 3, 3] += sigma_pm_inv_sq    # population PM prior (μ_δ)
     H_vv[_all_prior, 4, 4] += sigma_plx_inv_sq   # LVD parallax prior
@@ -1049,13 +1060,14 @@ def _joint_solve_cte(
             continue
 
         sidx         = d["sidx"]
-        # All fitting stars (no member restriction) — constrain r and γ
-        use_fit      = d["use_for_fit"]
-        use_astrom_f = (d.get("use_for_astrom", d["use_for_fit"])
-                        if getattr(solver, '_use_two_tier', False) else d["use_for_fit"])
-        use_any      = use_fit | use_astrom_f          # all active (Gaia + HST-only)
-        # Member stars get tight population PM prior
-        use_member   = use_any & member_mask[sidx]
+        _mem         = all_member_mask[sidx]           # True for all members in this image
+        # Restrict to member stars only — non-members have unconstrained positions/PMs
+        # and absorb CTE signal rather than constraining it.
+        use_fit      = d["use_for_fit"] & _mem
+        use_astrom_f = ((d.get("use_for_astrom", d["use_for_fit"])
+                         if getattr(solver, '_use_two_tier', False) else d["use_for_fit"]) & _mem)
+        use_any      = use_fit | use_astrom_f          # all active members
+        use_member   = use_any & member_mask[sidx]     # Gaia members only (drive μ_pop)
 
         sidx_any = sidx[use_any]
         sidx_fit = sidx[use_fit]
@@ -1172,7 +1184,12 @@ def _joint_solve_cte(
                                          X[use_fit], Cs_inv[use_fit], G[use_fit])
 
     # ── Invert H_vv → C_vT, stellar posteriors ───────────────────────────────
-    C_vT    = np.linalg.inv(H_vv)
+    # Only invert for member stars that were active (non-members have singular H_vv
+    # since C_survey_inv=0 for HST-only and no diffuse prior is applied).
+    C_vT = np.zeros_like(H_vv)
+    _active_sidx = np.where(active_glob)[0]
+    if len(_active_sidx) > 0:
+        C_vT[_active_sidx] = np.linalg.inv(H_vv[_active_sidx])
     a_align = np.einsum('nij,nj->ni', C_vT, h_align)
     a       = np.einsum('nij,nj->ni', C_vT, h_all)
 
@@ -1252,27 +1269,27 @@ def _joint_solve_cte(
 
         cs       = j_idx * nr
         sidx     = d["sidx"]
-        # All fitting stars — no member restriction for (r,r) and (r,γ)
-        use_fit  = d["use_for_fit"]
-        use_fmem = use_fit & member_mask[sidx]   # fitting ∩ member for (r,μ)
+        _mem     = all_member_mask[sidx]
+        use_fit  = d["use_for_fit"] & _mem      # member-only alignment
+        use_fmem = use_fit                       # all are members; all couple to μ_pop
 
         sidx_fit  = sidx[use_fit]
         K_fit     = K_img[img][use_fit]          # (n_fit, 5, N_R)
         Cv_fit    = C_vT[sidx_fit]               # (n_fit, 5, 5)
 
-        # (r, r) diagonal Schur block — all fitting stars
+        # (r, r) diagonal Schur block — member fitting stars only
         CvT_K_fit = np.einsum('nij,njk->nik', Cv_fit, K_fit)
         Lambda[cs:cs+nr, cs:cs+nr] -= np.einsum('nji,njk->ik', K_fit, CvT_K_fit)
         rhs[cs:cs+nr]              += np.einsum('nji,nj->i',   K_fit, a_align[sidx_fit])
 
-        # (r, γ) Schur: K_fit^T C_vT Q_total_all — all fitting stars
+        # (r, γ) Schur: K_fit^T C_vT Q_total_all — member fitting stars
         Qt_fit    = Q_total_all[sidx_fit]
         CvT_Q_fit = np.einsum('nij,njk->nik', Cv_fit, Qt_fit)
         KT_CvT_Q  = np.einsum('nji,njk->ik', K_fit, CvT_Q_fit)   # (N_R, n_gamma)
         Lambda[cs:cs+nr, idx_gam] -= KT_CvT_Q
         Lambda[idx_gam, cs:cs+nr] -= KT_CvT_Q.T
 
-        # (r, μ) Schur: -σ^{-2} K_{fit∩member}^T C_vT M
+        # (r, μ) Schur: -σ^{-2} K_{member}^T C_vT M — all fitting stars are members
         if use_fmem.any():
             sidx_fmem = sidx[use_fmem]
             K_fmem    = K_img[img][use_fmem]
@@ -1281,7 +1298,7 @@ def _joint_solve_cte(
             Lambda[cs:cs+nr, idx_mu] -= sigma_pm_inv_sq * KT_CvT_M
             Lambda[idx_mu, cs:cs+nr] -= sigma_pm_inv_sq * KT_CvT_M.T
 
-        # (r, r) cross-image coupling — all fitting stars (no member restriction)
+        # (r, r) cross-image coupling — member fitting stars only
         for j2_idx, img2 in enumerate(image_names):
             if j2_idx <= j_idx:
                 continue
@@ -1289,7 +1306,7 @@ def _joint_solve_cte(
             if d2 is None or K_img.get(img2) is None:
                 continue
             sidx_d2  = d2["sidx"]
-            use2     = d2["use_for_fit"]    # all fitting, no member restriction
+            use2     = d2["use_for_fit"] & all_member_mask[sidx_d2]
             sidx2    = sidx_d2[use2]
             K2       = K_img[img2][use2]
 
