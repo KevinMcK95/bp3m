@@ -1480,8 +1480,51 @@ def _joint_solve_cte(
             _xr_max = float(np.max(np.abs(_xra)))
             _worst_img = max(_xresid_img_rms, key=_xresid_img_rms.get)
             print(f"    [A diag] x_resid stats ({len(_xra)} fitting stars): "
-                  f"rms={_xr_rms:.4e} arcsec  max={_xr_max:.4e} arcsec  "
+                  f"rms={_xr_rms:.4e} pix  max={_xr_max:.4e} pix  "
                   f"worst_img={_worst_img} (rms={_xresid_img_rms[_worst_img]:.4e})")
+            # Dump per-star detail for the worst image to locate the source
+            _dw = solver._img_data.get(_worst_img)
+            if _dw is not None:
+                _sidxw = _dw["sidx"]
+                _gmw   = solver.C_survey_inv[_sidxw].sum(axis=(1, 2)) > 0
+                _ufw   = _dw["use_for_fit"] & _gmw
+                _jw    = image_names.index(_worst_img)
+                _rw    = r_current[_jw * nr:(_jw + 1) * nr]
+                _xysw  = _dw.get("xys_orig", _dw["xys"])
+                _Xw    = _dw["X_mat"]
+                _xpw   = np.einsum('nkl,l->nk', _Xw, _rw)
+                _xrw   = _xysw - _xpw
+                _rmag  = np.hypot(_xrw[:, 0], _xrw[:, 1])
+                _order = np.argsort(_rmag[_ufw])[::-1]
+                _fit_idx = np.where(_ufw)[0]
+                # Gaia_id lookup: filtered_spi rows match sidx order
+                _spw = filtered_spi.get(_worst_img) if filtered_spi else None
+                _gids_w = _spw["Gaia_id"].values if _spw is not None else None
+                # Check for and warn about duplicate sidx entries
+                _sidx_counts: dict[int, list[int]] = {}
+                for _li in _fit_idx:
+                    _gi = int(_sidxw[_li])
+                    _sidx_counts.setdefault(_gi, []).append(_li)
+                _dup_sidx = {g: ls for g, ls in _sidx_counts.items() if len(ls) > 1}
+                if _dup_sidx:
+                    for _gs, _ls in _dup_sidx.items():
+                        _gid_str = str(_gids_w[_ls[0]]) if _gids_w is not None else "?"
+                        print(f"    [A diag] WARNING: sidx={_gs} (gaia_id={_gid_str}) "
+                              f"appears {len(_ls)} times in {_worst_img}: "
+                              f"local_idx={_ls}")
+                print(f"    [A diag] {_worst_img} top-10 residuals "
+                      f"(pix): gaia_id  sidx  xys_x  xys_y  xpred_x  xpred_y  resid_x  resid_y  |resid|")
+                for _ki in _fit_idx[_order[:10]]:
+                    _xi, _yi = _xysw[_ki]
+                    _xpi, _ypi = _xpw[_ki]
+                    _ri = _rmag[_ki]
+                    _gid_str = str(_gids_w[_ki]) if _gids_w is not None and _ki < len(_gids_w) else "?"
+                    print(f"      star_local={_ki:4d}: "
+                          f"gaia_id={_gid_str}  sidx={int(_sidxw[_ki]):5d}  "
+                          f"xys=({_xi:+8.3f},{_yi:+8.3f})  "
+                          f"xpred=({_xpi:+8.3f},{_ypi:+8.3f})  "
+                          f"resid=({_xrw[_ki,0]:+7.3f},{_xrw[_ki,1]:+7.3f})  "
+                          f"|r|={_ri:.3f}")
         print(f"    [A diag] rhs_r_v2: max|data|={np.max(np.abs(_rhs_data_v2)):.3e}  "
               f"max|schur|={np.max(np.abs(_rhs_schur_v2)):.3e}  "
               f"max|total|={np.max(np.abs(rhs_r_v2)):.3e}")
@@ -5176,33 +5219,49 @@ def run_alignment_joint_cte(
         except Exception as _exc_v2:
             print(f"  WARNING: v2 pre-warmstart residuals failed — {_exc_v2}")
 
-    # ── Override Gaia use_for_fit from BP3M_v2_results ───────────────────────
-    # The v2 use_for_fit flags represent the fully-converged Gaia alignment quality.
-    # We apply them directly to the solver so ALL CTE phases use exactly the same
-    # Gaia detections as v2 used.  HST-only use_for_fit is left unchanged.
+    # ── Override Gaia use_for_fit and use_for_astrom from BP3M_v2_results ───────
+    # use_for_fit.npz   — alignment stars (~160/image); drives XCsX and rhs_r.
+    # use_for_astrom.npz — all Gaia astrometry stars (~1190/image, superset of
+    #   use_for_fit); drives the stellar Schur complement (K^T C_vT K) so that
+    #   Phase [2/4] uses the same Schur structure as v2 (v2 used all astrometry
+    #   stars in its Schur complement, not just alignment stars).  Without this,
+    #   Lambda_r in Phase [2/4] differs from v2's and sub-solve A gives Δr≈1.2
+    #   instead of ≈0.
     _v2_uff_path = data_root / field_name / "BP3M_v2_results" / "use_for_fit.npz"
+    _v2_ufa_path = data_root / field_name / "BP3M_v2_results" / "use_for_astrom.npz"
     _v2_si_path  = data_root / field_name / "BP3M_v2_results" / "star_indices.npz"
     _v2_sa_path  = data_root / field_name / "BP3M_v2_results" / "stellar_astrometry.csv"
     if all(p.exists() for p in [_v2_uff_path, _v2_si_path, _v2_sa_path]):
         _v2_uff = np.load(_v2_uff_path)
+        _v2_ufa = np.load(_v2_ufa_path) if _v2_ufa_path.exists() else None
         _v2_si  = np.load(_v2_si_path)
         # Read Gaia_id as int64 directly — never let it pass through float64
         _v2_sa  = pd.read_csv(_v2_sa_path, dtype={'Gaia_id': np.int64})
         _v2_gids_arr = _v2_sa['Gaia_id'].to_numpy(np.int64)
-        # Per-image frozensets of Gaia IDs used in v2
-        _v2_per_img: dict[str, frozenset] = {}
-        for _img in _v2_uff.files:
-            _mask = _v2_uff[_img].astype(bool)
-            _sidx = _v2_si[_img]
-            _gids_used = _v2_gids_arr[_sidx[_mask]]
-            _v2_per_img[_img] = frozenset(int(g) for g in _gids_used if g > 0)
+
+        def _build_per_img_gid_set(npz_file):
+            """Return dict[img] -> frozenset of Gaia IDs with flag=True."""
+            out: dict[str, frozenset] = {}
+            for _img in npz_file.files:
+                _mask = npz_file[_img].astype(bool)
+                _sidx = _v2_si[_img]
+                _gids = _v2_gids_arr[_sidx[_mask]]
+                out[_img] = frozenset(int(g) for g in _gids if g > 0)
+            return out
+
+        _v2_fit_per_img   = _build_per_img_gid_set(_v2_uff)
+        _v2_astrom_per_img = (_build_per_img_gid_set(_v2_ufa)
+                               if _v2_ufa is not None else _v2_fit_per_img)
+
         # Build joint-CTE-solver star-index → Gaia ID (int64, no float roundtrip)
         _n_sol = solver.C_survey_inv.shape[0]
         _sol_gid = np.zeros(_n_sol, dtype=np.int64)
         for _gid, _idx in solver.star_id_to_idx.items():
             _sol_gid[_idx] = np.int64(_gid)
-        # Override use_for_fit in-place: Gaia stars follow v2 flags, HST-only unchanged
-        _n_gaia_det_enabled = 0
+
+        # Override use_for_fit and use_for_astrom in-place for all Gaia stars.
+        # HST-only stars keep their existing use_for_fit flags unchanged.
+        _n_fit_enabled = 0; _n_astrom_enabled = 0
         for _img in image_names:
             _d = solver._img_data.get(_img)
             if _d is None:
@@ -5210,22 +5269,32 @@ def run_alignment_joint_cte(
             _sidx_j  = _d["sidx"]
             _gids_j  = _sol_gid[_sidx_j]               # int64, no float roundtrip
             _is_gaia = _gids_j > 0
-            _v2_set  = _v2_per_img.get(_img, frozenset())
-            _in_v2   = np.array([int(g) in _v2_set for g in _gids_j], dtype=bool)
-            # Gaia detections: use v2 flag; HST-only: keep existing flag
-            _d["use_for_fit"] = np.where(_is_gaia, _in_v2, _d["use_for_fit"])
-            _n_gaia_det_enabled += int((_is_gaia & _in_v2).sum())
-        _all_used_gids: set = set()
+            _fit_set    = _v2_fit_per_img.get(_img, frozenset())
+            _astrom_set = _v2_astrom_per_img.get(_img, frozenset())
+            _in_fit    = np.array([int(g) in _fit_set    for g in _gids_j], dtype=bool)
+            _in_astrom = np.array([int(g) in _astrom_set for g in _gids_j], dtype=bool)
+            # Gaia detections: use v2 flags; HST-only: keep existing flag
+            _d["use_for_fit"]   = np.where(_is_gaia, _in_fit,    _d["use_for_fit"])
+            _d["use_for_astrom"] = np.where(_is_gaia, _in_astrom, _d.get(
+                "use_for_astrom", _d["use_for_fit"]))
+            _n_fit_enabled    += int((_is_gaia & _in_fit).sum())
+            _n_astrom_enabled += int((_is_gaia & _in_astrom).sum())
+
+        _all_fit_gids: set = set(); _all_astrom_gids: set = set()
         for _img in image_names:
             _d2 = solver._img_data.get(_img)
             if _d2 is None:
                 continue
             _gids_j2 = _sol_gid[_d2["sidx"]]
-            _used    = _d2["use_for_fit"] & (_gids_j2 > 0)
-            _all_used_gids.update(int(g) for g in _gids_j2[_used])
-        print(f"  Applied v2 Gaia use_for_fit: "
-              f"{len(_all_used_gids)} unique Gaia stars, "
-              f"{_n_gaia_det_enabled} detections across all images")
+            _all_fit_gids.update(int(g) for g in _gids_j2[_d2["use_for_fit"] & (_gids_j2 > 0)])
+            _all_astrom_gids.update(int(g) for g in _gids_j2[
+                _d2.get("use_for_astrom", _d2["use_for_fit"]) & (_gids_j2 > 0)])
+        print(f"  Applied v2 Gaia use_for_fit:   "
+              f"{len(_all_fit_gids)} unique stars, {_n_fit_enabled} detections")
+        print(f"  Applied v2 Gaia use_for_astrom: "
+              f"{len(_all_astrom_gids)} unique stars, {_n_astrom_enabled} detections"
+              + (" (use_for_astrom.npz not found — using use_for_fit)"
+                 if _v2_ufa is None else ""))
     else:
         print("  WARNING: BP3M_v2_results/use_for_fit.npz not found — "
               "using quality-cut Gaia use_for_fit flags")
