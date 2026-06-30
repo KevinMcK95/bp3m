@@ -516,11 +516,11 @@ def _joint_solve_pop(
     delta    = C_shared @ rhs
 
     if fix_r:
-        return r_current.copy(), mu_pop_current + delta, C_shared, C_vT, a, a_align
+        return r_current.copy(), mu_pop_current + delta, C_shared, C_vT, a, a_align, K_img
     else:
         return (r_current + delta[idx_r],
                 mu_pop_current + delta[idx_mu],
-                C_shared, C_vT, a, a_align)
+                C_shared, C_vT, a, a_align, K_img)
 
 
 # ── Per-visit residual plots (before / after) ─────────────────────────────────
@@ -830,12 +830,21 @@ def run_pop_fit(
         gaia_catalog, mu_pop_current, member_sigma_clip, sigma_pm)
     print(f"  Initial members: {len(member_sidx)}")
 
+    # Recompute gaia_n_hst_used to reflect the v1 flags we just applied
+    solver.gaia_n_hst_used[:] = 0
+    for _img in image_names:
+        _d = solver._img_data.get(_img)
+        if _d is None:
+            continue
+        _use_any = _d['use_for_fit'] | _d.get('use_for_astrom', _d['use_for_fit'])
+        np.add.at(solver.gaia_n_hst_used, _d['sidx'][_use_any], 1)
+
     # ── Phase 1: μ-only solve (r fixed at v1 values) ──────────────────────────
     print(f"\n  Phase 1: μ-only solve ({n_iter_mu} iterations, r fixed)...")
     r_current = r_bp3m.copy()
     C_shared_mu = None
     for mu_iter in range(n_iter_mu):
-        _, mu_pop_new, C_shared_mu, C_vT, a_arr, _ = _joint_solve_pop(
+        _, mu_pop_new, C_shared_mu, C_vT, a_arr, _, _ = _joint_solve_pop(
             solver, image_names,
             member_sidx, mu_pop_current,
             sigma_pm, plx_pop, sigma_plx_tot,
@@ -862,7 +871,7 @@ def run_pop_fit(
     print(f"\n  Phase 2: joint solve ({n_iter_joint} iterations)...")
     C_shared_joint = None
     for jt_iter in range(n_iter_joint):
-        r_new, mu_pop_new, C_shared_joint, C_vT, a_arr, _ = _joint_solve_pop(
+        r_new, mu_pop_new, C_shared_joint, C_vT, a_arr, _, _ = _joint_solve_pop(
             solver, image_names,
             member_sidx, mu_pop_current,
             sigma_pm, plx_pop, sigma_plx_tot,
@@ -893,7 +902,7 @@ def run_pop_fit(
 
     # ── Final posterior pass at convergence ───────────────────────────────────
     print("\n  Final posterior pass...")
-    _, _, C_shared_final, C_vT_final, v_mean, _ = _joint_solve_pop(
+    _, _, C_shared_final, C_vT_final, v_mean, _, K_img_final = _joint_solve_pop(
         solver, image_names,
         member_sidx, mu_pop_current,
         sigma_pm, plx_pop, sigma_plx_tot,
@@ -901,48 +910,117 @@ def run_pop_fit(
         r_current, fix_r=False,
     )
 
-    # ── Save results ──────────────────────────────────────────────────────────
+    # ── Analytic marginalised posteriors (mirrors run_alignment.py) ──────────
+    print("\n  Computing analytic marginalised posteriors...")
+    C_r = C_shared_final[:n_r, :n_r]
+    v_mean_marg, v_cov = solver.compute_analytic_posteriors(
+        r_current, C_r, v_mean, K_img_final, C_vT_final)
+    v_cov_full = v_cov + C_vT_final   # full marginal covariance per star
+
+    # ── Save results (mirrors _save_results in run_alignment.py) ─────────────
     print("\n  Saving results...")
 
-    # image_transformations.csv
+    from bp3m.pipeline.run_alignment import compute_chi2_per_star
+
+    # 1. image_transformations.csv — same columns as v1 including sigmas
     _rows = []
     for j_idx, img in enumerate(image_names):
         cs    = j_idx * solver.N_R
         r_j   = r_current[cs:cs + solver.N_R]
+        C_j   = C_r[cs:cs + solver.N_R, cs:cs + solver.N_R]
         d_img = solver._img_data.get(img, {}) or {}
+        use_ast = d_img.get('use_for_astrom', d_img.get('use_for_fit', np.zeros(0, bool)))
+        a, b, c, d = r_j[:4]
         _rows.append(dict(
             image_name=img,
             n_stars_alignment=int(np.sum(d_img.get('use_for_fit', np.zeros(0, bool)))),
             n_stars_astrometry_only=int(np.sum(
-                d_img.get('use_for_astrom', d_img.get('use_for_fit', np.zeros(0, bool)))
-                & ~d_img.get('use_for_fit', np.zeros(0, bool)))),
-            a=r_j[0], b=r_j[1], c=r_j[2], d=r_j[3],
+                use_ast & ~d_img.get('use_for_fit', np.zeros(0, bool)))),
+            a=a, b=b, c=c, d=d,
             w=r_j[4], z=r_j[5],
             delta_ra0_mas=r_j[6] * 1000 if solver.N_R > 6 else 0.0,
             delta_dec0_mas=r_j[7] * 1000 if solver.N_R > 7 else 0.0,
+            pixel_scale_mas=(np.sqrt(a * d - b * c)
+                             * imgs.get(img, {}).get('orig_pixel_scale', 50.0)),
+            rotation_deg=np.degrees(np.arctan2(b - c, a + d)),
+            on_skew=(a - d) / 2,
+            off_skew=(b + c) / 2,
+            sigma_a=np.sqrt(C_j[0, 0]),   sigma_b=np.sqrt(C_j[1, 1]),
+            sigma_c=np.sqrt(C_j[2, 2]),   sigma_d=np.sqrt(C_j[3, 3]),
+            sigma_w=np.sqrt(C_j[4, 4]),   sigma_z=np.sqrt(C_j[5, 5]),
+            sigma_dra0_mas=np.sqrt(C_j[6, 6]) * 1000 if solver.N_R > 6 else 0.0,
+            sigma_ddec0_mas=np.sqrt(C_j[7, 7]) * 1000 if solver.N_R > 7 else 0.0,
             alpha=float(d_img.get('alpha_applied', 1.0)),
             **{f'r_{k}': float(r_j[k]) for k in range(8, solver.N_R)},
         ))
     pd.DataFrame(_rows).to_csv(output_pfr / 'image_transformations.csv', index=False)
     print(f"  Saved: image_transformations.csv  ({len(_rows)} images)")
 
-    # stellar_astrometry.csv
+    # 2. stellar_astrometry.csv — same columns as v1 plus is_member
     g = gaia_catalog.copy()
-    g['pmra_bp3m']           = v_mean[:, 2]
-    g['pmdec_bp3m']          = v_mean[:, 3]
-    g['parallax_bp3m']       = v_mean[:, 4]
-    g['delta_racosdec_bp3m'] = v_mean[:, 0]
-    g['delta_dec_bp3m']      = v_mean[:, 1]
-    g['sigma_pmra_bp3m']     = np.sqrt(np.maximum(C_vT_final[:, 2, 2], 0.0))
-    g['sigma_pmdec_bp3m']    = np.sqrt(np.maximum(C_vT_final[:, 3, 3], 0.0))
-    g['sigma_parallax_bp3m'] = np.sqrt(np.maximum(C_vT_final[:, 4, 4], 0.0))
+    g['n_hst_used']      = solver.gaia_n_hst_used
+
+    n_align_per_star = np.zeros(solver.n_stars, dtype=int)
+    for img in image_names:
+        d_img = solver._img_data.get(img)
+        if d_img is not None:
+            np.add.at(n_align_per_star, d_img['sidx'][d_img['use_for_fit']], 1)
+    g['n_hst_alignment'] = n_align_per_star
+
+    chi2_hst, n_chi2 = compute_chi2_per_star(
+        solver, r_current, v_mean, image_names, use_key='use_for_astrom')
+    g['chi2_hst']     = chi2_hst
+    g['n_det_chi2']   = n_chi2
+    with np.errstate(invalid='ignore', divide='ignore'):
+        g['chi2_hst_red'] = np.where(n_chi2 > 0, chi2_hst / (2 * n_chi2), np.nan)
+
+    g['delta_racosdec_bp3m'] = v_mean_marg[:, 0]
+    g['delta_dec_bp3m']      = v_mean_marg[:, 1]
+    g['pmra_bp3m']           = v_mean_marg[:, 2]
+    g['pmdec_bp3m']          = v_mean_marg[:, 3]
+    g['parallax_bp3m']       = v_mean_marg[:, 4]
+
+    g['sigma_delta_racosdec'] = np.sqrt(np.maximum(v_cov_full[:, 0, 0], 0.0))
+    g['sigma_delta_dec']      = np.sqrt(np.maximum(v_cov_full[:, 1, 1], 0.0))
+    g['sigma_pmra_bp3m']      = np.sqrt(np.maximum(v_cov_full[:, 2, 2], 0.0))
+    g['sigma_pmdec_bp3m']     = np.sqrt(np.maximum(v_cov_full[:, 3, 3], 0.0))
+    g['sigma_parallax_bp3m']  = np.sqrt(np.maximum(v_cov_full[:, 4, 4], 0.0))
+
+    _sig = np.sqrt(np.maximum(np.diagonal(v_cov_full, axis1=1, axis2=2), 0.0))
+    for col, i, j in [
+        ('corr_dra_ddec', 0, 1), ('corr_dra_pmra', 0, 2),
+        ('corr_dra_pmdec', 0, 3), ('corr_dra_plx', 0, 4),
+        ('corr_ddec_pmra', 1, 2), ('corr_ddec_pmdec', 1, 3),
+        ('corr_ddec_plx', 1, 4), ('corr_pmra_pmdec', 2, 3),
+        ('corr_pmra_plx', 2, 4), ('corr_pmdec_plx', 3, 4),
+    ]:
+        denom = _sig[:, i] * _sig[:, j]
+        g[col] = np.where(denom > 0, v_cov_full[:, i, j] / denom, np.nan)
+
+    # Conditional (MAP alignment fixed) — v_mean is the conditional mean
+    g['pmra_bp3m_cond']           = v_mean[:, 2]
+    g['pmdec_bp3m_cond']          = v_mean[:, 3]
+    g['parallax_bp3m_cond']       = v_mean[:, 4]
+    g['sigma_pmra_bp3m_cond']     = np.sqrt(np.maximum(C_vT_final[:, 2, 2], 0.0))
+    g['sigma_pmdec_bp3m_cond']    = np.sqrt(np.maximum(C_vT_final[:, 3, 3], 0.0))
+    g['sigma_parallax_bp3m_cond'] = np.sqrt(np.maximum(C_vT_final[:, 4, 4], 0.0))
+
     _mem_mask = np.zeros(solver.n_stars, dtype=bool)
     _mem_mask[member_sidx] = True
     g['is_member'] = _mem_mask
-    g.to_csv(output_pfr / 'stellar_astrometry.csv', index=False)
-    print(f"  Saved: stellar_astrometry.csv  ({len(g)} stars)")
 
-    # detection flags and star indices
+    g.to_csv(output_pfr / 'stellar_astrometry.csv', index=False)
+    print(f"  Saved: stellar_astrometry.csv  "
+          f"({len(g)} stars, {solver.gaia_n_hst_used.sum()} HST detections)")
+
+    # 3. Covariance arrays
+    np.save(output_pfr / 'v_cov_marginalised.npy', v_cov)
+    np.save(output_pfr / 'C_vT.npy',              C_vT_final)
+    np.save(output_pfr / 'C_r.npy',               C_r)
+    np.save(output_pfr / 'C_joint.npy',            C_shared_final)  # (n_r+2) × (n_r+2)
+    print(f"  Saved: v_cov_marginalised.npy, C_vT.npy, C_r.npy, C_joint.npy")
+
+    # 4. Detection flags
     _fit_data = {}; _astrom_data = {}; _idx_data = {}
     for img in image_names:
         d_img = solver._img_data.get(img)
@@ -955,19 +1033,28 @@ def run_pop_fit(
     np.savez(output_pfr / 'use_for_astrom.npz', **_astrom_data)
     np.savez(output_pfr / 'star_indices.npz',   **_idx_data)
 
-    # detections.npz
+    # 5. Per-detection GDC-frame residuals (same keys as v1 detections.npz)
     try:
-        gdc_fin = solver.compute_gdc_residuals(r_current, v_mean, C_vT=C_vT_final)
-        _det: dict = {}
+        gdc_fin = solver.compute_gdc_residuals(r_current, v_mean, C_r=C_r, C_vT=C_vT_final)
+        _det_data: dict = {}
+        n_det_total = 0
         for img, rd in gdc_fin.items():
-            for k, v in rd.items():
-                _det[f'{img}_{k}'] = v
-        np.savez_compressed(output_pfr / 'detections.npz', **_det)
-        print(f"  Saved: detections.npz  ({len(gdc_fin)} images)")
+            _det_data[f'{img}_X_c']            = rd['X_c']
+            _det_data[f'{img}_Y_c']            = rd['Y_c']
+            _det_data[f'{img}_dx_gdc']         = rd['dx_gdc']
+            _det_data[f'{img}_dy_gdc']         = rd['dy_gdc']
+            _det_data[f'{img}_C_hst']          = rd['C_hst']
+            _det_data[f'{img}_C_gdc_total']    = rd['C_gdc_total']
+            _det_data[f'{img}_sidx']           = rd['sidx']
+            _det_data[f'{img}_use_for_fit']    = rd['use_for_fit']
+            _det_data[f'{img}_use_for_astrom'] = rd['use_for_astrom']
+            n_det_total += len(rd['sidx'])
+        np.savez_compressed(output_pfr / 'detections.npz', **_det_data)
+        print(f"  Saved: detections.npz  ({len(gdc_fin)} images, {n_det_total} detections)")
     except Exception as _exc:
         print(f"  WARNING: detections.npz failed — {_exc}")
 
-    # mu_pop.json
+    # 6. mu_pop.json
     mu_result = {
         'mu_pop_ra_masyr':    float(mu_pop_current[0]),
         'mu_pop_dec_masyr':   float(mu_pop_current[1]),
@@ -984,10 +1071,11 @@ def run_pop_fit(
     with open(output_pfr / 'mu_pop.json', 'w') as _f:
         json.dump(mu_result, _f, indent=2)
 
-    # run_config.json
+    # 7. run_config.json
     with open(output_pfr / 'run_config.json', 'w') as _f:
         json.dump({
-            'poly_order': poly_order, 'n_images': len(image_names),
+            'poly_order': poly_order, 'n_r_per_image': solver.N_R,
+            'n_images': len(image_names),
             'n_stars': solver.n_stars, 'image_names': image_names,
             'sigma_pm': sigma_pm, 'plx_pop': plx_pop,
             'sigma_plx_tot': sigma_plx_tot,
@@ -1001,10 +1089,28 @@ def run_pop_fit(
         }, _f, indent=2)
     print(f"  Saved: mu_pop.json, run_config.json")
 
+    # 8. Star influence
+    try:
+        influence_df = solver.compute_star_influence(r_current, C_r, v_mean)
+        influence_df.to_csv(output_pfr / 'star_influence.csv', index=False)
+        print(f"  Saved: star_influence.csv  ({len(influence_df)} star-image pairs)")
+    except Exception as _exc:
+        print(f"  WARNING: star_influence.csv failed — {_exc}")
+
     # ── Plots ─────────────────────────────────────────────────────────────────
     if not no_plots:
+        try:
+            from bp3m.pipeline.plot_results import make_plots
+            print("\n  Generating diagnostic plots...")
+            make_plots(solver, imgs, gaia_catalog,
+                       r_current, v_mean, v_mean_marg, v_cov, C_vT_final, C_r,
+                       output_dir=output_pfr,
+                       plot_residuals=False)
+        except Exception as _exc:
+            print(f"  WARNING: make_plots failed — {_exc}")
+
         _plot_dir = output_pfr / 'plots' / 'residuals'
-        print(f"\n  Plotting residual maps ({len(image_names)} images)...")
+        print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
         try:
             _plot_pop_residual_maps(
                 _plot_dir, image_names, solver,
