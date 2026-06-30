@@ -916,6 +916,7 @@ def _joint_solve_cte(
     gamma_prior: np.ndarray | None = None,
     hst_prior_sidx: np.ndarray | None = None,
     fit_cte_x: bool = True,
+    restrict_align_to_members: bool = True,
 ) -> tuple:
     """
     Joint Schur-complement solve for (r, γ_CTE, μ_pop) after marginalising
@@ -1000,10 +1001,19 @@ def _joint_solve_cte(
 
     # ── Precision matrices and information vectors ────────────────────────────
     # Start from solver's Gaia prior; population prior added for members below.
-    # _C_VG_inv_per_star (diffuse 100 mas/yr PM prior) is intentionally excluded:
-    # the population prior is the correct constraint for members, and non-member
-    # stars are not processed at all in this solve.
+    # _C_VG_inv_per_star (diffuse 100 mas/yr PM prior): excluded for member stars
+    # (population prior is the correct constraint) and normally excluded for
+    # non-members (they are not processed). When restrict_align_to_members=False,
+    # non-member 2p Gaia stars are included for alignment and need the diffuse
+    # prior to ensure a well-posed H_vv (their C_survey_inv has zero PM/plx blocks).
     H_vv = solver.C_survey_inv.copy()
+    if not restrict_align_to_members:
+        # Add diffuse prior for non-member 2p stars so their H_vv is invertible.
+        # 5p/6p non-members already have full Gaia PM/plx precision; 2p do not.
+        _nonmem_2p = ~all_member_mask & (solver._C_VG_inv_per_star[:, 2] > 0)
+        if _nonmem_2p.any():
+            for _k in range(N_V):
+                H_vv[_nonmem_2p, _k, _k] += solver._C_VG_inv_per_star[_nonmem_2p, _k]
 
     # All stars that receive the population prior (Gaia members + fixed HST-only).
     # member_sidx alone drives μ_pop (Schur correction below).
@@ -1061,12 +1071,19 @@ def _joint_solve_cte(
 
         sidx         = d["sidx"]
         _mem         = all_member_mask[sidx]           # True for all members in this image
-        # Restrict to member stars only — non-members have unconstrained positions/PMs
-        # and absorb CTE signal rather than constraining it.
-        use_fit      = d["use_for_fit"] & _mem
-        use_astrom_f = ((d.get("use_for_astrom", d["use_for_fit"])
-                         if getattr(solver, '_use_two_tier', False) else d["use_for_fit"]) & _mem)
-        use_any      = use_fit | use_astrom_f          # all active members
+        if restrict_align_to_members:
+            # CTE joint solve: restrict to member stars — non-members absorb CTE signal.
+            use_fit      = d["use_for_fit"] & _mem
+            use_astrom_f = ((d.get("use_for_astrom", d["use_for_fit"])
+                             if getattr(solver, '_use_two_tier', False) else d["use_for_fit"]) & _mem)
+        else:
+            # Phase [2/4]: use all Gaia-matched stars (d["use_for_fit"] has already been
+            # overridden with BP3M_v2_results flags for Gaia stars; HST-only excluded
+            # via the C_survey_inv > 0 filter).
+            _gaia_matched = (solver.C_survey_inv[sidx].sum(axis=(1, 2)) > 0)
+            use_fit      = d["use_for_fit"] & _gaia_matched
+            use_astrom_f = use_fit
+        use_any      = use_fit | use_astrom_f          # all active stars
         use_member   = use_any & member_mask[sidx]     # Gaia members only (drive μ_pop)
 
         sidx_any = sidx[use_any]
@@ -1269,8 +1286,13 @@ def _joint_solve_cte(
         cs       = j_idx * nr
         sidx     = d["sidx"]
         _mem     = all_member_mask[sidx]
-        use_fit  = d["use_for_fit"] & _mem      # member-only alignment
-        use_fmem = use_fit                       # all are members; all couple to μ_pop
+        if restrict_align_to_members:
+            use_fit  = d["use_for_fit"] & _mem  # member-only alignment
+            use_fmem = use_fit                   # all are members; all couple to μ_pop
+        else:
+            _gaia_matched = (solver.C_survey_inv[sidx].sum(axis=(1, 2)) > 0)
+            use_fit  = d["use_for_fit"] & _gaia_matched
+            use_fmem = use_fit & member_mask[sidx]
 
         sidx_fit  = sidx[use_fit]
         K_fit     = K_img[img][use_fit]          # (n_fit, 5, N_R)
@@ -1305,7 +1327,11 @@ def _joint_solve_cte(
             if d2 is None or K_img.get(img2) is None:
                 continue
             sidx_d2  = d2["sidx"]
-            use2     = d2["use_for_fit"] & all_member_mask[sidx_d2]
+            if restrict_align_to_members:
+                use2 = d2["use_for_fit"] & all_member_mask[sidx_d2]
+            else:
+                _gm2 = (solver.C_survey_inv[sidx_d2].sum(axis=(1, 2)) > 0)
+                use2 = d2["use_for_fit"] & _gm2
             sidx2    = sidx_d2[use2]
             K2       = K_img[img2][use2]
 
@@ -2210,8 +2236,26 @@ def warm_start_cte(
     _cte_tmpl_gaia = default_cte_params(
         0, cte_template['hi'].mag_norm_ref, cte_template['hi'].mag_norm_scale,
         0, time_poly_order=0)  # spatial_order=0 ⟹ nb=0 ⟹ n_gamma=0
+    # Count unique Gaia stars with use_for_fit=True across all images.
+    # This reflects the v2 override and is the actual set used in the solve.
+    _used_gaia_sidx: set = set()
+    for _img in image_names:
+        _di = solver._img_data.get(_img)
+        if _di is None:
+            continue
+        _si = _di["sidx"]
+        _gm = solver.C_survey_inv[_si].sum(axis=(1, 2)) > 0
+        _uf = _di["use_for_fit"]
+        _used_gaia_sidx.update(int(s) for s in _si[_uf & _gm])
+    _n_gaia_total = len(_used_gaia_sidx)
+    _member_sidx_set = set(int(s) for s in member_sidx_gaia)
+    _n_gaia_mem    = len(_used_gaia_sidx & _member_sidx_set)
+    _n_gaia_nonmem = _n_gaia_total - _n_gaia_mem
     print(f"\n  [2/4] Gaia-only (r, μ_pop) refinement "
-          f"({n_gaia_warmstart_iters} iter, {len(member_sidx_gaia)} stars)...")
+          f"({n_gaia_warmstart_iters} iter, "
+          f"{_n_gaia_mem} members + "
+          f"{_n_gaia_nonmem} non-members = "
+          f"{_n_gaia_total} Gaia stars for alignment)...")
 
     # ── Gaia-only weighted mean PM diagnostic ────────────────────────────────
     # Compute the maximum-likelihood population mean PM using only Gaia catalog
@@ -2247,6 +2291,7 @@ def warm_start_cte(
             regularize_gamma=regularize_gamma,
             hst_prior_sidx=None,
             fit_cte_x=fit_cte_x,
+            restrict_align_to_members=False,
         )
         r_ws, _, _, mu_ws, _C_shared_ws, _, _, _ = _result_g
         solver._update_R(r_ws)
@@ -3058,6 +3103,9 @@ def _plot_cte_diagnostics(output_dir: Path, cte_params: dict,
         _has_bp3m = (astrom['pmra_bp3m'].notna() & astrom['pmdec_bp3m'].notna() &
                      astrom['sigma_pmra_bp3m'].notna())
         astrom = astrom[_has_bp3m].copy().reset_index(drop=True)
+        # Restrict to member stars only for plots (non-members stay in the CSV)
+        if 'is_member' in astrom.columns:
+            astrom = astrom[astrom['is_member'].astype(bool)].copy().reset_index(drop=True)
         if len(astrom) < 10:
             print(f"  pm_vs_detector: too few CTE members ({len(astrom)}) — skipping")
             raise RuntimeError("astrom_csv_missing")
@@ -3703,6 +3751,11 @@ def _run_joint_cte_loop(
     # Single post-convergence alpha update with the final CTE+transform solution.
     _update_image_alpha(solver, image_names, r_hat, a_arr)
 
+    # ── Post-convergence covariance / degeneracy report ───────────────────────
+    if C_shared is not None:
+        _print_covariance_analysis(C_shared, nr, len(image_names), image_names,
+                                   cte_params)
+
     return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT, cte_params, gamma_history, mu_pop_history, C_mu_history
 
 
@@ -3856,6 +3909,7 @@ def _plot_per_image_detector_residuals(
     prefix: str = 'warmstart',
     vclip: float | None = None,
     img_meta: dict | None = None,
+    member_gaia_ids: set | None = None,
 ) -> None:
     """
     Per-visit 3×2 detector residual maps combining both chips (hi+lo).
@@ -3906,6 +3960,12 @@ def _plot_per_image_detector_residuals(
             spi = filtered_spi.get(img)
             if spi is None or len(spi) == 0:
                 continue
+            # Filter to member stars only if member_gaia_ids provided
+            if member_gaia_ids is not None and 'Gaia_id' in spi.columns:
+                _gids = spi['Gaia_id'].to_numpy(np.int64)
+                spi = spi[np.isin(_gids, list(member_gaia_ids))].copy()
+                if len(spi) == 0:
+                    continue
             xc_key = f'{img}_X_c'
             if xc_key not in arrays_stage1:
                 continue
@@ -4060,6 +4120,7 @@ def _save_warmstart_stellar_astrometry(
     solver,
     gaia_catalog: 'pd.DataFrame',
     output_dir: Path,
+    member_sidx: np.ndarray | None = None,
 ) -> None:
     """
     Save warmstart stellar astrometry as stellar_astrometry_warmstart.csv.
@@ -4076,6 +4137,14 @@ def _save_warmstart_stellar_astrometry(
 
     pmra   = a_arr_ws[star_rows[order], 2]
     pmdec  = a_arr_ws[star_rows[order], 3]
+
+    # Build member mask
+    if member_sidx is not None:
+        _mem_mask_all = np.zeros(n_stars, dtype=bool)
+        _mem_mask_all[member_sidx] = True
+        is_member = _mem_mask_all[star_rows[order]]
+    else:
+        is_member = np.ones(len(star_ids), dtype=bool)
 
     # Get ra, dec from gaia_catalog where available
     ra_arr  = np.full(len(star_ids), np.nan)
@@ -4100,6 +4169,7 @@ def _save_warmstart_stellar_astrometry(
         'pmdec_bp3m':      pmdec,
         'sigma_pmra_bp3m': np.ones(len(star_ids)),   # uniform uncertainty
         'sigma_pmdec_bp3m': np.ones(len(star_ids)),
+        'is_member':       is_member.astype(int),
     })
     out_path = Path(output_dir) / 'stellar_astrometry_warmstart.csv'
     df.to_csv(out_path, index=False)
@@ -4721,24 +4791,31 @@ def run_alignment_joint_cte(
     t_launch_yr  = _ACS_LAUNCH_YR
     print(f"  t_epoch0 = {t_epoch0_yr:.4f} yr")
 
-    # ── Warm start from v1/v2 transformations ─────────────────────────────────
-    v1_bp3m_dir   = data_root / field_name / "BP3M_results"
-    v1_xform_path = v1_bp3m_dir / "image_transformations.csv"
+    # ── Warm start from v2 transformations (fall back to v1 if absent) ──────────
+    # v2 parameters are already fully converged on the Gaia reference frame, so
+    # starting from them gives Δr ≈ 0 in Phase [2/4] and suppresses the (r, μ_pop)
+    # Schur coupling that corrupts μ_pop when starting from the coarser v1 solution.
+    _init_sources = [
+        (data_root / field_name / "BP3M_v2_results" / "image_transformations.csv", "v2"),
+        (data_root / field_name / "BP3M_results"    / "image_transformations.csv", "v1"),
+    ]
     v1_abcdwz: dict[str, np.ndarray] = {}
-    if v1_xform_path.exists():
-        v1_df = pd.read_csv(v1_xform_path)
-        for _, row in v1_df.iterrows():
-            img_key = str(row["image_name"])
-            v1_abcdwz[img_key] = np.array([
-                float(row["a"]), float(row["b"]),
-                float(row["c"]), float(row["d"]),
-                float(row["w"]), float(row["z"]),
-            ])
-        imgs = {sub: dict(meta) for sub, meta in imgs.items()}
-        for sub, meta in imgs.items():
-            if sub in v1_abcdwz:
-                meta["fcm_abcdwz"] = v1_abcdwz[sub]
-        print(f"  Loaded v1 BP3M: {len(v1_abcdwz)} images as initialization")
+    for _xform_path, _label in _init_sources:
+        if _xform_path.exists():
+            _df = pd.read_csv(_xform_path)
+            for _, row in _df.iterrows():
+                img_key = str(row["image_name"])
+                v1_abcdwz[img_key] = np.array([
+                    float(row["a"]), float(row["b"]),
+                    float(row["c"]), float(row["d"]),
+                    float(row["w"]), float(row["z"]),
+                ])
+            imgs = {sub: dict(meta) for sub, meta in imgs.items()}
+            for sub, meta in imgs.items():
+                if sub in v1_abcdwz:
+                    meta["fcm_abcdwz"] = v1_abcdwz[sub]
+            print(f"  Loaded {_label} BP3M: {len(v1_abcdwz)} images as initialization")
+            break
 
     # ── Initialise solver ──────────────────────────────────────────────────────
     SolverClass = BP3MSolverSparse if use_sparse else BP3MSolver
@@ -4922,7 +4999,62 @@ def run_alignment_joint_cte(
         except Exception as _exc_v2:
             print(f"  WARNING: v2 pre-warmstart residuals failed — {_exc_v2}")
 
+    # ── Override Gaia use_for_fit from BP3M_v2_results ───────────────────────
+    # The v2 use_for_fit flags represent the fully-converged Gaia alignment quality.
+    # We apply them directly to the solver so ALL CTE phases use exactly the same
+    # Gaia detections as v2 used.  HST-only use_for_fit is left unchanged.
+    _v2_uff_path = data_root / field_name / "BP3M_v2_results" / "use_for_fit.npz"
+    _v2_si_path  = data_root / field_name / "BP3M_v2_results" / "star_indices.npz"
+    _v2_sa_path  = data_root / field_name / "BP3M_v2_results" / "stellar_astrometry.csv"
+    if all(p.exists() for p in [_v2_uff_path, _v2_si_path, _v2_sa_path]):
+        _v2_uff = np.load(_v2_uff_path)
+        _v2_si  = np.load(_v2_si_path)
+        # Read Gaia_id as int64 directly — never let it pass through float64
+        _v2_sa  = pd.read_csv(_v2_sa_path, dtype={'Gaia_id': np.int64})
+        _v2_gids_arr = _v2_sa['Gaia_id'].to_numpy(np.int64)
+        # Per-image frozensets of Gaia IDs used in v2
+        _v2_per_img: dict[str, frozenset] = {}
+        for _img in _v2_uff.files:
+            _mask = _v2_uff[_img].astype(bool)
+            _sidx = _v2_si[_img]
+            _gids_used = _v2_gids_arr[_sidx[_mask]]
+            _v2_per_img[_img] = frozenset(int(g) for g in _gids_used if g > 0)
+        # Build joint-CTE-solver star-index → Gaia ID (int64, no float roundtrip)
+        _n_sol = solver.C_survey_inv.shape[0]
+        _sol_gid = np.zeros(_n_sol, dtype=np.int64)
+        for _gid, _idx in solver.star_id_to_idx.items():
+            _sol_gid[_idx] = np.int64(_gid)
+        # Override use_for_fit in-place: Gaia stars follow v2 flags, HST-only unchanged
+        _n_gaia_det_enabled = 0
+        for _img in image_names:
+            _d = solver._img_data.get(_img)
+            if _d is None:
+                continue
+            _sidx_j  = _d["sidx"]
+            _gids_j  = _sol_gid[_sidx_j]               # int64, no float roundtrip
+            _is_gaia = _gids_j > 0
+            _v2_set  = _v2_per_img.get(_img, frozenset())
+            _in_v2   = np.array([int(g) in _v2_set for g in _gids_j], dtype=bool)
+            # Gaia detections: use v2 flag; HST-only: keep existing flag
+            _d["use_for_fit"] = np.where(_is_gaia, _in_v2, _d["use_for_fit"])
+            _n_gaia_det_enabled += int((_is_gaia & _in_v2).sum())
+        _all_used_gids: set = set()
+        for _img in image_names:
+            _d2 = solver._img_data.get(_img)
+            if _d2 is None:
+                continue
+            _gids_j2 = _sol_gid[_d2["sidx"]]
+            _used    = _d2["use_for_fit"] & (_gids_j2 > 0)
+            _all_used_gids.update(int(g) for g in _gids_j2[_used])
+        print(f"  Applied v2 Gaia use_for_fit: "
+              f"{len(_all_used_gids)} unique Gaia stars, "
+              f"{_n_gaia_det_enabled} detections across all images")
+    else:
+        print("  WARNING: BP3M_v2_results/use_for_fit.npz not found — "
+              "using quality-cut Gaia use_for_fit flags")
+
     # ── CTE warm start ─────────────────────────────────────────────────────────
+    _mem_gaia_ids_ws = None  # populated in warmstart diagnostic block; used by per-image plots
     print("\n  CTE warm start...")
     cte_params, mu_pop_warm, r_ws_diag, a_arr_ws = warm_start_cte(
         solver, image_names, filtered_spi, t_launch_yr,
@@ -4958,8 +5090,11 @@ def run_alignment_joint_cte(
             print(f"  WARNING: warmstart CTE diagnostics failed — {_exc}")
         # Warmstart cte_pm_vs_detector using warmstart stellar astrometry
         try:
+            _mem_sidx_all = np.concatenate([member_sidx_gaia, member_sidx_hst]) \
+                if len(member_sidx_hst) > 0 else member_sidx_gaia
             _save_warmstart_stellar_astrometry(
-                a_arr_ws, solver, gaia_catalog, output_dir_joint)
+                a_arr_ws, solver, gaia_catalog, output_dir_joint,
+                member_sidx=_mem_sidx_all)
             _plot_cte_diagnostics(
                 output_dir_joint, cte_params,
                 before_npz=None,
@@ -4973,6 +5108,15 @@ def run_alignment_joint_cte(
             print(f"  WARNING: warmstart pm_vs_detector failed — {_exc}")
 
         # ── Per-image detector residual maps (3 stages × dx/dy) ──────────────
+        # Build member Gaia ID set for plot filtering
+        _mem_sidx_set_ws = set(int(x) for x in (
+            np.concatenate([member_sidx_gaia, member_sidx_hst])
+            if len(member_sidx_hst) > 0 else member_sidx_gaia
+        ))
+        _mem_gaia_ids_ws = set(
+            int(gid) for gid, idx in solver.star_id_to_idx.items()
+            if idx in _mem_sidx_set_ws
+        )
         if _ws_v2 is not None:
             try:
                 _plot_per_image_detector_residuals(
@@ -4986,6 +5130,7 @@ def run_alignment_joint_cte(
                                   "post-CTE warmstart"),
                     prefix='warmstart',
                     img_meta=_img_meta,
+                    member_gaia_ids=_mem_gaia_ids_ws,
                 )
             except Exception as _exc:
                 import traceback
@@ -5057,6 +5202,8 @@ def run_alignment_joint_cte(
         n_r = C_shared.shape[0] - _n_gamma - 2  # n_shared = n_r + n_gamma + n_mu(2)
         cte_out['C_mu_pop'] = C_shared[-2:, -2:]
         cte_out['C_gamma']  = C_shared[n_r:n_r + _n_gamma, n_r:n_r + _n_gamma]
+        np.save(output_dir_joint / 'C_shared.npy', C_shared)
+        print(f"  Saved: C_shared.npy  (shape {C_shared.shape})")
     np.savez(output_dir_joint / 'cte_params.npz', **cte_out)
     print(f"  Saved: cte_params.npz")
 
@@ -5180,6 +5327,7 @@ def run_alignment_joint_cte(
                                   "post-CTE (final)"),
                     prefix='final',
                     img_meta=_img_meta,
+                    member_gaia_ids=_mem_gaia_ids_ws,
                 )
             except Exception as exc:
                 print(f"  WARNING: final per-image residual maps failed — {exc}")
