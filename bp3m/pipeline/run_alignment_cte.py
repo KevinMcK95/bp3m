@@ -917,6 +917,7 @@ def _joint_solve_cte(
     hst_prior_sidx: np.ndarray | None = None,
     fit_cte_x: bool = True,
     restrict_align_to_members: bool = True,
+    diag_substeps: bool = False,
 ) -> tuple:
     """
     Joint Schur-complement solve for (r, γ_CTE, μ_pop) after marginalising
@@ -1356,6 +1357,39 @@ def _joint_solve_cte(
         C_shared_sc = np.linalg.pinv(Lambda_sc)
     C_shared = d_inv[:, None] * C_shared_sc * d_inv[None, :]
     delta    = C_shared @ rhs
+
+    if diag_substeps:
+        # ── Diagnostic: r-only, μ-only, and joint sub-solutions ─────────────────
+        # Sub-solve A: r-only (μ_pop fixed at mu_pop_current)
+        _Lrr  = Lambda[idx_r, idx_r]
+        _d_rr = np.sqrt(np.maximum(np.abs(np.diag(_Lrr)), 1e-30))
+        _di_rr = 1.0 / _d_rr
+        _Lrr_sc = _di_rr[:, None] * _Lrr * _di_rr[None, :]
+        try:    _Crr_sc = np.linalg.inv(_Lrr_sc)
+        except: _Crr_sc = np.linalg.pinv(_Lrr_sc)
+        _delta_r_only = _di_rr * (_Crr_sc @ (_di_rr * rhs[idx_r]))
+        _dr_only = float(np.max(np.abs(_delta_r_only)))
+        # Sub-solve B: μ-only (r fixed at r_current)
+        _Lmm = Lambda[idx_mu, idx_mu]
+        try:    _Cmm = np.linalg.inv(_Lmm)
+        except: _Cmm = np.linalg.pinv(_Lmm)
+        _delta_mu_only = _Cmm @ rhs[idx_mu]
+        _mu_only = mu_pop_current + _delta_mu_only
+        _s_ra_only = float(np.sqrt(max(_Cmm[0, 0], 0.0)))
+        _s_de_only = float(np.sqrt(max(_Cmm[1, 1], 0.0)))
+        _rho_only  = float(_Cmm[0, 1] / (_s_ra_only * _s_de_only + 1e-30))
+        _dmu_only  = float(np.max(np.abs(_delta_mu_only)))
+        # Sub-solve C: joint (from full solve above)
+        _mu_joint = mu_pop_current + delta[idx_mu]
+        _dr_joint  = float(np.max(np.abs(delta[idx_r])))
+        _dmu_joint = float(np.max(np.abs(delta[idx_mu])))
+        print(f"\n    [2/4 pre-diag] sub-solutions at current initialization:")
+        print(f"      A) r-only  (μ_pop fixed):  Δr={_dr_only:.3e}")
+        print(f"      B) μ-only  (r fixed):       Δμ={_dmu_only:.4f}  "
+              f"μ_pop=({_mu_only[0]:+.4f}±{_s_ra_only:.4f}, "
+              f"{_mu_only[1]:+.4f}±{_s_de_only:.4f}) ρ={_rho_only:+.3f} mas/yr")
+        print(f"      C) joint:                   Δr={_dr_joint:.3e}  Δμ={_dmu_joint:.4f}  "
+              f"μ_pop=({_mu_joint[0]:+.4f}, {_mu_joint[1]:+.4f}) mas/yr")
 
     r_hat      = r_current + delta[idx_r]
     gamma_hat  = delta[idx_gam]
@@ -2281,6 +2315,25 @@ def warm_start_cte(
     _t0 = _wtime.time()
     r_ws  = r_init.copy()
     mu_ws = mu_pop_prior.copy()
+
+    # ── One-shot diagnostic: r-only, μ-only, joint sub-solutions at init ────────
+    # Runs once at the initial (r, μ_pop) before any Phase [2/4] update.
+    # Reveals whether (A) r is already at the astrometric optimum (Δr small),
+    # (B) μ_pop converges correctly when r is held fixed, and
+    # (C) the joint update reproduces both or shows the r–μ degeneracy.
+    print(f"\n    Diagnostic: one-shot sub-solutions at initialization (no update applied):")
+    _joint_solve_cte(
+        solver, image_names, _cte_tmpl_gaia, t_launch_yr, filtered_spi,
+        member_sidx_gaia, sigma_pm, plx_pop, sigma_plx_tot,
+        mu_ws, mu_pop_prior, C_pop_prior_inv, r_ws,
+        regularize_gamma=regularize_gamma,
+        hst_prior_sidx=None,
+        fit_cte_x=fit_cte_x,
+        restrict_align_to_members=False,
+        diag_substeps=True,
+    )
+    # r_ws and mu_ws are NOT updated — diagnostic only.
+
     _r_prev_ws  = r_ws.copy()
     _mu_prev_ws = mu_ws.copy()
     for _ws_it in range(n_gaia_warmstart_iters):
