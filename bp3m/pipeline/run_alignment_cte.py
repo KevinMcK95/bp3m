@@ -1454,7 +1454,35 @@ def _joint_solve_cte(
                 _sfv_d = _sidxv_d[_ufv_d]
                 _Kfv_d = K_img[_imgv_d][_ufv_d]
                 _rhs_schur_v2[_csv_d:_csv_d+nr] += np.einsum('nji,nj->i', _Kfv_d, a_align_v2[_sfv_d])
-        print(f"\n    [A diag] rhs_r_v2: max|data|={np.max(np.abs(_rhs_data_v2)):.3e}  "
+        # Also compute x_resid statistics across all fitting stars
+        _xresid_all = []
+        _xresid_img_rms = {}
+        for _jv_d, _imgv_d in enumerate(image_names):
+            _dv_d = solver._img_data.get(_imgv_d)
+            if _dv_d is None:
+                continue
+            _sidxv_d = _dv_d["sidx"]
+            _gmv_d = solver.C_survey_inv[_sidxv_d].sum(axis=(1, 2)) > 0
+            _ufv_d = _dv_d["use_for_fit"] & _gmv_d
+            if not _ufv_d.any():
+                continue
+            _Xv = _dv_d["X_mat"]
+            _xys_v = _dv_d.get("xys_orig", _dv_d["xys"])
+            _csv_d = _jv_d * nr
+            _r_jv = r_current[_csv_d:_csv_d + nr]
+            _xpred_v = np.einsum('nkl,l->nk', _Xv, _r_jv)
+            _xres_v = _xys_v[_ufv_d] - _xpred_v[_ufv_d]
+            _xresid_all.append(_xres_v)
+            _xresid_img_rms[_imgv_d] = float(np.sqrt(np.mean(_xres_v**2)))
+        if _xresid_all:
+            _xra = np.concatenate(_xresid_all, axis=0)
+            _xr_rms = float(np.sqrt(np.mean(_xra**2)))
+            _xr_max = float(np.max(np.abs(_xra)))
+            _worst_img = max(_xresid_img_rms, key=_xresid_img_rms.get)
+            print(f"    [A diag] x_resid stats ({len(_xra)} fitting stars): "
+                  f"rms={_xr_rms:.4e} arcsec  max={_xr_max:.4e} arcsec  "
+                  f"worst_img={_worst_img} (rms={_xresid_img_rms[_worst_img]:.4e})")
+        print(f"    [A diag] rhs_r_v2: max|data|={np.max(np.abs(_rhs_data_v2)):.3e}  "
               f"max|schur|={np.max(np.abs(_rhs_schur_v2)):.3e}  "
               f"max|total|={np.max(np.abs(rhs_r_v2)):.3e}")
         _imax_v2 = int(np.argmax(np.abs(_delta_r_v2)))
