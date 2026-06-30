@@ -341,13 +341,21 @@ def load_master_v2(
             pairs = []
             for col in hst_idx_cols:
                 pairs.extend(_parse_detections_column(row.get(col, "")))
-            # deduplicate while preserving order
-            seen: set = set()
+            # Deduplicate: first by exact (sub_name, cat_idx), then by sub_name.
+            # A source should have at most one detection per image; if the same
+            # sub_name appears with two different cat_idx values (matched to two
+            # catalog entries in the same image), keep the first occurrence.
+            seen_pair: set = set()
+            seen_sub: set = set()
             deduped = []
             for p in pairs:
-                if p not in seen:
-                    seen.add(p)
-                    deduped.append(p)
+                if p in seen_pair:
+                    continue
+                seen_pair.add(p)
+                if p[0] in seen_sub:
+                    continue
+                seen_sub.add(p[0])
+                deduped.append(p)
             pairs = deduped
 
         # Phase 4 outliers: keep them in a SEPARATE list so they enter the
