@@ -1359,36 +1359,106 @@ def _joint_solve_cte(
     delta    = C_shared @ rhs
 
     if diag_substeps:
-        # ── Diagnostic: r-only, μ-only, and joint sub-solutions ─────────────────
-        # Sub-solve A: r-only (μ_pop fixed at mu_pop_current)
-        _Lrr  = Lambda[idx_r, idx_r]
-        _d_rr = np.sqrt(np.maximum(np.abs(np.diag(_Lrr)), 1e-30))
-        _di_rr = 1.0 / _d_rr
-        _Lrr_sc = _di_rr[:, None] * _Lrr * _di_rr[None, :]
-        try:    _Crr_sc = np.linalg.inv(_Lrr_sc)
-        except: _Crr_sc = np.linalg.pinv(_Lrr_sc)
-        _delta_r_only = _di_rr * (_Crr_sc @ (_di_rr * rhs[idx_r]))
-        _dr_only = float(np.max(np.abs(_delta_r_only)))
-        # Sub-solve B: μ-only (r fixed at r_current)
+        # ── Diagnostic: v2-like r-only (A), μ-only (B), joint (C) ──────────────
+        #
+        # A) v2-like r-only: remove population PM/parallax prior from H_vv and
+        #    h_align, recompute stellar posteriors, then solve r-only.  This
+        #    mirrors what BP3M v2 does (pure astrometric solve, no pop prior).
+        #    If Δr ≈ 0, v2 init is at the optimum for this star set.
+        H_vv_v2     = H_vv.copy()
+        h_align_v2  = h_align.copy()
+        H_vv_v2[_all_prior, 2, 2] -= sigma_pm_inv_sq
+        H_vv_v2[_all_prior, 3, 3] -= sigma_pm_inv_sq
+        H_vv_v2[_all_prior, 4, 4] -= sigma_plx_inv_sq
+        h_align_v2[_all_prior, 2] -= sigma_pm_inv_sq * mu_pop_current[0]
+        h_align_v2[_all_prior, 3] -= sigma_pm_inv_sq * mu_pop_current[1]
+        h_align_v2[_all_prior, 4] -= sigma_plx_inv_sq * plx_pop
+        # Recompute stellar posteriors without population prior
+        C_vT_v2 = np.zeros_like(H_vv_v2)
+        C_vT_v2[_active_sidx] = np.linalg.inv(H_vv_v2[_active_sidx])
+        a_align_v2 = np.einsum('nij,nj->ni', C_vT_v2, h_align_v2)
+        # Build r-only Lambda and rhs using v2 stellar posteriors
+        Lambda_r_v2 = H_rr.copy()
+        rhs_r_v2    = np.zeros(n_r)
+        for _jv, _imgv in enumerate(image_names):
+            _dv = solver._img_data.get(_imgv)
+            if _dv is None or K_img.get(_imgv) is None:
+                continue
+            _csv = _jv * nr
+            _sidxv = _dv["sidx"]
+            if restrict_align_to_members:
+                _ufv = _dv["use_for_fit"] & all_member_mask[_sidxv]
+            else:
+                _gmv = solver.C_survey_inv[_sidxv].sum(axis=(1, 2)) > 0
+                _ufv = _dv["use_for_fit"] & _gmv
+            rhs_r_v2[_csv:_csv+nr] += (_dv["C_r_prior_inv"]
+                                        @ (_dv["r_prior"] - r_current[_csv:_csv+nr]))
+            if _imgv in XCs_xresid:
+                rhs_r_v2[_csv:_csv+nr] += XCs_xresid[_imgv].sum(axis=0)
+            if not _ufv.any():
+                continue
+            _sfv = _sidxv[_ufv]
+            _Kfv = K_img[_imgv][_ufv]
+            _Cvfv = C_vT_v2[_sfv]
+            _CvKv = np.einsum('nij,njk->nik', _Cvfv, _Kfv)
+            Lambda_r_v2[_csv:_csv+nr, _csv:_csv+nr] -= np.einsum('nji,njk->ik', _Kfv, _CvKv)
+            rhs_r_v2[_csv:_csv+nr] += np.einsum('nji,nj->i', _Kfv, a_align_v2[_sfv])
+            # Cross-image coupling
+            for _jv2, _imgv2 in enumerate(image_names):
+                if _jv2 <= _jv:
+                    continue
+                _dv2 = solver._img_data.get(_imgv2)
+                if _dv2 is None or K_img.get(_imgv2) is None:
+                    continue
+                _sidxv2 = _dv2["sidx"]
+                if restrict_align_to_members:
+                    _ufv2 = _dv2["use_for_fit"] & all_member_mask[_sidxv2]
+                else:
+                    _gmv2 = solver.C_survey_inv[_sidxv2].sum(axis=(1, 2)) > 0
+                    _ufv2 = _dv2["use_for_fit"] & _gmv2
+                if not _ufv2.any():
+                    continue
+                _sfv2 = _sidxv2[_ufv2]
+                _Kfv2 = K_img[_imgv2][_ufv2]
+                _com_v, _ix1_v, _ix2_v = np.intersect1d(_sfv, _sfv2, return_indices=True)
+                if len(_com_v) == 0:
+                    continue
+                _csv2 = _jv2 * nr
+                _CvK2v = np.einsum('nij,njk->nik', C_vT_v2[_com_v], _Kfv2[_ix2_v])
+                _blkv  = np.einsum('nji,njk->ik', _Kfv[_ix1_v], _CvK2v)
+                Lambda_r_v2[_csv:_csv+nr,   _csv2:_csv2+nr] -= _blkv
+                Lambda_r_v2[_csv2:_csv2+nr, _csv:_csv+nr]   -= _blkv.T
+        _dv2_d = np.sqrt(np.maximum(np.abs(np.diag(Lambda_r_v2)), 1e-30))
+        _div2  = 1.0 / _dv2_d
+        _Lv2sc = _div2[:, None] * Lambda_r_v2 * _div2[None, :]
+        try:    _Cv2sc = np.linalg.inv(_Lv2sc)
+        except: _Cv2sc = np.linalg.pinv(_Lv2sc)
+        _dr_v2 = float(np.max(np.abs(_div2 * (_Cv2sc @ (_div2 * rhs_r_v2)))))
+
+        # B) μ-only: r fixed at r_current, population prior active (current setup)
         _Lmm = Lambda[idx_mu, idx_mu]
         try:    _Cmm = np.linalg.inv(_Lmm)
         except: _Cmm = np.linalg.pinv(_Lmm)
         _delta_mu_only = _Cmm @ rhs[idx_mu]
-        _mu_only = mu_pop_current + _delta_mu_only
+        _mu_only   = mu_pop_current + _delta_mu_only
         _s_ra_only = float(np.sqrt(max(_Cmm[0, 0], 0.0)))
         _s_de_only = float(np.sqrt(max(_Cmm[1, 1], 0.0)))
         _rho_only  = float(_Cmm[0, 1] / (_s_ra_only * _s_de_only + 1e-30))
         _dmu_only  = float(np.max(np.abs(_delta_mu_only)))
-        # Sub-solve C: joint (from full solve above)
-        _mu_joint = mu_pop_current + delta[idx_mu]
+
+        # C) Joint: full Schur solve (current Phase [2/4] behavior)
+        _mu_joint  = mu_pop_current + delta[idx_mu]
         _dr_joint  = float(np.max(np.abs(delta[idx_r])))
         _dmu_joint = float(np.max(np.abs(delta[idx_mu])))
+
         print(f"\n    [2/4 pre-diag] sub-solutions at current initialization:")
-        print(f"      A) r-only  (μ_pop fixed):  Δr={_dr_only:.3e}")
-        print(f"      B) μ-only  (r fixed):       Δμ={_dmu_only:.4f}  "
+        print(f"      A) r-only, no pop prior (v2-like):  Δr={_dr_v2:.3e}"
+              f"  ({'≈0 expected' if _dr_v2 < 5e-3 else 'LARGE — data/init issue'})")
+        print(f"      B) μ-only, r fixed (pop prior on):  Δμ={_dmu_only:.4f}  "
               f"μ_pop=({_mu_only[0]:+.4f}±{_s_ra_only:.4f}, "
               f"{_mu_only[1]:+.4f}±{_s_de_only:.4f}) ρ={_rho_only:+.3f} mas/yr")
-        print(f"      C) joint:                   Δr={_dr_joint:.3e}  Δμ={_dmu_joint:.4f}  "
+        print(f"      C) joint (current Phase [2/4]):      Δr={_dr_joint:.3e}  "
+              f"Δμ={_dmu_joint:.4f}  "
               f"μ_pop=({_mu_joint[0]:+.4f}, {_mu_joint[1]:+.4f}) mas/yr")
 
     r_hat      = r_current + delta[idx_r]
