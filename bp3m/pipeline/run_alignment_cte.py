@@ -1433,7 +1433,33 @@ def _joint_solve_cte(
         _Lv2sc = _div2[:, None] * Lambda_r_v2 * _div2[None, :]
         try:    _Cv2sc = np.linalg.inv(_Lv2sc)
         except: _Cv2sc = np.linalg.pinv(_Lv2sc)
-        _dr_v2 = float(np.max(np.abs(_div2 * (_Cv2sc @ (_div2 * rhs_r_v2)))))
+        _delta_r_v2 = _div2 * (_Cv2sc @ (_div2 * rhs_r_v2))
+        _dr_v2 = float(np.max(np.abs(_delta_r_v2)))
+        # Decompose rhs_r_v2 into data term vs Schur term for diagnostics
+        _rhs_data_v2 = np.zeros(n_r)
+        _rhs_schur_v2 = np.zeros(n_r)
+        for _jv_d, _imgv_d in enumerate(image_names):
+            _csv_d = _jv_d * nr
+            if _imgv_d in XCs_xresid:
+                _rhs_data_v2[_csv_d:_csv_d+nr] += XCs_xresid[_imgv_d].sum(axis=0)
+        for _jv_d, _imgv_d in enumerate(image_names):
+            _dv_d = solver._img_data.get(_imgv_d)
+            if _dv_d is None or K_img.get(_imgv_d) is None:
+                continue
+            _csv_d = _jv_d * nr
+            _sidxv_d = _dv_d["sidx"]
+            _gmv_d = solver.C_survey_inv[_sidxv_d].sum(axis=(1, 2)) > 0
+            _ufv_d = _dv_d["use_for_fit"] & _gmv_d
+            if _ufv_d.any():
+                _sfv_d = _sidxv_d[_ufv_d]
+                _Kfv_d = K_img[_imgv_d][_ufv_d]
+                _rhs_schur_v2[_csv_d:_csv_d+nr] += np.einsum('nji,nj->i', _Kfv_d, a_align_v2[_sfv_d])
+        print(f"\n    [A diag] rhs_r_v2: max|data|={np.max(np.abs(_rhs_data_v2)):.3e}  "
+              f"max|schur|={np.max(np.abs(_rhs_schur_v2)):.3e}  "
+              f"max|total|={np.max(np.abs(rhs_r_v2)):.3e}")
+        _imax_v2 = int(np.argmax(np.abs(_delta_r_v2)))
+        print(f"    [A diag] largest Δr component: idx={_imax_v2} "
+              f"(img={_imax_v2//nr}, param={_imax_v2%nr})  Δr={_delta_r_v2[_imax_v2]:.4e}")
 
         # B) μ-only: r fixed at r_current, population prior active (current setup)
         _Lmm = Lambda[idx_mu, idx_mu]
