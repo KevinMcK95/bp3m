@@ -47,6 +47,7 @@ dev = ["pytest", "pytest-cov"]
 [project.scripts]
 bp3m = "bp3m_run:main"
 bp3m-v2 = "bp3m.pipeline.run_iterate_v2:main"
+bp3m-pop-fit = "bp3m.pipeline.run_pop_fit:main"
 bp3m-notebooks = "bp3m.notebooks_cmd:main"
 bp3m-setup = "bp3m.setup:main"
 
