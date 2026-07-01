@@ -593,16 +593,15 @@ def _plot_pop_residual_maps(
             if not use_any.any():
                 continue
 
-            # detector pixel coordinates for plotting
-            xraw = d.get('x_raw', np.zeros(len(d['sidx'])))
-            yraw = d.get('y_raw', np.zeros(len(d['sidx'])))
-
+            n_det = len(d['sidx'])
             for si, gdc in enumerate([gdc_before, gdc_after]):
-                rd  = gdc.get(img, {})
-                dx_all = rd.get('dx_gdc', np.zeros(len(d['sidx'])))
-                dy_all = rd.get('dy_gdc', np.zeros(len(d['sidx'])))
-                rows_x [si].append(xraw[use_any])
-                rows_y [si].append(yraw[use_any])
+                rd     = gdc.get(img, {})
+                xc_all = rd.get('X_c',    np.zeros(n_det))
+                yc_all = rd.get('Y_c',    np.zeros(n_det))
+                dx_all = rd.get('dx_gdc', np.zeros(n_det))
+                dy_all = rd.get('dy_gdc', np.zeros(n_det))
+                rows_x [si].append(xc_all[use_any])
+                rows_y [si].append(yc_all[use_any])
                 rows_dx[si].append(dx_all[use_any])
                 rows_dy[si].append(dy_all[use_any])
 
