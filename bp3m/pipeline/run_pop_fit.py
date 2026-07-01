@@ -537,8 +537,11 @@ def _plot_pop_residual_maps(
     prefix: str = 'final',
 ) -> None:
     """
-    Per-visit 2-row scatter maps (before bp3m / after pop-fit).
+    Per-visit 2-row scatter maps (v1 bp3m / pop-fit).
     Columns: dx_gdc, dy_gdc, dx/σ, dy/σ (latter pair when C_vT_after available).
+
+    Geometry (JU, xys) is updated to the appropriate r_hat before each
+    compute_gdc_residuals call to ensure correct Jacobians.
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -557,13 +560,17 @@ def _plot_pop_residual_maps(
         root = img[:-3] if img.endswith(('_hi', '_lo')) else img
         visit_groups[root].append(img)
 
-    # Pre-compute GDC residuals for both stages
+    # Pre-compute GDC residuals for both stages.
+    # IMPORTANT: JU and xys in each image's data dict are geometry-dependent
+    # (_update_geometry writes them).  Must update geometry before each call.
     try:
+        solver._update_geometry(r_before, v_before)
         gdc_before = solver.compute_gdc_residuals(r_before, v_before)
     except Exception as _exc:
         print(f"  WARNING: before-residuals failed — {_exc}")
         gdc_before = {}
     try:
+        solver._update_geometry(r_after, v_after)
         gdc_after = solver.compute_gdc_residuals(r_after, v_after, C_vT=C_vT_after)
     except Exception as _exc:
         print(f"  WARNING: after-residuals failed — {_exc}")
@@ -801,6 +808,25 @@ def run_pop_fit(
     r_bp3m = _load_bp3m_outputs(bp3m_dir, image_names, solver.N_R, solver)
     solver._update_R(r_bp3m)
     solver._update_geometry(r_bp3m, solver.v_survey)
+
+    # ── Load v1 bp3m posteriors (for before/after residual plots) ─────────────
+    v1_astrom_path = bp3m_dir / 'stellar_astrometry.csv'
+    v_bp3m = solver.v_survey.copy()   # fallback: Gaia-only
+    if v1_astrom_path.exists():
+        try:
+            _v1 = pd.read_csv(v1_astrom_path)
+            _v1['Gaia_id'] = _v1['Gaia_id'].astype(np.int64)
+            _v1_idx = {int(g): i for i, g in enumerate(_v1['Gaia_id'])}
+            _cols = ['delta_racosdec_bp3m', 'delta_dec_bp3m',
+                     'pmra_bp3m', 'pmdec_bp3m', 'parallax_bp3m']
+            if all(c in _v1.columns for c in _cols):
+                _v1_arr = _v1[_cols].to_numpy(float)
+                for i, gid in enumerate(gaia_catalog['Gaia_id']):
+                    j = _v1_idx.get(int(gid))
+                    if j is not None:
+                        v_bp3m[i] = _v1_arr[j]
+        except Exception as _exc:
+            print(f"  WARNING: could not load v1 posteriors for plot — {_exc}")
 
     # ── Apply v1 use_for_fit / use_for_astrom flags ───────────────────────────
     print("\n  Applying v1 detection flags...")
@@ -1099,6 +1125,21 @@ def run_pop_fit(
 
     # ── Plots ─────────────────────────────────────────────────────────────────
     if not no_plots:
+        _plot_dir = output_pfr / 'plots' / 'residuals'
+        print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
+        try:
+            _plot_pop_residual_maps(
+                _plot_dir, image_names, solver,
+                r_before=r_bp3m,   v_before=v_bp3m,
+                r_after=r_current, v_after=v_mean,
+                C_vT_after=C_vT_final,
+                prefix='final',
+            )
+        except Exception as _exc:
+            print(f"  WARNING: residual maps failed — {_exc}")
+        # Restore geometry to final state for make_plots
+        solver._update_geometry(r_current, v_mean)
+
         try:
             from bp3m.pipeline.plot_results import make_plots
             print("\n  Generating diagnostic plots...")
@@ -1108,19 +1149,6 @@ def run_pop_fit(
                        plot_residuals=False)
         except Exception as _exc:
             print(f"  WARNING: make_plots failed — {_exc}")
-
-        _plot_dir = output_pfr / 'plots' / 'residuals'
-        print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
-        try:
-            _plot_pop_residual_maps(
-                _plot_dir, image_names, solver,
-                r_before=r_bp3m,   v_before=solver.v_survey,
-                r_after=r_current, v_after=v_mean,
-                C_vT_after=C_vT_final,
-                prefix='final',
-            )
-        except Exception as _exc:
-            print(f"  WARNING: residual maps failed — {_exc}")
 
     elapsed = time.time() - t_start
     print(f"\n  Done in {elapsed:.1f}s")
