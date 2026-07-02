@@ -77,6 +77,38 @@ def _estimate_mu_pop(
     return mu
 
 
+def _estimate_mu_pop_v1(
+    pmra: np.ndarray,
+    pmdec: np.ndarray,
+    n_sigma: float = 3.0,
+    n_iter: int = 10,
+) -> np.ndarray:
+    """Sigma-clipped mean of v1 bp3m proper motions (finite values only)."""
+    finite = np.isfinite(pmra) & np.isfinite(pmdec)
+    pmra_f, pmdec_f = pmra[finite], pmdec[finite]
+    if len(pmra_f) < 5:
+        print("  WARNING: fewer than 5 stars with finite v1 PMs — using (0, 0)")
+        return np.zeros(2)
+
+    keep = np.ones(len(pmra_f), dtype=bool)
+    for _ in range(n_iter):
+        if keep.sum() < 5:
+            break
+        med_ra  = float(np.median(pmra_f[keep]))
+        med_dec = float(np.median(pmdec_f[keep]))
+        dra, ddec = pmra_f[keep] - med_ra, pmdec_f[keep] - med_dec
+        sigma   = max(float(np.median(np.hypot(dra, ddec))) / 0.6745, 0.01)
+        new_keep = np.hypot(pmra_f - med_ra, pmdec_f - med_dec) < n_sigma * sigma
+        if new_keep.sum() == keep.sum():
+            break
+        keep = new_keep
+
+    mu = np.array([float(np.mean(pmra_f[keep])), float(np.mean(pmdec_f[keep]))])
+    print(f"  Bootstrap μ_pop (v1 σ-clip, n={keep.sum()}/{len(pmra_f)}): "
+          f"({mu[0]:+.4f}, {mu[1]:+.4f}) mas/yr")
+    return mu
+
+
 # ── Member selection from posterior stellar astrometry ────────────────────────
 
 def _select_members_from_a(
@@ -1178,6 +1210,7 @@ def run_pop_fit(
                         else np.zeros(solver.n_stars))
 
     _v1_pm_loaded = False
+    _v1_matched   = np.zeros(solver.n_stars, dtype=bool)
     if v1_astrom_path.exists():
         try:
             _v1 = pd.read_csv(v1_astrom_path)
@@ -1206,6 +1239,7 @@ def run_pop_fit(
                         _sig_pmra_init[i]  = _v1_sig[j, 0]
                         _sig_pmdec_init[i] = _v1_sig[j, 1]
                         _corr_pm_init[i]   = _v1_sig[j, 2]
+                        _v1_matched[i]     = True
                 _v1_pm_loaded = True
 
         except Exception as _exc:
@@ -1228,23 +1262,73 @@ def run_pop_fit(
         _use_a = d.get('use_for_astrom', d['use_for_fit'])
         np.add.at(_n_hst_det, d['sidx'][_use_a], 1)
 
-    # ── Empirical initial μ_pop ────────────────────────────────────────────────
-    print("\n  Estimating initial μ_pop from Gaia catalog PMs...")
-    mu_pop_est    = _estimate_mu_pop(gaia_catalog)
-    mu_pop_prior  = mu_pop_est.copy()
+    # ── Bootstrap μ_pop from v1 PMs only ──────────────────────────────────────
+    if _v1_pm_loaded:
+        print("\n  Bootstrapping μ_pop from v1 bp3m PMs (sigma-clip)...")
+        _pmra_v1_only  = np.where(_v1_matched, _pmra_init,  np.nan)
+        _pmdec_v1_only = np.where(_v1_matched, _pmdec_init, np.nan)
+        _mu_boot = _estimate_mu_pop_v1(_pmra_v1_only, _pmdec_v1_only)
+    else:
+        print("\n  WARNING: v1 PMs not loaded; using Gaia sigma-clip for μ_pop bootstrap")
+        _pmra_v1_only  = _pmra_init
+        _pmdec_v1_only = _pmdec_init
+        _mu_boot = _estimate_mu_pop(gaia_catalog)
+
+    # ── Initial member selection using v1 PMs only ────────────────────────────
+    print("\n  Selecting initial members from v1 bp3m PMs...")
+    member_sidx = _select_initial_members(
+        _pmra_v1_only, _pmdec_v1_only,
+        _sig_pmra_init, _sig_pmdec_init, _corr_pm_init,
+        _mu_boot, member_sigma_clip, sigma_pm, pm_sys_floor)
+    print(f"  Initial members: {len(member_sidx)}")
+
+    # ── μ_pop prior = weighted mean of initial members' v1 PMs ───────────────
+    _extra = sigma_pm ** 2 + pm_sys_floor ** 2
+    _mem_pm_ra   = _pmra_v1_only[member_sidx]
+    _mem_pm_dec  = _pmdec_v1_only[member_sidx]
+    _mem_sig_ra  = _sig_pmra_init[member_sidx]
+    _mem_sig_dec = _sig_pmdec_init[member_sidx]
+    _fin_m = np.isfinite(_mem_pm_ra) & np.isfinite(_mem_pm_dec)
+    if _fin_m.sum() >= 3:
+        _wra  = 1.0 / (np.where(np.isfinite(_mem_sig_ra[_fin_m]),
+                                 _mem_sig_ra[_fin_m] ** 2, 1.0) + _extra)
+        _wdec = 1.0 / (np.where(np.isfinite(_mem_sig_dec[_fin_m]),
+                                  _mem_sig_dec[_fin_m] ** 2, 1.0) + _extra)
+        _mu_ra_v1   = float(np.sum(_wra  * _mem_pm_ra[_fin_m])  / np.sum(_wra))
+        _mu_dec_v1  = float(np.sum(_wdec * _mem_pm_dec[_fin_m]) / np.sum(_wdec))
+        _unc_ra_v1  = float(1.0 / np.sqrt(np.sum(_wra)))
+        _unc_dec_v1 = float(1.0 / np.sqrt(np.sum(_wdec)))
+        mu_pop_prior = np.array([_mu_ra_v1, _mu_dec_v1])
+    else:
+        print("  WARNING: too few members with finite v1 PMs; using bootstrap center as prior")
+        mu_pop_prior = _mu_boot.copy()
+        _unc_ra_v1 = _unc_dec_v1 = 0.0
+
     C_pop_prior_inv = np.eye(2) / mu_pop_prior_sigma ** 2
     mu_pop_current  = mu_pop_prior.copy()
-    print(f"  μ_pop prior: ({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) ± "
-          f"{mu_pop_prior_sigma:.2f} mas/yr")
+    print(f"  μ_pop prior from v1 members (N={_fin_m.sum()}): "
+          f"({mu_pop_prior[0]:+.4f} ± {_unc_ra_v1:.4f}, "
+          f"{mu_pop_prior[1]:+.4f} ± {_unc_dec_v1:.4f}) mas/yr  "
+          f"[prior σ = ±{mu_pop_prior_sigma:.2f} mas/yr]")
 
-    # ── Initial member selection from v1 bp3m posteriors ─────────────────────
-    _src = "v1 bp3m" if _v1_pm_loaded else "Gaia"
-    print(f"\n  Selecting initial members from {_src} PMs...")
-    member_sidx = _select_initial_members(
-        _pmra_init, _pmdec_init,
-        _sig_pmra_init, _sig_pmdec_init, _corr_pm_init,
-        mu_pop_current, member_sigma_clip, sigma_pm, pm_sys_floor)
-    print(f"  Initial members: {len(member_sidx)}")
+    # Print Gaia weighted PM mean for the same initial members (reference only)
+    _gaia_pmra_col   = gaia_catalog['pmra'].to_numpy(float)[member_sidx]
+    _gaia_pmdec_col  = gaia_catalog['pmdec'].to_numpy(float)[member_sidx]
+    _gaia_sig_ra_col = gaia_catalog['pmra_error'].to_numpy(float)[member_sidx]
+    _gaia_sig_dec_col = gaia_catalog['pmdec_error'].to_numpy(float)[member_sidx]
+    _gaia_fin = np.isfinite(_gaia_pmra_col) & np.isfinite(_gaia_pmdec_col)
+    if _gaia_fin.sum() > 0:
+        _gw_ra  = 1.0 / (np.where(np.isfinite(_gaia_sig_ra_col[_gaia_fin]),
+                                    _gaia_sig_ra_col[_gaia_fin] ** 2, 1.0) + _extra)
+        _gw_dec = 1.0 / (np.where(np.isfinite(_gaia_sig_dec_col[_gaia_fin]),
+                                    _gaia_sig_dec_col[_gaia_fin] ** 2, 1.0) + _extra)
+        _gmu_ra  = float(np.sum(_gw_ra  * _gaia_pmra_col[_gaia_fin])  / np.sum(_gw_ra))
+        _gmu_dec = float(np.sum(_gw_dec * _gaia_pmdec_col[_gaia_fin]) / np.sum(_gw_dec))
+        _gunc_ra  = float(1.0 / np.sqrt(np.sum(_gw_ra)))
+        _gunc_dec = float(1.0 / np.sqrt(np.sum(_gw_dec)))
+        print(f"  Gaia PM mean for initial members (N={_gaia_fin.sum()}, reference only): "
+              f"({_gmu_ra:+.4f} ± {_gunc_ra:.4f}, "
+              f"{_gmu_dec:+.4f} ± {_gunc_dec:.4f}) mas/yr")
 
     # Recompute gaia_n_hst_used to reflect the v1 flags we just applied
     solver.gaia_n_hst_used[:] = 0
