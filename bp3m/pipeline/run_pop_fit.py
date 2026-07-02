@@ -119,13 +119,18 @@ def _select_members_from_a(
     sigma_pm: float,
     sigma_clip: float = 3.0,
     min_members: int = 5,
-    pm_sys_floor: float = 0.2,
+    pm_sys_floor: float = 0.2,   # retained for call-site compatibility, not used
 ) -> np.ndarray:
-    """Select members using the same per-star PM uncertainty as _select_initial_members.
+    """Select members by 2D Mahalanobis distance from mu_pop.
 
-    Per-star threshold = sigma_clip × det(C_pm_i + (sigma_pm² + pm_sys_floor²)·I)^(1/4),
-    identical to the _select_initial_members formula.  Only stars with ≥1 HST
-    detection are eligible.
+    C_vT is expected to be the diffuse-prior (free) covariance so the
+    population prior does not pull stars into apparent membership.
+
+    C_total = C_vT[star, 2:4, 2:4] + sigma_pm² · I   (measurement + intrinsic dispersion)
+    chi2    = Δμ^T C_total^{-1} Δμ
+    Kept    ← chi2 < sigma_clip²   (Mahalanobis distance < sigma_clip)
+
+    Only stars with ≥1 HST detection are eligible.
     """
     eidx = np.where(n_hst >= 1)[0]
     if len(eidx) < min_members:
@@ -133,19 +138,16 @@ def _select_members_from_a(
 
     pmra  = a_arr[eidx, 2]
     pmdec = a_arr[eidx, 3]
-    dist  = np.hypot(pmra - mu_pop[0], pmdec - mu_pop[1])
 
-    extra    = sigma_pm ** 2 + pm_sys_floor ** 2
-    C_pm     = C_vT[eidx, 2:4, 2:4]                   # (n_elig, 2, 2)
-    c00      = C_pm[:, 0, 0] + extra
-    c11      = C_pm[:, 1, 1] + extra
-    c01      = C_pm[:, 0, 1]
-    det_C    = np.maximum(c00 * c11 - c01 ** 2, 1e-30)
-    geom_sig = det_C ** 0.25                            # (n_elig,)
+    delta_pm = np.column_stack([pmra - mu_pop[0], pmdec - mu_pop[1]])  # (n, 2)
+    C_pm     = C_vT[eidx, 2:4, 2:4].copy()                             # (n, 2, 2)
+    C_pm[:, 0, 0] += sigma_pm ** 2
+    C_pm[:, 1, 1] += sigma_pm ** 2
+    chi2 = np.einsum('ni,nij,nj->n', delta_pm, np.linalg.inv(C_pm), delta_pm)
 
-    keep = np.isfinite(dist) & (dist < sigma_clip * geom_sig)
+    keep = np.isfinite(chi2) & (chi2 < sigma_clip ** 2)
     if keep.sum() < min_members:
-        keep = np.isfinite(dist)
+        keep = np.isfinite(chi2)
 
     return eidx[keep]
 
@@ -792,15 +794,20 @@ def _hard_update_phase4(
     ok_star_prev=None,
     adaptive_k: float = 5.0,
     adaptive_delta: float = 0.1,
+    a_free: np.ndarray | None = None,
+    C_free: np.ndarray | None = None,
 ) -> tuple:
     """
     Population-aware hard outlier rejection for Phase 4.
 
     Test 1  Gaia prior chi2 (adaptive, with hysteresis): identical to v1.
-    Test 2  Prior chi2 (fixed threshold):
+    Test 2  Prior chi2 (posterior+prior covariance):
               members     → compare PM+plx to population prior
               non-members → compare all 5 components to diffuse prior
     Test 3  Per-image position residual chi2 (adaptive, with hysteresis): v1.
+    Test 4  Free-posterior PM vs population mean (df=2, 2σ threshold).
+              Only applied to member stars; catches stars the pop prior was
+              pulling in that the data alone do not support as members.
 
     Updates solver._img_data[img]['use_for_fit'] and ['use_for_astrom'] in-place.
     Returns (ok_star, n_use_changed, info).
@@ -844,20 +851,32 @@ def _hard_update_phase4(
     else:
         ok_gaia = ok_gaia_admit
 
-    # ── Test 2: Prior chi2 ────────────────────────────────────────────────────
+    # ── Test 2: Prior chi2 (posterior + prior covariance) ─────────────────────
+    # C_test = C_vT[relevant] + C_prior — mirrors Test 1's C_comb = C_vT + C_survey
     is_member = np.zeros(solver.n_stars, dtype=bool)
     is_member[member_sidx] = True
 
-    sigma_pm_inv_sq  = sigma_pm      ** -2
-    sigma_plx_inv_sq = sigma_plx_tot ** -2
-    chi2_pop = (
-        (a_arr[:, 2] - mu_pop[0]) ** 2 * sigma_pm_inv_sq +
-        (a_arr[:, 3] - mu_pop[1]) ** 2 * sigma_pm_inv_sq +
-        (a_arr[:, 4] - plx_pop)   ** 2 * sigma_plx_inv_sq
-    )
-    chi2_diff = np.sum((a_arr / solver._sigma_diff_per_star) ** 2, axis=1)
+    # Members: PM + parallax vs population prior (df=3)
+    delta_pop   = np.column_stack([
+        a_arr[:, 2] - mu_pop[0],
+        a_arr[:, 3] - mu_pop[1],
+        a_arr[:, 4] - plx_pop,
+    ])  # (n, 3)
+    C_prior_pop = np.diag([sigma_pm ** 2, sigma_pm ** 2, sigma_plx_tot ** 2])  # (3,3)
+    C_test_pop  = C_vT[:, 2:5, 2:5] + C_prior_pop[np.newaxis]                 # (n,3,3)
+    chi2_pop    = np.einsum('ni,nij,nj->n',
+                            delta_pop, np.linalg.inv(C_test_pop), delta_pop)
 
-    thresh_pop  = float(chi2_dist.ppf(0.9545, df=3))   # ≈ 7.8, df=PM_ra+PM_dec+plx
+    # Non-members: all 5 components vs diffuse prior (df=5)
+    # _sigma_diff_per_star is (n, 5); diffuse prior mean is 0
+    sigma_diff_sq = solver._sigma_diff_per_star ** 2                           # (n,5)
+    C_test_diff   = C_vT.copy()
+    for _i in range(5):
+        C_test_diff[:, _i, _i] += sigma_diff_sq[:, _i]
+    chi2_diff = np.einsum('ni,nij,nj->n',
+                          a_arr, np.linalg.inv(C_test_diff), a_arr)
+
+    thresh_pop  = float(chi2_dist.ppf(0.9545, df=3))   # ≈ 7.8
     thresh_diff = float(chi2_dist.ppf(0.9545, df=5))   # ≈ 11.1
 
     ok_prior = np.where(is_member, chi2_pop < thresh_pop, chi2_diff < thresh_diff)
@@ -925,6 +944,26 @@ def _hard_update_phase4(
         chi2_u = sig_sq[new_use]
         alpha_raw = float(np.sqrt(np.median(chi2_u) / _MEDIAN_CHI2_2)) if n_u >= 4 else 1.0
         info.append((img, n_u, len(new_use), thresh_a, alpha_raw))
+
+    # ── Test 4: Free-posterior PM vs pop mean (member stars only) ────────────
+    # Uses the diffuse-prior posterior so the population prior can't pull a star
+    # into agreement with mu_pop — if the data alone say it's a non-member, remove it.
+    if a_free is not None and C_free is not None and is_member.any():
+        delta_free  = np.column_stack([
+            a_free[:, 2] - mu_pop[0],
+            a_free[:, 3] - mu_pop[1],
+        ])  # (n, 2)
+        C_free_pm = C_free[:, 2:4, 2:4].copy()
+        C_free_pm[:, 0, 0] += sigma_pm ** 2
+        C_free_pm[:, 1, 1] += sigma_pm ** 2
+        chi2_free = np.einsum('ni,nij,nj->n', delta_free,
+                              np.linalg.inv(C_free_pm), delta_free)
+        thresh_free = float(chi2_dist.ppf(0.9545, df=2))   # ≈ 6.18  (2σ in 2D)
+        ok_free = np.where(is_member, chi2_free < thresh_free, True)
+        n_fail_4 = int((~ok_free & ok_star & observed).sum())
+        print(f"    [hard] Test 4 (free PM vs pop, df=2, thresh={thresh_free:.2f}): "
+              f"{n_fail_4} member(s) additionally excluded")
+        ok_star = ok_star & ok_free
 
     return ok_star, n_use_changed, info
 
@@ -1861,17 +1900,19 @@ def run_pop_fit(
             mu_pop_current = mu_pop_new
             a_arr          = a_arr_p4
 
+            _a_free, _C_free = _compute_free_stellar_posterior(
+                a_arr, C_vT_p4, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+                solver._C_VG_inv_per_star)
+
             ok_star, n_use_changed, uff_info = _hard_update_phase4(
                 solver, image_names, r_current, a_arr, C_vT_p4,
                 member_sidx, mu_pop_current,
                 sigma_pm, plx_pop, sigma_plx_tot,
                 ok_star_prev=ok_star_prev,
+                a_free=_a_free, C_free=_C_free,
             )
             ok_star_prev = ok_star
 
-            _a_free, _C_free = _compute_free_stellar_posterior(
-                a_arr, C_vT_p4, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
-                solver._C_VG_inv_per_star)
             member_sidx = _select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
