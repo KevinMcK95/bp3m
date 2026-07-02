@@ -996,11 +996,43 @@ def run_pop_fit(
         r_current, fix_r=False,
     )
 
-    # ── Analytic marginalised posteriors (mirrors run_alignment.py) ──────────
+    # ── Analytic marginalised posteriors (joint r + μ_pop propagation) ──────────
     print("\n  Computing analytic marginalised posteriors...")
-    C_r = C_shared_final[:n_r, :n_r]
-    v_mean_marg, v_cov = solver.compute_analytic_posteriors(
+    C_r     = C_shared_final[:n_r, :n_r]
+    C_mu    = C_shared_final[n_r:, n_r:]    # (2, 2) μ_pop posterior covariance
+    C_r_mu  = C_shared_final[:n_r, n_r:]    # (n_r, 2) r–μ_pop cross-covariance
+
+    # Step 1: r-only extra covariance (existing analytic formula)
+    v_mean_marg, v_cov_r = solver.compute_analytic_posteriors(
         r_current, C_r, v_mean, K_img_final, C_vT_final)
+
+    # Step 2: build K_all (n_stars × 5 × n_r_tot) — same loop as compute_analytic_posteriors
+    nr      = solver.N_R
+    n_r_tot = nr * solver.n_images
+    K_all   = np.zeros((solver.n_stars, 5, n_r_tot))
+    for _j, _img in enumerate(solver.image_names):
+        if K_img_final.get(_img) is None:
+            continue
+        _d = solver._img_data[_img]
+        _use = _d['use_for_fit'] | _d.get('use_for_astrom', _d['use_for_fit'])
+        if not _use.any():
+            continue
+        _sidx = _d['sidx'][_use]
+        np.add.at(K_all[:, :, _j * nr:_j * nr + nr], _sidx, K_img_final[_img][_use])
+
+    # A_i = C_vT_i @ K_all_i  (sensitivity of v_i to r, n_stars × 5 × n_r_tot)
+    CvT_K = np.einsum('nij,njk->nik', C_vT_final, K_all)
+
+    # Step 3: μ_pop sensitivity for member stars
+    #   ∂v_i/∂μ_pop = σ_pm^{-2} C_vT_i[:, 2:4]  (only for members, 0 for non-members)
+    B_all = np.zeros((solver.n_stars, 5, 2))
+    B_all[member_sidx] = (sigma_pm ** -2) * C_vT_final[member_sidx, :, 2:4]
+
+    # Step 4: full extra covariance = A C_r A^T + A C_{r,μ} B^T + B C_{μ,r} A^T + B C_μ B^T
+    C_extra_mu    = np.einsum('nik,kl,njl->nij', B_all, C_mu, B_all)
+    C_extra_cross = (np.einsum('nik,kl,njl->nij', CvT_K, C_r_mu,   B_all) +
+                     np.einsum('nik,kl,njl->nij', B_all,  C_r_mu.T, CvT_K))
+    v_cov      = v_cov_r + C_extra_cross + C_extra_mu
     v_cov_full = v_cov + C_vT_final   # full marginal covariance per star
 
     # ── Save results (mirrors _save_results in run_alignment.py) ─────────────
