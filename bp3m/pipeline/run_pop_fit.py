@@ -1098,18 +1098,22 @@ def run_pop_fit(
         print(f"  WARNING: detections.npz failed — {_exc}")
 
     # 6. mu_pop.json
+    _C_mu = C_shared_final[n_r:, n_r:]   # (2, 2) μ_pop posterior covariance
+    _corr_mu = (float(_C_mu[0, 1] / (sigma_mu_joint[0] * sigma_mu_joint[1]))
+                if (sigma_mu_joint[0] > 0 and sigma_mu_joint[1] > 0) else 0.0)
     mu_result = {
-        'mu_pop_ra_masyr':    float(mu_pop_current[0]),
-        'mu_pop_dec_masyr':   float(mu_pop_current[1]),
-        'sigma_mu_pop_ra':    float(sigma_mu_joint[0]),
-        'sigma_mu_pop_dec':   float(sigma_mu_joint[1]),
-        'n_members':          int(len(member_sidx)),
-        'sigma_pm_masyr':     float(sigma_pm),
-        'plx_pop_mas':        float(plx_pop),
-        'sigma_plx_tot_mas':  float(sigma_plx_tot),
-        'mu_pop_prior_ra':    float(mu_pop_prior[0]),
-        'mu_pop_prior_dec':   float(mu_pop_prior[1]),
-        'mu_pop_prior_sigma': float(mu_pop_prior_sigma),
+        'mu_pop_ra_masyr':       float(mu_pop_current[0]),
+        'mu_pop_dec_masyr':      float(mu_pop_current[1]),
+        'sigma_mu_pop_ra':       float(sigma_mu_joint[0]),
+        'sigma_mu_pop_dec':      float(sigma_mu_joint[1]),
+        'corr_mu_pop_ra_dec':    _corr_mu,
+        'n_members':             int(len(member_sidx)),
+        'sigma_pm_masyr':        float(sigma_pm),
+        'plx_pop_mas':           float(plx_pop),
+        'sigma_plx_tot_mas':     float(sigma_plx_tot),
+        'mu_pop_prior_ra':       float(mu_pop_prior[0]),
+        'mu_pop_prior_dec':      float(mu_pop_prior[1]),
+        'mu_pop_prior_sigma':    float(mu_pop_prior_sigma),
     }
     with open(output_pfr / 'mu_pop.json', 'w') as _f:
         json.dump(mu_result, _f, indent=2)
