@@ -120,6 +120,7 @@ def _select_members_from_a(
     sigma_clip: float = 3.0,
     min_members: int = 5,
     pm_sys_floor: float = 0.2,   # retained for call-site compatibility, not used
+    max_sigma_free_pm: float = 1.0,
 ) -> np.ndarray:
     """Select members by 2D Mahalanobis distance from mu_pop.
 
@@ -128,7 +129,11 @@ def _select_members_from_a(
 
     C_total = C_vT[star, 2:4, 2:4] + sigma_pm² · I   (measurement + intrinsic dispersion)
     chi2    = Δμ^T C_total^{-1} Δμ
-    Kept    ← chi2 < sigma_clip²   (Mahalanobis distance < sigma_clip)
+    Kept    ← chi2 < sigma_clip²  AND  RMS free PM sigma < max_sigma_free_pm
+
+    The sigma constraint prevents stars dominated by the diffuse prior (2p stars with
+    few HST epochs) from trivially passing chi2 — their C_free is so large that any
+    PM is consistent with mu_pop, providing no real membership evidence.
 
     Only stars with ≥1 HST detection are eligible.
     """
@@ -139,15 +144,21 @@ def _select_members_from_a(
     pmra  = a_arr[eidx, 2]
     pmdec = a_arr[eidx, 3]
 
+    C_pm_sub = C_vT[eidx, 2:4, 2:4].copy()                             # (n, 2, 2)
+    C_pm_sub[:, 0, 0] += sigma_pm ** 2
+    C_pm_sub[:, 1, 1] += sigma_pm ** 2
     delta_pm = np.column_stack([pmra - mu_pop[0], pmdec - mu_pop[1]])  # (n, 2)
-    C_pm     = C_vT[eidx, 2:4, 2:4].copy()                             # (n, 2, 2)
-    C_pm[:, 0, 0] += sigma_pm ** 2
-    C_pm[:, 1, 1] += sigma_pm ** 2
-    chi2 = np.einsum('ni,nij,nj->n', delta_pm, np.linalg.inv(C_pm), delta_pm)
+    chi2 = np.einsum('ni,nij,nj->n', delta_pm, np.linalg.inv(C_pm_sub), delta_pm)
 
-    keep = np.isfinite(chi2) & (chi2 < sigma_clip ** 2)
+    # Require PM to be meaningfully constrained; stars where C_free_pm is dominated
+    # by the diffuse prior trivially pass chi2 and provide no membership evidence.
+    sig_free = np.sqrt(np.maximum(
+        (C_vT[eidx, 2, 2] + C_vT[eidx, 3, 3]) / 2, 0))
+    well_constrained = sig_free < max_sigma_free_pm
+
+    keep = np.isfinite(chi2) & (chi2 < sigma_clip ** 2) & well_constrained
     if keep.sum() < min_members:
-        keep = np.isfinite(chi2)
+        keep = np.isfinite(chi2) & well_constrained
 
     return eidx[keep]
 
@@ -1448,6 +1459,7 @@ def run_pop_fit(
     z_threshold: float = 0.8,
     member_sigma_clip: float = 3.0,
     pm_sys_floor: float = 0.2,
+    max_sigma_free_pm: float = 1.0,
     poly_order: int | None = None,
     no_plots: bool = False,
 ) -> Path:
@@ -1812,7 +1824,8 @@ def run_pop_fit(
                 solver._C_VG_inv_per_star)
             member_sidx = _select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
-                sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
+                sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
+                max_sigma_free_pm=max_sigma_free_pm)
 
             for img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new in alpha_info:
                 tag = '  ← raised' if alpha_new > alpha_prev + 1e-4 else (
@@ -1922,7 +1935,8 @@ def run_pop_fit(
 
             member_sidx = _select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
-                sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
+                sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
+                max_sigma_free_pm=max_sigma_free_pm)
 
             n_use_img = sum(d['use_for_fit'].sum()
                             for d in (solver._img_data.get(img) for img in image_names)
@@ -2010,7 +2024,8 @@ def run_pop_fit(
                 solver._C_VG_inv_per_star)
             member_sidx = _select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
-                sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
+                sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
+                max_sigma_free_pm=max_sigma_free_pm)
 
             print(f"    iter {sw_iter + 1}/{n_iter_phase4}: "
                   f"n_eff={n_eff_new:.0f}/{n_det_total}  "
@@ -2439,7 +2454,11 @@ def main():
                         help='[soft mode only] Minimum z weight for a detection to contribute; '
                              'detections below this are hard-excluded (default 0.8)')
     parser.add_argument('--member_sigma_clip', type=float, default=3.0,
-                        help='Sigma threshold for membership selection')
+                        help='Mahalanobis sigma threshold for membership selection (default 3.0)')
+    parser.add_argument('--max_sigma_free_pm', type=float, default=1.0,
+                        help='Maximum free-posterior RMS PM sigma (mas/yr) for membership '
+                             'eligibility; stars dominated by diffuse prior (2p, few epochs) '
+                             'are excluded (default 1.0)')
     parser.add_argument('--pm_sys_floor', type=float, default=0.2,
                         help='Systematic PM floor added in quadrature to per-star '
                              'PM uncertainty for membership radius (mas/yr)')
@@ -2467,6 +2486,7 @@ def main():
         z_threshold=args.z_threshold,
         member_sigma_clip=args.member_sigma_clip,
         pm_sys_floor=args.pm_sys_floor,
+        max_sigma_free_pm=args.max_sigma_free_pm,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
     )
