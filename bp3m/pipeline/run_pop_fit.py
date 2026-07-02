@@ -592,6 +592,70 @@ def _compute_alpha_updates(
     return info
 
 
+# ── Re-open detections based on Phase 3 residual thresholds ──────────────────
+
+def _reopen_detections(
+    solver,
+    image_names: list[str],
+    r_current: np.ndarray,
+    a_arr: np.ndarray,
+    adaptive_k: float = 3.0,
+) -> list:
+    """
+    Use the Phase 3 solution to re-evaluate ALL detections against a per-image
+    adaptive chi2 threshold derived from the currently-used (use_for_fit=True)
+    set.  Any detection—including those excluded by v1 quality filters—is
+    admitted to Phase 4 if its sigma_resid² falls below the threshold.
+
+    The threshold mirrors v1's _adapt_thresh formula:
+        thresh = max(p50 + k*(p50 - p16),  chi2_floor)
+    where the percentiles are computed on sigma_resid² for the currently-used
+    detections only, and chi2_floor = chi2.ppf(0.90, df=2) ≈ 4.61.
+
+    Updates d['use_for_fit'] and d['use_for_astrom'] in place.
+
+    Returns list of (img, n_before, n_after, n_added, n_removed, threshold).
+    """
+    from scipy.stats import chi2 as _chi2
+
+    _FLOOR = float(_chi2.ppf(0.95, df=2))   # ≈ 5.99
+
+    resid_all = solver.compute_residuals(r_current, a_arr)   # ALL detections
+
+    info = []
+    for img in image_names:
+        rd = resid_all.get(img)
+        d  = solver._img_data.get(img)
+        if rd is None or d is None:
+            continue
+
+        sig_sq   = rd['sigma_resid'] ** 2           # (n,) all detections
+        use_fit  = np.asarray(d['use_for_fit'], dtype=bool)
+        n_before = int(use_fit.sum())
+
+        # Threshold from currently-used good detections
+        good = sig_sq[use_fit]
+        if len(good) >= 10:
+            p16   = float(np.percentile(good, 16))
+            p50   = float(np.median(good))
+            thresh = float(max(p50 + adaptive_k * max(p50 - p16, 1e-6), _FLOOR))
+        else:
+            thresh = _FLOOR
+
+        new_use  = sig_sq < thresh
+        n_after  = int(new_use.sum())
+        n_added  = int(np.sum(new_use & ~use_fit))
+        n_removed = int(np.sum(~new_use & use_fit))
+
+        d['use_for_fit']    = new_use
+        d['use_for_astrom'] = new_use.copy()
+
+        n_total = int(d['n'])
+        info.append((img, n_total, n_before, n_after, n_added, n_removed, thresh))
+
+    return info
+
+
 # ── Per-visit residual plots (before / after) ─────────────────────────────────
 
 def _plot_pop_residual_maps(
@@ -655,12 +719,14 @@ def _plot_pop_residual_maps(
         sigma_dx_all: list = []
         sigma_dy_all: list = []
         total_n = 0
+        total_n_possible = 0
 
         for img in imgs:
             d = solver._img_data.get(img)
             if d is None:
                 continue
             use_any = d['use_for_fit'] | d.get('use_for_astrom', d['use_for_fit'])
+            total_n_possible += int(d['n'])
             if not use_any.any():
                 continue
 
@@ -698,9 +764,15 @@ def _plot_pop_residual_maps(
         has_sigma = (sigma_dx is not None
                      and np.any(np.isfinite(sigma_dx) & (sigma_dx > 0)))
 
-        _vals = np.concatenate([np.abs(rows_dx[0]), np.abs(rows_dy[0])])
-        _fin  = _vals[np.isfinite(_vals)]
-        _vc   = max(float(np.percentile(_fin, 97)) if len(_fin) > 0 else 0.3, 0.05)
+        # Colorbar limits: use 68% spread (p84 - p16) / 2 of the after residuals,
+        # floored at 0.01 px to avoid degenerate colorbars.
+        _after_dx = rows_dx[1][np.isfinite(rows_dx[1])]
+        _after_dy = rows_dy[1][np.isfinite(rows_dy[1])]
+        def _half68(v):
+            if len(v) < 4:
+                return 0.05
+            return max(float((np.percentile(v, 84) - np.percentile(v, 16)) / 2), 0.01)
+        _vc = max(_half68(_after_dx), _half68(_after_dy))
         _vc_sig = 2.0
 
         n_cols = 4 if has_sigma else 2
@@ -710,7 +782,8 @@ def _plot_pop_residual_maps(
         if axes.ndim == 1:
             axes = axes[np.newaxis, :]
 
-        fig.suptitle(f'{root}  n={total_n}', fontsize=10, y=0.99)
+        fig.suptitle(f'{root}  n={total_n}/{total_n_possible} (used/total Gaia-matched)',
+                     fontsize=10, y=0.99)
 
         for row_i, stage_lbl in enumerate(stage_labels):
             raw_pairs = [(rows_dx[row_i], 'dx_gdc (px)'),
@@ -755,6 +828,122 @@ def _plot_pop_residual_maps(
     print(f"  Saved {saved} residual map(s) to {output_dir}/")
 
 
+# ── Soft-weight diagnostic plot ───────────────────────────────────────────────
+
+def _plot_soft_weights_pop(
+    z_weights_final: dict,
+    p3_active: dict,
+    solver,
+    image_names: list[str],
+    plot_dir: Path,
+    student_t_nu: float,
+) -> None:
+    """
+    Two-panel diagnostic for Phase 4 soft-weight IRLS results.
+
+    Left:  histogram of z values split by Phase-3-active vs re-admitted.
+    Right: per-image bar chart of N_possible / N_threshold / N_eff,
+           sorted by N_eff descending.
+
+    Saved to plot_dir / 'soft_weights_diagnostic.png'.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    all_z        = []   # z values for threshold-passing detections
+    all_p3       = []   # True if the detection was already active in Phase 3
+    neff_per     = {}   # {img: (n_possible, n_thresh, n_eff)}
+
+    for img in image_names:
+        z = z_weights_final.get(img) if z_weights_final else None
+        d = solver._img_data.get(img)
+        if z is None or d is None:
+            continue
+
+        # Threshold-passing mask: detections that participate (z > 0 or use_for_fit)
+        survivors = np.asarray(d['use_for_fit'], dtype=bool) | np.asarray(
+            d.get('use_for_astrom', d['use_for_fit']), dtype=bool)
+        p3_was_active = np.asarray(
+            p3_active.get(img, np.zeros(len(z), dtype=bool)), dtype=bool)
+
+        z_surv  = z[survivors]
+        p3_surv = p3_was_active[survivors]
+        all_z.extend(z_surv.tolist())
+        all_p3.extend(p3_surv.tolist())
+
+        n_possible = int(d['n'])
+        n_thresh   = int(survivors.sum())
+        n_eff      = float(z_surv.sum())
+        neff_per[img] = (n_possible, n_thresh, n_eff)
+
+    all_z  = np.array(all_z)
+    all_p3 = np.array(all_p3, dtype=bool)
+
+    n_thresh_total   = len(all_z)
+    n_possible_total = sum(v[0] for v in neff_per.values())
+    n_eff_total      = float(all_z.sum())
+    pct = 100.0 * n_eff_total / max(n_thresh_total, 1)
+
+    # Merge _hi/_lo chip pairs into per-FLC totals for the bar chart
+    flc_per = {}   # {root: (n_possible, n_thresh, n_eff)}
+    for img, (np_, nt, ne) in neff_per.items():
+        root = img[:-3] if img.endswith(('_hi', '_lo')) else img
+        if root in flc_per:
+            flc_per[root] = (flc_per[root][0] + np_,
+                             flc_per[root][1] + nt,
+                             flc_per[root][2] + ne)
+        else:
+            flc_per[root] = (np_, nt, ne)
+
+    flcs_sorted = sorted(flc_per, key=lambda i: flc_per[i][2], reverse=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    # ── Left: z histogram ────────────────────────────────────────────────────
+    ax = axes[0]
+    bins = np.linspace(0, 1, 51)
+    if all_p3.any():
+        ax.hist(all_z[all_p3],  bins=bins, alpha=0.6, label='Phase-3 active',
+                color='steelblue')
+    if (~all_p3).any():
+        ax.hist(all_z[~all_p3], bins=bins, alpha=0.6, label='Re-admitted (Phase 4)',
+                color='darkorange')
+    ax.axvline(0.5, color='red', lw=1, ls='--', label='z=0.5')
+    ax.set_xlabel('z  (Student-t weight)')
+    ax.set_ylabel('N detections')
+    ax.set_title('Detection weight distribution')
+    ax.legend(fontsize=9)
+
+    # ── Right: N_possible / N_threshold / N_eff per FLC ──────────────────────
+    ax2 = axes[1]
+    x   = np.arange(len(flcs_sorted))
+    nposs_vals   = [flc_per[r][0] for r in flcs_sorted]
+    nthresh_vals = [flc_per[r][1] for r in flcs_sorted]
+    neff_vals    = [flc_per[r][2] for r in flcs_sorted]
+    ax2.bar(x, nposs_vals,   color='lightgrey',      label='N_possible (in solver)')
+    ax2.bar(x, nthresh_vals, color='cornflowerblue', alpha=0.8, label='N_threshold')
+    ax2.bar(x, neff_vals,    color='steelblue',      alpha=0.9, label='N_eff (Σz)')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(flcs_sorted, rotation=45, ha='right', fontsize=7)
+    ax2.set_ylabel('Detections (both chips combined)')
+    ax2.set_title('N_possible / N_threshold / N_eff per FLC (sorted by N_eff)')
+    ax2.legend(fontsize=9)
+
+    fig.suptitle(
+        f'Soft-weight IRLS: detection weights (ν={student_t_nu:.0f})\n'
+        f'N_possible={n_possible_total}  N_threshold={n_thresh_total}  '
+        f'N_eff={n_eff_total:.0f} ({pct:.1f}%)',
+        fontsize=11,
+    )
+    fig.tight_layout()
+    out = Path(plot_dir) / 'soft_weights_diagnostic.png'
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"    Saved: {out}")
+
+
 # ── Main function ─────────────────────────────────────────────────────────────
 
 def run_pop_fit(
@@ -764,10 +953,10 @@ def run_pop_fit(
     plx_pop: float = 0.003873,
     sigma_plx_tot: float = 0.0001425,
     mu_pop_prior_sigma: float = 0.5,
-    n_iter_mu: int = 5,
-    n_iter_joint: int = 10,
+    n_iter_mu: int = 20,
+    n_iter_joint: int = 20,
     n_iter_alpha: int = 20,
-    n_iter_soft: int = 10,
+    n_iter_soft: int = 20,
     student_t_nu: float = 50.0,
     member_sigma_clip: float = 3.0,
     pm_sys_floor: float = 0.2,
@@ -1081,6 +1270,39 @@ def run_pop_fit(
                 break
 
         C_shared_joint = C_shared_joint_p3
+
+    # ── Re-open detections using Phase 3 residual thresholds ─────────────────
+    _p3_active = None
+    if n_iter_soft > 0:
+        # Save Phase 3 active set for soft-weights plot later
+        _p3_active = {
+            img: solver._img_data[img]['use_for_fit'].copy()
+            for img in image_names
+            if solver._img_data.get(img) is not None
+        }
+
+        # Re-evaluate ALL detections (including v1-excluded ones) against
+        # per-image adaptive thresholds derived from the Phase 3 trusted set.
+        # Phase 4 soft weights then handle remaining outliers continuously.
+        print(f"\n  Re-evaluating all detections using Phase 3 thresholds...")
+        reopen_info = _reopen_detections(
+            solver, image_names, r_current, a_arr)
+        n_total_added   = sum(r[4] for r in reopen_info)
+        n_total_removed = sum(r[5] for r in reopen_info)
+        n_grand_total   = sum(r[1] for r in reopen_info)
+        n_grand_after   = sum(r[3] for r in reopen_info)
+        for img, n_tot, nb, na, nadd, nrem, thr in reopen_info:
+            parts = []
+            if nadd > 0:
+                parts.append(f"+{nadd}")
+            if nrem > 0:
+                parts.append(f"-{nrem}")
+            change_str = f" ({', '.join(parts)})" if parts else ""
+            print(f"    {img}: {na}/{n_tot} pass threshold"
+                  f"  (p3_used={nb}){change_str}  thresh={thr:.2f}")
+        print(f"    Total: {n_grand_after}/{n_grand_total} detections pass threshold  "
+              f"(+{n_total_added} re-admitted  -{n_total_removed} removed  "
+              f"vs Phase 3 active set)")
 
     # ── Phase 4: soft-weight IRLS (alpha frozen from Phase 3) ────────────────
     z_weights_final = None
@@ -1430,9 +1652,31 @@ def run_pop_fit(
         # Restore geometry to final state for make_plots
         solver._update_geometry(r_current, v_mean)
 
+        if z_weights_final is not None and _p3_active is not None:
+            try:
+                print("\n  Plotting soft-weight diagnostic...")
+                _plot_soft_weights_pop(
+                    z_weights_final, _p3_active,
+                    solver, image_names,
+                    plot_dir=output_pfr / 'plots',
+                    student_t_nu=student_t_nu,
+                )
+            except Exception as _exc:
+                print(f"  WARNING: soft_weights_diagnostic plot failed — {_exc}")
+
         try:
             from bp3m.pipeline.plot_results import make_plots
             print("\n  Generating diagnostic plots...")
+            # Temporarily restore Phase 3 use_for_fit flags so that
+            # chi2_hst_distributions uses the tightly-curated Phase 3 sample
+            # rather than all re-opened detections (which include borderline
+            # ones up to the threshold and inflate the chi2 distribution).
+            if _p3_active is not None:
+                for _img in image_names:
+                    _d = solver._img_data.get(_img)
+                    if _d is not None and _img in _p3_active:
+                        _d['use_for_fit']    = _p3_active[_img].copy()
+                        _d['use_for_astrom'] = _p3_active[_img].copy()
             make_plots(solver, imgs, gaia_catalog,
                        r_current, v_mean, v_mean_marg, v_cov, C_vT_final, C_r,
                        output_dir=output_pfr,
@@ -1468,13 +1712,13 @@ def main():
                         help='Total parallax uncertainty (mas) for pop prior')
     parser.add_argument('--mu_pop_prior_sigma', type=float, default=0.5,
                         help='Gaussian prior width on μ_pop (mas/yr)')
-    parser.add_argument('--n_iter_mu', type=int, default=5,
+    parser.add_argument('--n_iter_mu', type=int, default=20,
                         help='Phase 1 (μ-only) solve iterations')
-    parser.add_argument('--n_iter_joint', type=int, default=10,
+    parser.add_argument('--n_iter_joint', type=int, default=20,
                         help='Phase 2 (joint r+μ) solve iterations')
     parser.add_argument('--n_iter_alpha', type=int, default=20,
                         help='Phase 3 (joint r+μ+alpha) solve iterations (0 to skip)')
-    parser.add_argument('--n_iter_soft', type=int, default=10,
+    parser.add_argument('--n_iter_soft', type=int, default=20,
                         help='Phase 4 (soft-weight IRLS, frozen alpha) iterations (0 to skip)')
     parser.add_argument('--student_t_nu', type=float, default=50.0,
                         help='Student-t degrees of freedom for soft weights '
