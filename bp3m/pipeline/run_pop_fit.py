@@ -1440,6 +1440,33 @@ def _plot_soft_weights_pop(
     print(f"    Saved: {out}")
 
 
+def _restrict_to_members(solver, image_names: list, member_sidx: np.ndarray) -> None:
+    """Set use_for_fit=False for all detections belonging to non-member stars.
+
+    Called each iteration when --fit_members_only is active.  Updates
+    gaia_n_hst_used to reflect the new active set.
+    """
+    is_member = np.zeros(solver.n_stars, dtype=bool)
+    is_member[member_sidx] = True
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        sidx_img = d['sidx']
+        old_use  = np.asarray(d['use_for_fit'], dtype=bool)
+        new_use  = old_use & is_member[sidx_img]
+        d['use_for_fit'] = new_use
+        if 'use_for_astrom' in d:
+            d['use_for_astrom'] = np.asarray(d['use_for_astrom'], dtype=bool) & is_member[sidx_img]
+    solver.gaia_n_hst_used[:] = 0
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        use_any = d['use_for_fit'] | d.get('use_for_astrom', d['use_for_fit'])
+        np.add.at(solver.gaia_n_hst_used, d['sidx'][use_any], 1)
+
+
 # ── Main function ─────────────────────────────────────────────────────────────
 
 def run_pop_fit(
@@ -1460,6 +1487,7 @@ def run_pop_fit(
     member_sigma_clip: float = 3.0,
     pm_sys_floor: float = 0.2,
     max_sigma_free_pm: float = 1.0,
+    fit_members_only: bool = False,
     poly_order: int | None = None,
     no_plots: bool = False,
 ) -> Path:
@@ -1752,7 +1780,8 @@ def run_pop_fit(
             solver._C_VG_inv_per_star)
         member_sidx = _select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
-            sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
+            sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
+            max_sigma_free_pm=max_sigma_free_pm)
         print(f"    iter {mu_iter + 1}/{n_iter_mu}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr  "
               f"Δμ={delta_mu:.4e}  members={len(member_sidx)}")
@@ -1786,7 +1815,10 @@ def run_pop_fit(
             solver._C_VG_inv_per_star)
         member_sidx = _select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
-            sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
+            sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
+            max_sigma_free_pm=max_sigma_free_pm)
+        if fit_members_only:
+            _restrict_to_members(solver, image_names, member_sidx)
         print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
               f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  members={len(member_sidx)}")
@@ -1826,6 +1858,8 @@ def run_pop_fit(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
                 max_sigma_free_pm=max_sigma_free_pm)
+            if fit_members_only:
+                _restrict_to_members(solver, image_names, member_sidx)
 
             for img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new in alpha_info:
                 tag = '  ← raised' if alpha_new > alpha_prev + 1e-4 else (
@@ -1937,6 +1971,8 @@ def run_pop_fit(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
                 max_sigma_free_pm=max_sigma_free_pm)
+            if fit_members_only:
+                _restrict_to_members(solver, image_names, member_sidx)
 
             n_use_img = sum(d['use_for_fit'].sum()
                             for d in (solver._img_data.get(img) for img in image_names)
@@ -2026,6 +2062,8 @@ def run_pop_fit(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
                 max_sigma_free_pm=max_sigma_free_pm)
+            if fit_members_only:
+                _restrict_to_members(solver, image_names, member_sidx)
 
             print(f"    iter {sw_iter + 1}/{n_iter_phase4}: "
                   f"n_eff={n_eff_new:.0f}/{n_det_total}  "
@@ -2466,6 +2504,10 @@ def main():
                         help='Polynomial order (default: read from BP3M_results/run_config.json)')
     parser.add_argument('--no_plots', action='store_true',
                         help='Skip diagnostic plot generation')
+    parser.add_argument('--fit_members_only', action='store_true',
+                        help='When set, only identified members are used in the astrometric '
+                             'fit from Phase 2 onwards; non-members are excluded from '
+                             'use_for_fit each iteration')
 
     args = parser.parse_args()
 
@@ -2487,6 +2529,7 @@ def main():
         member_sigma_clip=args.member_sigma_clip,
         pm_sys_floor=args.pm_sys_floor,
         max_sigma_free_pm=args.max_sigma_free_pm,
+        fit_members_only=args.fit_members_only,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
     )
