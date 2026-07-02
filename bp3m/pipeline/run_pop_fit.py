@@ -670,9 +670,14 @@ def _plot_pop_residual_maps(
 
             for col_i, ((vals, clbl), (vmin, vmax)) in enumerate(zip(all_pairs, clims)):
                 ax = axes[row_i, col_i]
+                ax.set_facecolor('#D8D8D8')
+                ax.grid(True, which='major', color='white', linewidth=0.7, zorder=0)
+                ax.grid(True, which='minor', color='white', linewidth=0.3, zorder=0)
+                ax.minorticks_on()
                 sc = ax.scatter(rows_x[row_i], rows_y[row_i], c=vals,
-                                cmap='RdBu_r', vmin=vmin, vmax=vmax,
-                                s=1.5, alpha=0.6, linewidths=0, rasterized=True)
+                                cmap='RdYlBu_r', vmin=vmin, vmax=vmax,
+                                s=10, alpha=0.8, linewidths=0,
+                                rasterized=True, zorder=2)
                 cb = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
                 cb.ax.tick_params(labelsize=7)
                 if row_i == 0:
@@ -829,11 +834,11 @@ def run_pop_fit(
     v_bp3m = solver.v_survey.copy()   # fallback: Gaia-only
 
     # Initial membership PM arrays — start from Gaia, override with v1 bp3m
-    _pmra_init       = gaia_catalog['pmra'].to_numpy(float)
-    _pmdec_init      = gaia_catalog['pmdec'].to_numpy(float)
-    _sig_pmra_init   = gaia_catalog['pmra_error'].to_numpy(float)
-    _sig_pmdec_init  = gaia_catalog['pmdec_error'].to_numpy(float)
-    _corr_pm_init    = (gaia_catalog['pmra_pmdec_corr'].to_numpy(float)
+    _pmra_init       = gaia_catalog['pmra'].to_numpy(float).copy()
+    _pmdec_init      = gaia_catalog['pmdec'].to_numpy(float).copy()
+    _sig_pmra_init   = gaia_catalog['pmra_error'].to_numpy(float).copy()
+    _sig_pmdec_init  = gaia_catalog['pmdec_error'].to_numpy(float).copy()
+    _corr_pm_init    = (gaia_catalog['pmra_pmdec_corr'].to_numpy(float).copy()
                         if 'pmra_pmdec_corr' in gaia_catalog.columns
                         else np.zeros(solver.n_stars))
 
