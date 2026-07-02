@@ -1268,9 +1268,10 @@ def run_pop_fit(
             r_current, fix_r=True,
         )
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+        _mu_pop_used = mu_pop_current.copy()   # mu_pop baked into a_arr
         mu_pop_current = mu_pop_new
         _a_free, _C_free = _compute_free_stellar_posterior(
-            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop,
+            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
             solver._C_VG_inv_per_star)
         member_sidx = _select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
@@ -1300,10 +1301,11 @@ def run_pop_fit(
         )
         delta_r  = float(np.max(np.abs(r_new - r_current)))
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+        _mu_pop_used = mu_pop_current.copy()   # mu_pop baked into a_arr
         r_current      = r_new
         mu_pop_current = mu_pop_new
         _a_free, _C_free = _compute_free_stellar_posterior(
-            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop,
+            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
             solver._C_VG_inv_per_star)
         member_sidx = _select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
@@ -1336,10 +1338,12 @@ def run_pop_fit(
 
             delta_r     = float(np.max(np.abs(r_new - r_current)))
             delta_mu    = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+            _mu_pop_used = mu_pop_current.copy()   # mu_pop baked into a_arr
             r_current      = r_new
             mu_pop_current = mu_pop_new
             _a_free, _C_free = _compute_free_stellar_posterior(
-                a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop)
+                a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+                solver._C_VG_inv_per_star)
             member_sidx = _select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
@@ -1476,13 +1480,15 @@ def run_pop_fit(
                 for img in image_names
                 if z_new.get(img) is not None and z_weights_final.get(img) is not None))
 
+            _mu_pop_used    = mu_pop_current.copy()   # mu_pop baked into a_arr_sw
             r_current      = r_new
             mu_pop_current = mu_pop_new
             z_weights_final = z_new
             a_arr           = a_arr_sw
 
             _a_free, _C_free = _compute_free_stellar_posterior(
-                a_arr, C_vT_sw, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop)
+                a_arr, C_vT_sw, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+                solver._C_VG_inv_per_star)
             member_sidx = _select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
