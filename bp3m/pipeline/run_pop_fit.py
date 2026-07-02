@@ -118,38 +118,35 @@ def _select_members_from_a(
 # ── Initial member selection from Gaia catalog PMs ───────────────────────────
 
 def _select_initial_members(
-    gaia_catalog: pd.DataFrame,
+    pmra: np.ndarray,
+    pmdec: np.ndarray,
+    sigma_pmra: np.ndarray,
+    sigma_pmdec: np.ndarray,
+    corr_pm: np.ndarray,
     mu_pop: np.ndarray,
     member_sigma_clip: float,
     sigma_pm: float,
     pm_sys_floor: float = 0.2,
 ) -> np.ndarray:
-    """Select initial member candidates from Gaia catalog PMs.
+    """Select initial member candidates from BP3M v1 (or Gaia fallback) PMs.
 
-    For each star, the membership threshold is member_sigma_clip times the
-    geometric mean PM uncertainty, where the total per-star covariance is the
-    Gaia PM covariance plus (sigma_pm² + pm_sys_floor²) on the diagonal.
+    Per-star threshold = member_sigma_clip × geometric mean PM uncertainty,
+    where the total covariance is the per-star PM covariance plus
+    (sigma_pm² + pm_sys_floor²) on the diagonal.
+    Geometric mean sigma = det(C_total)^(1/4).
     """
-    pmra  = gaia_catalog['pmra'].to_numpy(float)
-    pmdec = gaia_catalog['pmdec'].to_numpy(float)
-    sig_ra  = gaia_catalog['pmra_error'].to_numpy(float)
-    sig_dec = gaia_catalog['pmdec_error'].to_numpy(float)
-    rho     = gaia_catalog.get('pmra_pmdec_corr',
-                               pd.Series(np.zeros(len(gaia_catalog)))).to_numpy(float)
-    rho     = np.where(np.isfinite(rho), rho, 0.0)
+    extra   = sigma_pm ** 2 + pm_sys_floor ** 2
+    var_ra  = np.where(np.isfinite(sigma_pmra),  sigma_pmra  ** 2, 1.0) + extra
+    var_dec = np.where(np.isfinite(sigma_pmdec), sigma_pmdec ** 2, 1.0) + extra
+    cov_off = np.where(np.isfinite(sigma_pmra) & np.isfinite(sigma_pmdec),
+                       np.where(np.isfinite(corr_pm), corr_pm, 0.0)
+                       * sigma_pmra * sigma_pmdec, 0.0)
 
-    extra = sigma_pm ** 2 + pm_sys_floor ** 2
-    var_ra  = np.where(np.isfinite(sig_ra),  sig_ra  ** 2, 1.0) + extra
-    var_dec = np.where(np.isfinite(sig_dec), sig_dec ** 2, 1.0) + extra
-    cov_off = np.where(np.isfinite(sig_ra) & np.isfinite(sig_dec),
-                       rho * sig_ra * sig_dec, 0.0)
+    det_C      = np.maximum(var_ra * var_dec - cov_off ** 2, 1e-30)
+    geom_sigma = det_C ** 0.25   # sqrt(sigma_1 * sigma_2)
 
-    # det(C) = var_ra * var_dec - cov_off²; geometric mean sigma = det(C)^(1/4)
-    det_C   = np.maximum(var_ra * var_dec - cov_off ** 2, 1e-30)
-    geom_sigma = det_C ** 0.25   # = sqrt(sigma_1 * sigma_2)
-
-    finite  = np.isfinite(pmra) & np.isfinite(pmdec)
-    dist    = np.where(finite, np.hypot(pmra - mu_pop[0], pmdec - mu_pop[1]), np.inf)
+    finite = np.isfinite(pmra) & np.isfinite(pmdec)
+    dist   = np.where(finite, np.hypot(pmra - mu_pop[0], pmdec - mu_pop[1]), np.inf)
     return np.where(dist < member_sigma_clip * geom_sigma)[0]
 
 
@@ -708,6 +705,7 @@ def run_pop_fit(
     n_iter_mu: int = 5,
     n_iter_joint: int = 10,
     member_sigma_clip: float = 3.0,
+    pm_sys_floor: float = 0.2,
     poly_order: int | None = None,
     no_plots: bool = False,
 ) -> Path:
@@ -750,7 +748,7 @@ def run_pop_fit(
     print(f"  σ_pm={sigma_pm} mas/yr  plx_pop={plx_pop} mas  "
           f"σ_plx_tot={sigma_plx_tot} mas")
     print(f"  μ_pop prior σ={mu_pop_prior_sigma} mas/yr  "
-          f"member_sigma_clip={member_sigma_clip}")
+          f"member_sigma_clip={member_sigma_clip}  pm_sys_floor={pm_sys_floor} mas/yr")
     print(f"  poly_order={poly_order}  split_ccd={v1_split_ccd}  "
           f"v1 images={len(v1_image_names)}")
 
@@ -826,24 +824,56 @@ def run_pop_fit(
     solver._update_R(r_bp3m)
     solver._update_geometry(r_bp3m, solver.v_survey)
 
-    # ── Load v1 bp3m posteriors (for before/after residual plots) ─────────────
+    # ── Load v1 bp3m posteriors (for initial membership + before/after plots) ──
     v1_astrom_path = bp3m_dir / 'stellar_astrometry.csv'
     v_bp3m = solver.v_survey.copy()   # fallback: Gaia-only
+
+    # Initial membership PM arrays — start from Gaia, override with v1 bp3m
+    _pmra_init       = gaia_catalog['pmra'].to_numpy(float)
+    _pmdec_init      = gaia_catalog['pmdec'].to_numpy(float)
+    _sig_pmra_init   = gaia_catalog['pmra_error'].to_numpy(float)
+    _sig_pmdec_init  = gaia_catalog['pmdec_error'].to_numpy(float)
+    _corr_pm_init    = (gaia_catalog['pmra_pmdec_corr'].to_numpy(float)
+                        if 'pmra_pmdec_corr' in gaia_catalog.columns
+                        else np.zeros(solver.n_stars))
+
+    _v1_pm_loaded = False
     if v1_astrom_path.exists():
         try:
             _v1 = pd.read_csv(v1_astrom_path)
             _v1['Gaia_id'] = _v1['Gaia_id'].astype(np.int64)
             _v1_idx = {int(g): i for i, g in enumerate(_v1['Gaia_id'])}
-            _cols = ['delta_racosdec_bp3m', 'delta_dec_bp3m',
-                     'pmra_bp3m', 'pmdec_bp3m', 'parallax_bp3m']
-            if all(c in _v1.columns for c in _cols):
-                _v1_arr = _v1[_cols].to_numpy(float)
+
+            _v_cols = ['delta_racosdec_bp3m', 'delta_dec_bp3m',
+                       'pmra_bp3m', 'pmdec_bp3m', 'parallax_bp3m']
+            _pm_sig_cols = ['sigma_pmra_bp3m', 'sigma_pmdec_bp3m', 'corr_pmra_pmdec']
+
+            if all(c in _v1.columns for c in _v_cols):
+                _v1_arr = _v1[_v_cols].to_numpy(float)
                 for i, gid in enumerate(gaia_catalog['Gaia_id']):
                     j = _v1_idx.get(int(gid))
                     if j is not None:
                         v_bp3m[i] = _v1_arr[j]
+
+            if all(c in _v1.columns for c in _pm_sig_cols):
+                _v1_pm  = _v1[['pmra_bp3m', 'pmdec_bp3m']].to_numpy(float)
+                _v1_sig = _v1[_pm_sig_cols].to_numpy(float)
+                for i, gid in enumerate(gaia_catalog['Gaia_id']):
+                    j = _v1_idx.get(int(gid))
+                    if j is not None:
+                        _pmra_init[i]      = _v1_pm[j, 0]
+                        _pmdec_init[i]     = _v1_pm[j, 1]
+                        _sig_pmra_init[i]  = _v1_sig[j, 0]
+                        _sig_pmdec_init[i] = _v1_sig[j, 1]
+                        _corr_pm_init[i]   = _v1_sig[j, 2]
+                _v1_pm_loaded = True
+
         except Exception as _exc:
-            print(f"  WARNING: could not load v1 posteriors for plot — {_exc}")
+            print(f"  WARNING: could not load v1 posteriors — {_exc}")
+
+    if not _v1_pm_loaded:
+        print("  WARNING: v1 stellar_astrometry.csv missing PM sigma columns; "
+              "falling back to Gaia PMs for initial membership")
 
     # ── Apply v1 use_for_fit / use_for_astrom flags ───────────────────────────
     print("\n  Applying v1 detection flags...")
@@ -867,10 +897,13 @@ def run_pop_fit(
     print(f"  μ_pop prior: ({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) ± "
           f"{mu_pop_prior_sigma:.2f} mas/yr")
 
-    # ── Initial member selection from Gaia catalog PMs ────────────────────────
-    print("\n  Selecting initial members from Gaia catalog PMs...")
+    # ── Initial member selection from v1 bp3m posteriors ─────────────────────
+    _src = "v1 bp3m" if _v1_pm_loaded else "Gaia"
+    print(f"\n  Selecting initial members from {_src} PMs...")
     member_sidx = _select_initial_members(
-        gaia_catalog, mu_pop_current, member_sigma_clip, sigma_pm)
+        _pmra_init, _pmdec_init,
+        _sig_pmra_init, _sig_pmdec_init, _corr_pm_init,
+        mu_pop_current, member_sigma_clip, sigma_pm, pm_sys_floor)
     print(f"  Initial members: {len(member_sidx)}")
 
     # Recompute gaia_n_hst_used to reflect the v1 flags we just applied
@@ -897,7 +930,8 @@ def run_pop_fit(
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
         mu_pop_current = mu_pop_new
         member_sidx = _select_members_from_a(
-            a_arr, mu_pop_current, _n_hst_det, sigma_clip=member_sigma_clip)
+            a_arr, mu_pop_current, _n_hst_det,
+            sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
         print(f"    iter {mu_iter + 1}/{n_iter_mu}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr  "
               f"Δμ={delta_mu:.4e}  members={len(member_sidx)}")
@@ -926,7 +960,8 @@ def run_pop_fit(
         r_current      = r_new
         mu_pop_current = mu_pop_new
         member_sidx = _select_members_from_a(
-            a_arr, mu_pop_current, _n_hst_det, sigma_clip=member_sigma_clip)
+            a_arr, mu_pop_current, _n_hst_det,
+            sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
         print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
               f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  members={len(member_sidx)}")
@@ -1205,6 +1240,9 @@ def main():
                         help='Phase 2 (joint r+μ) solve iterations')
     parser.add_argument('--member_sigma_clip', type=float, default=3.0,
                         help='Sigma threshold for membership selection')
+    parser.add_argument('--pm_sys_floor', type=float, default=0.2,
+                        help='Systematic PM floor added in quadrature to per-star '
+                             'PM uncertainty for membership radius (mas/yr)')
     parser.add_argument('--poly_order', type=int, default=None,
                         help='Polynomial order (default: read from BP3M_results/run_config.json)')
     parser.add_argument('--no_plots', action='store_true',
@@ -1222,6 +1260,7 @@ def main():
         n_iter_mu=args.n_iter_mu,
         n_iter_joint=args.n_iter_joint,
         member_sigma_clip=args.member_sigma_clip,
+        pm_sys_floor=args.pm_sys_floor,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
     )
