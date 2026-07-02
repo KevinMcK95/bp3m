@@ -621,7 +621,7 @@ def _reopen_detections(
     """
     from scipy.stats import chi2 as _chi2
 
-    _FLOOR = float(_chi2.ppf(0.95, df=2))   # ≈ 5.99
+    _FLOOR = float(_chi2.ppf(0.99, df=2))   # ≈ 9.21
 
     resid_all = solver.compute_residuals(r_current, a_arr)   # ALL detections
 
