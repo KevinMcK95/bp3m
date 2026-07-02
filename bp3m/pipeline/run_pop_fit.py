@@ -1328,6 +1328,38 @@ def run_pop_fit(
     if n_iter_soft > 0:
         print(f"\n  Phase 4: soft-weight IRLS  ν={student_t_nu:.1f}  z_threshold={z_threshold:.2f}  "
               f"({n_iter_soft} iterations, α frozen)...")
+
+        # Evaluate z on the Phase 3 active set (before re-opening) to show the
+        # warm-start distribution.  Save the re-opened flags, swap in Phase 3
+        # flags temporarily, compute z, then restore.
+        _reopened_flags = {
+            img: solver._img_data[img]['use_for_fit'].copy()
+            for img in image_names
+            if solver._img_data.get(img) is not None
+        }
+        for _img in image_names:
+            _d = solver._img_data.get(_img)
+            if _d is not None and _img in _p3_active:
+                _d['use_for_fit']    = _p3_active[_img].copy()
+                _d['use_for_astrom'] = _p3_active[_img].copy()
+        _z_p3, _, _ = solver._update_soft_weights(r_current, a_arr, student_t_nu)
+        for _img in image_names:
+            _d = solver._img_data.get(_img)
+            if _d is not None and _img in _reopened_flags:
+                _d['use_for_fit']    = _reopened_flags[_img]
+                _d['use_for_astrom'] = _reopened_flags[_img].copy()
+        _p3_z_vals = np.concatenate([
+            _z_p3[img][_p3_active[img]]
+            for img in image_names
+            if _z_p3.get(img) is not None and img in _p3_active
+        ])
+        _pcts = np.percentile(_p3_z_vals, [0, 16, 50, 84, 100]) if len(_p3_z_vals) else [np.nan]*5
+        print(f"  Phase 3 active set z-values (warm start):  "
+              f"min={_pcts[0]:.3f}  p16={_pcts[1]:.3f}  p50={_pcts[2]:.3f}  "
+              f"p84={_pcts[3]:.3f}  max={_pcts[4]:.3f}  "
+              f"(n={len(_p3_z_vals)}, n_below_thresh={int((_p3_z_vals < z_threshold).sum())})")
+
+        # Now compute z on the re-opened set for Phase 4
         _z_raw, n_det_total, n_eff = solver._update_soft_weights(
             r_current, a_arr, student_t_nu)
         z_weights_final = _apply_z_threshold(_z_raw, z_threshold)
