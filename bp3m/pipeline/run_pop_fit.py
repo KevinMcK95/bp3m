@@ -2285,8 +2285,10 @@ def run_pop_fit(
             print(f"  WARNING: make_plots failed — {_exc}")
 
         try:
+            _plot_dir = output_pfr / 'plots'
+            _plot_dir.mkdir(parents=True, exist_ok=True)
             _plot_pm_vs_properties(
-                output_pfr, solver, image_names, gaia_catalog,
+                _plot_dir, solver, image_names, gaia_catalog,
                 v_mean_free_marg, C_vT_free_sol,
                 member_sidx, mu_pop_current, sigma_pm, field_name,
             )
