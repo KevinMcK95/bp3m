@@ -15,13 +15,60 @@ from pathlib import Path
 PLOT_DIR_NAME = "plots"
 RESID_PLOT_DIR_NAME = "residuals"
 
+_MEM_MARKER = 'o'   # circle  — member stars
+_NON_MARKER = 'v'   # triangle-down — non-member stars
+_MEM_SIZE   = 8
+_NON_SIZE   = 5
+
+
+def _scatter_mem(ax, x, y, c, is_member, *, norm, cmap, alpha=0.8, zorder=2, **kw):
+    """Scatter with circles for members and downward-triangles for non-members.
+    Falls back to a single scatter (circle, s=6) when is_member is None.
+    Returns the last ScalarMappable created (use as colorbar source)."""
+    if is_member is None:
+        return ax.scatter(x, y, c=c, s=6, norm=norm, cmap=cmap,
+                          alpha=alpha, zorder=zorder, **kw)
+    sc = None
+    nm = ~is_member
+    if nm.any():
+        sc = ax.scatter(x[nm], y[nm], c=c[nm], marker=_NON_MARKER, s=_NON_SIZE,
+                        norm=norm, cmap=cmap, alpha=0.6, zorder=zorder, **kw)
+    if is_member.any():
+        sc = ax.scatter(x[is_member], y[is_member], c=c[is_member],
+                        marker=_MEM_MARKER, s=_MEM_SIZE,
+                        norm=norm, cmap=cmap, alpha=0.9, zorder=zorder + 0.1, **kw)
+    return sc
+
+
+def _add_mu_pop_lines(ax, mu_pop):
+    """Dashed lines at the population PM (μ_α*, μ_δ)."""
+    if mu_pop is None:
+        return
+    ax.axvline(mu_pop[0], c='0.35', lw=1.1, ls='--', zorder=1e9)
+    ax.axhline(mu_pop[1], c='0.35', lw=1.1, ls='--', zorder=1e9)
+
+
+def _mem_legend_handles():
+    from matplotlib.lines import Line2D
+    return [
+        Line2D([0], [0], marker=_MEM_MARKER, color='w', markerfacecolor='0.5',
+               markeredgecolor='0.5', markersize=6, label='Member'),
+        Line2D([0], [0], marker=_NON_MARKER, color='w', markerfacecolor='0.5',
+               markeredgecolor='0.5', markersize=5, label='Non-member'),
+    ]
+
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def make_plots(solver, images, gaia_catalog,
                r_hat, v_hat, v_mean, v_cov, C_vT, C_r,
                output_dir,
-               plot_residuals: bool = False):
+               plot_residuals: bool = False,
+               member_sidx=None,
+               mu_pop=None,
+               v_mean_free=None,
+               v_cov_free=None,
+               C_vT_free=None):
     """
     Generate all diagnostic plots.
 
@@ -47,6 +94,29 @@ def make_plots(solver, images, gaia_catalog,
 
     # Full marginal covariance = r-propagation + conditional
     v_cov_full = v_cov + C_vT   # (n_stars, 5, 5)
+
+    # ── Member mask and free (diffuse-prior) data ─────────────────────────────
+    is_member = None
+    if member_sidx is not None and len(member_sidx) > 0:
+        is_member = np.zeros(v_mean.shape[0], dtype=bool)
+        is_member[member_sidx] = True
+
+    has_free = (v_mean_free is not None
+                and v_cov_free is not None
+                and C_vT_free is not None)
+    if has_free:
+        _vcov_full_free    = v_cov_free + C_vT_free
+        _pmra_free         = v_mean_free[:, 2]
+        _pmdec_free        = v_mean_free[:, 3]
+        _C_pm_free         = _vcov_full_free[:, 2:4, 2:4]
+        _det_free          = np.linalg.det(_C_pm_free)
+        _sig_pm_free       = np.where(_det_free > 0, _det_free ** 0.25, np.nan)
+        _bp3m_conv_free    = _sig_pm_free < 90
+        _sig_pmra_free     = np.sqrt(_C_pm_free[:, 0, 0])
+        _sig_pmdec_free    = np.sqrt(_C_pm_free[:, 1, 1])
+        _rho_free          = (_C_pm_free[:, 0, 1]
+                              / np.where(_sig_pmra_free * _sig_pmdec_free > 0,
+                                         _sig_pmra_free * _sig_pmdec_free, np.nan))
 
     pmra_bp3m   = v_mean[:, 2]
     pmdec_bp3m  = v_mean[:, 3]
@@ -149,6 +219,73 @@ def make_plots(solver, images, gaia_catalog,
     fig.suptitle("Proper motion comparison", fontsize=13)
     _save(fig, plot_dir / "pm_one_to_one.png")
 
+    if has_free:
+        # Free version: BP3M column uses diffuse-prior PMs
+        pmra_bp3m_free_g   = _pmra_free[has_gaia]
+        pmdec_bp3m_free_g  = _pmdec_free[has_gaia]
+        sig_pmra_free_g    = _sig_pmra_free[has_gaia]
+        sig_pmdec_free_g   = _sig_pmdec_free[has_gaia]
+        sig_pm_free_g      = _pm_geom_unc(sig_pmra_free_g, sig_pmdec_free_g,
+                                          _rho_free[has_gaia])
+        _bp3m_gaia_conv_f  = _bp3m_conv_free & has_gaia
+        _bp3m_hst_conv_f   = _bp3m_conv_free & hst_only
+
+        fig = plt.figure(figsize=(13, 11/2*3), layout="constrained")
+        gs  = fig.add_gridspec(3, 2)
+        ax_pmra  = fig.add_subplot(gs[0, 0])
+        ax_pmdec = fig.add_subplot(gs[0, 1])
+        ax_unc   = fig.add_subplot(gs[1, :])
+        ax_unc_improve = fig.add_subplot(gs[2, :])
+
+        for ax, gaia_pm, bp3m_pm_g, sig_g, sig_b_g, comp in zip(
+                [ax_pmra, ax_pmdec],
+                [pmra_gaia[has_gaia],   pmdec_gaia[has_gaia]],
+                [pmra_bp3m_free_g,      pmdec_bp3m_free_g],
+                [sig_pmra_gaia[has_gaia], sig_pmdec_gaia[has_gaia]],
+                [sig_pmra_free_g,        sig_pmdec_free_g],
+                [r"$\mu_{\alpha*}$",    r"$\mu_\delta$"]):
+            ax.errorbar(gaia_pm, bp3m_pm_g, xerr=sig_g, yerr=sig_b_g,
+                        fmt='o', ms=3, lw=0.5, alpha=0.5, color='steelblue',
+                        label='Gaia-matched', zorder=2)
+            lim = _padded_lim(gaia_pm, bp3m_pm_g)
+            ax.plot(lim, lim, 'k--', lw=1, zorder=4)
+            ax.set_xlim(lim); ax.set_ylim(lim)
+            ax.set_xlabel(f"{comp} Gaia [mas/yr]")
+            ax.set_ylabel(f"{comp} BP3M diffuse prior [mas/yr]")
+            ax.set_title(f"{comp}: BP3M (diffuse prior) vs Gaia")
+            ax.set_aspect("equal")
+            ax.legend(fontsize=7, loc='upper left')
+            _style_ax(ax)
+
+        gm = gmag[has_gaia]
+        ax_unc.scatter(gm, sig_pm_gaia[has_gaia],
+                       s=6, alpha=0.7, color='#444444', label='Gaia 5p', zorder=2)
+        ax_unc.scatter(gmag[_bp3m_gaia_conv_f], _sig_pm_free[_bp3m_gaia_conv_f],
+                       s=6, alpha=0.7, color='steelblue',
+                       label='BP3M Gaia 5p (diffuse prior)', zorder=3)
+        if _bp3m_hst_conv_f.any():
+            ax_unc.scatter(gmag[_bp3m_hst_conv_f], _sig_pm_free[_bp3m_hst_conv_f],
+                           s=10, alpha=0.8, color='darkorange', marker='^',
+                           label='BP3M Gaia 2p + HST (diffuse prior)', zorder=4)
+        ax_unc.set_xlabel("G [mag]")
+        ax_unc.set_ylabel(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
+        ax_unc.set_title(r"Geometric-mean PM uncertainty (diffuse prior) vs magnitude")
+        ax_unc.legend()
+        ax_unc.set_yscale("log")
+        _style_ax(ax_unc)
+
+        ax_unc_improve.scatter(gm, sig_pm_gaia[has_gaia] / _sig_pm_free[has_gaia],
+                               s=6, alpha=0.6, color='steelblue', zorder=2)
+        ax_unc_improve.set_xlabel("Gaia G [mag]")
+        ax_unc_improve.set_ylabel("PM Improvement Factor (diffuse prior)")
+        ax_unc_improve.set_title(
+            "PM uncertainty improvement vs magnitude (diffuse prior vs Gaia-alone)")
+        ax_unc_improve.axhline(1.0, c='k', lw=2, ls='--', zorder=-1e10)
+        _style_ax(ax_unc_improve)
+
+        fig.suptitle("Proper motion comparison (diffuse prior)", fontsize=13)
+        _save(fig, plot_dir / "pm_one_to_one_diffuse_prior.png")
+
     # ── Figure 2: PM vector diagrams coloured by geometric-mean uncertainty ───
     print("  Plotting PM vector diagrams...")
 
@@ -177,77 +314,119 @@ def make_plots(solver, images, gaia_catalog,
     norm = mcolors.LogNorm(vmin=max(vmin, 1e-6), vmax=vmax)
     cmap = "plasma"
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
+    _is_mem_gaia_h = is_member[has_gaia]       if is_member is not None else None
+    _is_mem_bp3m_h = is_member[bp3m_converged] if is_member is not None else None
 
-    sc_last = None
-    for col, pmra, pmdec, c_vals, label in zip(
-            [0, 1],
-            [gaia_pmra_h,  bp3m_pmra_h],
-            [gaia_pmdec_h, bp3m_pmdec_h],
-            [c_gaia,       c_bp3m],
-            ["Gaia",       "BP3M"]):
-
-        for row, xlim, ylim, suffix in zip(
+    def _render_vd(axes, pmra_g, pmdec_g, c_g, pmra_b, pmdec_b, c_b,
+                   is_m_g, is_m_b, vd_norm, title_bp3m='BP3M'):
+        sc_last = None
+        for col, pmra, pmdec, c_vals, label, is_m in zip(
                 [0, 1],
-                [full_xlim, zoom_xlim],
-                [full_ylim, zoom_ylim],
-                ["full range", "zoom (68% CI)"]):
+                [pmra_g,  pmra_b],
+                [pmdec_g, pmdec_b],
+                [c_g,     c_b],
+                ["Gaia",  title_bp3m],
+                [is_m_g,  is_m_b]):
+            for row, xlim, ylim, suffix in zip(
+                    [0, 1],
+                    [full_xlim, zoom_xlim],
+                    [full_ylim, zoom_ylim],
+                    ["full range", "zoom (68% CI)"]):
+                ax = axes[row, col]
+                sc = _scatter_mem(ax, pmra, pmdec, c_vals, is_m,
+                                  norm=vd_norm, cmap=cmap, zorder=2)
+                ax.axhline(0, c='k', lw=1, ls='--', zorder=1e10)
+                ax.axvline(0, c='k', lw=1, ls='--', zorder=1e10)
+                _add_mu_pop_lines(ax, mu_pop)
+                ax.set_xlim(xlim); ax.set_ylim(ylim)
+                ax.set_xlabel(r"$\mu_{\alpha*}$ [mas/yr]")
+                ax.set_ylabel(r"$\mu_\delta$ [mas/yr]")
+                ax.set_title(f"{label} — {suffix}")
+                ax.set_aspect("equal")
+                _style_ax(ax)
+                sc_last = sc
+                if row == 0 and col == 0 and is_m is not None:
+                    ax.legend(handles=_mem_legend_handles(), fontsize=7,
+                              loc='upper left', framealpha=0.7)
+        return sc_last
 
-            ax = axes[row, col]
-            sc = ax.scatter(pmra, pmdec, c=c_vals, s=6, alpha=0.8,
-                            cmap=cmap, norm=norm, zorder=2)
-            ax.axhline(0,c='k',lw=1,ls='--',zorder=1e10)
-            ax.axvline(0,c='k',lw=1,ls='--',zorder=1e10)
-            ax.set_xlim(xlim); ax.set_ylim(ylim)
-            ax.set_xlabel(r"$\mu_{\alpha*}$ [mas/yr]")
-            ax.set_ylabel(r"$\mu_\delta$ [mas/yr]")
-            ax.set_title(f"{label} — {suffix}")
-            ax.set_aspect("equal")
-            _style_ax(ax)
-            sc_last = sc
-
+    fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
+    sc_last = _render_vd(axes, gaia_pmra_h, gaia_pmdec_h, c_gaia,
+                         bp3m_pmra_h, bp3m_pmdec_h, c_bp3m,
+                         _is_mem_gaia_h, _is_mem_bp3m_h, norm)
     cbar = fig.colorbar(sc_last, ax=axes, shrink=0.6, pad=0.02, aspect=30)
     cbar.set_label(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
     fig.suptitle("PM vector diagrams coloured by geometric-mean uncertainty", fontsize=13)
     _save(fig, plot_dir / "pm_vector_diagram.png")
 
+    if has_free:
+        _bp3m_pmra_free_h  = _pmra_free[_bp3m_conv_free]
+        _bp3m_pmdec_free_h = _pmdec_free[_bp3m_conv_free]
+        _c_bp3m_free       = _sig_pm_free[_bp3m_conv_free]
+        _is_m_free_h       = is_member[_bp3m_conv_free] if is_member is not None else None
+        _all_unc_free = np.concatenate([c_gaia[np.isfinite(c_gaia)],
+                                        _c_bp3m_free[np.isfinite(_c_bp3m_free)]])
+        _norm_free = mcolors.LogNorm(
+            vmin=max(float(np.nanpercentile(_all_unc_free, 2)), 1e-6),
+            vmax=float(np.nanpercentile(_all_unc_free, 98)))
+        fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
+        sc_last = _render_vd(axes, gaia_pmra_h, gaia_pmdec_h, c_gaia,
+                             _bp3m_pmra_free_h, _bp3m_pmdec_free_h, _c_bp3m_free,
+                             _is_mem_gaia_h, _is_m_free_h, _norm_free,
+                             title_bp3m='BP3M (diffuse prior)')
+        cbar = fig.colorbar(sc_last, ax=axes, shrink=0.6, pad=0.02, aspect=30)
+        cbar.set_label(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
+        fig.suptitle("PM vector diagrams (diffuse prior) coloured by geometric-mean uncertainty",
+                     fontsize=13)
+        _save(fig, plot_dir / "pm_vector_diagram_diffuse_prior.png")
+
     # ── Figure 2b: PM vector diagrams with covariance error bars ─────────────
     print("  Plotting PM vector diagrams with error bars...")
+
+    def _render_vd_eb(axes, pmra_g, pmdec_g, c_g, C_pm_g,
+                      pmra_b, pmdec_b, c_b, C_pm_b,
+                      is_m_g, is_m_b, vd_norm, title_bp3m='BP3M'):
+        sc_last = None
+        for col, pmra, pmdec, c_vals, C_pm_col, label, is_m in zip(
+                [0, 1],
+                [pmra_g,  pmra_b],
+                [pmdec_g, pmdec_b],
+                [c_g,     c_b],
+                [C_pm_g,  C_pm_b],
+                ["Gaia",  title_bp3m],
+                [is_m_g,  is_m_b]):
+            for row, xlim, ylim, suffix in zip(
+                    [0, 1],
+                    [full_xlim, zoom_xlim],
+                    [full_ylim, zoom_ylim],
+                    ["full range", "zoom (68% CI)"]):
+                ax = axes[row, col]
+                _pm_error_bars(ax, pmra, pmdec, C_pm_col)
+                sc = _scatter_mem(ax, pmra, pmdec, c_vals, is_m,
+                                  norm=vd_norm, cmap=cmap, zorder=2)
+                ax.axhline(0, c='k', lw=1, ls='--', zorder=1e10)
+                ax.axvline(0, c='k', lw=1, ls='--', zorder=1e10)
+                _add_mu_pop_lines(ax, mu_pop)
+                ax.set_xlim(xlim); ax.set_ylim(ylim)
+                ax.set_xlabel(r"$\mu_{\alpha*}$ [mas/yr]")
+                ax.set_ylabel(r"$\mu_\delta$ [mas/yr]")
+                ax.set_title(f"{label} — {suffix}")
+                ax.set_aspect("equal")
+                _style_ax(ax)
+                sc_last = sc
+                if row == 0 and col == 0 and is_m is not None:
+                    ax.legend(handles=_mem_legend_handles(), fontsize=7,
+                              loc='upper left', framealpha=0.7)
+        return sc_last
 
     C_pm_gaia_h = solver.C_survey[has_gaia, 2:4, 2:4]
     C_pm_bp3m_h = C_pm_bp3m[bp3m_converged]
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
-
-    sc_last = None
-    for col, pmra, pmdec, c_vals, C_pm_col, label in zip(
-            [0, 1],
-            [gaia_pmra_h,  bp3m_pmra_h],
-            [gaia_pmdec_h, bp3m_pmdec_h],
-            [c_gaia,       c_bp3m],
-            [C_pm_gaia_h,  C_pm_bp3m_h],
-            ["Gaia",       "BP3M"]):
-
-        for row, xlim, ylim, suffix in zip(
-                [0, 1],
-                [full_xlim, zoom_xlim],
-                [full_ylim, zoom_ylim],
-                ["full range", "zoom (68% CI)"]):
-
-            ax = axes[row, col]
-            _pm_error_bars(ax, pmra, pmdec, C_pm_col)
-            sc = ax.scatter(pmra, pmdec, c=c_vals, s=6, alpha=0.8,
-                            cmap=cmap, norm=norm, zorder=2)
-            ax.axhline(0, c='k', lw=1, ls='--', zorder=1e10)
-            ax.axvline(0, c='k', lw=1, ls='--', zorder=1e10)
-            ax.set_xlim(xlim); ax.set_ylim(ylim)
-            ax.set_xlabel(r"$\mu_{\alpha*}$ [mas/yr]")
-            ax.set_ylabel(r"$\mu_\delta$ [mas/yr]")
-            ax.set_title(f"{label} — {suffix}")
-            ax.set_aspect("equal")
-            _style_ax(ax)
-            sc_last = sc
-
+    sc_last = _render_vd_eb(axes,
+                            gaia_pmra_h, gaia_pmdec_h, c_gaia, C_pm_gaia_h,
+                            bp3m_pmra_h, bp3m_pmdec_h, c_bp3m, C_pm_bp3m_h,
+                            _is_mem_gaia_h, _is_mem_bp3m_h, norm)
     cbar = fig.colorbar(sc_last, ax=axes, shrink=0.6, pad=0.02, aspect=30)
     cbar.set_label(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
     fig.suptitle(
@@ -255,6 +434,23 @@ def make_plots(solver, images, gaia_catalog,
         r"(coloured by $(\det\,C_{\mu})^{1/4}$)",
         fontsize=13)
     _save(fig, plot_dir / "pm_vector_diagram_errorbars.png")
+
+    if has_free:
+        _C_pm_bp3m_free_h = _C_pm_free[_bp3m_conv_free]
+        fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
+        sc_last = _render_vd_eb(axes,
+                                gaia_pmra_h, gaia_pmdec_h, c_gaia, C_pm_gaia_h,
+                                _bp3m_pmra_free_h, _bp3m_pmdec_free_h,
+                                _c_bp3m_free, _C_pm_bp3m_free_h,
+                                _is_mem_gaia_h, _is_m_free_h, _norm_free,
+                                title_bp3m='BP3M (diffuse prior)')
+        cbar = fig.colorbar(sc_last, ax=axes, shrink=0.6, pad=0.02, aspect=30)
+        cbar.set_label(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
+        fig.suptitle(
+            "PM vector diagrams (diffuse prior) with 1σ principal-axis error bars\n"
+            r"(coloured by $(\det\,C_{\mu})^{1/4}$)",
+            fontsize=13)
+        _save(fig, plot_dir / "pm_vector_diagram_errorbars_diffuse_prior.png")
 
     # ── Figure 2c: BP3M PM coloured by detector position ─────────────────────
     print("  Plotting BP3M PM vector diagram coloured by detector position...")
@@ -316,11 +512,15 @@ def make_plots(solver, images, gaia_catalog,
                 ["X_orig",    "Y_orig"]):
 
             ax = axes[row, col]
-            sc = ax.scatter(bp3m_pmra_h, bp3m_pmdec_h,
-                            c=c_vals, s=6, alpha=0.8,
-                            cmap=cmap_c, norm=norm_c, zorder=2)
+            sc = _scatter_mem(ax, bp3m_pmra_h, bp3m_pmdec_h,
+                              c_vals, _is_mem_bp3m_h,
+                              norm=norm_c, cmap=cmap_c, zorder=2)
             ax.axhline(0, c='k', lw=1, ls='--', zorder=1e10)
             ax.axvline(0, c='k', lw=1, ls='--', zorder=1e10)
+            _add_mu_pop_lines(ax, mu_pop)
+            if row == 0 and col == 0 and _is_mem_bp3m_h is not None:
+                ax.legend(handles=_mem_legend_handles(), fontsize=7,
+                          loc='upper left', framealpha=0.7)
             ax.set_xlim(xlim); ax.set_ylim(ylim)
             ax.set_xlabel(r"$\mu_{\alpha*}$ [mas/yr]")
             ax.set_ylabel(r"$\mu_\delta$ [mas/yr]")
@@ -340,6 +540,66 @@ def make_plots(solver, images, gaia_catalog,
     fig.suptitle("BP3M proper motions coloured by HST detector position", fontsize=13)
     _save(fig, plot_dir / "pm_vector_diagram_detector_pos.png")
 
+    if has_free:
+        _bp3m_conv_free_obs = _obs & _bp3m_conv_free
+        _x_orig_free  = np.where(_bp3m_conv_free_obs,
+                                 _xo_sum / np.maximum(_det_cnt, 1), np.nan)[_bp3m_conv_free]
+        _y_orig_free  = np.where(_bp3m_conv_free_obs,
+                                 _yo_sum / np.maximum(_det_cnt, 1), np.nan)[_bp3m_conv_free]
+        _norm_xo_free = _lin_norm(_x_orig_free)
+        _norm_yo_free = _lin_norm(_y_orig_free)
+
+        _bx_cen_f = np.nanmedian(_bp3m_pmra_free_h)
+        _by_cen_f = np.nanmedian(_bp3m_pmdec_free_h)
+        _bx_hw_f  = max(np.abs(np.nanpercentile(_bp3m_pmra_free_h,  [16, 84]) - _bx_cen_f))
+        _by_hw_f  = max(np.abs(np.nanpercentile(_bp3m_pmdec_free_h, [16, 84]) - _by_cen_f))
+        _b_hw_f   = max(_bx_hw_f, _by_hw_f) * 1.15
+        _free_full_xlim = _padded_lim(_bp3m_pmra_free_h)
+        _free_full_ylim = _padded_lim(_bp3m_pmdec_free_h)
+        _free_zoom_xlim = (_bx_cen_f - _b_hw_f, _bx_cen_f + _b_hw_f)
+        _free_zoom_ylim = (_by_cen_f - _b_hw_f, _by_cen_f + _b_hw_f)
+
+        fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
+        sc_xo_f = sc_yo_f = None
+        for row, xlim, ylim, row_label in zip(
+                [0, 1],
+                [_free_full_xlim, _free_zoom_xlim],
+                [_free_full_ylim, _free_zoom_ylim],
+                ["full range", "zoom (68% CI)"]):
+            for col, c_vals, norm_c, cmap_c, coord_label in zip(
+                    [0, 1],
+                    [_x_orig_free, _y_orig_free],
+                    [_norm_xo_free, _norm_yo_free],
+                    ["plasma",      "plasma"],
+                    ["X_orig",      "Y_orig"]):
+                ax = axes[row, col]
+                sc = _scatter_mem(ax, _bp3m_pmra_free_h, _bp3m_pmdec_free_h,
+                                  c_vals, _is_m_free_h,
+                                  norm=norm_c, cmap=cmap_c, zorder=2)
+                ax.axhline(0, c='k', lw=1, ls='--', zorder=1e10)
+                ax.axvline(0, c='k', lw=1, ls='--', zorder=1e10)
+                _add_mu_pop_lines(ax, mu_pop)
+                ax.set_xlim(xlim); ax.set_ylim(ylim)
+                ax.set_xlabel(r"$\mu_{\alpha*}$ [mas/yr]")
+                ax.set_ylabel(r"$\mu_\delta$ [mas/yr]")
+                ax.set_title(f"BP3M (diffuse prior) — {row_label}  (colour: {coord_label})")
+                ax.set_aspect("equal")
+                _style_ax(ax)
+                if row == 0 and col == 0:
+                    sc_xo_f = sc
+                    if _is_m_free_h is not None:
+                        ax.legend(handles=_mem_legend_handles(), fontsize=7,
+                                  loc='upper left', framealpha=0.7)
+                if row == 0 and col == 1:
+                    sc_yo_f = sc
+        cbar_xo = fig.colorbar(sc_xo_f, ax=axes[:, 0], shrink=0.6, pad=0.02, aspect=30)
+        cbar_xo.set_label("X_orig [pixels]")
+        cbar_yo = fig.colorbar(sc_yo_f, ax=axes[:, 1], shrink=0.6, pad=0.02, aspect=30)
+        cbar_yo.set_label("Y_orig [pixels]")
+        fig.suptitle("BP3M (diffuse prior) proper motions coloured by HST detector position",
+                     fontsize=13)
+        _save(fig, plot_dir / "pm_vector_diagram_detector_pos_diffuse_prior.png")
+
     # ── Figure: HST chi2 distributions ───────────────────────────────────────
     print("  Plotting HST chi2 distributions...")
     _plot_chi2_distributions(solver, r_hat, v_hat, plot_dir)
@@ -353,7 +613,16 @@ def make_plots(solver, images, gaia_catalog,
     pm_size = np.sqrt(pmra_bp3m**2 + pmdec_bp3m**2)
     pm_unc  = np.sqrt(sig_pmra_bp3m**2 + sig_pmdec_bp3m**2)
     ok = bp3m_converged & np.isfinite(gmag) & np.isfinite(pm_size)
-    _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir)
+    _is_mem_sky = is_member if is_member is not None else None
+    _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
+                      is_member=_is_mem_sky)
+    if has_free:
+        pm_size_free = np.sqrt(_pmra_free**2 + _pmdec_free**2)
+        pm_unc_free  = np.sqrt(_sig_pmra_free**2 + _sig_pmdec_free**2)
+        ok_free = _bp3m_conv_free & np.isfinite(gmag) & np.isfinite(pm_size_free)
+        _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size_free, pm_unc_free, ok_free,
+                          plot_dir, is_member=_is_mem_sky,
+                          fname='sky_cmd_pm_diffuse_prior.png')
 
     # ── Figure: HST XY residuals + BP3M proper motions on detector ───────────
     if not plot_residuals:
@@ -611,7 +880,8 @@ def _style_ax(ax):
     ax.tick_params(which="both", direction="in", top=True, right=True)
 
 
-def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir):
+def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
+                      is_member=None, fname='sky_cmd_pm.png'):
     """Three panels: sky map coloured by |PM|, CMD coloured by |PM|, CMD coloured by σ_PM."""
     from matplotlib.colors import LogNorm
 
@@ -629,12 +899,13 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir):
     cmap_unc = "viridis"
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6), layout="constrained")
-    ms = 6
 
     # ── Panel 1: sky distribution coloured by |PM| ──────────────────────────
     ax = axes[0]
-    sc = ax.scatter(ra[ok], dec[ok], c=pm_size[ok], cmap=cmap_pm,
-                    norm=norm_pm, s=ms, linewidths=0, rasterized=True)
+    _is_m_ok = is_member[ok] if is_member is not None else None
+    sc = _scatter_mem(ax, ra[ok], dec[ok], pm_size[ok], _is_m_ok,
+                      norm=norm_pm, cmap=cmap_pm, zorder=2,
+                      linewidths=0, rasterized=True)
     plt.colorbar(sc, ax=ax, label="|PM| (mas/yr)")
     ax.set_xlabel("R.A. (deg)")
     ax.set_ylabel("Dec. (deg)")
@@ -645,8 +916,10 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir):
     # ── Panel 2: CMD coloured by |PM| ───────────────────────────────────────
     ax = axes[1]
     has_cmd = ok & np.isfinite(bp_rp)
-    sc = ax.scatter(bp_rp[has_cmd], gmag[has_cmd], c=pm_size[has_cmd],
-                    cmap=cmap_pm, norm=norm_pm, s=ms, linewidths=0, rasterized=True)
+    _is_m_cmd = is_member[has_cmd] if is_member is not None else None
+    sc = _scatter_mem(ax, bp_rp[has_cmd], gmag[has_cmd], pm_size[has_cmd], _is_m_cmd,
+                      norm=norm_pm, cmap=cmap_pm, zorder=2,
+                      linewidths=0, rasterized=True)
     plt.colorbar(sc, ax=ax, label="|PM| (mas/yr)")
     ax.set_xlabel("Gaia BP − RP (mag)")
     ax.set_ylabel("Gaia G (mag)")
@@ -656,8 +929,10 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir):
 
     # ── Panel 3: CMD coloured by PM uncertainty ──────────────────────────────
     ax = axes[2]
-    sc = ax.scatter(bp_rp[has_cmd], gmag[has_cmd], c=pm_unc[has_cmd],
-                    cmap=cmap_unc, norm=norm_unc, s=ms, linewidths=0, rasterized=True)
+    _is_m_cmd2 = is_member[has_cmd] if is_member is not None else None
+    sc = _scatter_mem(ax, bp_rp[has_cmd], gmag[has_cmd], pm_unc[has_cmd], _is_m_cmd2,
+                      norm=norm_unc, cmap=cmap_unc, zorder=2,
+                      linewidths=0, rasterized=True)
     plt.colorbar(sc, ax=ax, label="σ_PM (mas/yr)")
     ax.set_xlabel("Gaia BP − RP (mag)")
     ax.set_ylabel("Gaia G (mag)")
@@ -665,7 +940,7 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir):
     ax.invert_yaxis()
     _style_ax(ax)
 
-    _save(fig, plot_dir / "sky_cmd_pm.png")
+    _save(fig, plot_dir / fname)
 
 
 def _save(fig, path):

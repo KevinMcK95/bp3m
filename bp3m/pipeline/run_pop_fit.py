@@ -1536,6 +1536,19 @@ def run_pop_fit(
     v_cov      = v_cov_r + C_extra_cross + C_extra_mu
     v_cov_full = v_cov + C_vT_final   # full marginal covariance per star
 
+    # ── Diffuse-prior stellar posteriors (no population prior for any star) ──────
+    print("\n  Computing diffuse-prior (free) stellar posteriors...")
+    _, _, _, C_vT_free_sol, v_mean_free_cond, _, K_img_free = _joint_solve_pop(
+        solver, image_names,
+        np.array([], dtype=int),   # no members → no population prior
+        mu_pop_current,
+        sigma_pm, plx_pop, sigma_plx_tot,
+        C_pop_prior_inv, mu_pop_prior,
+        r_current, fix_r=True,
+    )
+    v_mean_free_marg, v_cov_free_sol = solver.compute_analytic_posteriors(
+        r_current, C_r, v_mean_free_cond, K_img_free, C_vT_free_sol)
+
     # ── Save results (mirrors _save_results in run_alignment.py) ─────────────
     print("\n  Saving results...")
 
@@ -1624,9 +1637,16 @@ def run_pop_fit(
     g['sigma_pmdec_bp3m_cond']    = np.sqrt(np.maximum(C_vT_final[:, 3, 3], 0.0))
     g['sigma_parallax_bp3m_cond'] = np.sqrt(np.maximum(C_vT_final[:, 4, 4], 0.0))
 
-    _mem_mask = np.zeros(solver.n_stars, dtype=bool)
-    _mem_mask[member_sidx] = True
-    g['is_member'] = _mem_mask
+    g['pmra_bp3m_free_cond']     = v_mean_free_cond[:, 2]
+    g['pmdec_bp3m_free_cond']    = v_mean_free_cond[:, 3]
+    g['parallax_bp3m_free_cond'] = v_mean_free_cond[:, 4]
+    g['pmra_bp3m_free']          = v_mean_free_marg[:, 2]
+    g['pmdec_bp3m_free']         = v_mean_free_marg[:, 3]
+    g['parallax_bp3m_free']      = v_mean_free_marg[:, 4]
+    _is_member_arr               = np.zeros(solver.n_stars, dtype=bool)
+    if member_sidx is not None and len(member_sidx) > 0:
+        _is_member_arr[member_sidx] = True
+    g['is_member']               = _is_member_arr
 
     g.to_csv(output_pfr / 'stellar_astrometry.csv', index=False)
     print(f"  Saved: stellar_astrometry.csv  "
@@ -1805,7 +1825,12 @@ def run_pop_fit(
             make_plots(solver, imgs, gaia_catalog,
                        r_current, v_mean, v_mean_marg, v_cov, C_vT_final, C_r,
                        output_dir=output_pfr,
-                       plot_residuals=False)
+                       plot_residuals=False,
+                       member_sidx=member_sidx,
+                       mu_pop=mu_pop_current,
+                       v_mean_free=v_mean_free_marg,
+                       v_cov_free=v_cov_free_sol,
+                       C_vT_free=C_vT_free_sol)
         except Exception as _exc:
             print(f"  WARNING: make_plots failed — {_exc}")
 
