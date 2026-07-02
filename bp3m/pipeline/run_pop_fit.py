@@ -83,13 +83,18 @@ def _select_members_from_a(
     a_arr: np.ndarray,
     mu_pop: np.ndarray,
     n_hst: np.ndarray,
+    C_vT: np.ndarray,
+    sigma_pm: float,
     sigma_clip: float = 3.0,
-    n_iter: int = 5,
     min_members: int = 5,
-    init_window_masyr: float = 2.0,
     pm_sys_floor: float = 0.2,
 ) -> np.ndarray:
-    """Sigma-clip on PM distance from mu_pop; only stars with ≥1 HST detection eligible."""
+    """Select members using the same per-star PM uncertainty as _select_initial_members.
+
+    Per-star threshold = sigma_clip × det(C_pm_i + (sigma_pm² + pm_sys_floor²)·I)^(1/4),
+    identical to the _select_initial_members formula.  Only stars with ≥1 HST
+    detection are eligible.
+    """
     eidx = np.where(n_hst >= 1)[0]
     if len(eidx) < min_members:
         return eidx
@@ -98,19 +103,17 @@ def _select_members_from_a(
     pmdec = a_arr[eidx, 3]
     dist  = np.hypot(pmra - mu_pop[0], pmdec - mu_pop[1])
 
-    keep = np.isfinite(dist) & (dist < init_window_masyr)
+    extra    = sigma_pm ** 2 + pm_sys_floor ** 2
+    C_pm     = C_vT[eidx, 2:4, 2:4]                   # (n_elig, 2, 2)
+    c00      = C_pm[:, 0, 0] + extra
+    c11      = C_pm[:, 1, 1] + extra
+    c01      = C_pm[:, 0, 1]
+    det_C    = np.maximum(c00 * c11 - c01 ** 2, 1e-30)
+    geom_sig = det_C ** 0.25                            # (n_elig,)
+
+    keep = np.isfinite(dist) & (dist < sigma_clip * geom_sig)
     if keep.sum() < min_members:
         keep = np.isfinite(dist)
-
-    for _ in range(n_iter):
-        if keep.sum() < min_members:
-            break
-        sigma    = float(np.median(dist[keep])) / 0.6745
-        sigma    = max(sigma, pm_sys_floor)
-        new_keep = np.isfinite(dist) & (dist < sigma_clip * sigma)
-        if new_keep.sum() == keep.sum():
-            break
-        keep = new_keep
 
     return eidx[keep]
 
@@ -1186,7 +1189,7 @@ def run_pop_fit(
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
         mu_pop_current = mu_pop_new
         member_sidx = _select_members_from_a(
-            a_arr, mu_pop_current, _n_hst_det,
+            a_arr, mu_pop_current, _n_hst_det, C_vT, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
         print(f"    iter {mu_iter + 1}/{n_iter_mu}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr  "
@@ -1216,7 +1219,7 @@ def run_pop_fit(
         r_current      = r_new
         mu_pop_current = mu_pop_new
         member_sidx = _select_members_from_a(
-            a_arr, mu_pop_current, _n_hst_det,
+            a_arr, mu_pop_current, _n_hst_det, C_vT, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
         print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
@@ -1249,7 +1252,7 @@ def run_pop_fit(
             r_current      = r_new
             mu_pop_current = mu_pop_new
             member_sidx = _select_members_from_a(
-                a_arr, mu_pop_current, _n_hst_det,
+                a_arr, mu_pop_current, _n_hst_det, C_vT, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
 
             for img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new in alpha_info:
@@ -1341,7 +1344,7 @@ def run_pop_fit(
             a_arr           = a_arr_sw
 
             member_sidx = _select_members_from_a(
-                a_arr, mu_pop_current, _n_hst_det,
+                a_arr, mu_pop_current, _n_hst_det, C_vT_sw, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
 
             print(f"    iter {sw_iter + 1}/{n_iter_soft}: "
