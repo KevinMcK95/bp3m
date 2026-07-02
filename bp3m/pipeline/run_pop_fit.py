@@ -947,12 +947,14 @@ def _plot_pm_vs_properties(
     2×6 figure: diffuse-prior posterior PMs for member stars vs
     Gaia G magnitude (cols 0-1), mean HST x_raw (cols 2-3),
     mean HST y_raw (cols 4-5).  Row 0 = raw mas/yr; row 1 = normalised
-    by individual posterior uncertainty.  Population PM shown as line +
-    shaded ±sigma_pm region.
+    by individual posterior uncertainty.  Points coloured by 2D Mahalanobis
+    distance from pop PM mean (marginalised PM covariance + sigma_pm^2 * I).
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
 
     if len(member_sidx) == 0:
         return
@@ -962,6 +964,17 @@ def _plot_pm_vs_properties(
     pmdec_m = a_free[member_sidx, 3]
     sig_ra  = np.sqrt(np.maximum(C_vT_free[member_sidx, 2, 2], 0.0))
     sig_dec = np.sqrt(np.maximum(C_vT_free[member_sidx, 3, 3], 0.0))
+
+    # 2D Mahalanobis distance from pop PM mean:
+    #   C_total = C_pm_marg + sigma_pm^2 * I  (measurement + intrinsic dispersion)
+    #   sigma_from_pop = sqrt(delta^T C_total^{-1} delta)
+    C_pm_marg = C_vT_free[member_sidx, 2:4, 2:4].copy()   # (n, 2, 2)
+    C_pm_marg[:, 0, 0] += sigma_pm ** 2
+    C_pm_marg[:, 1, 1] += sigma_pm ** 2
+    C_total_inv = np.linalg.inv(C_pm_marg)
+    delta       = np.column_stack([pmra_m - mu_pop[0], pmdec_m - mu_pop[1]])  # (n, 2)
+    chi2_pop    = np.einsum('ni,nij,nj->n', delta, C_total_inv, delta)
+    sigma_from_pop = np.sqrt(np.maximum(chi2_pop, 0.0))
 
     gmag_arr = gaia_catalog['gmag'].to_numpy(float)
     gmag_m   = gmag_arr[member_sidx]
@@ -986,11 +999,18 @@ def _plot_pm_vs_properties(
     xraw_m = xraw_all[member_sidx]
     yraw_m = yraw_all[member_sidx]
 
+    # ── Colour mapping ────────────────────────────────────────────────────────
+    cmap  = cm.plasma_r
+    vmin, vmax = 0.0, 3.0
+    norm  = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    cols  = cmap(norm(sigma_from_pop))   # (n, 4) RGBA per star
+
     # ── Figure layout ─────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(2, 6, figsize=(22, 7), constrained_layout=True)
+    fig, axes = plt.subplots(2, 6, figsize=(22, 7.5), constrained_layout=True)
     fig.suptitle(
         f'{field_name} — diffuse-prior PMs for member stars  '
-        f'(N={len(member_sidx)}  μ_pop=({mu_pop[0]:+.3f},{mu_pop[1]:+.3f}) mas/yr)',
+        f'(N={len(member_sidx)}  μ_pop=({mu_pop[0]:+.3f},{mu_pop[1]:+.3f}) mas/yr  '
+        f'colour = 2D σ from pop)',
         fontsize=11,
     )
 
@@ -1003,24 +1023,36 @@ def _plot_pm_vs_properties(
     ylabs_nrm = [r'$(\mu_{\alpha*}-\mu_{\rm pop})/\sigma_{\mu_{\alpha*}}$',
                  r'$(\mu_\delta-\mu_{\rm pop})/\sigma_{\mu_\delta}$'] * 3
 
+    def _draw_colored(ax, x, y, yerr, c_rgba, finite):
+        """Draw errorbars in star colour, then scatter points on top."""
+        for xi, yi, ei, ci in zip(x[finite], y[finite], yerr[finite], c_rgba[finite]):
+            ax.errorbar(xi, yi, yerr=ei, fmt='none',
+                        ecolor=ci, elinewidth=0.6, capsize=0, alpha=0.7)
+        sc = ax.scatter(x[finite], y[finite], c=c_rgba[finite],
+                        s=8, zorder=3, linewidths=0)
+        return sc
+
+    sc_ref = None
     for col in range(6):
         x      = xs_list[col]
         pm     = pm_vals[col]
         err    = pm_errs[col]
         mu_ref = pop_means[col]
+        finite = np.isfinite(x) & np.isfinite(pm) & np.isfinite(err) & (err > 0)
+        _xmin  = np.nanmin(x) if np.any(np.isfinite(x)) else 0.0
+        _xmax  = np.nanmax(x) if np.any(np.isfinite(x)) else 1.0
+        _xpad  = 0.05 * max(_xmax - _xmin, 1e-6)
 
         # ── Row 0: raw mas/yr ─────────────────────────────────────────────────
         ax0 = axes[0, col]
-        finite = np.isfinite(x) & np.isfinite(pm) & np.isfinite(err) & (err > 0)
         if finite.any():
-            ax0.errorbar(x[finite], pm[finite], yerr=err[finite],
-                         fmt='o', ms=2, lw=0.5, color='steelblue', alpha=0.6,
-                         elinewidth=0.5, capsize=0)
-        _xmin, _xmax = (np.nanmin(x), np.nanmax(x)) if np.any(np.isfinite(x)) else (0, 1)
+            sc = _draw_colored(ax0, x, pm, err, cols, finite)
+            if sc_ref is None:
+                sc_ref = sc
         ax0.axhline(mu_ref, color='firebrick', lw=1.2, ls='-', label=r'$\mu_{\rm pop}$')
         ax0.axhspan(mu_ref - sigma_pm, mu_ref + sigma_pm,
                     alpha=0.15, color='firebrick', label=r'$\pm\sigma_{\rm pm}$')
-        ax0.set_xlim(_xmin - 0.05 * (_xmax - _xmin), _xmax + 0.05 * (_xmax - _xmin))
+        ax0.set_xlim(_xmin - _xpad, _xmax + _xpad)
         ax0.set_xlabel(xlabs[col], fontsize=8)
         ax0.set_ylabel(ylabs_raw[col], fontsize=8)
         ax0.tick_params(labelsize=7)
@@ -1029,19 +1061,26 @@ def _plot_pm_vs_properties(
 
         # ── Row 1: normalised ─────────────────────────────────────────────────
         ax1 = axes[1, col]
-        norm_pm = (pm - mu_ref) / err
+        norm_pm  = (pm - mu_ref) / err
+        norm_err = np.ones(len(pm))
         if finite.any():
-            ax1.errorbar(x[finite], norm_pm[finite], yerr=np.ones(finite.sum()),
-                         fmt='o', ms=2, lw=0.5, color='steelblue', alpha=0.6,
-                         elinewidth=0.5, capsize=0)
+            _draw_colored(ax1, x, norm_pm, norm_err, cols, finite)
         ax1.axhline(0,  color='firebrick', lw=1.2, ls='-')
         ax1.axhspan(-1, 1, alpha=0.15, color='firebrick')
         ax1.axhline(-3, color='grey', lw=0.7, ls='--')
         ax1.axhline( 3, color='grey', lw=0.7, ls='--')
-        ax1.set_xlim(_xmin - 0.05 * (_xmax - _xmin), _xmax + 0.05 * (_xmax - _xmin))
+        ax1.set_xlim(_xmin - _xpad, _xmax + _xpad)
         ax1.set_xlabel(xlabs[col], fontsize=8)
         ax1.set_ylabel(ylabs_nrm[col], fontsize=8)
         ax1.tick_params(labelsize=7)
+
+    # Shared colorbar
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes, shrink=0.6, pad=0.01, aspect=30)
+    cbar.set_label(r'2D $\sigma$ from $\mu_{\rm pop}$  ($\sqrt{\Delta\mu^T\,C_{\rm tot}^{-1}\,\Delta\mu}$)',
+                   fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
 
     out_path = output_dir / 'pm_vs_properties.png'
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
