@@ -118,6 +118,49 @@ def _select_members_from_a(
     return eidx[keep]
 
 
+def _compute_free_stellar_posterior(
+    a: np.ndarray,
+    C_vT: np.ndarray,
+    member_sidx: np.ndarray,
+    sigma_pm: float,
+    sigma_plx_tot: float,
+    mu_pop: np.ndarray,
+    plx_pop: float,
+) -> tuple:
+    """Return (a_free, C_vT_free) with the LVD prior removed for member stars.
+
+    The regular solve bakes in sigma_pm^{-2} for members, pulling a[member, 2:4]
+    toward mu_pop regardless of what the data says.  Evaluating membership from
+    that posterior means members can never be demoted.  This function undoes the
+    LVD contribution so _select_members_from_a sees what Gaia + HST alone imply.
+    """
+    if len(member_sidx) == 0:
+        return a, C_vT
+
+    sigma_pm_inv_sq  = sigma_pm ** -2
+    sigma_plx_inv_sq = sigma_plx_tot ** -2
+
+    a_free    = a.copy()
+    C_vT_free = C_vT.copy()
+
+    # H_vv = C_vT^{-1}; recover information vector h = H_vv @ a
+    H_mem = np.linalg.inv(C_vT[member_sidx])
+    h_mem = np.einsum('nij,nj->ni', H_mem, a[member_sidx])
+
+    # Strip the LVD prior from the normal equations
+    H_mem[:, 2, 2] -= sigma_pm_inv_sq
+    H_mem[:, 3, 3] -= sigma_pm_inv_sq
+    H_mem[:, 4, 4] -= sigma_plx_inv_sq
+    h_mem[:, 2]    -= sigma_pm_inv_sq * mu_pop[0]
+    h_mem[:, 3]    -= sigma_pm_inv_sq * mu_pop[1]
+    h_mem[:, 4]    -= sigma_plx_inv_sq * plx_pop
+
+    C_vT_free[member_sidx] = np.linalg.inv(H_mem)
+    a_free[member_sidx]    = np.einsum('nij,nj->ni', C_vT_free[member_sidx], h_mem)
+
+    return a_free, C_vT_free
+
+
 # ── Initial member selection from Gaia catalog PMs ───────────────────────────
 
 def _select_initial_members(
@@ -1190,8 +1233,10 @@ def run_pop_fit(
         )
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
         mu_pop_current = mu_pop_new
+        _a_free, _C_free = _compute_free_stellar_posterior(
+            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop)
         member_sidx = _select_members_from_a(
-            a_arr, mu_pop_current, _n_hst_det, C_vT, sigma_pm,
+            _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
         print(f"    iter {mu_iter + 1}/{n_iter_mu}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr  "
@@ -1220,8 +1265,10 @@ def run_pop_fit(
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
         r_current      = r_new
         mu_pop_current = mu_pop_new
+        _a_free, _C_free = _compute_free_stellar_posterior(
+            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop)
         member_sidx = _select_members_from_a(
-            a_arr, mu_pop_current, _n_hst_det, C_vT, sigma_pm,
+            _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
         print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
@@ -1253,8 +1300,10 @@ def run_pop_fit(
             delta_mu    = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
             r_current      = r_new
             mu_pop_current = mu_pop_new
+            _a_free, _C_free = _compute_free_stellar_posterior(
+                a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop)
             member_sidx = _select_members_from_a(
-                a_arr, mu_pop_current, _n_hst_det, C_vT, sigma_pm,
+                _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
 
             for img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new in alpha_info:
@@ -1394,8 +1443,10 @@ def run_pop_fit(
             z_weights_final = z_new
             a_arr           = a_arr_sw
 
+            _a_free, _C_free = _compute_free_stellar_posterior(
+                a_arr, C_vT_sw, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop)
             member_sidx = _select_members_from_a(
-                a_arr, mu_pop_current, _n_hst_det, C_vT_sw, sigma_pm,
+                _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
 
             print(f"    iter {sw_iter + 1}/{n_iter_soft}: "
