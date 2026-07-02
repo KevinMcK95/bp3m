@@ -538,6 +538,55 @@ def _joint_solve_pop(
                 C_shared, C_vT, a, a_align, K_img)
 
 
+# ── Per-image alpha update ────────────────────────────────────────────────────
+
+def _compute_alpha_updates(
+    solver,
+    image_names: list[str],
+    r_current: np.ndarray,
+    a_arr: np.ndarray,
+) -> list:
+    """
+    Compute and apply per-image alpha inflation from HST-only residual chi2.
+
+    Mirrors the v1 bp3m logic:
+        alpha_raw  = sqrt( median(sigma_resid²) / (2 ln 2) )
+        alpha_new  = max(1.0, alpha_prev × alpha_raw)
+
+    where sigma_resid is the 2-D Mahalanobis distance using the currently
+    inflated C_hst (no stellar-astrometry or alignment-parameter covariance).
+
+    Returns a list of (img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new).
+    Updates solver._img_data[img]['alpha_applied'] and ['C_hst'] in place.
+    """
+    _MEDIAN_CHI2_2 = 2.0 * np.log(2.0)   # median of chi2(2)
+    resid_hst = solver.compute_residuals(r_current, a_arr)   # HST-only, no C_r/C_vT
+
+    info = []
+    for img in image_names:
+        rd = resid_hst.get(img)
+        d  = solver._img_data.get(img)
+        if rd is None or d is None:
+            continue
+        use_fit    = np.asarray(d['use_for_fit'], dtype=bool)
+        n_use      = int(use_fit.sum())
+        n_tot      = len(use_fit)
+        alpha_prev = float(d.get('alpha_applied', 1.0))
+
+        if n_use >= 4:
+            chi2_use  = rd['sigma_resid'][use_fit] ** 2
+            alpha_raw = float(np.sqrt(np.median(chi2_use) / _MEDIAN_CHI2_2))
+        else:
+            alpha_raw = 1.0
+
+        alpha_new              = float(max(1.0, alpha_prev * alpha_raw))
+        d['alpha_applied']     = alpha_new
+        d['C_hst']             = alpha_new ** 2 * d['C_hst_orig']
+        info.append((img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new))
+
+    return info
+
+
 # ── Per-visit residual plots (before / after) ─────────────────────────────────
 
 def _plot_pop_residual_maps(
@@ -712,6 +761,7 @@ def run_pop_fit(
     mu_pop_prior_sigma: float = 0.5,
     n_iter_mu: int = 5,
     n_iter_joint: int = 10,
+    n_iter_alpha: int = 5,
     member_sigma_clip: float = 3.0,
     pm_sys_floor: float = 0.2,
     poly_order: int | None = None,
@@ -757,6 +807,7 @@ def run_pop_fit(
           f"σ_plx_tot={sigma_plx_tot} mas")
     print(f"  μ_pop prior σ={mu_pop_prior_sigma} mas/yr  "
           f"member_sigma_clip={member_sigma_clip}  pm_sys_floor={pm_sys_floor} mas/yr")
+    print(f"  n_iter: μ={n_iter_mu}  joint={n_iter_joint}  alpha={n_iter_alpha}")
     print(f"  poly_order={poly_order}  split_ccd={v1_split_ccd}  "
           f"v1 images={len(v1_image_names)}")
 
@@ -978,6 +1029,50 @@ def run_pop_fit(
         if delta_r < 1e-6 and delta_mu < 1e-6:
             print(f"    Converged.")
             break
+
+    # ── Phase 3: joint solve + per-image alpha update ────────────────────────
+    if n_iter_alpha > 0:
+        print(f"\n  Phase 3: joint solve + alpha update ({n_iter_alpha} iterations)...")
+        C_shared_joint_p3 = C_shared_joint   # may be updated in loop
+        for al_iter in range(n_iter_alpha):
+            r_new, mu_pop_new, C_shared_joint_p3, C_vT, a_arr, _, _ = _joint_solve_pop(
+                solver, image_names,
+                member_sidx, mu_pop_current,
+                sigma_pm, plx_pop, sigma_plx_tot,
+                C_pop_prior_inv, mu_pop_prior,
+                r_current, fix_r=False,
+            )
+            solver._update_R(r_new)
+            solver._update_geometry(r_new, a_arr)
+
+            alpha_info = _compute_alpha_updates(solver, image_names, r_new, a_arr)
+
+            delta_r     = float(np.max(np.abs(r_new - r_current)))
+            delta_mu    = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+            r_current      = r_new
+            mu_pop_current = mu_pop_new
+            member_sidx = _select_members_from_a(
+                a_arr, mu_pop_current, _n_hst_det,
+                sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
+
+            for img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new in alpha_info:
+                tag = '  ← raised' if alpha_new > alpha_prev + 1e-4 else (
+                      '  ← lowered' if alpha_new < alpha_prev - 1e-4 else '')
+                print(f"    {img}: {n_use:4d}/{n_tot:4d} align  "
+                      f"α_prev={alpha_prev:.3f}  α_raw={alpha_raw:.3f}  "
+                      f"α_new={alpha_new:.3f}{tag}")
+
+            delta_alpha_max = (max(abs(ai[5] - ai[3]) for ai in alpha_info)
+                               if alpha_info else 0.0)
+            print(f"    iter {al_iter + 1}/{n_iter_alpha}: "
+                  f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+                  f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  "
+                  f"Δα_max={delta_alpha_max:.3e}  members={len(member_sidx)}")
+            if delta_r < 1e-6 and delta_mu < 1e-6 and delta_alpha_max < 1e-4:
+                print(f"    Converged.")
+                break
+
+        C_shared_joint = C_shared_joint_p3
 
     n_r = len(image_names) * solver.N_R
     sigma_mu_joint = (np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
@@ -1317,6 +1412,8 @@ def main():
                         help='Phase 1 (μ-only) solve iterations')
     parser.add_argument('--n_iter_joint', type=int, default=10,
                         help='Phase 2 (joint r+μ) solve iterations')
+    parser.add_argument('--n_iter_alpha', type=int, default=5,
+                        help='Phase 3 (joint r+μ+alpha) solve iterations (0 to skip)')
     parser.add_argument('--member_sigma_clip', type=float, default=3.0,
                         help='Sigma threshold for membership selection')
     parser.add_argument('--pm_sys_floor', type=float, default=0.2,
@@ -1338,6 +1435,7 @@ def main():
         mu_pop_prior_sigma=args.mu_pop_prior_sigma,
         n_iter_mu=args.n_iter_mu,
         n_iter_joint=args.n_iter_joint,
+        n_iter_alpha=args.n_iter_alpha,
         member_sigma_clip=args.member_sigma_clip,
         pm_sys_floor=args.pm_sys_floor,
         poly_order=args.poly_order,
