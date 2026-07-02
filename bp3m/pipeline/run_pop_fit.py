@@ -1156,10 +1156,12 @@ def run_pop_fit(
         _Lambda_g = np.zeros((2, 2))
         _h_g      = np.zeros(2)
         for _k in np.where(_g_ok)[0]:
-            _C_k = np.array([[_g_sra[_k]**2,
+            # Total per-star covariance = Gaia measurement cov + intrinsic dispersion
+            # (marginalises over individual star true PMs ~ N(mu_pop, sigma_pm^2 I))
+            _C_k = np.array([[_g_sra[_k]**2 + sigma_pm**2,
                                _g_rho[_k] * _g_sra[_k] * _g_sdec[_k]],
                               [_g_rho[_k] * _g_sra[_k] * _g_sdec[_k],
-                               _g_sdec[_k]**2]])
+                               _g_sdec[_k]**2 + sigma_pm**2]])
             _Ci  = np.linalg.inv(_C_k)
             _Lambda_g += _Ci
             _h_g      += _Ci @ np.array([_g_pmra[_k], _g_pmdec[_k]])
