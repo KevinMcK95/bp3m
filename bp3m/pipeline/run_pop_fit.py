@@ -299,6 +299,7 @@ def _joint_solve_pop(
     mu_pop_prior: np.ndarray,
     r_current: np.ndarray,
     fix_r: bool = False,
+    z_weights: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     One Newton step for (Δr, Δμ_pop) with stellar astrometry marginalised out.
@@ -397,6 +398,10 @@ def _joint_solve_pop(
 
         Cs     = solver._compute_Cs(img, r_j)
         Cs_inv = np.linalg.inv(Cs)
+        if z_weights is not None:
+            _z = z_weights.get(img)
+            if _z is not None:
+                Cs_inv = Cs_inv * _z[:, None, None]
 
         x_pred  = np.einsum('nkl,l->nk', X, r_j)
         x_resid = xys - x_pred
@@ -761,7 +766,9 @@ def run_pop_fit(
     mu_pop_prior_sigma: float = 0.5,
     n_iter_mu: int = 5,
     n_iter_joint: int = 10,
-    n_iter_alpha: int = 5,
+    n_iter_alpha: int = 20,
+    n_iter_soft: int = 10,
+    student_t_nu: float = 50.0,
     member_sigma_clip: float = 3.0,
     pm_sys_floor: float = 0.2,
     poly_order: int | None = None,
@@ -807,7 +814,8 @@ def run_pop_fit(
           f"σ_plx_tot={sigma_plx_tot} mas")
     print(f"  μ_pop prior σ={mu_pop_prior_sigma} mas/yr  "
           f"member_sigma_clip={member_sigma_clip}  pm_sys_floor={pm_sys_floor} mas/yr")
-    print(f"  n_iter: μ={n_iter_mu}  joint={n_iter_joint}  alpha={n_iter_alpha}")
+    print(f"  n_iter: μ={n_iter_mu}  joint={n_iter_joint}  alpha={n_iter_alpha}  "
+          f"soft={n_iter_soft} (ν={student_t_nu:.1f})")
     print(f"  poly_order={poly_order}  split_ccd={v1_split_ccd}  "
           f"v1 images={len(v1_image_names)}")
 
@@ -1074,6 +1082,57 @@ def run_pop_fit(
 
         C_shared_joint = C_shared_joint_p3
 
+    # ── Phase 4: soft-weight IRLS (alpha frozen from Phase 3) ────────────────
+    z_weights_final = None
+    if n_iter_soft > 0:
+        print(f"\n  Phase 4: soft-weight IRLS  ν={student_t_nu:.1f}  "
+              f"({n_iter_soft} iterations, α frozen)...")
+        z_weights_final, n_det_total, n_eff = solver._update_soft_weights(
+            r_current, a_arr, student_t_nu)
+        C_shared_joint_sw = C_shared_joint   # fallback if loop never runs
+
+        for sw_iter in range(n_iter_soft):
+            r_new, mu_pop_new, C_shared_joint_sw, C_vT_sw, a_arr_sw, _, _ = _joint_solve_pop(
+                solver, image_names,
+                member_sidx, mu_pop_current,
+                sigma_pm, plx_pop, sigma_plx_tot,
+                C_pop_prior_inv, mu_pop_prior,
+                r_current, fix_r=False,
+                z_weights=z_weights_final,
+            )
+            solver._update_R(r_new)
+            solver._update_geometry(r_new, a_arr_sw)
+
+            z_new, n_det_total, n_eff_new = solver._update_soft_weights(
+                r_new, a_arr_sw, student_t_nu)
+
+            delta_r   = float(np.max(np.abs(r_new - r_current)))
+            delta_mu  = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+            delta_z   = float(sum(
+                np.sum(np.abs(z_new[img] - z_weights_final[img]))
+                for img in image_names
+                if z_new.get(img) is not None and z_weights_final.get(img) is not None))
+
+            r_current      = r_new
+            mu_pop_current = mu_pop_new
+            z_weights_final = z_new
+            a_arr           = a_arr_sw
+
+            member_sidx = _select_members_from_a(
+                a_arr, mu_pop_current, _n_hst_det,
+                sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
+
+            print(f"    iter {sw_iter + 1}/{n_iter_soft}: "
+                  f"n_eff={n_eff_new:.0f}/{n_det_total}  "
+                  f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+                  f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  Δz={delta_z:.3e}  "
+                  f"members={len(member_sidx)}")
+            if delta_r < 1e-6 and delta_mu < 1e-6 and delta_z < 1e-2:
+                print(f"    Converged.")
+                break
+
+        C_shared_joint = C_shared_joint_sw
+
     n_r = len(image_names) * solver.N_R
     sigma_mu_joint = (np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
                       if C_shared_joint is not None else np.array([np.nan, np.nan]))
@@ -1089,6 +1148,7 @@ def run_pop_fit(
         sigma_pm, plx_pop, sigma_plx_tot,
         C_pop_prior_inv, mu_pop_prior,
         r_current, fix_r=False,
+        z_weights=z_weights_final,
     )
 
     # ── Analytic marginalised posteriors (joint r + μ_pop propagation) ──────────
@@ -1412,8 +1472,13 @@ def main():
                         help='Phase 1 (μ-only) solve iterations')
     parser.add_argument('--n_iter_joint', type=int, default=10,
                         help='Phase 2 (joint r+μ) solve iterations')
-    parser.add_argument('--n_iter_alpha', type=int, default=5,
+    parser.add_argument('--n_iter_alpha', type=int, default=20,
                         help='Phase 3 (joint r+μ+alpha) solve iterations (0 to skip)')
+    parser.add_argument('--n_iter_soft', type=int, default=10,
+                        help='Phase 4 (soft-weight IRLS, frozen alpha) iterations (0 to skip)')
+    parser.add_argument('--student_t_nu', type=float, default=50.0,
+                        help='Student-t degrees of freedom for soft weights '
+                             '(larger = harder, 50 ≈ nearly hard exclusion)')
     parser.add_argument('--member_sigma_clip', type=float, default=3.0,
                         help='Sigma threshold for membership selection')
     parser.add_argument('--pm_sys_floor', type=float, default=0.2,
@@ -1436,6 +1501,8 @@ def main():
         n_iter_mu=args.n_iter_mu,
         n_iter_joint=args.n_iter_joint,
         n_iter_alpha=args.n_iter_alpha,
+        n_iter_soft=args.n_iter_soft,
+        student_t_nu=args.student_t_nu,
         member_sigma_clip=args.member_sigma_clip,
         pm_sys_floor=args.pm_sys_floor,
         poly_order=args.poly_order,
