@@ -124,15 +124,33 @@ def _select_initial_members(
     sigma_pm: float,
     pm_sys_floor: float = 0.2,
 ) -> np.ndarray:
-    """Select initial member candidates from Gaia catalog PMs."""
-    _radius = member_sigma_clip * max(sigma_pm, pm_sys_floor)
+    """Select initial member candidates from Gaia catalog PMs.
+
+    For each star, the membership threshold is member_sigma_clip times the
+    geometric mean PM uncertainty, where the total per-star covariance is the
+    Gaia PM covariance plus (sigma_pm² + pm_sys_floor²) on the diagonal.
+    """
     pmra  = gaia_catalog['pmra'].to_numpy(float)
     pmdec = gaia_catalog['pmdec'].to_numpy(float)
-    finite = np.isfinite(pmra) & np.isfinite(pmdec)
-    dist   = np.where(finite,
-                      np.hypot(pmra - mu_pop[0], pmdec - mu_pop[1]),
-                      np.inf)
-    return np.where(dist < _radius)[0]
+    sig_ra  = gaia_catalog['pmra_error'].to_numpy(float)
+    sig_dec = gaia_catalog['pmdec_error'].to_numpy(float)
+    rho     = gaia_catalog.get('pmra_pmdec_corr',
+                               pd.Series(np.zeros(len(gaia_catalog)))).to_numpy(float)
+    rho     = np.where(np.isfinite(rho), rho, 0.0)
+
+    extra = sigma_pm ** 2 + pm_sys_floor ** 2
+    var_ra  = np.where(np.isfinite(sig_ra),  sig_ra  ** 2, 1.0) + extra
+    var_dec = np.where(np.isfinite(sig_dec), sig_dec ** 2, 1.0) + extra
+    cov_off = np.where(np.isfinite(sig_ra) & np.isfinite(sig_dec),
+                       rho * sig_ra * sig_dec, 0.0)
+
+    # det(C) = var_ra * var_dec - cov_off²; geometric mean sigma = det(C)^(1/4)
+    det_C   = np.maximum(var_ra * var_dec - cov_off ** 2, 1e-30)
+    geom_sigma = det_C ** 0.25   # = sqrt(sigma_1 * sigma_2)
+
+    finite  = np.isfinite(pmra) & np.isfinite(pmdec)
+    dist    = np.where(finite, np.hypot(pmra - mu_pop[0], pmdec - mu_pop[1]), np.inf)
+    return np.where(dist < member_sigma_clip * geom_sigma)[0]
 
 
 # ── Load bp3m outputs from BP3M_results ───────────────────────────────────────
