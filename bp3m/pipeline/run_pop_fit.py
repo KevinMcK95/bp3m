@@ -961,6 +961,7 @@ def run_pop_fit(
     n_iter_alpha: int = 20,
     n_iter_soft: int = 20,
     student_t_nu: float = 50.0,
+    z_threshold: float = 0.8,
     member_sigma_clip: float = 3.0,
     pm_sys_floor: float = 0.2,
     poly_order: int | None = None,
@@ -1307,13 +1308,29 @@ def run_pop_fit(
               f"(+{n_total_added} re-admitted  -{n_total_removed} removed  "
               f"vs Phase 3 active set)")
 
+        # Recompute _n_hst_det to include newly re-admitted detections so that
+        # stars whose all-detections were v1-excluded can now qualify as members.
+        _n_hst_det = np.zeros(solver.n_stars, dtype=int)
+        for _img in image_names:
+            _d = solver._img_data.get(_img)
+            if _d is None:
+                continue
+            _use = _d['use_for_fit'] | _d.get('use_for_astrom', _d['use_for_fit'])
+            np.add.at(_n_hst_det, _d['sidx'][_use], 1)
+
     # ── Phase 4: soft-weight IRLS (alpha frozen from Phase 3) ────────────────
+    def _apply_z_threshold(z_dict: dict, thresh: float) -> dict:
+        """Zero out z values below thresh so they contribute nothing to the solve."""
+        return {img: (z * (z >= thresh) if z is not None else None)
+                for img, z in z_dict.items()}
+
     z_weights_final = None
     if n_iter_soft > 0:
-        print(f"\n  Phase 4: soft-weight IRLS  ν={student_t_nu:.1f}  "
+        print(f"\n  Phase 4: soft-weight IRLS  ν={student_t_nu:.1f}  z_threshold={z_threshold:.2f}  "
               f"({n_iter_soft} iterations, α frozen)...")
-        z_weights_final, n_det_total, n_eff = solver._update_soft_weights(
+        _z_raw, n_det_total, n_eff = solver._update_soft_weights(
             r_current, a_arr, student_t_nu)
+        z_weights_final = _apply_z_threshold(_z_raw, z_threshold)
         C_shared_joint_sw = C_shared_joint   # fallback if loop never runs
 
         for sw_iter in range(n_iter_soft):
@@ -1328,8 +1345,9 @@ def run_pop_fit(
             solver._update_R(r_new)
             solver._update_geometry(r_new, a_arr_sw)
 
-            z_new, n_det_total, n_eff_new = solver._update_soft_weights(
+            _z_raw_new, n_det_total, n_eff_new = solver._update_soft_weights(
                 r_new, a_arr_sw, student_t_nu)
+            z_new = _apply_z_threshold(_z_raw_new, z_threshold)
 
             delta_r   = float(np.max(np.abs(r_new - r_current)))
             delta_mu  = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
@@ -1726,6 +1744,10 @@ def main():
     parser.add_argument('--student_t_nu', type=float, default=50.0,
                         help='Student-t degrees of freedom for soft weights '
                              '(larger = harder, 50 ≈ nearly hard exclusion)')
+    parser.add_argument('--z_threshold', type=float, default=0.8,
+                        help='Minimum z weight for a detection to contribute to the '
+                             'Phase 4 solve; detections below this are hard-excluded '
+                             '(default 0.8)')
     parser.add_argument('--member_sigma_clip', type=float, default=3.0,
                         help='Sigma threshold for membership selection')
     parser.add_argument('--pm_sys_floor', type=float, default=0.2,
@@ -1750,6 +1772,7 @@ def main():
         n_iter_alpha=args.n_iter_alpha,
         n_iter_soft=args.n_iter_soft,
         student_t_nu=args.student_t_nu,
+        z_threshold=args.z_threshold,
         member_sigma_clip=args.member_sigma_clip,
         pm_sys_floor=args.pm_sys_floor,
         poly_order=args.poly_order,
