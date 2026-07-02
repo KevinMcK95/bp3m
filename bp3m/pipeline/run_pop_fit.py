@@ -776,6 +776,159 @@ def _reopen_detections(
     return info
 
 
+# ── Hard-weight Phase 4: population-aware Tests 1+2+3 ────────────────────────
+
+def _hard_update_phase4(
+    solver,
+    image_names: list[str],
+    r_current: np.ndarray,
+    a_arr: np.ndarray,
+    C_vT: np.ndarray,
+    member_sidx: np.ndarray,
+    mu_pop: np.ndarray,
+    sigma_pm: float,
+    plx_pop: float,
+    sigma_plx_tot: float,
+    ok_star_prev=None,
+    adaptive_k: float = 5.0,
+    adaptive_delta: float = 0.1,
+) -> tuple:
+    """
+    Population-aware hard outlier rejection for Phase 4.
+
+    Test 1  Gaia prior chi2 (adaptive, with hysteresis): identical to v1.
+    Test 2  Prior chi2 (fixed threshold):
+              members     → compare PM+plx to population prior
+              non-members → compare all 5 components to diffuse prior
+    Test 3  Per-image position residual chi2 (adaptive, with hysteresis): v1.
+
+    Updates solver._img_data[img]['use_for_fit'] and ['use_for_astrom'] in-place.
+    Returns (ok_star, n_use_changed, info).
+    """
+    from scipy.stats import chi2 as chi2_dist
+
+    floor_5 = float(chi2_dist.ppf(0.99, df=5))
+    floor_2 = float(chi2_dist.ppf(0.99, df=2))
+
+    def _adapt_thresh(values, k, fallback, floor=0.0):
+        if len(values) < 10:
+            return float(max(fallback, floor)), float('nan'), float('nan'), float('nan')
+        p16 = float(np.percentile(values, 16))
+        p50 = float(np.median(values))
+        p84 = float(np.percentile(values, 84))
+        return float(max(p50 + k * max(p50 - p16, 1e-6), floor)), p16, p50, p84
+
+    observed = solver.gaia_n_hst_used > 0
+    obs_5p   = observed & ~solver.gaia_2p
+    obs_2p   = observed & solver.gaia_2p
+
+    # ── Test 1: Gaia prior chi2 ───────────────────────────────────────────────
+    delta_g    = a_arr - solver.v_survey                   # (n, 5)
+    C_comb     = C_vT + solver.C_survey                    # (n, 5, 5)
+    C_comb_inv = np.linalg.inv(C_comb)
+    chi2_gaia  = np.einsum('ni,nij,nj->n', delta_g, C_comb_inv, delta_g)
+
+    thresh_5a, _, _, _ = _adapt_thresh(chi2_gaia[obs_5p], adaptive_k,
+                                        chi2_dist.ppf(0.95, df=5), floor_5)
+    thresh_2a, _, _, _ = _adapt_thresh(chi2_gaia[obs_2p], adaptive_k,
+                                        chi2_dist.ppf(0.95, df=2), floor_2)
+    ok_gaia_admit = np.where(solver.gaia_2p, chi2_gaia < thresh_2a, chi2_gaia < thresh_5a)
+
+    if ok_star_prev is not None and adaptive_delta > 0:
+        thresh_5e, _, _, _ = _adapt_thresh(chi2_gaia[obs_5p], adaptive_k + adaptive_delta,
+                                            chi2_dist.ppf(0.95, df=5), floor_5)
+        thresh_2e, _, _, _ = _adapt_thresh(chi2_gaia[obs_2p], adaptive_k + adaptive_delta,
+                                            chi2_dist.ppf(0.95, df=2), floor_2)
+        ok_gaia_retain = np.where(solver.gaia_2p, chi2_gaia < thresh_2e, chi2_gaia < thresh_5e)
+        ok_gaia = np.where(ok_star_prev, ok_gaia_retain, ok_gaia_admit)
+    else:
+        ok_gaia = ok_gaia_admit
+
+    # ── Test 2: Prior chi2 ────────────────────────────────────────────────────
+    is_member = np.zeros(solver.n_stars, dtype=bool)
+    is_member[member_sidx] = True
+
+    sigma_pm_inv_sq  = sigma_pm      ** -2
+    sigma_plx_inv_sq = sigma_plx_tot ** -2
+    chi2_pop = (
+        (a_arr[:, 2] - mu_pop[0]) ** 2 * sigma_pm_inv_sq +
+        (a_arr[:, 3] - mu_pop[1]) ** 2 * sigma_pm_inv_sq +
+        (a_arr[:, 4] - plx_pop)   ** 2 * sigma_plx_inv_sq
+    )
+    chi2_diff = np.sum((a_arr / solver._sigma_diff_per_star) ** 2, axis=1)
+
+    thresh_pop  = float(chi2_dist.ppf(0.9545, df=3))   # ≈ 7.8, df=PM_ra+PM_dec+plx
+    thresh_diff = float(chi2_dist.ppf(0.9545, df=5))   # ≈ 11.1
+
+    ok_prior = np.where(is_member, chi2_pop < thresh_pop, chi2_diff < thresh_diff)
+    ok_star  = ok_gaia & ok_prior
+
+    n_fail_1 = int((~ok_gaia  & observed).sum())
+    n_fail_2 = int((~ok_prior & ok_gaia & observed).sum())
+    print(f"    [hard] Tests 1+2 (of {int(observed.sum())} observed): "
+          f"{n_fail_1} Gaia-incompatible  {n_fail_2} prior-incompatible  "
+          f"(thresh_5p={thresh_5a:.1f}  thresh_2p={thresh_2a:.1f}  "
+          f"thresh_pop={thresh_pop:.1f}  thresh_diff={thresh_diff:.1f})")
+
+    # ── Test 3: Per-image position residual chi2 ──────────────────────────────
+    resid_hst = solver.compute_residuals(r_current, a_arr)
+
+    _FLOOR          = float(chi2_dist.ppf(0.99, df=2))
+    _MEDIAN_CHI2_2  = 2.0 * np.log(2.0)
+
+    solver.gaia_n_hst_used[:] = 0
+    n_use_changed = 0
+    info = []
+
+    for img in image_names:
+        rd = resid_hst.get(img)
+        d  = solver._img_data.get(img)
+        if rd is None or d is None:
+            continue
+
+        sig_sq     = rd['sigma_resid'] ** 2
+        sidx_img   = rd['sidx']
+        prev_use   = np.asarray(d['use_for_fit'],          dtype=bool)
+        align_init = np.asarray(d['use_for_align_init'],   dtype=bool)
+        ok_here    = ok_star[sidx_img]
+
+        ok_thresh_ref = ok_here & align_init
+        if ok_thresh_ref.sum() < 10:
+            ok_thresh_ref = ok_here
+
+        thresh_a, _, _, _ = _adapt_thresh(sig_sq[ok_thresh_ref], adaptive_k,
+                                           chi2_dist.ppf(0.95, df=2), floor=_FLOOR)
+        thresh_e, _, _, _ = _adapt_thresh(sig_sq[ok_thresh_ref], adaptive_k + adaptive_delta,
+                                           chi2_dist.ppf(0.95, df=2), floor=_FLOOR)
+
+        ok_resid = np.where(prev_use, sig_sq < thresh_e, sig_sq < thresh_a)
+
+        new_use  = ok_resid & ok_here
+        new_use  = new_use & np.asarray(d['use_for_fit_max'], dtype=bool)
+        infl_excl = d.get('influence_excl')
+        if infl_excl is not None:
+            new_use = new_use & ~np.asarray(infl_excl, dtype=bool)
+        can_enter = align_init | prev_use
+        new_use   = new_use & can_enter
+
+        n_use_changed += int(np.sum(prev_use != new_use))
+
+        new_use_astrom = np.asarray(d['use_for_astrom'], dtype=bool).copy()
+        new_use_astrom[align_init] = new_use[align_init]
+        d['use_for_fit']    = new_use
+        d['use_for_astrom'] = new_use_astrom
+
+        use_any = new_use | new_use_astrom
+        np.add.at(solver.gaia_n_hst_used, sidx_img[use_any], 1)
+
+        n_u = int(new_use.sum())
+        chi2_u = sig_sq[new_use]
+        alpha_raw = float(np.sqrt(np.median(chi2_u) / _MEDIAN_CHI2_2)) if n_u >= 4 else 1.0
+        info.append((img, n_u, len(new_use), thresh_a, alpha_raw))
+
+    return ok_star, n_use_changed, info
+
+
 # ── Per-visit residual plots (before / after) ─────────────────────────────────
 
 def _plot_pop_residual_maps(
@@ -1078,7 +1231,8 @@ def run_pop_fit(
     n_iter_joint: int = 20,
     n_iter_alpha: int = 20,
     alpha_damp: float = 0.5,
-    n_iter_soft: int = 20,
+    n_iter_phase4: int = 20,
+    phase4_mode: str = 'hard',
     student_t_nu: float = 50.0,
     z_threshold: float = 0.8,
     member_sigma_clip: float = 3.0,
@@ -1126,8 +1280,10 @@ def run_pop_fit(
           f"σ_plx_tot={sigma_plx_tot} mas")
     print(f"  μ_pop prior σ={mu_pop_prior_sigma} mas/yr  "
           f"member_sigma_clip={member_sigma_clip}  pm_sys_floor={pm_sys_floor} mas/yr")
+    _p4_detail = (f"ν={student_t_nu:.1f}" if phase4_mode == 'soft'
+                  else "hard-weight Tests 1+2+3")
     print(f"  n_iter: μ={n_iter_mu}  joint={n_iter_joint}  alpha={n_iter_alpha}  "
-          f"soft={n_iter_soft} (ν={student_t_nu:.1f})")
+          f"phase4={n_iter_phase4} ({phase4_mode}: {_p4_detail})")
     print(f"  poly_order={poly_order}  split_ccd={v1_split_ccd}  "
           f"v1 images={len(v1_image_names)}")
 
@@ -1468,8 +1624,8 @@ def run_pop_fit(
 
     # ── Re-open detections using Phase 3 residual thresholds ─────────────────
     _p3_active = None
-    if n_iter_soft > 0:
-        # Save Phase 3 active set for soft-weights plot later
+    if n_iter_phase4 > 0:
+        # Save Phase 3 active set for diagnostics / soft-weights plot
         _p3_active = {
             img: solver._img_data[img]['use_for_fit'].copy()
             for img in image_names
@@ -1478,7 +1634,6 @@ def run_pop_fit(
 
         # Re-evaluate ALL detections (including v1-excluded ones) against
         # per-image adaptive thresholds derived from the Phase 3 trusted set.
-        # Phase 4 soft weights then handle remaining outliers continuously.
         print(f"\n  Re-evaluating all detections using Phase 3 thresholds...")
         reopen_info = _reopen_detections(
             solver, image_names, r_current, a_arr)
@@ -1509,20 +1664,72 @@ def run_pop_fit(
             _use = _d['use_for_fit'] | _d.get('use_for_astrom', _d['use_for_fit'])
             np.add.at(_n_hst_det, _d['sidx'][_use], 1)
 
-    # ── Phase 4: soft-weight IRLS (alpha frozen from Phase 3) ────────────────
+    # ── Phase 4 ───────────────────────────────────────────────────────────────
     def _apply_z_threshold(z_dict: dict, thresh: float) -> dict:
-        """Zero out z values below thresh so they contribute nothing to the solve."""
         return {img: (z * (z >= thresh) if z is not None else None)
                 for img, z in z_dict.items()}
 
     z_weights_final = None
-    if n_iter_soft > 0:
+    if n_iter_phase4 > 0 and phase4_mode == 'hard':
+        # ── Phase 4 (hard): population-aware Tests 1+2+3, iterate until stable
+        print(f"\n  Phase 4: hard-weight outlier rejection  "
+              f"({n_iter_phase4} max iterations, α frozen)...")
+        C_shared_joint_p4 = C_shared_joint
+        ok_star_prev = None
+
+        for h_iter in range(n_iter_phase4):
+            r_new, mu_pop_new, C_shared_joint_p4, C_vT_p4, a_arr_p4, _, _ = _joint_solve_pop(
+                solver, image_names,
+                member_sidx, mu_pop_current,
+                sigma_pm, plx_pop, sigma_plx_tot,
+                C_pop_prior_inv, mu_pop_prior,
+                r_current, fix_r=False,
+            )
+            solver._update_R(r_new)
+            solver._update_geometry(r_new, a_arr_p4)
+
+            delta_r  = float(np.max(np.abs(r_new - r_current)))
+            delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+            _mu_pop_used   = mu_pop_current.copy()
+            r_current      = r_new
+            mu_pop_current = mu_pop_new
+            a_arr          = a_arr_p4
+
+            ok_star, n_use_changed, uff_info = _hard_update_phase4(
+                solver, image_names, r_current, a_arr, C_vT_p4,
+                member_sidx, mu_pop_current,
+                sigma_pm, plx_pop, sigma_plx_tot,
+                ok_star_prev=ok_star_prev,
+            )
+            ok_star_prev = ok_star
+
+            _a_free, _C_free = _compute_free_stellar_posterior(
+                a_arr, C_vT_p4, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+                solver._C_VG_inv_per_star)
+            member_sidx = _select_members_from_a(
+                _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
+                sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
+
+            n_use_img = sum(d['use_for_fit'].sum()
+                            for d in (solver._img_data.get(img) for img in image_names)
+                            if d is not None)
+            print(f"    iter {h_iter + 1}/{n_iter_phase4}: "
+                  f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+                  f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  "
+                  f"Δuse={n_use_changed}  members={len(member_sidx)}")
+            if delta_r < 1e-6 and delta_mu < 1e-6 and n_use_changed == 0:
+                print(f"    Converged.")
+                break
+
+        C_shared_joint = C_shared_joint_p4
+
+    elif n_iter_phase4 > 0 and phase4_mode == 'soft':
+        # ── Phase 4 (soft): Student-t IRLS ───────────────────────────────────
         print(f"\n  Phase 4: soft-weight IRLS  ν={student_t_nu:.1f}  z_threshold={z_threshold:.2f}  "
-              f"({n_iter_soft} iterations, α frozen)...")
+              f"({n_iter_phase4} iterations, α frozen)...")
 
         # Evaluate z on the Phase 3 active set (before re-opening) to show the
-        # warm-start distribution.  Save the re-opened flags, swap in Phase 3
-        # flags temporarily, compute z, then restore.
+        # warm-start distribution.
         _reopened_flags = {
             img: solver._img_data[img]['use_for_fit'].copy()
             for img in image_names
@@ -1550,13 +1757,12 @@ def run_pop_fit(
               f"p84={_pcts[3]:.3f}  max={_pcts[4]:.3f}  "
               f"(n={len(_p3_z_vals)}, n_below_thresh={int((_p3_z_vals < z_threshold).sum())})")
 
-        # Now compute z on the re-opened set for Phase 4
         _z_raw, n_det_total, n_eff = solver._update_soft_weights(
             r_current, a_arr, student_t_nu)
         z_weights_final = _apply_z_threshold(_z_raw, z_threshold)
-        C_shared_joint_sw = C_shared_joint   # fallback if loop never runs
+        C_shared_joint_sw = C_shared_joint
 
-        for sw_iter in range(n_iter_soft):
+        for sw_iter in range(n_iter_phase4):
             r_new, mu_pop_new, C_shared_joint_sw, C_vT_sw, a_arr_sw, _, _ = _joint_solve_pop(
                 solver, image_names,
                 member_sidx, mu_pop_current,
@@ -1572,14 +1778,14 @@ def run_pop_fit(
                 r_new, a_arr_sw, student_t_nu)
             z_new = _apply_z_threshold(_z_raw_new, z_threshold)
 
-            delta_r   = float(np.max(np.abs(r_new - r_current)))
-            delta_mu  = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
-            delta_z   = float(sum(
+            delta_r  = float(np.max(np.abs(r_new - r_current)))
+            delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+            delta_z  = float(sum(
                 np.sum(np.abs(z_new[img] - z_weights_final[img]))
                 for img in image_names
                 if z_new.get(img) is not None and z_weights_final.get(img) is not None))
 
-            _mu_pop_used    = mu_pop_current.copy()   # mu_pop baked into a_arr_sw
+            _mu_pop_used   = mu_pop_current.copy()
             r_current      = r_new
             mu_pop_current = mu_pop_new
             z_weights_final = z_new
@@ -1592,7 +1798,7 @@ def run_pop_fit(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
 
-            print(f"    iter {sw_iter + 1}/{n_iter_soft}: "
+            print(f"    iter {sw_iter + 1}/{n_iter_phase4}: "
                   f"n_eff={n_eff_new:.0f}/{n_det_total}  "
                   f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
                   f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  Δz={delta_z:.3e}  "
@@ -1995,15 +2201,18 @@ def main():
     parser.add_argument('--alpha_damp', type=float, default=0.5,
                         help='Under-relaxation for alpha update: alpha_new = alpha_prev * '
                              'alpha_raw^alpha_damp (0.5=geometric mean; 1.0=full step, may oscillate)')
-    parser.add_argument('--n_iter_soft', type=int, default=20,
-                        help='Phase 4 (soft-weight IRLS, frozen alpha) iterations (0 to skip)')
+    parser.add_argument('--n_iter_phase_4', type=int, default=20,
+                        help='Phase 4 iterations (0 to skip)')
+    parser.add_argument('--phase4_mode', type=str, default='hard',
+                        choices=['hard', 'soft'],
+                        help='Phase 4 mode: hard=population-aware Tests 1+2+3 (default), '
+                             'soft=Student-t IRLS')
     parser.add_argument('--student_t_nu', type=float, default=50.0,
-                        help='Student-t degrees of freedom for soft weights '
+                        help='[soft mode only] Student-t degrees of freedom '
                              '(larger = harder, 50 ≈ nearly hard exclusion)')
     parser.add_argument('--z_threshold', type=float, default=0.8,
-                        help='Minimum z weight for a detection to contribute to the '
-                             'Phase 4 solve; detections below this are hard-excluded '
-                             '(default 0.8)')
+                        help='[soft mode only] Minimum z weight for a detection to contribute; '
+                             'detections below this are hard-excluded (default 0.8)')
     parser.add_argument('--member_sigma_clip', type=float, default=3.0,
                         help='Sigma threshold for membership selection')
     parser.add_argument('--pm_sys_floor', type=float, default=0.2,
@@ -2027,7 +2236,8 @@ def main():
         n_iter_joint=args.n_iter_joint,
         n_iter_alpha=args.n_iter_alpha,
         alpha_damp=args.alpha_damp,
-        n_iter_soft=args.n_iter_soft,
+        n_iter_phase4=args.n_iter_phase_4,
+        phase4_mode=args.phase4_mode,
         student_t_nu=args.student_t_nu,
         z_threshold=args.z_threshold,
         member_sigma_clip=args.member_sigma_clip,
