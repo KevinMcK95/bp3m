@@ -126,13 +126,20 @@ def _compute_free_stellar_posterior(
     sigma_plx_tot: float,
     mu_pop: np.ndarray,
     plx_pop: float,
+    C_VG_inv_per_star: np.ndarray,
 ) -> tuple:
-    """Return (a_free, C_vT_free) with the LVD prior removed for member stars.
+    """Return (a_free, C_vT_free) with the population prior removed for member stars.
 
     The regular solve bakes in sigma_pm^{-2} for members, pulling a[member, 2:4]
     toward mu_pop regardless of what the data says.  Evaluating membership from
     that posterior means members can never be demoted.  This function undoes the
-    LVD contribution so _select_members_from_a sees what Gaia + HST alone imply.
+    population prior contribution so _select_members_from_a sees what Gaia + HST
+    alone imply.
+
+    For 2p stars (no Gaia PM), removing the population prior makes H_free
+    rank-deficient in the PM/parallax directions.  We add back the same diffuse
+    prior that _joint_solve_pop applies to 2p non-members (C_VG_inv_per_star),
+    giving exactly the posterior those stars would have as non-members.
     """
     if len(member_sidx) == 0:
         return a, C_vT
@@ -147,13 +154,23 @@ def _compute_free_stellar_posterior(
     H_mem = np.linalg.inv(C_vT[member_sidx])
     h_mem = np.einsum('nij,nj->ni', H_mem, a[member_sidx])
 
-    # Strip the LVD prior from the normal equations
+    # Strip the population prior from the normal equations
     H_mem[:, 2, 2] -= sigma_pm_inv_sq
     H_mem[:, 3, 3] -= sigma_pm_inv_sq
     H_mem[:, 4, 4] -= sigma_plx_inv_sq
     h_mem[:, 2]    -= sigma_pm_inv_sq * mu_pop[0]
     h_mem[:, 3]    -= sigma_pm_inv_sq * mu_pop[1]
     h_mem[:, 4]    -= sigma_plx_inv_sq * plx_pop
+
+    # For 2p member stars, add the diffuse prior that non-members get
+    # (_joint_solve_pop line 350-355).  These stars have no Gaia PM so
+    # H_free would otherwise be rank-deficient in the PM/parallax directions.
+    # The diffuse prior has zero mean so only H_mem (not h_mem) changes.
+    needs_diffuse = C_VG_inv_per_star[member_sidx, 2] > 0
+    if needs_diffuse.any():
+        ndx = member_sidx[needs_diffuse]
+        for _k in range(5):
+            H_mem[needs_diffuse, _k, _k] += C_VG_inv_per_star[ndx, _k]
 
     C_vT_free[member_sidx] = np.linalg.inv(H_mem)
     a_free[member_sidx]    = np.einsum('nij,nj->ni', C_vT_free[member_sidx], h_mem)
@@ -1234,7 +1251,8 @@ def run_pop_fit(
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
         mu_pop_current = mu_pop_new
         _a_free, _C_free = _compute_free_stellar_posterior(
-            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop)
+            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop,
+            solver._C_VG_inv_per_star)
         member_sidx = _select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
@@ -1266,7 +1284,8 @@ def run_pop_fit(
         r_current      = r_new
         mu_pop_current = mu_pop_new
         _a_free, _C_free = _compute_free_stellar_posterior(
-            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop)
+            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, mu_pop_current, plx_pop,
+            solver._C_VG_inv_per_star)
         member_sidx = _select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor)
