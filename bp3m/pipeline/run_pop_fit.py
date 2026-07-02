@@ -1141,13 +1141,51 @@ def run_pop_fit(
     _C_mu = C_shared_final[n_r:, n_r:]   # (2, 2) μ_pop posterior covariance
     _corr_mu = (float(_C_mu[0, 1] / (sigma_mu_joint[0] * sigma_mu_joint[1]))
                 if (sigma_mu_joint[0] > 0 and sigma_mu_joint[1] > 0) else 0.0)
+
+    # Gaia-alone inverse-variance weighted mean PM for the final member stars
+    _g_pmra   = gaia_catalog['pmra'].to_numpy(float)[member_sidx]
+    _g_pmdec  = gaia_catalog['pmdec'].to_numpy(float)[member_sidx]
+    _g_sra    = gaia_catalog['pmra_error'].to_numpy(float)[member_sidx]
+    _g_sdec   = gaia_catalog['pmdec_error'].to_numpy(float)[member_sidx]
+    _g_rho    = (_corr_pm_init[member_sidx]
+                 if '_corr_pm_init' in dir() else np.zeros(len(member_sidx)))
+    _g_ok     = (np.isfinite(_g_pmra) & np.isfinite(_g_pmdec)
+                 & np.isfinite(_g_sra) & (_g_sra > 0)
+                 & np.isfinite(_g_sdec) & (_g_sdec > 0))
+    if _g_ok.sum() >= 2:
+        _Lambda_g = np.zeros((2, 2))
+        _h_g      = np.zeros(2)
+        for _k in np.where(_g_ok)[0]:
+            _C_k = np.array([[_g_sra[_k]**2,
+                               _g_rho[_k] * _g_sra[_k] * _g_sdec[_k]],
+                              [_g_rho[_k] * _g_sra[_k] * _g_sdec[_k],
+                               _g_sdec[_k]**2]])
+            _Ci  = np.linalg.inv(_C_k)
+            _Lambda_g += _Ci
+            _h_g      += _Ci @ np.array([_g_pmra[_k], _g_pmdec[_k]])
+        _C_mu_g    = np.linalg.inv(_Lambda_g)
+        _mu_g      = _C_mu_g @ _h_g
+        _sig_g     = np.sqrt(np.diag(_C_mu_g))
+        _corr_mu_g = (float(_C_mu_g[0, 1] / (_sig_g[0] * _sig_g[1]))
+                      if (_sig_g[0] > 0 and _sig_g[1] > 0) else 0.0)
+    else:
+        _mu_g = np.array([np.nan, np.nan])
+        _sig_g = np.array([np.nan, np.nan])
+        _corr_mu_g = np.nan
+
     mu_result = {
         'mu_pop_ra_masyr':       float(mu_pop_current[0]),
         'mu_pop_dec_masyr':      float(mu_pop_current[1]),
         'sigma_mu_pop_ra':       float(sigma_mu_joint[0]),
         'sigma_mu_pop_dec':      float(sigma_mu_joint[1]),
         'corr_mu_pop_ra_dec':    _corr_mu,
+        'mu_gaia_ra_masyr':      float(_mu_g[0]),
+        'mu_gaia_dec_masyr':     float(_mu_g[1]),
+        'sigma_mu_gaia_ra':      float(_sig_g[0]),
+        'sigma_mu_gaia_dec':     float(_sig_g[1]),
+        'corr_mu_gaia_ra_dec':   _corr_mu_g,
         'n_members':             int(len(member_sidx)),
+        'n_members_gaia_finite': int(_g_ok.sum()),
         'sigma_pm_masyr':        float(sigma_pm),
         'plx_pop_mas':           float(plx_pop),
         'sigma_plx_tot_mas':     float(sigma_plx_tot),
