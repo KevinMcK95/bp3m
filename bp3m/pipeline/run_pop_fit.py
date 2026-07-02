@@ -586,7 +586,9 @@ def _plot_pop_residual_maps(
         gdc_before = {}
     try:
         solver._update_geometry(r_after, v_after)
-        gdc_after = solver.compute_gdc_residuals(r_after, v_after, C_vT=C_vT_after)
+        # C_vT intentionally omitted: C_gdc_total gives measurement-only (HST+alpha)
+        # uncertainty in GDC pixel units, which is the correct sigma for normalisation.
+        gdc_after = solver.compute_gdc_residuals(r_after, v_after)
     except Exception as _exc:
         print(f"  WARNING: after-residuals failed — {_exc}")
         gdc_after = {}
@@ -620,10 +622,11 @@ def _plot_pop_residual_maps(
                 rows_dx[si].append(dx_all[use_any])
                 rows_dy[si].append(dy_all[use_any])
 
-            if C_vT_after is not None:
-                sidx_u = d['sidx'][use_any]
-                sigma_dx_all.append(np.sqrt(np.maximum(C_vT_after[sidx_u, 0, 0], 0.0)))
-                sigma_dy_all.append(np.sqrt(np.maximum(C_vT_after[sidx_u, 1, 1], 0.0)))
+            rd_after = gdc_after.get(img, {})
+            c_gdc_tot = rd_after.get('C_gdc_total')
+            if c_gdc_tot is not None:
+                sigma_dx_all.append(np.sqrt(np.maximum(c_gdc_tot[use_any, 0, 0], 0.0)))
+                sigma_dy_all.append(np.sqrt(np.maximum(c_gdc_tot[use_any, 1, 1], 0.0)))
 
             total_n += int(use_any.sum())
 
