@@ -141,6 +141,15 @@ def _select_members_from_a(
     if len(eidx) < min_members:
         return eidx
 
+    # Exclude stars with degenerate posteriors (C_vT=0, a_arr=0) — these are
+    # stars that were excluded from the active solve by fit_members_only and have
+    # no meaningful posterior.  Their a_arr=0 can trivially satisfy chi2<threshold
+    # if mu_pop is near zero in the solver's internal frame.
+    _has_valid_posterior = (C_vT[eidx, 2, 2] > 0) | (C_vT[eidx, 3, 3] > 0)
+    eidx = eidx[_has_valid_posterior]
+    if len(eidx) < min_members:
+        return eidx
+
     pmra  = a_arr[eidx, 2]
     pmdec = a_arr[eidx, 3]
 
