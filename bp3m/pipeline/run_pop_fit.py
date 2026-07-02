@@ -796,18 +796,18 @@ def _hard_update_phase4(
     adaptive_delta: float = 0.1,
     a_free: np.ndarray | None = None,
     C_free: np.ndarray | None = None,
+    mu_pop_solve: np.ndarray | None = None,
 ) -> tuple:
     """
     Population-aware hard outlier rejection for Phase 4.
 
     Test 1  Gaia prior chi2 (adaptive, with hysteresis): identical to v1.
     Test 2  Prior chi2 (posterior+prior covariance):
-              members     → compare PM+plx to population prior
+              members     → compare PM+plx to mu_pop_solve (the value used in the
+                            solve that produced a_arr, NOT the updated mu_pop)
               non-members → compare all 5 components to diffuse prior
     Test 3  Per-image position residual chi2 (adaptive, with hysteresis): v1.
-    Test 4  Free-posterior PM vs population mean (df=2, 2σ threshold).
-              Only applied to member stars; catches stars the pop prior was
-              pulling in that the data alone do not support as members.
+    Test 4  Free-posterior PM vs mu_pop (updated) for member stars only.
 
     Updates solver._img_data[img]['use_for_fit'] and ['use_for_astrom'] in-place.
     Returns (ok_star, n_use_changed, info).
@@ -853,13 +853,17 @@ def _hard_update_phase4(
 
     # ── Test 2: Prior chi2 (posterior + prior covariance) ─────────────────────
     # C_test = C_vT[relevant] + C_prior — mirrors Test 1's C_comb = C_vT + C_survey
+    # IMPORTANT: use mu_pop_solve (the value that constrained a_arr) so that the
+    # chi2 is not spuriously inflated by a mu_pop update between iterations.
     is_member = np.zeros(solver.n_stars, dtype=bool)
     is_member[member_sidx] = True
 
+    _mu_t2 = mu_pop_solve if mu_pop_solve is not None else mu_pop
+
     # Members: PM + parallax vs population prior (df=3)
     delta_pop   = np.column_stack([
-        a_arr[:, 2] - mu_pop[0],
-        a_arr[:, 3] - mu_pop[1],
+        a_arr[:, 2] - _mu_t2[0],
+        a_arr[:, 3] - _mu_t2[1],
         a_arr[:, 4] - plx_pop,
     ])  # (n, 3)
     C_prior_pop = np.diag([sigma_pm ** 2, sigma_pm ** 2, sigma_plx_tot ** 2])  # (3,3)
@@ -1910,6 +1914,7 @@ def run_pop_fit(
                 sigma_pm, plx_pop, sigma_plx_tot,
                 ok_star_prev=ok_star_prev,
                 a_free=_a_free, C_free=_C_free,
+                mu_pop_solve=_mu_pop_used,
             )
             ok_star_prev = ok_star
 
