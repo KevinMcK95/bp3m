@@ -1052,6 +1052,13 @@ def _plot_pm_vs_properties(
         ax0.axhline(mu_ref, color='firebrick', lw=1.2, ls='-', label=r'$\mu_{\rm pop}$')
         ax0.axhspan(mu_ref - sigma_pm, mu_ref + sigma_pm,
                     alpha=0.15, color='firebrick', label=r'$\pm\sigma_{\rm pm}$')
+        # y-limits: median ± 5 * MAD of the plotted PMs
+        if finite.any():
+            _pm_f = pm[finite]
+            _med  = float(np.median(_pm_f))
+            _mad  = float(np.median(np.abs(_pm_f - _med)))
+            _half = max(5.0 * _mad, sigma_pm * 3)
+            ax0.set_ylim(_med - _half, _med + _half)
         ax0.set_xlim(_xmin - _xpad, _xmax + _xpad)
         ax0.set_xlabel(xlabs[col], fontsize=8)
         ax0.set_ylabel(ylabs_raw[col], fontsize=8)
