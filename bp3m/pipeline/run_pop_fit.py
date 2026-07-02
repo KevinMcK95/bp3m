@@ -1142,26 +1142,25 @@ def run_pop_fit(
     _corr_mu = (float(_C_mu[0, 1] / (sigma_mu_joint[0] * sigma_mu_joint[1]))
                 if (sigma_mu_joint[0] > 0 and sigma_mu_joint[1] > 0) else 0.0)
 
-    # Gaia-alone inverse-variance weighted mean PM for the final member stars
-    _g_pmra   = gaia_catalog['pmra'].to_numpy(float)[member_sidx]
-    _g_pmdec  = gaia_catalog['pmdec'].to_numpy(float)[member_sidx]
-    _g_sra    = gaia_catalog['pmra_error'].to_numpy(float)[member_sidx]
-    _g_sdec   = gaia_catalog['pmdec_error'].to_numpy(float)[member_sidx]
-    _g_rho    = (_corr_pm_init[member_sidx]
-                 if '_corr_pm_init' in dir() else np.zeros(len(member_sidx)))
-    _g_ok     = (np.isfinite(_g_pmra) & np.isfinite(_g_pmdec)
-                 & np.isfinite(_g_sra) & (_g_sra > 0)
-                 & np.isfinite(_g_sdec) & (_g_sdec > 0))
+    # Gaia-alone pop PM posterior for the final member stars.
+    # Uses solver.C_survey (already inflated and floored identically to bp3m fitting)
+    # plus sigma_pm^2 on diagonal to marginalise over individual star true PMs.
+    _g_pmra  = solver.v_survey[member_sidx, 2]   # pmra in solver frame
+    _g_pmdec = solver.v_survey[member_sidx, 3]   # pmdec in solver frame
+    # PM 2x2 block of solver.C_survey (indices 2,3 = pmra, pmdec)
+    _g_C_pm  = solver.C_survey[member_sidx][:, 2:4, 2:4]   # (n, 2, 2)
+    _g_ok    = np.isfinite(_g_pmra) & np.isfinite(_g_pmdec) & (
+        np.isfinite(_g_C_pm[:, 0, 0]) & (_g_C_pm[:, 0, 0] > 0) &
+        np.isfinite(_g_C_pm[:, 1, 1]) & (_g_C_pm[:, 1, 1] > 0))
     if _g_ok.sum() >= 2:
         _Lambda_g = np.zeros((2, 2))
         _h_g      = np.zeros(2)
         for _k in np.where(_g_ok)[0]:
-            # Total per-star covariance = Gaia measurement cov + intrinsic dispersion
+            # Total per-star covariance = bp3m Gaia cov + intrinsic dispersion
             # (marginalises over individual star true PMs ~ N(mu_pop, sigma_pm^2 I))
-            _C_k = np.array([[_g_sra[_k]**2 + sigma_pm**2,
-                               _g_rho[_k] * _g_sra[_k] * _g_sdec[_k]],
-                              [_g_rho[_k] * _g_sra[_k] * _g_sdec[_k],
-                               _g_sdec[_k]**2 + sigma_pm**2]])
+            _C_k     = _g_C_pm[_k].copy()
+            _C_k[0, 0] += sigma_pm ** 2
+            _C_k[1, 1] += sigma_pm ** 2
             _Ci  = np.linalg.inv(_C_k)
             _Lambda_g += _Ci
             _h_g      += _Ci @ np.array([_g_pmra[_k], _g_pmdec[_k]])
