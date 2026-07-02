@@ -949,9 +949,13 @@ def _hard_update_phase4(
         alpha_raw = float(np.sqrt(np.median(chi2_u) / _MEDIAN_CHI2_2)) if n_u >= 4 else 1.0
         info.append((img, n_u, len(new_use), thresh_a, alpha_raw))
 
-    # ── Test 4: Free-posterior PM vs pop mean (member stars only) ────────────
-    # Uses the diffuse-prior posterior so the population prior can't pull a star
-    # into agreement with mu_pop — if the data alone say it's a non-member, remove it.
+    # ── Test 4: Free-posterior PM vs pop mean (diagnostic only) ──────────────
+    # Computes who would be demoted by the free-PM membership criterion.
+    # Does NOT modify ok_star — excluding stars from use_for_fit here causes
+    # the plate solution to wander and the loop to diverge.  Demotion is handled
+    # by _select_members_from_a (same free posterior, chi2 < sigma_clip²) which
+    # switches those stars to the diffuse prior in the next solve instead of
+    # removing them from the fit entirely.
     if a_free is not None and C_free is not None and is_member.any():
         delta_free  = np.column_stack([
             a_free[:, 2] - mu_pop[0],
@@ -963,11 +967,9 @@ def _hard_update_phase4(
         chi2_free = np.einsum('ni,nij,nj->n', delta_free,
                               np.linalg.inv(C_free_pm), delta_free)
         thresh_free = float(chi2_dist.ppf(0.9545, df=2))   # ≈ 6.18  (2σ in 2D)
-        ok_free = np.where(is_member, chi2_free < thresh_free, True)
-        n_fail_4 = int((~ok_free & ok_star & observed).sum())
+        n_demote = int((is_member & (chi2_free >= thresh_free) & observed).sum())
         print(f"    [hard] Test 4 (free PM vs pop, df=2, thresh={thresh_free:.2f}): "
-              f"{n_fail_4} member(s) additionally excluded")
-        ok_star = ok_star & ok_free
+              f"{n_demote} member(s) will be demoted by membership update")
 
     return ok_star, n_use_changed, info
 
