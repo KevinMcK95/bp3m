@@ -840,6 +840,7 @@ def _plot_soft_weights_pop(
     image_names: list[str],
     plot_dir: Path,
     student_t_nu: float,
+    z_threshold: float = 0.8,
 ) -> None:
     """
     Two-panel diagnostic for Phase 4 soft-weight IRLS results.
@@ -912,7 +913,7 @@ def _plot_soft_weights_pop(
     if (~all_p3).any():
         ax.hist(all_z[~all_p3], bins=bins, alpha=0.6, label='Re-admitted (Phase 4)',
                 color='darkorange')
-    ax.axvline(0.5, color='red', lw=1, ls='--', label='z=0.5')
+    ax.axvline(z_threshold, color='red', lw=1, ls='--', label=f'z={z_threshold:.2f} threshold')
     ax.set_xlabel('z  (Student-t weight)')
     ax.set_ylabel('N detections')
     ax.set_title('Detection weight distribution')
@@ -1713,6 +1714,7 @@ def run_pop_fit(
                     solver, image_names,
                     plot_dir=output_pfr / 'plots',
                     student_t_nu=student_t_nu,
+                    z_threshold=z_threshold,
                 )
             except Exception as _exc:
                 print(f"  WARNING: soft_weights_diagnostic plot failed — {_exc}")
