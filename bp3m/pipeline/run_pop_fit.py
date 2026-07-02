@@ -929,6 +929,126 @@ def _hard_update_phase4(
     return ok_star, n_use_changed, info
 
 
+# ── PM vs properties figure (2 rows × 6 cols) ────────────────────────────────
+
+def _plot_pm_vs_properties(
+    output_dir,
+    solver,
+    image_names: list,
+    gaia_catalog,
+    a_free: np.ndarray,
+    C_vT_free: np.ndarray,
+    member_sidx: np.ndarray,
+    mu_pop: np.ndarray,
+    sigma_pm: float,
+    field_name: str,
+) -> None:
+    """
+    2×6 figure: diffuse-prior posterior PMs for member stars vs
+    Gaia G magnitude (cols 0-1), mean HST x_raw (cols 2-3),
+    mean HST y_raw (cols 4-5).  Row 0 = raw mas/yr; row 1 = normalised
+    by individual posterior uncertainty.  Population PM shown as line +
+    shaded ±sigma_pm region.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    if len(member_sidx) == 0:
+        return
+
+    # ── Per-member arrays ─────────────────────────────────────────────────────
+    pmra_m  = a_free[member_sidx, 2]
+    pmdec_m = a_free[member_sidx, 3]
+    sig_ra  = np.sqrt(np.maximum(C_vT_free[member_sidx, 2, 2], 0.0))
+    sig_dec = np.sqrt(np.maximum(C_vT_free[member_sidx, 3, 3], 0.0))
+
+    gmag_arr = gaia_catalog['gmag'].to_numpy(float)
+    gmag_m   = gmag_arr[member_sidx]
+
+    # Mean HST x_raw / y_raw per member star (X_c + 2048, Y_c + 2048)
+    _XO = 2048.0
+    xsum  = np.zeros(solver.n_stars)
+    ysum  = np.zeros(solver.n_stars)
+    ncnt  = np.zeros(solver.n_stars, dtype=int)
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        sidx_img = d['sidx']
+        use      = np.asarray(d['use_for_fit'], dtype=bool)
+        np.add.at(xsum, sidx_img[use], d['X_c'][use] + _XO)
+        np.add.at(ysum, sidx_img[use], d['Y_c'][use] + _XO)
+        np.add.at(ncnt, sidx_img[use], 1)
+    with np.errstate(invalid='ignore'):
+        xraw_all = np.where(ncnt > 0, xsum / ncnt, np.nan)
+        yraw_all = np.where(ncnt > 0, ysum / ncnt, np.nan)
+    xraw_m = xraw_all[member_sidx]
+    yraw_m = yraw_all[member_sidx]
+
+    # ── Figure layout ─────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 6, figsize=(22, 7), constrained_layout=True)
+    fig.suptitle(
+        f'{field_name} — diffuse-prior PMs for member stars  '
+        f'(N={len(member_sidx)}  μ_pop=({mu_pop[0]:+.3f},{mu_pop[1]:+.3f}) mas/yr)',
+        fontsize=11,
+    )
+
+    xs_list   = [gmag_m,  gmag_m,  xraw_m,  xraw_m,  yraw_m,  yraw_m]
+    xlabs     = ['Gaia G (mag)'] * 2 + ['mean x_raw (px)'] * 2 + ['mean y_raw (px)'] * 2
+    pm_vals   = [pmra_m,  pmdec_m, pmra_m,  pmdec_m, pmra_m,  pmdec_m]
+    pm_errs   = [sig_ra,  sig_dec, sig_ra,  sig_dec, sig_ra,  sig_dec]
+    pop_means = [mu_pop[0], mu_pop[1]] * 3
+    ylabs_raw = [r'$\mu_{\alpha*}$ (mas/yr)', r'$\mu_\delta$ (mas/yr)'] * 3
+    ylabs_nrm = [r'$(\mu_{\alpha*}-\mu_{\rm pop})/\sigma_{\mu_{\alpha*}}$',
+                 r'$(\mu_\delta-\mu_{\rm pop})/\sigma_{\mu_\delta}$'] * 3
+
+    for col in range(6):
+        x      = xs_list[col]
+        pm     = pm_vals[col]
+        err    = pm_errs[col]
+        mu_ref = pop_means[col]
+
+        # ── Row 0: raw mas/yr ─────────────────────────────────────────────────
+        ax0 = axes[0, col]
+        finite = np.isfinite(x) & np.isfinite(pm) & np.isfinite(err) & (err > 0)
+        if finite.any():
+            ax0.errorbar(x[finite], pm[finite], yerr=err[finite],
+                         fmt='o', ms=2, lw=0.5, color='steelblue', alpha=0.6,
+                         elinewidth=0.5, capsize=0)
+        _xmin, _xmax = (np.nanmin(x), np.nanmax(x)) if np.any(np.isfinite(x)) else (0, 1)
+        ax0.axhline(mu_ref, color='firebrick', lw=1.2, ls='-', label=r'$\mu_{\rm pop}$')
+        ax0.axhspan(mu_ref - sigma_pm, mu_ref + sigma_pm,
+                    alpha=0.15, color='firebrick', label=r'$\pm\sigma_{\rm pm}$')
+        ax0.set_xlim(_xmin - 0.05 * (_xmax - _xmin), _xmax + 0.05 * (_xmax - _xmin))
+        ax0.set_xlabel(xlabs[col], fontsize=8)
+        ax0.set_ylabel(ylabs_raw[col], fontsize=8)
+        ax0.tick_params(labelsize=7)
+        if col == 0:
+            ax0.legend(fontsize=7, loc='upper right')
+
+        # ── Row 1: normalised ─────────────────────────────────────────────────
+        ax1 = axes[1, col]
+        norm_pm = (pm - mu_ref) / err
+        if finite.any():
+            ax1.errorbar(x[finite], norm_pm[finite], yerr=np.ones(finite.sum()),
+                         fmt='o', ms=2, lw=0.5, color='steelblue', alpha=0.6,
+                         elinewidth=0.5, capsize=0)
+        ax1.axhline(0,  color='firebrick', lw=1.2, ls='-')
+        ax1.axhspan(-1, 1, alpha=0.15, color='firebrick')
+        ax1.axhline(-3, color='grey', lw=0.7, ls='--')
+        ax1.axhline( 3, color='grey', lw=0.7, ls='--')
+        ax1.set_xlim(_xmin - 0.05 * (_xmax - _xmin), _xmax + 0.05 * (_xmax - _xmin))
+        ax1.set_xlabel(xlabs[col], fontsize=8)
+        ax1.set_ylabel(ylabs_nrm[col], fontsize=8)
+        ax1.tick_params(labelsize=7)
+
+    out_path = output_dir / 'pm_vs_properties.png'
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
 # ── Per-visit residual plots (before / after) ─────────────────────────────────
 
 def _plot_pop_residual_maps(
@@ -2163,6 +2283,15 @@ def run_pop_fit(
                        C_vT_free=C_vT_free_sol)
         except Exception as _exc:
             print(f"  WARNING: make_plots failed — {_exc}")
+
+        try:
+            _plot_pm_vs_properties(
+                output_pfr, solver, image_names, gaia_catalog,
+                v_mean_free_marg, C_vT_free_sol,
+                member_sidx, mu_pop_current, sigma_pm, field_name,
+            )
+        except Exception as _exc:
+            print(f"  WARNING: _plot_pm_vs_properties failed — {_exc}")
 
     elapsed = time.time() - t_start
     print(f"\n  Done in {elapsed:.1f}s")
