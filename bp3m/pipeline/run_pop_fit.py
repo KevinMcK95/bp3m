@@ -239,8 +239,9 @@ def _select_initial_members(
     Geometric mean sigma = det(C_total)^(1/4).
     """
     extra   = sigma_pm ** 2 + pm_sys_floor ** 2
-    var_ra  = np.where(np.isfinite(sigma_pmra),  sigma_pmra  ** 2, 1.0) + extra
-    var_dec = np.where(np.isfinite(sigma_pmdec), sigma_pmdec ** 2, 1.0) + extra
+    # NaN sigma propagates to NaN threshold → star not selected (correct: unknown uncertainty)
+    var_ra  = sigma_pmra  ** 2 + extra
+    var_dec = sigma_pmdec ** 2 + extra
     cov_off = np.where(np.isfinite(sigma_pmra) & np.isfinite(sigma_pmdec),
                        np.where(np.isfinite(corr_pm), corr_pm, 0.0)
                        * sigma_pmra * sigma_pmdec, 0.0)
@@ -664,13 +665,18 @@ def _compute_alpha_updates(
     image_names: list[str],
     r_current: np.ndarray,
     a_arr: np.ndarray,
+    alpha_damp: float = 0.5,
 ) -> list:
     """
     Compute and apply per-image alpha inflation from HST-only residual chi2.
 
-    Mirrors the v1 bp3m logic:
+    Mirrors the v1 bp3m logic with under-relaxation to prevent 2-cycle oscillation:
         alpha_raw  = sqrt( median(sigma_resid²) / (2 ln 2) )
-        alpha_new  = max(1.0, alpha_prev × alpha_raw)
+        alpha_new  = max(1.0, alpha_prev × alpha_raw^alpha_damp)
+
+    alpha_damp=1.0 is the full unrelaxed step; alpha_damp=0.5 (default) takes a
+    geometric-mean step that damps the 2-cycle without slowing convergence near
+    the fixed point.
 
     where sigma_resid is the 2-D Mahalanobis distance using the currently
     inflated C_hst (no stellar-astrometry or alignment-parameter covariance).
@@ -698,7 +704,7 @@ def _compute_alpha_updates(
         else:
             alpha_raw = 1.0
 
-        alpha_new              = float(max(1.0, alpha_prev * alpha_raw))
+        alpha_new              = float(max(1.0, alpha_prev * alpha_raw ** alpha_damp))
         d['alpha_applied']     = alpha_new
         d['C_hst']             = alpha_new ** 2 * d['C_hst_orig']
         info.append((img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new))
@@ -1071,6 +1077,7 @@ def run_pop_fit(
     n_iter_mu: int = 20,
     n_iter_joint: int = 20,
     n_iter_alpha: int = 20,
+    alpha_damp: float = 0.5,
     n_iter_soft: int = 20,
     student_t_nu: float = 50.0,
     z_threshold: float = 0.8,
@@ -1208,6 +1215,10 @@ def run_pop_fit(
     _corr_pm_init    = (gaia_catalog['pmra_pmdec_corr'].to_numpy(float).copy()
                         if 'pmra_pmdec_corr' in gaia_catalog.columns
                         else np.zeros(solver.n_stars))
+    # Save original Gaia uncertainties before v1 overwrites (used as fallback below)
+    _gaia_sig_pmra  = _sig_pmra_init.copy()
+    _gaia_sig_pmdec = _sig_pmdec_init.copy()
+    _gaia_corr_pm   = _corr_pm_init.copy()
 
     _v1_pm_loaded = False
     _v1_matched   = np.zeros(solver.n_stars, dtype=bool)
@@ -1241,6 +1252,13 @@ def run_pop_fit(
                         _corr_pm_init[i]   = _v1_sig[j, 2]
                         _v1_matched[i]     = True
                 _v1_pm_loaded = True
+                # Restore Gaia sigmas wherever v1 wrote NaN (don't lose Gaia covariance)
+                _sig_pmra_init  = np.where(np.isfinite(_sig_pmra_init),
+                                           _sig_pmra_init,  _gaia_sig_pmra)
+                _sig_pmdec_init = np.where(np.isfinite(_sig_pmdec_init),
+                                           _sig_pmdec_init, _gaia_sig_pmdec)
+                _corr_pm_init   = np.where(np.isfinite(_corr_pm_init),
+                                           _corr_pm_init,   _gaia_corr_pm)
 
         except Exception as _exc:
             print(f"  WARNING: could not load v1 posteriors — {_exc}")
@@ -1290,10 +1308,8 @@ def run_pop_fit(
     _mem_sig_dec = _sig_pmdec_init[member_sidx]
     _fin_m = np.isfinite(_mem_pm_ra) & np.isfinite(_mem_pm_dec)
     if _fin_m.sum() >= 3:
-        _wra  = 1.0 / (np.where(np.isfinite(_mem_sig_ra[_fin_m]),
-                                 _mem_sig_ra[_fin_m] ** 2, 1.0) + _extra)
-        _wdec = 1.0 / (np.where(np.isfinite(_mem_sig_dec[_fin_m]),
-                                  _mem_sig_dec[_fin_m] ** 2, 1.0) + _extra)
+        _wra  = 1.0 / (_mem_sig_ra[_fin_m]  ** 2 + _extra)
+        _wdec = 1.0 / (_mem_sig_dec[_fin_m] ** 2 + _extra)
         _mu_ra_v1   = float(np.sum(_wra  * _mem_pm_ra[_fin_m])  / np.sum(_wra))
         _mu_dec_v1  = float(np.sum(_wdec * _mem_pm_dec[_fin_m]) / np.sum(_wdec))
         _unc_ra_v1  = float(1.0 / np.sqrt(np.sum(_wra)))
@@ -1318,10 +1334,8 @@ def run_pop_fit(
     _gaia_sig_dec_col = gaia_catalog['pmdec_error'].to_numpy(float)[member_sidx]
     _gaia_fin = np.isfinite(_gaia_pmra_col) & np.isfinite(_gaia_pmdec_col)
     if _gaia_fin.sum() > 0:
-        _gw_ra  = 1.0 / (np.where(np.isfinite(_gaia_sig_ra_col[_gaia_fin]),
-                                    _gaia_sig_ra_col[_gaia_fin] ** 2, 1.0) + _extra)
-        _gw_dec = 1.0 / (np.where(np.isfinite(_gaia_sig_dec_col[_gaia_fin]),
-                                    _gaia_sig_dec_col[_gaia_fin] ** 2, 1.0) + _extra)
+        _gw_ra  = 1.0 / (_gaia_sig_ra_col[_gaia_fin]  ** 2 + _extra)
+        _gw_dec = 1.0 / (_gaia_sig_dec_col[_gaia_fin] ** 2 + _extra)
         _gmu_ra  = float(np.sum(_gw_ra  * _gaia_pmra_col[_gaia_fin])  / np.sum(_gw_ra))
         _gmu_dec = float(np.sum(_gw_dec * _gaia_pmdec_col[_gaia_fin]) / np.sum(_gw_dec))
         _gunc_ra  = float(1.0 / np.sqrt(np.sum(_gw_ra)))
@@ -1418,7 +1432,8 @@ def run_pop_fit(
             solver._update_R(r_new)
             solver._update_geometry(r_new, a_arr)
 
-            alpha_info = _compute_alpha_updates(solver, image_names, r_new, a_arr)
+            alpha_info = _compute_alpha_updates(solver, image_names, r_new, a_arr,
+                                                 alpha_damp=alpha_damp)
 
             delta_r     = float(np.max(np.abs(r_new - r_current)))
             delta_mu    = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
@@ -1977,6 +1992,9 @@ def main():
                         help='Phase 2 (joint r+μ) solve iterations')
     parser.add_argument('--n_iter_alpha', type=int, default=20,
                         help='Phase 3 (joint r+μ+alpha) solve iterations (0 to skip)')
+    parser.add_argument('--alpha_damp', type=float, default=0.5,
+                        help='Under-relaxation for alpha update: alpha_new = alpha_prev * '
+                             'alpha_raw^alpha_damp (0.5=geometric mean; 1.0=full step, may oscillate)')
     parser.add_argument('--n_iter_soft', type=int, default=20,
                         help='Phase 4 (soft-weight IRLS, frozen alpha) iterations (0 to skip)')
     parser.add_argument('--student_t_nu', type=float, default=50.0,
@@ -2008,6 +2026,7 @@ def main():
         n_iter_mu=args.n_iter_mu,
         n_iter_joint=args.n_iter_joint,
         n_iter_alpha=args.n_iter_alpha,
+        alpha_damp=args.alpha_damp,
         n_iter_soft=args.n_iter_soft,
         student_t_nu=args.student_t_nu,
         z_threshold=args.z_threshold,
