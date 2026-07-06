@@ -73,10 +73,9 @@ def _pixel_scale_from_cd(cd11, cd12, cd21, cd22) -> float:
     return np.sqrt(abs(cd11 * cd22 - cd12 * cd21)) * 3600.0 * 1000.0
 
 
-def _fcm_to_abcdwz(A, B, C, D, xs_o, ys_o, xt_o, yt_o, x_cen, y_cen,
-                   orig_rot_deg: float) -> np.ndarray:
+def _fcm_to_abcd(A, B, C, D, orig_rot_deg: float) -> np.ndarray:
     """
-    Convert fast_cross_match transformation parameters to BP3M (a,b,c,d,w,z).
+    Convert fast_cross_match transformation parameters to BP3M (a,b,c,d).
 
     The fast_cross_match affine maps HST pixels → Gaia pixels after applying
     orig_rot (= -orientat).  BP3M's (a,b,c,d) maps HST-centered pixels to the
@@ -84,22 +83,17 @@ def _fcm_to_abcdwz(A, B, C, D, xs_o, ys_o, xt_o, yt_o, x_cen, y_cen,
 
         [[a,b],[c,d]] = R_cw(orig_rot_deg) @ [[A,B],[C,D]]
 
-        [w,z] = R_cw(orig_rot_deg) @ ( [[A,B],[C,D]] @ [2048-xs_o, 2048-ys_o]
-                                        + [xt_o - x_cen, yt_o - y_cen] )
-
     where R_cw(θ) = [[cosθ, sinθ], [-sinθ, cosθ]] and Xo=Yo=2048 (BP3M pivot).
-    Validated on Leo_I (56 images) and Fornax_dSph (12 images): residuals
-    ≤6.5e-5 in a,b,c,d and ≤0.09 px in w,z relative to converged BP3M posteriors.
+    The bulk image offset is now captured by Δα0/Δδ0 (free parameters) rather
+    than by pixel translations w/z (removed).
     """
     deg2rad = np.pi / 180.0
     rot_rad = orig_rot_deg * deg2rad
     cos_r, sin_r = np.cos(rot_rad), np.sin(rot_rad)
     R_cw = np.array([[cos_r, sin_r], [-sin_r, cos_r]])
     M    = np.array([[A, B], [C, D]])
-    abcd = (R_cw @ M).ravel()                         # [a, b, c, d]
-    wz   = R_cw @ (M @ np.array([2048.0 - xs_o, 2048.0 - ys_o])
-                   + np.array([xt_o - x_cen, yt_o - y_cen]))
-    return np.array([abcd[0], abcd[1], abcd[2], abcd[3], wz[0], wz[1]])
+    abcd = (R_cw @ M).ravel()
+    return np.array([abcd[0], abcd[1], abcd[2], abcd[3]])
 
 
 def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
@@ -182,12 +176,11 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
         # Source pivot (needed to reconstruct the full initial transform)
         "xs_o": xs_o, "ys_o": ys_o,
         "xt_o": xt_o, "yt_o": yt_o,
-        # Pre-converted BP3M (a,b,c,d,w,z) from the cross-match solution.
+        # Pre-converted BP3M (a,b,c,d) from the cross-match solution.
         # Used to initialise r_hat before the first EM iteration; the prior
         # (r_prior, C_r_prior_inv) is still derived from the WCS header and
         # is unaffected by this value.
-        "fcm_abcdwz": _fcm_to_abcdwz(A, B, C, D, xs_o, ys_o, xt_o, yt_o,
-                                      x_cen, y_cen, -orientat),
+        "fcm_abcd": _fcm_to_abcd(A, B, C, D, -orientat),
     }
 
 

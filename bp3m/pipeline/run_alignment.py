@@ -343,25 +343,26 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
         n_astrom = int(np.sum(use_ast & ~d_img['use_for_fit']))
         a, b, c, d = r_j[:4]
         alpha_applied = float(d_img.get('alpha_applied', 1.0))
+        meta = images[img]
         rows.append(dict(
             image_name=img,
             n_stars_alignment=n_align,
             n_stars_astrometry_only=n_astrom,
             a=a, b=b, c=c, d=d,
-            w=r_j[4], z=r_j[5],
-            delta_ra0_mas=r_j[6]*1000,
-            delta_dec0_mas=r_j[7]*1000,
+            delta_ra0_mas=r_j[4]*1000,
+            delta_dec0_mas=r_j[5]*1000,
+            ra0_final=meta.get('ra0_final', meta['ra0']),
+            dec0_final=meta.get('dec0_final', meta['dec0']),
             pixel_scale_mas=np.sqrt(a*d - b*c) * images[img].get('orig_pixel_scale', 50.0),
             rotation_deg=np.degrees(np.arctan2(b - c, a + d)),
             on_skew=(a - d) / 2,
             off_skew=(b + c) / 2,
             sigma_a=np.sqrt(C_j[0,0]), sigma_b=np.sqrt(C_j[1,1]),
             sigma_c=np.sqrt(C_j[2,2]), sigma_d=np.sqrt(C_j[3,3]),
-            sigma_w=np.sqrt(C_j[4,4]), sigma_z=np.sqrt(C_j[5,5]),
-            sigma_dra0_mas=np.sqrt(C_j[6,6])*1000,
-            sigma_ddec0_mas=np.sqrt(C_j[7,7])*1000,
+            sigma_dra0_mas=np.sqrt(C_j[4,4])*1000,
+            sigma_ddec0_mas=np.sqrt(C_j[5,5])*1000,
             alpha=alpha_applied,
-            **{f'r_{k}': float(r_j[k]) for k in range(8, solver.N_R)},
+            **{f'r_{k}': float(r_j[k]) for k in range(6, solver.N_R)},
         ))
     pd.DataFrame(rows).to_csv(output_dir / "image_transformations.csv", index=False)
 

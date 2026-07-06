@@ -301,17 +301,22 @@ def n_r_from_poly_order(poly_order):
     Number of image-transformation parameters for a given polynomial order.
 
     Layout:
-      Degree 0–1 (linear + tangent point): 8 parameters — fixed.
+      Degree 0–1 (linear + tangent point): 6 parameters — fixed.
       Each additional degree k ≥ 2 contributes 2*(k+1) new parameters:
         (k+1) for the x-equation block + (k+1) for the y-equation block.
 
-    Formula: N_R(p) = 2 + (p+1)*(p+2)
+    Formula: N_R(p) = (p+1)*(p+2)
 
-      p=1 → 8  (linear: a,b,c,d,w,z,Δα0,Δδ0)
-      p=2 → 14 (adds 3 quadratic terms per equation)
-      p=3 → 22 (adds 4 cubic terms per equation)
+      p=1 →  6  (linear: a,b,c,d,Δα0,Δδ0)
+      p=2 → 12  (adds 3 quadratic terms per equation)
+      p=3 → 20  (adds 4 cubic terms per equation)
+
+    Note: the w/z pixel-translation terms have been removed.  The tangent-point
+    shift parameters Δα0/Δδ0 (indices 4,5) capture the same bulk-offset effect
+    more accurately via per-star Jacobians, and the two sets of parameters were
+    degenerate when both were free.
     """
-    return 2 + (poly_order + 1) * (poly_order + 2)
+    return (poly_order + 1) * (poly_order + 2)
 
 
 def build_X_matrix(x_hst, y_hst, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
@@ -321,12 +326,16 @@ def build_X_matrix(x_hst, y_hst, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
 
     X · r_j = observed position, where
 
-      r_j = (a, b, c, d, w, z, Δα0, Δδ0,
+      r_j = (a, b, c, d, Δα0, Δδ0,
              [x² coeff (x eq), xy coeff (x eq), y² coeff (x eq),
               x² coeff (y eq), xy coeff (y eq), y² coeff (y eq),
               ... higher-degree blocks ...])
 
-    Column layout for degree k ≥ 2 (new terms beyond the 8 base parameters):
+    The w/z pixel-translation terms have been removed.  Bulk image offsets are
+    now captured by Δα0/Δδ0 (indices 4,5) via per-star Jacobians, which is more
+    accurate than a constant pixel translation.
+
+    Column layout for degree k ≥ 2 (new terms beyond the 6 base parameters):
       x-equation block (k+1 cols): coeff of x^(k-j)·y^j, j=0..k  → row 0 only
       y-equation block (k+1 cols): same monomials                  → row 1 only
 
@@ -343,11 +352,11 @@ def build_X_matrix(x_hst, y_hst, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
     n_r = n_r_from_poly_order(poly_order)
     X = np.zeros((2, n_r))
 
-    # ── Linear and tangent-point terms (positions 0-7) ────────────────────────
-    X[0, 0] = x_hst;   X[0, 1] = y_hst;   X[0, 4] = 1.0
-    X[0, 6] = dxs_dra0; X[0, 7] = dxs_ddec0
-    X[1, 2] = x_hst;   X[1, 3] = y_hst;   X[1, 5] = 1.0
-    X[1, 6] = dys_dra0; X[1, 7] = dys_ddec0
+    # ── Linear and tangent-point terms (positions 0-5) ────────────────────────
+    X[0, 0] = x_hst;    X[0, 1] = y_hst
+    X[0, 4] = dxs_dra0; X[0, 5] = dxs_ddec0
+    X[1, 2] = x_hst;    X[1, 3] = y_hst
+    X[1, 4] = dys_dra0; X[1, 5] = dys_ddec0
 
     # ── Higher-order polynomial terms ─────────────────────────────────────────
     # Scale each degree-k monomial by 1/2048^(k-1) so that the basis functions
@@ -355,7 +364,7 @@ def build_X_matrix(x_hst, y_hst, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
     # This keeps all polynomial r-vector coefficients (a, b, … and higher-order)
     # at a similar order of magnitude, improving numerical conditioning.
     _S = 2048.0
-    col = 8
+    col = 6
     for deg in range(2, poly_order + 1):
         scale = _S ** (deg - 1)
         for j in range(deg + 1):

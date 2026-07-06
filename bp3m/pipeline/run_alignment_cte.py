@@ -4519,21 +4519,20 @@ def run_alignment_cte(
     # ── Inject v1/v2 BP3M transformation as warm start ────────────────────────
     v1_bp3m_dir   = data_root / field_name / "BP3M_results"
     v1_xform_path = v1_bp3m_dir / "image_transformations.csv"
-    v1_abcdwz: dict[str, np.ndarray] = {}
+    v1_abcd: dict[str, np.ndarray] = {}
     if v1_xform_path.exists():
         v1_df = pd.read_csv(v1_xform_path)
         for _, row in v1_df.iterrows():
             img_key = str(row["image_name"])
-            v1_abcdwz[img_key] = np.array([
+            v1_abcd[img_key] = np.array([
                 float(row["a"]), float(row["b"]),
                 float(row["c"]), float(row["d"]),
-                float(row["w"]), float(row["z"]),
             ])
         imgs = {sub: dict(meta) for sub, meta in imgs.items()}
         for sub, meta in imgs.items():
-            if sub in v1_abcdwz:
-                meta["fcm_abcdwz"] = v1_abcdwz[sub]
-        print(f"  Loaded v1 BP3M: {len(v1_abcdwz)} images as initialization")
+            if sub in v1_abcd:
+                meta["fcm_abcd"] = v1_abcd[sub]
+        print(f"  Loaded v1 BP3M: {len(v1_abcd)} images as initialization")
 
     # ── Initialise solver ──────────────────────────────────────────────────────
     SolverClass = BP3MSolverSparse if use_sparse else BP3MSolver
@@ -4573,7 +4572,7 @@ def run_alignment_cte(
 
     # ── Phase 0: fixed-transformation pre-filter ───────────────────────────────
     r_init_hat = None
-    if v1_abcdwz:
+    if v1_abcd:
         r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
                                       for img in image_names])
         solver._update_R(r_init_hat)
@@ -5019,22 +5018,21 @@ def run_alignment_joint_cte(
         (data_root / field_name / "BP3M_v2_results" / "image_transformations.csv", "v2"),
         (data_root / field_name / "BP3M_results"    / "image_transformations.csv", "v1"),
     ]
-    v1_abcdwz: dict[str, np.ndarray] = {}
+    v1_abcd: dict[str, np.ndarray] = {}
     for _xform_path, _label in _init_sources:
         if _xform_path.exists():
             _df = pd.read_csv(_xform_path)
             for _, row in _df.iterrows():
                 img_key = str(row["image_name"])
-                v1_abcdwz[img_key] = np.array([
+                v1_abcd[img_key] = np.array([
                     float(row["a"]), float(row["b"]),
                     float(row["c"]), float(row["d"]),
-                    float(row["w"]), float(row["z"]),
                 ])
             imgs = {sub: dict(meta) for sub, meta in imgs.items()}
             for sub, meta in imgs.items():
-                if sub in v1_abcdwz:
-                    meta["fcm_abcdwz"] = v1_abcdwz[sub]
-            print(f"  Loaded {_label} BP3M: {len(v1_abcdwz)} images as initialization")
+                if sub in v1_abcd:
+                    meta["fcm_abcd"] = v1_abcd[sub]
+            print(f"  Loaded {_label} BP3M: {len(v1_abcd)} images as initialization")
             break
 
     # ── Initialise solver ──────────────────────────────────────────────────────
@@ -5066,7 +5064,7 @@ def run_alignment_joint_cte(
 
     # ── Phase 0: fixed-transform pre-filter ──────────────────────────────────
     r_init_hat = None
-    if v1_abcdwz:
+    if v1_abcd:
         r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
                                       for img in image_names])
         solver._update_R(r_init_hat)

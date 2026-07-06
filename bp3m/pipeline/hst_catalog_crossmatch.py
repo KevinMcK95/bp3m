@@ -295,11 +295,11 @@ def _load_all_detections(field_dir: Path,
     for j, row in enumerate(transform_df.itertuples()):
         cs       = j * n_r
         sub_name = row.image_name
-        r_base   = np.array([row.a, row.b, row.c, row.d, row.w, row.z,
+        r_base   = np.array([row.a, row.b, row.c, row.d,
                               row.delta_ra0_mas / 1000.0,
                               row.delta_dec0_mas / 1000.0])
-        if n_r > 8:
-            extra = np.array([getattr(row, f'r_{k}', 0.0) for k in range(8, n_r)])
+        if n_r > 6:
+            extra = np.array([getattr(row, f'r_{k}', 0.0) for k in range(6, n_r)])
             r_j   = np.concatenate([r_base, extra])
         else:
             r_j   = r_base
@@ -3808,13 +3808,16 @@ def run_hst_crossmatch(
 
             # Build r_hat array from image_transformations.csv
             # Base 8 params; higher-order coefficients saved as r_8, r_9, … when poly_order > 1
-            _r_base_cols = ['a', 'b', 'c', 'd', 'w', 'z', 'delta_ra0_mas', 'delta_dec0_mas']
-            _r_extra_cols = [f'r_{k}' for k in range(8, n_r4)]
+            _r_base_cols = ['a', 'b', 'c', 'd']
+            _r_extra_cols = [f'r_{k}' for k in range(6, n_r4)]
             r_hat4_blocks = []
             for row in transform_df4.itertuples():
                 r_base  = np.array([getattr(row, p) for p in _r_base_cols])
+                # Δα0/Δδ0 are saved in mas but stored internally in arcsec
+                dra0  = float(getattr(row, 'delta_ra0_mas',  0.0)) / 1000.0
+                ddec0 = float(getattr(row, 'delta_dec0_mas', 0.0)) / 1000.0
                 r_extra = np.array([getattr(row, c, 0.0) for c in _r_extra_cols])
-                r_hat4_blocks.append(np.concatenate([r_base, r_extra]))
+                r_hat4_blocks.append(np.concatenate([r_base, [dra0, ddec0], r_extra]))
             r_hat4 = np.concatenate(r_hat4_blocks)
             image_names4 = transform_df4['image_name'].tolist()
 

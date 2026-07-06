@@ -729,7 +729,7 @@ def run_alignment_v2(
     # rough fast_cross_match solution from transformation.csv.
     v1_bp3m_dir   = data_root / field_name / "BP3M_results"
     v1_xform_path = v1_bp3m_dir / "image_transformations.csv"
-    v1_abcdwz: dict[str, np.ndarray] = {}
+    v1_abcd: dict[str, np.ndarray] = {}
     v1_alpha:  dict[str, float]      = {}
     # v1 stellar astrometry (MAP conditional posteriors) used for Phase 0 chi2 validation
     v1_stellar_astrom: pd.DataFrame | None = None
@@ -737,22 +737,21 @@ def run_alignment_v2(
         v1_df = pd.read_csv(v1_xform_path)
         for _, row in v1_df.iterrows():
             img_key = str(row["image_name"])
-            v1_abcdwz[img_key] = np.array([
+            v1_abcd[img_key] = np.array([
                 float(row["a"]), float(row["b"]),
                 float(row["c"]), float(row["d"]),
-                float(row["w"]), float(row["z"]),
             ])
             v1_alpha[img_key] = float(row["alpha"]) if "alpha" in row.index else 1.0
-        n_matched = sum(1 for k in imgs if k in v1_abcdwz)
-        print(f"  Loaded v1 BP3M results: {len(v1_abcdwz)} images, "
+        n_matched = sum(1 for k in imgs if k in v1_abcd)
+        print(f"  Loaded v1 BP3M results: {len(v1_abcd)} images, "
               f"{n_matched}/{len(imgs)} matched to current image list.")
         # Deep-copy each meta dict so per-sub-name overrides don't bleed across.
         imgs = {
             sub: dict(meta) for sub, meta in imgs.items()
         }
         for sub, meta in imgs.items():
-            if sub in v1_abcdwz:
-                meta["fcm_abcdwz"] = v1_abcdwz[sub]
+            if sub in v1_abcd:
+                meta["fcm_abcd"] = v1_abcd[sub]
 
         # Load v1 MAP stellar astrometry for chi2 validation in Phase 0
         _v1_astrom_path = v1_bp3m_dir / "stellar_astrometry.csv"
@@ -775,10 +774,10 @@ def run_alignment_v2(
             # (default 3.0 means "auto-scale from V1 C_r").
             try:
                 _v1_cr = np.load(_v1_cr_path)
-                _n_r_per = _v1_cr.shape[0] // max(len(v1_abcdwz), 1)
-                # Typical w-parameter (translation) uncertainty = median sqrt(C_r[4,4])
+                _n_r_per = _v1_cr.shape[0] // max(len(v1_abcd), 1)
+                # Typical Δα0 uncertainty = median sqrt(C_r[4,4])
                 _cr_w_vals = []
-                for _j in range(len(v1_abcdwz)):
+                for _j in range(len(v1_abcd)):
                     _cs = _j * _n_r_per
                     _cr_j = _v1_cr[_cs:_cs+_n_r_per, _cs:_cs+_n_r_per]
                     if _cr_j.shape[0] > 4:
@@ -872,7 +871,7 @@ def run_alignment_v2(
     _PHASE0_SIGMA_THRESH = 5.0
     _run_solver_prefilter = not no_prefilter
 
-    if v1_abcdwz and not no_prefilter:
+    if v1_abcd and not no_prefilter:
         _run_solver_prefilter = False   # we handle Phase 0 ourselves below
 
         r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
@@ -1236,15 +1235,15 @@ def run_alignment_v2(
     # Fix: scale D_thresh so that the ABSOLUTE shift threshold (in pixels) is
     # the same as V1's, i.e.  D_thresh_V2 = D_thresh × (C_r_V1 / C_r_V2).
     _infl_d_thresh_scaled = influence_d_thresh
-    if v1_abcdwz and n_iter > 0:
+    if v1_abcd and n_iter > 0:
         v1_cr_path = data_root / field_name / "BP3M_results" / "C_r.npy"
         if v1_cr_path.exists():
             try:
                 _v1_cr = np.load(v1_cr_path)
                 _nr    = solver.N_R
                 _n_img = len(image_names)
-                # Median σ_w (sqrt of C_r[4,4] per image) as scale indicator
-                _v1_sigma_w = float(np.median([
+                # Median σ_Δα0 (sqrt of C_r[4,4] per image) as scale indicator
+                _v1_sigma_dra0 = float(np.median([
                     np.sqrt(max(_v1_cr[j*_nr+4, j*_nr+4], 0.0))
                     for j in range(min(_n_img, _v1_cr.shape[0] // _nr))
                 ]))
@@ -1252,19 +1251,19 @@ def run_alignment_v2(
                 _r_init_for_cr = np.concatenate([
                     solver._img_data[img]["r_init"] for img in image_names])
                 _, _C_r_v2, _, _, _ = solver._solve_one_pass(_r_init_for_cr)
-                _v2_sigma_w = float(np.median([
+                _v2_sigma_dra0 = float(np.median([
                     np.sqrt(max(_C_r_v2[j*_nr+4, j*_nr+4], 0.0))
                     for j in range(_n_img)
                 ]))
-                if _v2_sigma_w > 0 and _v1_sigma_w > 0:
+                if _v2_sigma_dra0 > 0 and _v1_sigma_dra0 > 0:
                     # D = (X Cs^{-1} resid)^T C_r (X Cs^{-1} resid) / N_R.
                     # Larger C_r → larger D for the same physical resid.
-                    # To apply the same physical shift threshold as V1 (D_thresh_V1 × σ_w_V1),
-                    # V2 needs D_thresh_V2 = D_thresh_V1 × (σ_w_V2 / σ_w_V1).
-                    _cr_ratio = _v2_sigma_w / _v1_sigma_w
+                    # To apply the same physical shift threshold as V1 (D_thresh_V1 × σ_Δα0_V1),
+                    # V2 needs D_thresh_V2 = D_thresh_V1 × (σ_Δα0_V2 / σ_Δα0_V1).
+                    _cr_ratio = _v2_sigma_dra0 / _v1_sigma_dra0
                     _infl_d_thresh_scaled = influence_d_thresh * _cr_ratio
-                    print(f"  Influence clipping: σ_w(V1)={_v1_sigma_w:.4e}  "
-                          f"σ_w(V2)={_v2_sigma_w:.4e}  "
+                    print(f"  Influence clipping: σ_Δα0(V1)={_v1_sigma_dra0:.4e}  "
+                          f"σ_Δα0(V2)={_v2_sigma_dra0:.4e}  "
                           f"C_r ratio(V2/V1)={_cr_ratio:.2f}  "
                           f"→ influence_d_thresh={_infl_d_thresh_scaled:.2f} "
                           f"(base={influence_d_thresh:.1f})")

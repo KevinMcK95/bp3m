@@ -64,10 +64,9 @@ _SIGMA_PM  = 100.0  # mas/yr  (2p / HST-only only)
 _SIGMA_ROT_DEG  = 0.1    # degrees
 _SIGMA_SCALE    = 1.5e-2  # fractional pixel scale ratio
 _SIGMA_SKEW     = 5e-3   # on- and off-axis skew terms
-_SIGMA_POINTING = 1e-6  # RA0,Dec0 (ARCSEC) — effectively fixed at 0; tangent-point
-                        # update is disabled in _update_geometry (w/z degeneracy), so
-                        # these must be pinned or the [w,Δα0] block is 3e8-ill-conditioned
-_SIGMA_CENTER = 2048   # WZ (global pixels)
+_SIGMA_POINTING = 5.0   # RA0,Dec0 (ARCSEC) — ~100 ACS WFC pixels; loose enough to
+                        # absorb real HST pointing error, tight enough to regularise
+                        # the tangent-point update in _update_geometry
 
 # Initial residual filter applied in _precompute_geometry.
 # Stars whose corrected 2D residual (after removing bulk w,z offset)
@@ -82,11 +81,10 @@ def _make_image_prior(meta, poly_order=1):
     """
     Return (r_prior_j, C_r_prior_inv_j) for image j.
 
-    r_j = (a, b, c, d, w, z, Δα0, Δδ0 [, poly terms...])
+    r_j = (a, b, c, d, Δα0, Δδ0 [, poly terms...])
     Prior:
       (a,b,c,d) — from header rotation/scale (strong prior)
-      (w, z)    — uninformative (flat); mean initialised to median residual later
-      (Δα0,Δδ0) — sigma = _SIGMA_POINTING arcsec
+      (Δα0,Δδ0) — sigma = _SIGMA_POINTING arcsec (loose; ~100 ACS WFC pixels)
       poly terms — zero mean, flat prior (determined entirely by data)
     """
     n_r = n_r_from_poly_order(poly_order)
@@ -100,7 +98,7 @@ def _make_image_prior(meta, poly_order=1):
 
     r_prior = np.zeros(n_r)
     r_prior[:4] = [a, b, c, d]
-    # r_prior[4:] = 0  (w, z, Δα0, Δδ0 and all poly terms start at zero)
+    # r_prior[4:] = 0  (Δα0, Δδ0 and all poly terms start at zero)
 
     # Jacobian ∂(a,b,c,d)/∂(rot_rad, scale_ratio, on_skew, off_skew)
     cr, sr = np.cos(rot_rad), np.sin(rot_rad)
@@ -120,12 +118,9 @@ def _make_image_prior(meta, poly_order=1):
     except np.linalg.LinAlgError:
         C_r_prior_inv[:4, :4] = np.diag(1.0 / np.diag(C_abcd + 1e-30 * np.eye(4)))
 
-    C_r_prior_inv[4, 4] = _SIGMA_CENTER ** -2
-    C_r_prior_inv[5, 5] = _SIGMA_CENTER ** -2
-    C_r_prior_inv[6, 6] = _SIGMA_POINTING ** -2
-    C_r_prior_inv[7, 7] = _SIGMA_POINTING ** -2
-
-    # Indices 4, 5 (w, z) and 8+ (poly terms) remain zero — flat prior.
+    C_r_prior_inv[4, 4] = _SIGMA_POINTING ** -2  # Δα0
+    C_r_prior_inv[5, 5] = _SIGMA_POINTING ** -2  # Δδ0
+    # Indices 6+ (poly terms) remain zero — flat prior.
 
     return r_prior, C_r_prior_inv
 
@@ -421,20 +416,19 @@ class BP3MSolver:
             r_prior, C_r_prior_inv = _make_image_prior(meta, poly_order=self.poly_order)
 
             # ── Build r_init (initial iterate) ───────────────────────────────
-            # When transformation.csv provides (a,b,c,d,w,z) from fast_cross_match,
+            # When transformation.csv provides (a,b,c,d) from fast_cross_match,
             # use those as the starting point.  The prior (r_prior, C_r_prior_inv)
             # is computed solely from the WCS header and is never modified here.
             # r_init is a copy: changing it never changes the prior.
-            fcm_abcdwz = meta.get("fcm_abcdwz")
+            fcm_abcd = meta.get("fcm_abcd")
             r_init = r_prior.copy()
-            if fcm_abcdwz is not None:
-                r_init[:6] = fcm_abcdwz   # a, b, c, d, w, z from cross-match
+            if fcm_abcd is not None:
+                r_init[:4] = fcm_abcd   # a, b, c, d from cross-match
 
             # ── Initial residual screening ────────────────────────────────────
             # Used to permanently block implausible cross-matches (> 100 px after
-            # accounting for the bulk offset).  r_init provides a better prediction
-            # than r_prior because a,b,c,d,w,z are already well-constrained, so
-            # the per-star residuals are much smaller and the screening is cleaner.
+            # subtracting the median bulk offset).  Without w/z, there is always a
+            # bulk offset in r_init predictions, so we always subtract the median.
             # Use only PM and parallax (cols 2-4): position offset Δα,Δδ = 0 at
             # reference epoch. v_survey[:, 0:2] stores absolute ra/dec in degrees,
             # which would produce spuriously large offsets for non-Gaia stars.
@@ -445,16 +439,10 @@ class BP3MSolver:
             x_pred_init = np.einsum('nkl,l->nk', X_mat, r_init) - ave_motion_offset
             x_resid_init = xys - x_pred_init
 
-            if fcm_abcdwz is not None:
-                # w,z already encoded in r_init — residuals are centred near zero.
-                # No bulk-offset subtraction needed for the ok_init screen.
-                resid_mag = np.hypot(x_resid_init[:, 0], x_resid_init[:, 1])
-            else:
-                # r_init = r_prior (w=z=0): subtract median bulk offset as before.
-                med_wz_screen = (np.nanmedian(x_resid_init[good_for_fitting], axis=0)
-                                 if good_for_fitting.any() else np.zeros(2))
-                x_resid_corr = x_resid_init - med_wz_screen
-                resid_mag = np.hypot(x_resid_corr[:, 0], x_resid_corr[:, 1])
+            med_screen = (np.nanmedian(x_resid_init[good_for_fitting], axis=0)
+                          if good_for_fitting.any() else np.zeros(2))
+            x_resid_corr = x_resid_init - med_screen
+            resid_mag = np.hypot(x_resid_corr[:, 0], x_resid_corr[:, 1])
 
             ok_init = resid_mag <= _INIT_RESID_CLIP_PX  # (n,) hard ceiling mask
 
@@ -467,17 +455,11 @@ class BP3MSolver:
                           f"initial residual > {_INIT_RESID_CLIP_PX:.0f} px")
 
             # ── Set prior mean from cross-match solution ──────────────────────
-            # When transformation.csv provides (a,b,c,d,w,z), override the
-            # WCS-only prior mean for all 6 parameters.  This ensures that when
-            # no data stars contribute (good_for_fitting all-False), the solve
-            # returns r_hat = r_prior = cross-match solution rather than the
-            # WCS-only estimate, so Phase-0 residuals are computed at the correct
-            # transformation and stars can be re-admitted.  Falls back to residual
-            # median for w,z (or zero) only when no cross-match solution exists.
-            if fcm_abcdwz is not None:
-                r_prior[:6] = fcm_abcdwz[:6]
-            elif good_for_fitting.any():
-                r_prior[[4, 5]] = np.nanmedian(x_resid_init[good_for_fitting], axis=0)
+            # When transformation.csv provides (a,b,c,d), override the WCS-only
+            # prior mean so that Phase-0 residuals are computed at the correct
+            # transformation and stars can be re-admitted when no data contribute.
+            if fcm_abcd is not None:
+                r_prior[:4] = fcm_abcd[:4]
 
             self.gaia_n_hst_used[sidx[good_for_fitting]] += 1
 
@@ -594,17 +576,12 @@ class BP3MSolver:
             self.gaia_n_hst_used[sidx[use_align | use_astrom]] += 1
 
             # ── Updated tangent point (ra0 + Δα0, dec0 + Δδ0) ──────────────
-            # Δα0, Δδ0 are in ARCSEC (pscale/1000 scaling used in X_mat).
-            # r_j[6] = Δα0 arcsec, r_j[7] = Δδ0 arcsec.
-            # ra0_up  = meta["ra0"]  + r_j[6] / 3600.0   # degrees
-            # dec0_up = meta["dec0"] + r_j[7] / 3600.0   # degrees
-
-            #it is currently unstable to update RA0,Dec0 (because of correlation with WZ)
-            #so don't update for now. Maybe future versions will have better priors on WZ
-            #and RA0,Dec0 (including correlations between images, e.g., where we have a 
-            #good estimate of their offsets from each other)
-            ra0_up  = meta["ra0"]   # degrees
-            dec0_up = meta["dec0"]  # degrees
+            # r_j[4] = Δα0 arcsec, r_j[5] = Δδ0 arcsec (pscale/1000 scaling in X_mat).
+            ra0_up  = meta["ra0"]  + r_j[4] / 3600.0   # degrees
+            dec0_up = meta["dec0"] + r_j[5] / 3600.0   # degrees
+            # Store for output (final converged tangent point).
+            meta["ra0_final"]  = ra0_up
+            meta["dec0_final"] = dec0_up
 
             pscale   = meta["orig_pixel_scale"]
             hst_time = Time(meta["hst_time_mjd"], format="mjd")
@@ -1046,10 +1023,10 @@ class BP3MSolver:
         nr  = self.N_R
         C_r = None
 
-        # Parameter names for diagnostic output (indices 6,7 are always zeroed)
-        _pnames = ['a', 'b', 'c', 'd', 'w', 'z', 'Δα0', 'Δδ0']
-        if nr > 8:
-            _pnames += [f'poly{i}' for i in range(nr - 8)]
+        # Parameter names for diagnostic output
+        _pnames = ['a', 'b', 'c', 'd', 'Δα0', 'Δδ0']
+        if nr > 6:
+            _pnames += [f'poly{i}' for i in range(nr - 6)]
         _n_imgs = len(self.image_names)
 
         def _delta_summary(diff):
@@ -1060,11 +1037,8 @@ class BP3MSolver:
             max_str   = (f"{diff[imax]:.3e}"
                          f"  [{self.image_names[img_idx]} / {_pnames[param_idx]}]")
 
-            # Per-parameter median and 68% width across images (skip pinned params 6,7)
             parts = []
             for p in range(nr):
-                if p in (6, 7):
-                    continue
                 vals = diff[p::nr]
                 med  = float(np.median(vals))
                 if _n_imgs > 1:
@@ -1079,8 +1053,6 @@ class BP3MSolver:
             for it_i in range(500):
                 r_new, C_r_i, a_i, K_i, CvT_i = self._solve_one_pass(r_hat, z_weights=z_weights)
                 diff = np.abs(r_new - r_hat)
-                diff[6::nr] = 0
-                diff[7::nr] = 0
                 delta = np.max(diff)
                 r_hat = r_new
                 self._update_R(r_hat)
@@ -2074,8 +2046,7 @@ class BP3MSolver:
         import pandas as pd
 
         nr = self.N_R
-        param_names = ['a', 'b', 'c', 'd', 'w', 'z',
-                       'da0', 'dd0'][:nr]
+        param_names = ['a', 'b', 'c', 'd', 'Δα0', 'Δδ0'][:nr]
 
         rows = []
         for j_idx, img in enumerate(self.image_names):
