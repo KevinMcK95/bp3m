@@ -151,7 +151,7 @@ def _project_to_radec(
     ra_approx, dec_approx = plane_project_inverse(
         x_approx[:, 0], x_approx[:, 1], ra0, dec0, pscale)
     dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = plane_project_tangent_derivs(
-        ra_approx, dec_approx, ra0, dec0, pscale)
+        ra_approx, dec_approx, ra0, dec0, pscale / 1000.0)
     X_mats = np.zeros((n, 2, n_r))
     X_mats[:, 0, 0] = X_c;        X_mats[:, 0, 1] = Y_c
     X_mats[:, 0, 4] = dxs_dra0;   X_mats[:, 0, 5] = dxs_ddec0
@@ -302,6 +302,26 @@ def _load_all_detections(field_dir: Path,
             alpha_lookup[row['image_name']] = float(row['alpha'])
         print(f"  Loaded alpha inflation factors for {len(alpha_lookup)} sub-images")
 
+    # Per-sub-image initial tangent-point ra0/dec0 (what the v1 solver used).
+    # The solver stores ra0_final = ra0_initial + delta_ra0_mas / 3.6e6, so we
+    # recover ra0_initial = ra0_final - delta_ra0_mas / 3.6e6.  This is the
+    # per-chip pointing (chip_pointing_hi / chip_pointing_lo) that the v1 solver
+    # received via split_images_by_ccd — NOT the combined-image ra_cen from
+    # transformation.csv.  Using ra0_initial here ensures _project_to_radec
+    # builds the same design matrix as the v1 solver, so the stored r_j correctly
+    # maps HST pixels to sky positions.
+    ra0_initial_lookup: dict[str, tuple[float, float]] = {}
+    for _row in transform_df.itertuples():
+        _ra0f  = float(getattr(_row, 'ra0_final',      np.nan))
+        _dec0f = float(getattr(_row, 'dec0_final',     np.nan))
+        _dra   = float(getattr(_row, 'delta_ra0_mas',  0.0))
+        _ddec  = float(getattr(_row, 'delta_dec0_mas', 0.0))
+        if np.isfinite(_ra0f) and np.isfinite(_dec0f):
+            ra0_initial_lookup[_row.image_name] = (
+                _ra0f - _dra / 3_600_000.0,
+                _dec0f - _ddec / 3_600_000.0,
+            )
+
     # r-vectors per sub-image
     r_vecs = {}
     for j, row in enumerate(transform_df.itertuples()):
@@ -351,6 +371,14 @@ def _load_all_detections(field_dir: Path,
         except Exception as exc:
             print(f"  Warning: skipping {base} (transformation.csv error): {exc}")
             return None
+
+        # Override ra0/dec0 with the per-sub-image initial tangent point that the
+        # v1 solver actually used.  For _hi/_lo chip splits this is the per-chip
+        # CRVAL pointing (chip_pointing_hi / chip_pointing_lo), not ra_cen.
+        # Without this override the design matrix differs from the solver's, and
+        # plane_project_inverse maps the prediction to the wrong sky position.
+        if sub_name in ra0_initial_lookup:
+            ra0, dec0 = ra0_initial_lookup[sub_name]
 
         # Instrument/detector/epoch from FITS header
         flt = instrument = detector = 'UNKNOWN'
@@ -2849,7 +2877,7 @@ def _measure_astrometry_proper(
                     r_blk[2]*x_c + r_blk[3]*y_c,
                     ra0_k, dec0_k, ps_k)
             _dxdra0, _dxddec0, _dydra0, _dyddec0 = plane_project_tangent_derivs(
-                _tpd_ra, _tpd_dec, ra0_k, dec0_k, ps_k)
+                _tpd_ra, _tpd_dec, ra0_k, dec0_k, ps_k / 1000.0)
             if _poly1:
                 y_obs = np.array([
                     r_blk[0]*x_c + r_blk[1]*y_c
@@ -3977,8 +4005,25 @@ def run_hst_crossmatch(
             r_hat4 = np.concatenate(r_hat4_blocks)
             image_names4 = transform_df4['image_name'].tolist()
 
+            # Build per-sub-image initial tangent-point from transform_df4.
+            # ra0_initial = ra0_final - delta_ra0_mas / 3.6e6 recovers the per-chip
+            # CRVAL that the solver used as its tangent point (same logic as Phase 0).
+            ra0_init4: dict[str, tuple[float, float]] = {}
+            for _r4 in transform_df4.itertuples():
+                _ra0f4  = float(getattr(_r4, 'ra0_final',      np.nan))
+                _dec0f4 = float(getattr(_r4, 'dec0_final',     np.nan))
+                _dra4   = float(getattr(_r4, 'delta_ra0_mas',  0.0))
+                _ddec4  = float(getattr(_r4, 'delta_dec0_mas', 0.0))
+                if np.isfinite(_ra0f4) and np.isfinite(_dec0f4):
+                    ra0_init4[_r4.image_name] = (
+                        _ra0f4 - _dra4 / 3_600_000.0,
+                        _dec0f4 - _ddec4 / 3_600_000.0,
+                    )
+
             # Build per-sub-image metadata: sub_name → (ra0_deg, dec0_deg, pscale_mas)
             # transformation.csv is per obs_id directory; both _hi and _lo chips share it.
+            # Per-chip ra0/dec0 from ra0_init4 override the combined-image ra_cen for
+            # _hi/_lo sub-images so the design matrix matches the solver convention.
             hst_root4 = field_dir / 'HST' / 'mastDownload' / 'HST'
             sub_img_meta4: dict[str, tuple[float, float, float]] = {}
             pscale4 = 50.0  # ACS/WFC default; overwritten per image below
@@ -4000,7 +4045,12 @@ def run_hst_crossmatch(
                     pscale4 = ps4  # remember last valid pscale as fallback
                     base4 = img_dir4.name
                     for sfx in ('_hi', '_lo', ''):
-                        sub_img_meta4[base4 + sfx] = (ra4, dec4, ps4)
+                        sname4 = base4 + sfx
+                        if sname4 in ra0_init4:
+                            ra4_s, dec4_s = ra0_init4[sname4]
+                        else:
+                            ra4_s, dec4_s = ra4, dec4
+                        sub_img_meta4[sname4] = (ra4_s, dec4_s, ps4)
                     sub_img_meta4[base4] = (ra4, dec4, ps4)
                 except Exception:
                     pass
