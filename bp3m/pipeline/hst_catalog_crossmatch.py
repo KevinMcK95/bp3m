@@ -2697,6 +2697,10 @@ def _measure_astrometry_proper(
         # For poly_order=1 (the common case) we skip build_X_matrix entirely:
         # X_mat is reconstructed vectorised inside _build_system, and y_obs is
         # computed inline.  For higher orders we fall back to the full call.
+        # In either case the Δα0/Δδ0 tangent-point derivatives (indices 4-5)
+        # are computed at the star's sky position — for Gaia stars that is
+        # ra_g/dec_g; for HST-only stars we invert a,b,c,d to get an
+        # approximate sky position for the derivative computation.
         det_data: list[dict] = []
         _poly1 = (poly_order == 1)
         for (sname, cidx) in valid_pairs:
@@ -2708,16 +2712,30 @@ def _measure_astrometry_proper(
             y_c = float(d['y_gdc']) - _SOLVER_YO
             cs  = j_idx * n_r
             r_blk = r_hat_arr[cs:cs + n_r]
+            ra0_k, dec0_k, ps_k = _img_meta(sname)
+            if has_gaia:
+                _tpd_ra, _tpd_dec = ra_g, dec_g
+            else:
+                # Approximate sky position from a,b,c,d only (no Δα0/Δδ0)
+                _tpd_ra, _tpd_dec = plane_project_inverse(
+                    r_blk[0]*x_c + r_blk[1]*y_c,
+                    r_blk[2]*x_c + r_blk[3]*y_c,
+                    ra0_k, dec0_k, ps_k)
+            _dxdra0, _dxddec0, _dydra0, _dyddec0 = plane_project_tangent_derivs(
+                _tpd_ra, _tpd_dec, ra0_k, dec0_k, ps_k)
             if _poly1:
-                # y_obs = X_mat @ r_blk for poly_order=1.  The Δα0/Δδ0 correction
-                # (indices 4-5, in mas) contributes <0.02 px and is dropped here,
-                # consistent with the else-branch (which passes zero tangent-point
-                # derivs to build_X_matrix).
-                y_obs = np.array([r_blk[0]*x_c + r_blk[1]*y_c,
-                                  r_blk[2]*x_c + r_blk[3]*y_c])
+                y_obs = np.array([
+                    r_blk[0]*x_c + r_blk[1]*y_c
+                    + float(_dxdra0)*r_blk[4] + float(_dxddec0)*r_blk[5],
+                    r_blk[2]*x_c + r_blk[3]*y_c
+                    + float(_dydra0)*r_blk[4] + float(_dyddec0)*r_blk[5],
+                ])
                 X_mat = None   # reconstructed in _build_system
             else:
-                X_mat = build_X_matrix(x_c, y_c, 0., 0., 0., 0., poly_order=poly_order)
+                X_mat = build_X_matrix(x_c, y_c,
+                                       float(_dxdra0), float(_dxddec0),
+                                       float(_dydra0), float(_dyddec0),
+                                       poly_order=poly_order)
                 y_obs = X_mat @ r_blk
             det_data.append({
                 'sname':      sname,
