@@ -96,7 +96,7 @@ def run_alignment(  # noqa: C901
     import pandas as pd
 
     data_root   = Path(output_dir)
-    output_bp3m = data_root / field_name / "BP3M_results"
+    output_bp3m = Path(bp3m_dir) if bp3m_dir is not None else data_root / field_name / "BP3M_results"
     output_bp3m.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "─"*50)

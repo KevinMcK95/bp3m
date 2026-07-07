@@ -236,6 +236,9 @@ def _parse_args():
     bp.add_argument('--bp3m_min_stars', type=int, default=0,
                     help='Exclude images with fewer than this many Gaia cross-matched '
                          'stars from BP3M (default: 0 = keep all images)')
+    bp.add_argument('--fit_indv_images_only', action='store_true',
+                    help='Run BP3M separately on each image and save results in '
+                         'BP3M_indv_results/{image_name}/. Skips the joint multi-image fit.')
 
     # ── Synthetic tests ───────────────────────────────────────────────────────
     syn = p.add_argument_group('Synthetic tests (requires completed cross-match, Step 4)')
@@ -741,7 +744,83 @@ def main():
     if not args.skip_alignment:
         from bp3m.pipeline.run_alignment import run_alignment
 
-        if args.test_synthetic:
+        if args.fit_indv_images_only:
+            # Discover the filtered image list (mirrors run_alignment's filtering).
+            from bp3m.data_loader_flc import load_image_data_flc
+            from bp3m.data_loader import build_index_maps
+
+            _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
+                output_dir, field, pos_err_floor=args.bp3m_pos_err_floor)
+            _, _indv_names, _ = build_index_maps(_spi_all, _gaia_all)
+
+            if _bp3m_images is not None:
+                _req = set(_bp3m_images)
+                _indv_names = [n for n in _indv_names if n in _req]
+            if args.bp3m_remove_images:
+                _drop = set(args.bp3m_remove_images)
+                _indv_names = [n for n in _indv_names if n not in _drop]
+            if args.restrict_filters:
+                _kf = {f.upper() for f in args.restrict_filters}
+                _indv_names = [n for n in _indv_names
+                               if _imgs_all[n].get('filter', '').upper() in _kf]
+            if args.restrict_instdet:
+                _kid = {s.upper() for s in args.restrict_instdet}
+                _indv_names = [
+                    n for n in _indv_names
+                    if (_imgs_all[n].get('instrument', '') +
+                        _imgs_all[n].get('detector', '')).upper() in _kid
+                ]
+            if args.bp3m_min_stars > 0:
+                _indv_names = [n for n in _indv_names
+                               if len(_spi_all[n]) >= args.bp3m_min_stars]
+
+            _indv_root = output_dir / field / "BP3M_indv_results"
+            print("\n" + "─"*50)
+            print(f"Individual image fitting: {len(_indv_names)} images")
+            print(f"Output: {_indv_root}")
+            print("─"*50)
+
+            _n_ok, _n_fail = 0, 0
+            for _img in _indv_names:
+                print(f"\n  ── {_img} ──")
+                try:
+                    run_alignment(
+                        output_dir=output_dir, field_name=field,
+                        n_iter=args.n_bp3m_iter,
+                        n_samples=args.n_samples,
+                        mcmc_posteriors=args.mcmc_posteriors,
+                        clip_sigma=args.bp3m_clip_sigma,
+                        poly_order=args.poly_order,
+                        split_ccd=not args.no_split_ccd,
+                        min_stars_split_ccd=args.min_stars_split_ccd,
+                        inflate_hst_errors=not args.no_inflate_hst_errors,
+                        use_sparse=args.sparse,
+                        no_plots=args.no_plots,
+                        images=[_img],
+                        remove_images=None,
+                        restrict_filters=None,
+                        restrict_instdet=None,
+                        bp3m_min_stars=0,
+                        checkpoint_dir=None,
+                        use_influence_clip=not args.no_influence_clip,
+                        influence_d_thresh=args.influence_d_thresh,
+                        influence_sigma_min=args.influence_sigma_min,
+                        use_two_tier=args.two_tier,
+                        pos_err_floor=args.bp3m_pos_err_floor,
+                        plot_residuals=args.plot_residuals,
+                        plot_influence=args.plot_influence,
+                        bp3m_dir=_indv_root / _img,
+                    )
+                    _n_ok += 1
+                except Exception as _exc:
+                    import traceback as _tb
+                    print(f"  WARNING: {_img} failed: {_exc}")
+                    _tb.print_exc()
+                    _n_fail += 1
+
+            print(f"\nIndividual fitting complete: {_n_ok} succeeded, {_n_fail} failed")
+
+        elif args.test_synthetic:
             # Run BP3M on the synthetic directory tree.
             # The synthetic data lives at {output_dir}/{field}/{syn_name}/,
             # so we pass output_dir={output_dir}/{field} and field_name=syn_name.
