@@ -812,8 +812,8 @@ def _print_all_gaia_residuals(
         return
 
     # ── Compute per-detection separation ──────────────────────────────────────
-    epoch_lookup = (matched.groupby('sub_name')['epoch_mjd'].first()
-                    / MJD_YR + _MJD0_YR).to_dict()
+    epoch_lookup = (2000.0 + matched.groupby('sub_name')['epoch_mjd'].first()
+                    / MJD_YR - _MJD0_YR).to_dict()
     cos_dec_global = np.cos(np.radians(matched['dec'].median()))
 
     seps_per_sub: dict[str, list[float]] = {}
