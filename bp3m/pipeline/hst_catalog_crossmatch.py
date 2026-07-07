@@ -744,6 +744,109 @@ def _fit_astrometry(ra: np.ndarray, dec: np.ndarray,
     }
 
 
+def _print_all_gaia_residuals(
+    det_df: pd.DataFrame,
+    gaia_csv: Optional[Path],
+    v1_bp3m_dir: Optional[Path] = None,
+) -> None:
+    """
+    Print per-image angular separations between all Gaia-matched HST detections
+    and their propagated Gaia positions.  Uses v1 BP3M PMs when available,
+    falls back to Gaia catalog PMs.  Called after Phase 1+2 to diagnose
+    whether the cross-match initialization is on-target.
+    """
+    GAIA_EPOCH_YR  = 2016.0
+    PLATE_SCALE_DEG = 50.0 / 3.6e6   # 50 mas/px → deg/px
+
+    matched = det_df[det_df['has_gaia_match']].copy()
+    if len(matched) == 0:
+        return
+    matched['gaia_source_id'] = matched['gaia_source_id'].astype(np.int64)
+
+    # ── Build Gaia position/PM table: v1 BP3M estimates preferred ─────────────
+    gaia_info: dict[int, tuple[float, float, float, float]] = {}  # gid → (ra, dec, pmra, pmdec)
+
+    if gaia_csv is not None and Path(gaia_csv).exists():
+        try:
+            gcol = {'source_id': np.int64, 'SOURCE_ID': np.int64}
+            gdf = pd.read_csv(gaia_csv, dtype=gcol)
+            gdf.columns = [c.lower() for c in gdf.columns]
+            id_col = 'source_id' if 'source_id' in gdf.columns else None
+            if id_col:
+                for row in gdf.itertuples(index=False):
+                    gid = int(getattr(row, id_col))
+                    ra  = float(getattr(row, 'ra',  np.nan))
+                    dec = float(getattr(row, 'dec', np.nan))
+                    pmra  = float(getattr(row, 'pmra',  0) or 0) if np.isfinite(getattr(row, 'pmra',  np.nan)) else 0.0
+                    pmdec = float(getattr(row, 'pmdec', 0) or 0) if np.isfinite(getattr(row, 'pmdec', np.nan)) else 0.0
+                    if np.isfinite(ra) and np.isfinite(dec):
+                        gaia_info[gid] = (ra, dec, pmra, pmdec)
+        except Exception:
+            pass
+
+    if v1_bp3m_dir is not None:
+        astrom_path = Path(v1_bp3m_dir) / 'stellar_astrometry.csv'
+        if astrom_path.exists():
+            try:
+                adf = pd.read_csv(astrom_path, dtype={'Gaia_id': np.int64})
+                for row in adf.itertuples(index=False):
+                    gid = int(row.Gaia_id)
+                    if gid <= 0:
+                        continue
+                    ra  = float(getattr(row, 'ra',  np.nan))
+                    dec = float(getattr(row, 'dec', np.nan))
+                    pmra  = float(getattr(row, 'pmra_bp3m_cond',  getattr(row, 'pmra',  0) or 0) or 0)
+                    pmdec = float(getattr(row, 'pmdec_bp3m_cond', getattr(row, 'pmdec', 0) or 0) or 0)
+                    if np.isfinite(ra) and np.isfinite(dec):
+                        gaia_info[gid] = (ra, dec, pmra, pmdec)
+            except Exception:
+                pass
+
+    if not gaia_info:
+        n_tot  = int(matched['gaia_source_id'].nunique())
+        counts = matched.groupby('sub_name').size()
+        print(f"\n  Gaia stars anchored after Phase 1+2: {n_tot} unique stars, "
+              f"{len(matched)} detections across {len(counts)} sub-images")
+        for sub in sorted(counts.index):
+            print(f"    {sub:35s}  {int(counts[sub]):4d}")
+        return
+
+    # ── Compute per-detection separation ──────────────────────────────────────
+    epoch_lookup = (matched.groupby('sub_name')['epoch_mjd'].first()
+                    / MJD_YR + _MJD0_YR).to_dict()
+    cos_dec_global = np.cos(np.radians(matched['dec'].median()))
+
+    seps_per_sub: dict[str, list[float]] = {}
+    for row in matched.itertuples(index=False):
+        gid = int(row.gaia_source_id)
+        if gid not in gaia_info:
+            continue
+        ra0_g, dec0_g, pmra, pmdec = gaia_info[gid]
+        sub = row.sub_name
+        epoch_yr = epoch_lookup.get(sub, GAIA_EPOCH_YR)
+        dt = epoch_yr - GAIA_EPOCH_YR
+        ra_pred  = ra0_g + pmra  * dt / (np.cos(np.radians(dec0_g)) * 3.6e6)
+        dec_pred = dec0_g + pmdec * dt / 3.6e6
+        sep_deg = np.hypot((row.ra - ra_pred) * cos_dec_global, row.dec - dec_pred)
+        seps_per_sub.setdefault(sub, []).append(sep_deg / PLATE_SCALE_DEG)
+
+    all_seps = [s for ss in seps_per_sub.values() for s in ss]
+    n_tot = int(matched['gaia_source_id'].nunique())
+    print(f"\n  Gaia match residuals after Phase 1+2: {n_tot} unique stars, "
+          f"{len(all_seps)} detections across {len(seps_per_sub)} sub-images")
+    if all_seps:
+        print(f"  All images: mean={np.mean(all_seps):.2f} px  "
+              f"rms={np.std(all_seps):.2f} px  "
+              f"median={np.median(all_seps):.2f} px  "
+              f"p95={np.percentile(all_seps, 95):.2f} px")
+    print(f"  Per-image (N = matched detections, sep = predicted-vs-detected):")
+    for sub in sorted(seps_per_sub):
+        ss = np.array(seps_per_sub[sub])
+        print(f"    {sub:35s}  N={len(ss):4d}  "
+              f"mean={np.mean(ss):5.2f} px  rms={np.std(ss):5.2f} px  "
+              f"median={np.median(ss):5.2f} px")
+
+
 def _print_phase_residuals(seps_per_sub: dict, phase_label: str) -> None:
     """Print per-image Gaia match separations for Phase 1 / Phase 2 diagnostics."""
     if not seps_per_sub:
@@ -864,12 +967,11 @@ def _phase0b_anchor_gaia_stars(
 
     n_anchored  = 0
     n_stars_improved = 0
-    _seps_per_sub: dict[str, list[float]] = {}
 
     def _try_match(gid, ra0_g, dec0_g, pmra, pmdec, g_mag, sub_name, epoch_yr):
-        """Try to find star (gid) in sub_name; return (row_idx, sep_px) or (None, 0)."""
+        """Try to find star (gid) in sub_name; return det_df row index or None."""
         if (gid, sub_name) in already_labelled or sub_name not in sub_trees:
-            return None, 0.0
+            return None
         dt      = epoch_yr - GAIA_EPOCH_YR
         ra_pred = ra0_g + pmra  * dt / (np.cos(np.radians(dec0_g)) * 3.6e6)
         dec_pred = dec0_g + pmdec * dt / 3.6e6
@@ -879,7 +981,7 @@ def _phase0b_anchor_gaia_stars(
         dists = dists[0]; ii = ii[0]
         ok = dists < search_deg
         if not ok.any():
-            return None, 0.0
+            return None
         zp_info = zp_per_sub.get(sub_name)
         best_row = None; best_sep = np.inf
         for ki, dist_i in zip(ii[ok], dists[ok]):
@@ -893,9 +995,7 @@ def _phase0b_anchor_gaia_stars(
                         continue
             if dist_i < best_sep:
                 best_sep = dist_i; best_row = row_idx
-        if best_row is None:
-            return None, 0.0
-        return best_row, best_sep / PLATE_SCALE_DEG
+        return best_row
 
     # Pre-extract Gaia_id as int64 before iterrows loop to prevent float64
     # precision loss (iterrows promotes int64→float64 in mixed-dtype DataFrames).
@@ -910,8 +1010,8 @@ def _phase0b_anchor_gaia_stars(
 
         star_added = 0
         for sub_name, epoch_yr in epoch_lookup.items():
-            row_idx, sep_px = _try_match(gid, ra0_g, dec0_g, pmra, pmdec, g_mag,
-                                         sub_name, epoch_yr)
+            row_idx = _try_match(gid, ra0_g, dec0_g, pmra, pmdec, g_mag,
+                                 sub_name, epoch_yr)
             if row_idx is None:
                 continue
             det_df.iat[row_idx, det_df.columns.get_loc('has_gaia_match')] = True
@@ -927,7 +1027,6 @@ def _phase0b_anchor_gaia_stars(
                                        mag_s[keep], idx_s[keep])
             else:
                 del sub_trees[sub_name]
-            _seps_per_sub.setdefault(sub_name, []).append(sep_px)
             star_added += 1
             n_anchored += 1
 
@@ -936,7 +1035,6 @@ def _phase0b_anchor_gaia_stars(
 
     print(f"  Phase 1: added {n_anchored} detections across "
           f"{n_stars_improved} V1 Gaia stars")
-    _print_phase_residuals(_seps_per_sub, "Phase 1")
     return det_df
 
 
@@ -1023,7 +1121,6 @@ def _phase2_gaia_catalog_anchor(
     # Pre-extract source_id as int64 to prevent float64 precision loss via iterrows.
     _target_ids = targets[id_col].to_numpy(dtype=np.int64)
     n_anchored = 0; n_stars_improved = 0
-    _seps_per_sub: dict[str, list[float]] = {}
     for _tgt_i, (_, star) in enumerate(targets.iterrows()):
         gid = int(_target_ids[_tgt_i])
         ra0_g = float(star.get('ra', np.nan))
@@ -1073,15 +1170,12 @@ def _phase2_gaia_catalog_anchor(
                     ra_s[keep], dec_s[keep], mag_s[keep], idx_s[keep])
             else:
                 del sub_trees[sub_name]
-            _seps_per_sub.setdefault(sub_name, []).append(
-                best_sep / PLATE_SCALE_DEG)
             star_added += 1; n_anchored += 1
         if star_added > 0:
             n_stars_improved += 1
 
     print(f"  Phase 2: added {n_anchored} detections across "
           f"{n_stars_improved} non-V1 Gaia stars ({len(targets)} candidates)")
-    _print_phase_residuals(_seps_per_sub, "Phase 2")
     return det_df
 
 
@@ -3770,15 +3864,9 @@ def run_hst_crossmatch(
         anchor_gaia_ids=_v1_anchor_ids,
         search_radius_px=50.0, n_candidates=5)
 
-    # ── Post-Phase-2: per-image Gaia match summary ────────────────────────────
-    _gaia_matched = det_df[det_df['has_gaia_match']]
-    _counts = _gaia_matched.groupby('sub_name').size()
-    _n_gaia_total = int(_gaia_matched['gaia_source_id'].astype(np.int64).nunique())
-    print(f"\n  Gaia stars anchored after Phase 1+2: {_n_gaia_total} unique stars, "
-          f"{len(_gaia_matched)} detections across {len(_counts)} sub-images")
-    print(f"  Per-image counts (Gaia-matched detections):")
-    for _sub in sorted(_counts.index):
-        print(f"    {_sub:35s}  {int(_counts[_sub]):4d}")
+    # ── Post-Phase-2: per-image Gaia match residual summary ──────────────────
+    _print_all_gaia_residuals(det_df, gaia_csv=gaia_csv,
+                              v1_bp3m_dir=_anchor_dir)
 
     # ── Phase 3: within-filter matching ──────────────────────────────────────
     print("\nPhase 3: Within-filter cross-matching ...")
