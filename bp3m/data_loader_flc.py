@@ -143,7 +143,7 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
 
     orig_pixel_scale_mas = pscale_arcsec * 1000.0   # mas/pix
 
-    return {
+    meta = {
         # Pointing / tangent point
         "ra0":  ra_cen,
         "dec0": dec_cen,
@@ -181,7 +181,45 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
         # (r_prior, C_r_prior_inv) is still derived from the WCS header and
         # is unaffected by this value.
         "fcm_abcd": _fcm_to_abcd(A, B, C, D, -orientat),
+        # Per-chip tangent-point info (lo = lower chip, hi = upper chip).
+        # Populated from the catalog FITS header (CHIP{n}_CRPIX{1,2}_GDC /
+        # CHIP{n}_CRVAL{1,2}) when the catalog file is present.  None otherwise.
+        "chip_pointing_lo": None,
+        "chip_pointing_hi": None,
     }
+
+    # ── Per-chip pointing from catalog FITS (optional) ────────────────────────
+    cat_path = img_dir / f"{img_name}_flc_catalog.fits"
+    if cat_path.exists():
+        try:
+            with fits.open(cat_path, memmap=False) as cat_hdu:
+                cat_hdr = cat_hdu[1].header
+            # Collect all CHIP prefixes that have both _CRPIX1_GDC and CRVAL1
+            prefixes = sorted({
+                k.split("_CRPIX1_GDC")[0]
+                for k in cat_hdr.keys()
+                if k.endswith("_CRPIX1_GDC") and k.startswith("CHIP")
+            })
+            chip_pts = []
+            for pfx in prefixes:
+                xo  = cat_hdr.get(f"{pfx}_CRPIX1_GDC")
+                yo  = cat_hdr.get(f"{pfx}_CRPIX2_GDC")
+                ra0 = cat_hdr.get(f"{pfx}_CRVAL1")
+                dc0 = cat_hdr.get(f"{pfx}_CRVAL2")
+                if all(v is not None for v in [xo, yo, ra0, dc0]):
+                    chip_pts.append({
+                        "Xo": float(xo), "Yo": float(yo),
+                        "ra0": float(ra0), "dec0": float(dc0),
+                    })
+            if len(chip_pts) == 2:
+                # Sort by Yo: smaller Yo → lower chip (_lo), larger → upper (_hi)
+                chip_pts.sort(key=lambda p: p["Yo"])
+                meta["chip_pointing_lo"] = chip_pts[0]
+                meta["chip_pointing_hi"] = chip_pts[1]
+        except Exception:
+            pass  # catalog absent or malformed — fall back to shared pointing
+
+    return meta
 
 
 def _build_stars_df(img_dir: Path, img_name: str,
