@@ -4527,6 +4527,8 @@ def run_alignment_cte(
             v1_abcd[img_key] = np.array([
                 float(row["a"]), float(row["b"]),
                 float(row["c"]), float(row["d"]),
+                float(row.get("delta_ra0_mas", 0.0)),
+                float(row.get("delta_dec0_mas", 0.0)),
             ])
         imgs = {sub: dict(meta) for sub, meta in imgs.items()}
         for sub, meta in imgs.items():
@@ -5027,6 +5029,8 @@ def run_alignment_joint_cte(
                 v1_abcd[img_key] = np.array([
                     float(row["a"]), float(row["b"]),
                     float(row["c"]), float(row["d"]),
+                    float(row.get("delta_ra0_mas", 0.0)),
+                    float(row.get("delta_dec0_mas", 0.0)),
                 ])
             imgs = {sub: dict(meta) for sub, meta in imgs.items()}
             for sub, meta in imgs.items():
