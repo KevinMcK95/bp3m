@@ -421,9 +421,10 @@ class BP3MSolver:
             # is computed solely from the WCS header and is never modified here.
             # r_init is a copy: changing it never changes the prior.
             fcm_abcd = meta.get("fcm_abcd")
+            _n_fcm   = len(fcm_abcd) if fcm_abcd is not None else 0
             r_init = r_prior.copy()
-            if fcm_abcd is not None:
-                r_init[:4] = fcm_abcd   # a, b, c, d from cross-match
+            if _n_fcm:
+                r_init[:_n_fcm] = fcm_abcd[:_n_fcm]
 
             # ── Initial residual screening ────────────────────────────────────
             # Used to permanently block implausible cross-matches (> 100 px after
@@ -458,8 +459,8 @@ class BP3MSolver:
             # When transformation.csv provides (a,b,c,d), override the WCS-only
             # prior mean so that Phase-0 residuals are computed at the correct
             # transformation and stars can be re-admitted when no data contribute.
-            if fcm_abcd is not None:
-                r_prior[:4] = fcm_abcd[:4]
+            if _n_fcm:
+                r_prior[:_n_fcm] = fcm_abcd[:_n_fcm]
 
             self.gaia_n_hst_used[sidx[good_for_fitting]] += 1
 

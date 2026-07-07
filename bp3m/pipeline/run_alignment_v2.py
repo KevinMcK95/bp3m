@@ -738,6 +738,8 @@ def run_alignment_v2(
             v1_abcd[img_key] = np.array([
                 float(row["a"]), float(row["b"]),
                 float(row["c"]), float(row["d"]),
+                float(row.get("delta_ra0_mas", 0.0)),
+                float(row.get("delta_dec0_mas", 0.0)),
             ])
             v1_alpha[img_key] = float(row["alpha"]) if "alpha" in row.index else 1.0
         n_matched = sum(1 for k in imgs if k in v1_abcd)
