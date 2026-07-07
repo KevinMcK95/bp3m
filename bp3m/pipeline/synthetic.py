@@ -118,19 +118,17 @@ def _mjd_from_flc(flc_path: Path) -> float:
         return 0.5 * (float(h["EXPSTART"]) + float(h["EXPEND"]))
 
 
-def _fit_abcdwz(x_pred: np.ndarray, y_pred: np.ndarray,
-                xs_bp3m: np.ndarray, ys_bp3m: np.ndarray,
-                Xo: float = 2048.0, Yo: float = 2048.0) -> dict:
+def _fit_abcd(x_pred: np.ndarray, y_pred: np.ndarray,
+              xs_bp3m: np.ndarray, ys_bp3m: np.ndarray,
+              Xo: float = 2048.0, Yo: float = 2048.0) -> dict:
     """
-    Fit BP3M's 6-parameter linear transform from noiseless predictions.
+    Fit BP3M's 4-parameter linear transform (a,b,c,d) from noiseless predictions.
 
-    Solves  xs = a*(X-Xo) + b*(Y-Yo) + w
-            ys = c*(X-Xo) + d*(Y-Yo) + z
-    by least squares, which is exact for noiseless data.
-
-    Note: BP3M also has Δα0/Δδ0 columns in its design matrix, but
-    _SIGMA_POINTING = 1e-6 arcsec pins them to ≈0, so the effective
-    model is exactly 6-parameter.
+    Solves  xs = a*(X-Xo) + b*(Y-Yo)
+            ys = c*(X-Xo) + d*(Y-Yo)
+    by least squares, which is exact for noiseless data.  The constant-offset
+    terms (old w/z) are now absent — the free Δα0/Δδ0 tangent-point parameters
+    absorb any residual bulk offset and are fitted by the solver.
 
     Parameters
     ----------
@@ -140,12 +138,12 @@ def _fit_abcdwz(x_pred: np.ndarray, y_pred: np.ndarray,
     """
     dX = x_pred - Xo
     dY = y_pred - Yo
-    A_des = np.column_stack([dX, dY, np.ones(len(dX))])  # (N, 3)
+    A_des = np.column_stack([dX, dY])   # (N, 2)
     params_x, _, _, _ = np.linalg.lstsq(A_des, xs_bp3m, rcond=None)
     params_y, _, _, _ = np.linalg.lstsq(A_des, ys_bp3m, rcond=None)
     return dict(
-        true_a=float(params_x[0]), true_b=float(params_x[1]), true_w=float(params_x[2]),
-        true_c=float(params_y[0]), true_d=float(params_y[1]), true_z=float(params_y[2]),
+        true_a=float(params_x[0]), true_b=float(params_x[1]),
+        true_c=float(params_y[0]), true_d=float(params_y[1]),
     )
 
 
@@ -644,9 +642,9 @@ def generate_synthetic_data(
         xs_bp3m, ys_bp3m = _plane_project(
             ra_p, dec_p, t_fwd["ra_cen"], t_fwd["dec_cen"], pscale_mas)
 
-        # Fit true BP3M a,b,c,d,w,z from the noiseless data (exact linear fit)
-        abcdwz = _fit_abcdwz(x_pred, y_pred, xs_bp3m, ys_bp3m)
-        per_image[img_name]["true_abcdwz"] = abcdwz
+        # Fit true BP3M a,b,c,d from the noiseless data (exact linear fit)
+        abcd = _fit_abcd(x_pred, y_pred, xs_bp3m, ys_bp3m)
+        per_image[img_name]["true_abcd"] = abcd
 
         # Draw noise from real per-star covariance
         cov_xx = info["cat_cov_xx"][hst_idx]
@@ -723,9 +721,9 @@ def generate_synthetic_data(
             true_xs_o=t_f["xs_o"], true_ys_o=t_f["ys_o"],
             true_xt_o=t_f["xt_o"], true_yt_o=t_f["yt_o"],
         )
-        # BP3M-parameterized truth (a,b,c,d,w,z fitted from noiseless data)
-        if "true_abcdwz" in info:
-            row.update(info["true_abcdwz"])
+        # BP3M-parameterized truth (a,b,c,d fitted from noiseless data)
+        if "true_abcd" in info:
+            row.update(info["true_abcd"])
         img_truth_rows.append(row)
     pd.DataFrame(img_truth_rows).to_csv(syn_truth / "image_truth.csv", index=False)
 
@@ -839,10 +837,9 @@ def compare_synthetic_results(
             img_cmp = img_results.merge(
                 img_truth, left_on="image_name_base", right_on="image_name",
                 how="inner", suffixes=("", "_truth"))
-            # Compare BP3M output a,b,c,d,w,z to the fitted truth
+            # Compare BP3M output a,b,c,d to the fitted truth
             bp3m_params = [("a", "true_a"), ("b", "true_b"),
-                           ("c", "true_c"), ("d", "true_d"),
-                           ("w", "true_w"), ("z", "true_z")]
+                           ("c", "true_c"), ("d", "true_d")]
             for bp3m_col, true_col in bp3m_params:
                 if bp3m_col in img_cmp and true_col in img_cmp:
                     img_cmp[f"resid_{bp3m_col}"] = img_cmp[bp3m_col] - img_cmp[true_col]
@@ -962,9 +959,7 @@ def run_conditional_solve(
         r_true_vec[cs + 1] = row["true_b"]
         r_true_vec[cs + 2] = row["true_c"]
         r_true_vec[cs + 3] = row["true_d"]
-        r_true_vec[cs + 4] = row["true_w"]
-        r_true_vec[cs + 5] = row["true_z"]
-        # Δα0=Δδ0=0 (pinned by _SIGMA_POINTING — keep whatever r_init has)
+        # Δα0/Δδ0 (indices 4,5) are free — keep whatever r_init has
 
     # ── Conditional stellar solve at r_true ───────────────────────────────────
     _, _, a_arr, _, C_vT = solver._solve_one_pass(r_true_vec)
@@ -1177,12 +1172,12 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
         plt = None
 
     C_r = np.load(C_r_path)
-    n_r_per_img = 8          # a,b,c,d,w,z,dra0,ddec0 (8 params per CCD half)
+    n_r_per_img = 6          # a,b,c,d,Δα0,Δδ0 (6 params per CCD half, poly_order=1)
     n_img = len(img_cmp)
     n_tot = C_r.shape[0]
-    param_names = ["a", "b", "c", "d", "w", "z"]
+    param_names = ["a", "b", "c", "d", "Δα0", "Δδ0"]
 
-    print(f"\n  Per-image chi² (6 parameters: a,b,c,d,w,z):")
+    print(f"\n  Per-image chi² (6 parameters: a,b,c,d,Δα0,Δδ0):")
     print(f"  {'image':<22} {'chi2':>8}  {'dof':>4}  {'p-val':>7}")
 
     chi2_vals = []

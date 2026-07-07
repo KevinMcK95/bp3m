@@ -63,6 +63,7 @@ try:
         get_parallax_factors,
         plane_project,
         plane_project_jacobian,
+        plane_project_tangent_derivs,
         compute_poly_jacobian,
         hst_position_cov,
         n_r_from_poly_order,
@@ -140,13 +141,24 @@ def _project_to_radec(
     X_c = x_gdc - _SOLVER_XO
     Y_c = y_gdc - _SOLVER_YO
 
-    # Build design matrices (n, 2, n_r) — vectorised; tangent-point derivs are 0 here
+    # Build design matrices (n, 2, n_r).
+    # Tangent-point derivatives (indices 4,5) require approximate star positions;
+    # get those from a first pass with only a,b,c,d (indices 0-3).
+    X_approx = np.zeros((n, 2, n_r))
+    X_approx[:, 0, 0] = X_c;  X_approx[:, 0, 1] = Y_c
+    X_approx[:, 1, 2] = X_c;  X_approx[:, 1, 3] = Y_c
+    x_approx = np.einsum('nkl,l->nk', X_approx, r_j)
+    ra_approx, dec_approx = plane_project_inverse(
+        x_approx[:, 0], x_approx[:, 1], ra0, dec0, pscale)
+    dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = plane_project_tangent_derivs(
+        ra_approx, dec_approx, ra0, dec0, pscale)
     X_mats = np.zeros((n, 2, n_r))
-    X_mats[:, 0, 0] = X_c;  X_mats[:, 0, 1] = Y_c;  X_mats[:, 0, 4] = 1.0
-    X_mats[:, 1, 2] = X_c;  X_mats[:, 1, 3] = Y_c;  X_mats[:, 1, 5] = 1.0
-    # columns 6,7 (tangent-point derivatives) stay 0
+    X_mats[:, 0, 0] = X_c;        X_mats[:, 0, 1] = Y_c
+    X_mats[:, 0, 4] = dxs_dra0;   X_mats[:, 0, 5] = dxs_ddec0
+    X_mats[:, 1, 2] = X_c;        X_mats[:, 1, 3] = Y_c
+    X_mats[:, 1, 4] = dys_dra0;   X_mats[:, 1, 5] = dys_ddec0
     _S = 2048.0
-    _col = 8
+    _col = 6
     for _deg in range(2, poly_order + 1):
         _sc = _S ** (_deg - 1)
         for _j in range(_deg + 1):
@@ -2697,9 +2709,12 @@ def _measure_astrometry_proper(
             cs  = j_idx * n_r
             r_blk = r_hat_arr[cs:cs + n_r]
             if _poly1:
-                # y_obs = X_mat @ r_blk for poly_order=1 without allocating X_mat
-                y_obs = np.array([r_blk[0]*x_c + r_blk[1]*y_c + r_blk[4],
-                                  r_blk[2]*x_c + r_blk[3]*y_c + r_blk[5]])
+                # y_obs = X_mat @ r_blk for poly_order=1.  The Δα0/Δδ0 correction
+                # (indices 4-5, in mas) contributes <0.02 px and is dropped here,
+                # consistent with the else-branch (which passes zero tangent-point
+                # derivs to build_X_matrix).
+                y_obs = np.array([r_blk[0]*x_c + r_blk[1]*y_c,
+                                  r_blk[2]*x_c + r_blk[3]*y_c])
                 X_mat = None   # reconstructed in _build_system
             else:
                 X_mat = build_X_matrix(x_c, y_c, 0., 0., 0., 0., poly_order=poly_order)

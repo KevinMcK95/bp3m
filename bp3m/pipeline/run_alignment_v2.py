@@ -529,11 +529,9 @@ def _compute_full_catalog_residuals_from_df(
         if poly_order == 1:
             X_mat = np.zeros((n, 2, n_r))
             X_mat[:, 0, 0] = X_c;         X_mat[:, 0, 1] = Y_c
-            X_mat[:, 0, 4] = 1.0
-            X_mat[:, 0, 6] = dxs_dra0;    X_mat[:, 0, 7] = dxs_ddec0
+            X_mat[:, 0, 4] = dxs_dra0;    X_mat[:, 0, 5] = dxs_ddec0
             X_mat[:, 1, 2] = X_c;         X_mat[:, 1, 3] = Y_c
-            X_mat[:, 1, 5] = 1.0
-            X_mat[:, 1, 6] = dys_dra0;    X_mat[:, 1, 7] = dys_ddec0
+            X_mat[:, 1, 4] = dys_dra0;    X_mat[:, 1, 5] = dys_ddec0
         else:
             from bp3m.astro_utils import build_X_matrix
             X_mat = np.array([
@@ -724,7 +722,7 @@ def run_alignment_v2(
           f"   Images: {len(image_names)}")
 
     # ── Inject v1 BP3M transformation + alpha as initialization ──────────────
-    # Load converged (a,b,c,d,w,z) and alpha from the previous v1 BP3M run so
+    # Load converged (a,b,c,d) and alpha from the previous v1 BP3M run so
     # that Phase 0 uses those posteriors for outlier screening rather than the
     # rough fast_cross_match solution from transformation.csv.
     v1_bp3m_dir   = data_root / field_name / "BP3M_results"
@@ -776,15 +774,15 @@ def run_alignment_v2(
                 _v1_cr = np.load(_v1_cr_path)
                 _n_r_per = _v1_cr.shape[0] // max(len(v1_abcd), 1)
                 # Typical Δα0 uncertainty = median sqrt(C_r[4,4])
-                _cr_w_vals = []
+                _cr_dra0_vals = []
                 for _j in range(len(v1_abcd)):
                     _cs = _j * _n_r_per
                     _cr_j = _v1_cr[_cs:_cs+_n_r_per, _cs:_cs+_n_r_per]
                     if _cr_j.shape[0] > 4:
-                        _cr_w_vals.append(float(np.sqrt(max(_cr_j[4, 4], 0.0))))
-                if _cr_w_vals:
-                    _v1_cr_scale = float(np.median(_cr_w_vals))
-                    print(f"  V1 C_r scale (median σ_w): {_v1_cr_scale:.4e} px  "
+                        _cr_dra0_vals.append(float(np.sqrt(max(_cr_j[4, 4], 0.0))))
+                if _cr_dra0_vals:
+                    _v1_cr_scale = float(np.median(_cr_dra0_vals))
+                    print(f"  V1 C_r scale (median σ_Δα0): {_v1_cr_scale:.4e} mas  "
                           f"→ influence_d_thresh auto-scaled to {_v1_cr_scale / 1e-3:.1f}×1e-3")
             except Exception as _exc:
                 print(f"  Warning: could not load V1 C_r for d_thresh scaling: {_exc}")
