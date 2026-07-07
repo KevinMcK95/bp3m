@@ -541,7 +541,17 @@ def load_master_v2(
         if meta is None:
             skipped_meta.append(sub_name)
         else:
-            images[sub_name] = meta   # same dict for _lo and _hi (identical metadata)
+            for sfx in ("_lo", "_hi"):
+                if sub_name.endswith(sfx):
+                    cp = meta.get(f"chip_pointing{sfx}")
+                    if cp is not None:
+                        meta = dict(meta)
+                        meta["ra0"]  = cp["ra0"]
+                        meta["dec0"] = cp["dec0"]
+                        meta["Xo"]   = cp["Xo"]
+                        meta["Yo"]   = cp["Yo"]
+                    break
+            images[sub_name] = meta
 
     if skipped_meta:
         print(f"  Warning: metadata missing for {len(skipped_meta)} sub-images "
