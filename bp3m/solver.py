@@ -64,9 +64,9 @@ _SIGMA_PM  = 100.0  # mas/yr  (2p / HST-only only)
 _SIGMA_ROT_DEG  = 0.1    # degrees
 _SIGMA_SCALE    = 1.5e-2  # fractional pixel scale ratio
 _SIGMA_SKEW     = 5e-3   # on- and off-axis skew terms
-_SIGMA_POINTING = 5.0   # RA0,Dec0 (ARCSEC) — ~100 ACS WFC pixels; loose enough to
-                        # absorb real HST pointing error, tight enough to regularise
-                        # the tangent-point update in _update_geometry
+_SIGMA_POINTING = 5000.0  # RA0,Dec0 (MAS) = 5 arcsec; ~100 ACS WFC pixels; loose enough
+                          # to absorb real HST pointing error, tight enough to regularise
+                          # the tangent-point update in _update_geometry
 
 # Initial residual filter applied in _precompute_geometry.
 # Stars whose corrected 2D residual (after removing bulk w,z offset)
@@ -84,7 +84,7 @@ def _make_image_prior(meta, poly_order=1):
     r_j = (a, b, c, d, Δα0, Δδ0 [, poly terms...])
     Prior:
       (a,b,c,d) — from header rotation/scale (strong prior)
-      (Δα0,Δδ0) — sigma = _SIGMA_POINTING arcsec (loose; ~100 ACS WFC pixels)
+      (Δα0,Δδ0) — sigma = _SIGMA_POINTING mas (loose; ~100 ACS WFC pixels)
       poly terms — zero mean, flat prior (determined entirely by data)
     """
     n_r = n_r_from_poly_order(poly_order)
@@ -577,8 +577,8 @@ class BP3MSolver:
 
             # ── Updated tangent point (ra0 + Δα0, dec0 + Δδ0) ──────────────
             # r_j[4] = Δα0 arcsec, r_j[5] = Δδ0 arcsec (pscale/1000 scaling in X_mat).
-            ra0_up  = meta["ra0"]  + r_j[4] / 3600.0   # degrees
-            dec0_up = meta["dec0"] + r_j[5] / 3600.0   # degrees
+            ra0_up  = meta["ra0"]  + r_j[4] / 3_600_000.0   # mas → degrees
+            dec0_up = meta["dec0"] + r_j[5] / 3_600_000.0   # mas → degrees
             # Store for output (final converged tangent point).
             meta["ra0_final"]  = ra0_up
             meta["dec0_final"] = dec0_up

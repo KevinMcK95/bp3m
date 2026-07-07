@@ -308,9 +308,9 @@ def _load_bp3m_outputs(
         r_hat[cs + 2] = float(row['c'])
         r_hat[cs + 3] = float(row['d'])
         if nr > 4:
-            r_hat[cs + 4] = float(row.get('delta_ra0_mas',  0.0)) / 1000.0
+            r_hat[cs + 4] = float(row.get('delta_ra0_mas',  0.0))
         if nr > 5:
-            r_hat[cs + 5] = float(row.get('delta_dec0_mas', 0.0)) / 1000.0
+            r_hat[cs + 5] = float(row.get('delta_dec0_mas', 0.0))
         for k in range(6, nr):
             r_hat[cs + k] = float(row.get(f'r_{k}', 0.0))
 
@@ -2173,8 +2173,8 @@ def run_pop_fit(
             n_stars_astrometry_only=int(np.sum(
                 use_ast & ~d_img.get('use_for_fit', np.zeros(0, bool)))),
             a=a, b=b, c=c, d=d,
-            delta_ra0_mas=r_j[4] * 1000 if solver.N_R > 4 else 0.0,
-            delta_dec0_mas=r_j[5] * 1000 if solver.N_R > 5 else 0.0,
+            delta_ra0_mas=r_j[4] if solver.N_R > 4 else 0.0,
+            delta_dec0_mas=r_j[5] if solver.N_R > 5 else 0.0,
             ra0_final=imgs.get(img, {}).get('ra0_final', imgs.get(img, {}).get('ra0', float('nan'))),
             dec0_final=imgs.get(img, {}).get('dec0_final', imgs.get(img, {}).get('dec0', float('nan'))),
             pixel_scale_mas=(np.sqrt(a * d - b * c)
@@ -2184,8 +2184,8 @@ def run_pop_fit(
             off_skew=(b + c) / 2,
             sigma_a=np.sqrt(C_j[0, 0]),   sigma_b=np.sqrt(C_j[1, 1]),
             sigma_c=np.sqrt(C_j[2, 2]),   sigma_d=np.sqrt(C_j[3, 3]),
-            sigma_dra0_mas=np.sqrt(C_j[4, 4]) * 1000 if solver.N_R > 4 else 0.0,
-            sigma_ddec0_mas=np.sqrt(C_j[5, 5]) * 1000 if solver.N_R > 5 else 0.0,
+            sigma_dra0_mas=np.sqrt(C_j[4, 4]) if solver.N_R > 4 else 0.0,
+            sigma_ddec0_mas=np.sqrt(C_j[5, 5]) if solver.N_R > 5 else 0.0,
             alpha=float(d_img.get('alpha_applied', 1.0)),
             **{f'r_{k}': float(r_j[k]) for k in range(6, solver.N_R)},
         ))

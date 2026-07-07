@@ -296,8 +296,8 @@ def _load_all_detections(field_dir: Path,
         cs       = j * n_r
         sub_name = row.image_name
         r_base   = np.array([row.a, row.b, row.c, row.d,
-                              row.delta_ra0_mas / 1000.0,
-                              row.delta_dec0_mas / 1000.0])
+                              row.delta_ra0_mas,
+                              row.delta_dec0_mas])
         if n_r > 6:
             extra = np.array([getattr(row, f'r_{k}', 0.0) for k in range(6, n_r)])
             r_j   = np.concatenate([r_base, extra])
@@ -3813,9 +3813,8 @@ def run_hst_crossmatch(
             r_hat4_blocks = []
             for row in transform_df4.itertuples():
                 r_base  = np.array([getattr(row, p) for p in _r_base_cols])
-                # Δα0/Δδ0 are saved in mas but stored internally in arcsec
-                dra0  = float(getattr(row, 'delta_ra0_mas',  0.0)) / 1000.0
-                ddec0 = float(getattr(row, 'delta_dec0_mas', 0.0)) / 1000.0
+                dra0  = float(getattr(row, 'delta_ra0_mas',  0.0))
+                ddec0 = float(getattr(row, 'delta_dec0_mas', 0.0))
                 r_extra = np.array([getattr(row, c, 0.0) for c in _r_extra_cols])
                 r_hat4_blocks.append(np.concatenate([r_base, [dra0, ddec0], r_extra]))
             r_hat4 = np.concatenate(r_hat4_blocks)
