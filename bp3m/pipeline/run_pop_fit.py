@@ -82,15 +82,28 @@ def _estimate_mu_pop_v1(
     pmdec: np.ndarray,
     n_sigma: float = 3.0,
     n_iter: int = 10,
+    mu_init: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Sigma-clipped mean of v1 bp3m proper motions (finite values only)."""
+    """Sigma-clipped mean of v1 bp3m proper motions (finite values only).
+
+    If mu_init is given it seeds the first clip iteration; the iterative
+    sigma-clip then proceeds as normal from that starting point.
+    """
     finite = np.isfinite(pmra) & np.isfinite(pmdec)
     pmra_f, pmdec_f = pmra[finite], pmdec[finite]
     if len(pmra_f) < 5:
         print("  WARNING: fewer than 5 stars with finite v1 PMs — using (0, 0)")
         return np.zeros(2)
 
-    keep = np.ones(len(pmra_f), dtype=bool)
+    if mu_init is not None:
+        c_ra, c_dec = float(mu_init[0]), float(mu_init[1])
+        dists  = np.hypot(pmra_f - c_ra, pmdec_f - c_dec)
+        sigma  = max(float(np.median(dists)) / 0.6745, 0.01)
+        keep   = dists < n_sigma * sigma
+        if keep.sum() < 5:
+            keep = np.ones(len(pmra_f), dtype=bool)
+    else:
+        keep = np.ones(len(pmra_f), dtype=bool)
     for _ in range(n_iter):
         if keep.sum() < 5:
             break
@@ -1695,25 +1708,21 @@ def run_pop_fit(
         _use_a = d.get('use_for_astrom', d['use_for_fit'])
         np.add.at(_n_hst_det, d['sidx'][_use_a], 1)
 
-    # ── Bootstrap μ_pop from v1 PMs (or use user-supplied initial estimate) ───
-    if mu_pop_init is not None:
-        _mu_boot = np.array([float(mu_pop_init[0]), float(mu_pop_init[1])])
-        print(f"\n  Using user-supplied μ_pop_init: "
-              f"({_mu_boot[0]:+.4f}, {_mu_boot[1]:+.4f}) mas/yr  "
-              f"(bypassing empirical bootstrap)")
-        if _v1_pm_loaded:
-            _pmra_v1_only  = np.where(_v1_matched, _pmra_init,  np.nan)
-            _pmdec_v1_only = np.where(_v1_matched, _pmdec_init, np.nan)
-        else:
-            _pmra_v1_only  = _pmra_init
-            _pmdec_v1_only = _pmdec_init
-    elif _v1_pm_loaded:
+    # ── Bootstrap μ_pop from v1 PMs ──────────────────────────────────────────
+    _mu_init_arr = (np.array([float(mu_pop_init[0]), float(mu_pop_init[1])])
+                    if mu_pop_init is not None else None)
+    if _mu_init_arr is not None:
+        print(f"\n  Bootstrapping μ_pop from v1 bp3m PMs (sigma-clip seeded at "
+              f"({_mu_init_arr[0]:+.4f}, {_mu_init_arr[1]:+.4f}) mas/yr)...")
+    else:
         print("\n  Bootstrapping μ_pop from v1 bp3m PMs (sigma-clip)...")
+    if _v1_pm_loaded:
         _pmra_v1_only  = np.where(_v1_matched, _pmra_init,  np.nan)
         _pmdec_v1_only = np.where(_v1_matched, _pmdec_init, np.nan)
-        _mu_boot = _estimate_mu_pop_v1(_pmra_v1_only, _pmdec_v1_only)
+        _mu_boot = _estimate_mu_pop_v1(_pmra_v1_only, _pmdec_v1_only,
+                                       mu_init=_mu_init_arr)
     else:
-        print("\n  WARNING: v1 PMs not loaded; using Gaia sigma-clip for μ_pop bootstrap")
+        print("  WARNING: v1 PMs not loaded; using Gaia sigma-clip for μ_pop bootstrap")
         _pmra_v1_only  = _pmra_init
         _pmdec_v1_only = _pmdec_init
         _mu_boot = _estimate_mu_pop(gaia_catalog)
@@ -1726,38 +1735,30 @@ def run_pop_fit(
         _mu_boot, member_sigma_clip, sigma_pm, pm_sys_floor)
     print(f"  Initial members: {len(member_sidx)}")
 
-    # ── μ_pop prior: user-supplied init → use directly; else weighted mean ────
+    # ── μ_pop prior: weighted mean of initial members ─────────────────────────
     _extra = sigma_pm ** 2 + pm_sys_floor ** 2
-    if mu_pop_init is not None:
+    _mem_pm_ra   = _pmra_v1_only[member_sidx]
+    _mem_pm_dec  = _pmdec_v1_only[member_sidx]
+    _mem_sig_ra  = _sig_pmra_init[member_sidx]
+    _mem_sig_dec = _sig_pmdec_init[member_sidx]
+    _fin_m = np.isfinite(_mem_pm_ra) & np.isfinite(_mem_pm_dec)
+    if _fin_m.sum() >= 3:
+        _wra  = 1.0 / (_mem_sig_ra[_fin_m]  ** 2 + _extra)
+        _wdec = 1.0 / (_mem_sig_dec[_fin_m] ** 2 + _extra)
+        _mu_ra_v1   = float(np.sum(_wra  * _mem_pm_ra[_fin_m])  / np.sum(_wra))
+        _mu_dec_v1  = float(np.sum(_wdec * _mem_pm_dec[_fin_m]) / np.sum(_wdec))
+        _unc_ra_v1  = float(1.0 / np.sqrt(np.sum(_wra)))
+        _unc_dec_v1 = float(1.0 / np.sqrt(np.sum(_wdec)))
+        mu_pop_prior = np.array([_mu_ra_v1, _mu_dec_v1])
+    else:
+        print("  WARNING: too few members with finite v1 PMs; using bootstrap center as prior")
         mu_pop_prior = _mu_boot.copy()
         _unc_ra_v1 = _unc_dec_v1 = 0.0
-        _n_prior_members = len(member_sidx)
-        print(f"  μ_pop prior set to user-supplied init "
-              f"({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) mas/yr  "
-              f"[prior σ = ±{mu_pop_prior_sigma:.2f} mas/yr]")
-    else:
-        _mem_pm_ra   = _pmra_v1_only[member_sidx]
-        _mem_pm_dec  = _pmdec_v1_only[member_sidx]
-        _mem_sig_ra  = _sig_pmra_init[member_sidx]
-        _mem_sig_dec = _sig_pmdec_init[member_sidx]
-        _fin_m = np.isfinite(_mem_pm_ra) & np.isfinite(_mem_pm_dec)
-        if _fin_m.sum() >= 3:
-            _wra  = 1.0 / (_mem_sig_ra[_fin_m]  ** 2 + _extra)
-            _wdec = 1.0 / (_mem_sig_dec[_fin_m] ** 2 + _extra)
-            _mu_ra_v1   = float(np.sum(_wra  * _mem_pm_ra[_fin_m])  / np.sum(_wra))
-            _mu_dec_v1  = float(np.sum(_wdec * _mem_pm_dec[_fin_m]) / np.sum(_wdec))
-            _unc_ra_v1  = float(1.0 / np.sqrt(np.sum(_wra)))
-            _unc_dec_v1 = float(1.0 / np.sqrt(np.sum(_wdec)))
-            mu_pop_prior = np.array([_mu_ra_v1, _mu_dec_v1])
-        else:
-            print("  WARNING: too few members with finite v1 PMs; using bootstrap center as prior")
-            mu_pop_prior = _mu_boot.copy()
-            _unc_ra_v1 = _unc_dec_v1 = 0.0
-        _n_prior_members = int(_fin_m.sum()) if '_fin_m' in dir() else 0
-        print(f"  μ_pop prior from v1 members (N={_n_prior_members}): "
-              f"({mu_pop_prior[0]:+.4f} ± {_unc_ra_v1:.4f}, "
-              f"{mu_pop_prior[1]:+.4f} ± {_unc_dec_v1:.4f}) mas/yr  "
-              f"[prior σ = ±{mu_pop_prior_sigma:.2f} mas/yr]")
+    _n_prior_members = int(_fin_m.sum()) if '_fin_m' in dir() else 0
+    print(f"  μ_pop prior from v1 members (N={_n_prior_members}): "
+          f"({mu_pop_prior[0]:+.4f} ± {_unc_ra_v1:.4f}, "
+          f"{mu_pop_prior[1]:+.4f} ± {_unc_dec_v1:.4f}) mas/yr  "
+          f"[prior σ = ±{mu_pop_prior_sigma:.2f} mas/yr]")
 
     C_pop_prior_inv = np.eye(2) / mu_pop_prior_sigma ** 2
     mu_pop_current  = mu_pop_prior.copy()
