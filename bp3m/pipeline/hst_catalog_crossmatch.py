@@ -2693,6 +2693,14 @@ def _measure_astrometry_proper(
             has_full_gaia_astrometry = False
             gaia_g_mag = 20.0  # cap — HST-only sources are always faint
 
+        # ── Per-image tangent-plane metadata ─────────────────────────────────
+        # Needed both in the detection loop (for tangent-point derivatives) and
+        # later for _build_system / reference sky position computation.
+        _meta = sub_img_meta or {}
+
+        def _img_meta(sname: str) -> tuple[float, float, float]:
+            return _meta.get(sname, (ra0_field, dec0_field, pscale))
+
         # ── Collect per-detection data ────────────────────────────────────────
         # For poly_order=1 (the common case) we skip build_X_matrix entirely:
         # X_mat is reconstructed vectorised inside _build_system, and y_obs is
@@ -2768,13 +2776,6 @@ def _measure_astrometry_proper(
             return base_row
 
         # ── Reference sky position ────────────────────────────────────────────
-        # Per-image tangent-plane metadata (ra0, dec0, pscale) matching BP3M.
-        # sub_img_meta maps sub-image name → (ra0_deg, dec0_deg, pscale_mas).
-        _meta = sub_img_meta or {}
-
-        def _img_meta(sname: str) -> tuple[float, float, float]:
-            return _meta.get(sname, (ra0_field, dec0_field, pscale))
-
         if has_gaia:
             ref_ra, ref_dec = ra_g, dec_g
         else:
