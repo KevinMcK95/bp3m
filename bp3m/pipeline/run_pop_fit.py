@@ -2504,6 +2504,7 @@ def run_pop_fit(
             spatial_order=cte_spatial_order,
             time_poly_order=cte_time_poly_order,
             n_iter_cte=cte_n_iter,
+            output_dir=output_pfr,
         )
         import numpy as _np
         _cte_out = {}

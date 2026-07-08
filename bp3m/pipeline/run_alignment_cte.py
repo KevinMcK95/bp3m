@@ -5627,6 +5627,7 @@ def run_cte_phase_after_popfit(
     n_iter_cte: int = 10,
     regularize_gamma: float = 1e-8,
     fit_cte_x: bool = True,
+    output_dir: 'Path | None' = None,
 ) -> tuple:
     """
     CTE phase appended after bp3m-pop-fit convergence.
@@ -5750,6 +5751,16 @@ def run_cte_phase_after_popfit(
     gy_lo   = float(np.linalg.norm(gamma_warm[3*_nb_tot:4*_nb_tot]))
     print(f"  Warm start done ({_wtime.time()-_t0:.1f}s): "
           f"|γ_y_hi|={gy_hi:.3e}  |γ_y_lo|={gy_lo:.3e}")
+
+    if output_dir is not None:
+        try:
+            _plot_warmstart_cte(
+                solver, image_names, stars_per_image, t_launch_yr,
+                gamma_warm, member_sidx, r_hat, output_dir,
+                cte_template=cte_template,
+            )
+        except Exception as _e:
+            print(f"  [warn] _plot_warmstart_cte failed: {_e}")
 
     # Apply warm-started CTE correction to solver positions
     apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
