@@ -5683,6 +5683,53 @@ def run_cte_phase_after_popfit(
     solver._update_R(r_hat)
     solver._update_geometry(r_hat, solver.v_survey)
 
+    # ── Re-stabilize r and μ_pop before CTE (mirrors Phase [2/4] of warm_start_cte)
+    # Phase 4 of pop-fit can leave r in a bad state.  Run _joint_solve_pop with
+    # fix_r=True then fix_r=False to bring r and μ_pop to the Gaia optimum for
+    # the current α and membership before introducing the CTE block.
+    from .run_pop_fit import _joint_solve_pop as _pop_solve
+
+    _N_RESTAB = 3
+    r_current      = r_hat.copy()
+    mu_pop_current = mu_pop_hat.copy()
+
+    print(f"\n  [pre-CTE μ-only, {_N_RESTAB} iter]  (re-stabilize μ_pop with r fixed)")
+    for _it in range(_N_RESTAB):
+        _, mu_pop_current, _C_s, _, _, _, _ = _pop_solve(
+            solver, image_names,
+            member_sidx, mu_pop_current,
+            sigma_pm, plx_pop, sigma_plx_tot,
+            C_pop_prior_inv, mu_pop_prior, r_current,
+            fix_r=True,
+        )
+        _sr = float(np.sqrt(max(_C_s[0, 0], 0.0)))
+        _sd = float(np.sqrt(max(_C_s[1, 1], 0.0)))
+        print(f"    iter {_it+1}/{_N_RESTAB}: μ_pop=({mu_pop_current[0]:+.4f}±{_sr:.4f}, "
+              f"{mu_pop_current[1]:+.4f}±{_sd:.4f}) mas/yr")
+
+    print(f"  [pre-CTE joint r+μ, {_N_RESTAB} iter]")
+    _r_prev = r_current.copy()
+    for _it in range(_N_RESTAB):
+        r_current, mu_pop_current, _C_s, _, _, _, _ = _pop_solve(
+            solver, image_names,
+            member_sidx, mu_pop_current,
+            sigma_pm, plx_pop, sigma_plx_tot,
+            C_pop_prior_inv, mu_pop_prior, r_current,
+            fix_r=False,
+        )
+        solver._update_R(r_current)
+        solver._update_geometry(r_current, solver.v_survey)
+        _C_mu = _C_s[-2:, -2:]
+        _sr = float(np.sqrt(max(_C_mu[0, 0], 0.0)))
+        _sd = float(np.sqrt(max(_C_mu[1, 1], 0.0)))
+        _dr = float(np.max(np.abs(r_current - _r_prev)))
+        print(f"    iter {_it+1}/{_N_RESTAB}: Δr={_dr:.3e}  μ_pop=({mu_pop_current[0]:+.4f}±{_sr:.4f}, "
+              f"{mu_pop_current[1]:+.4f}±{_sd:.4f}) mas/yr")
+        _r_prev = r_current.copy()
+
+    r_hat      = r_current
+    mu_pop_hat = mu_pop_current
+
     # ── CTE warm start: fix r and μ_pop, learn γ only ─────────────────────────
     print(f"\n  [CTE warm start] learning γ with r and μ_pop fixed...")
     _t0 = _wtime.time()
