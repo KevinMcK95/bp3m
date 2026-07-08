@@ -330,10 +330,13 @@ class BP3MSolver:
             sidx = np.array([self.star_id_to_idx[gid] for gid in df["Gaia_id"]])
 
             ra0, dec0 = meta["ra0"], meta["dec0"]
+            # Initialize rolling tangent-point accumulator (reset each fit call)
+            meta["ra0_current"]  = ra0
+            meta["dec0_current"] = dec0
             # pscale    = meta["pixel_scale"]   # mas/pixel
             pscale    = meta["orig_pixel_scale"]   # mas/pixel
-            # Xo, Yo    = meta["Xo"], meta["Yo"]
-            Xo, Yo    = 2048.0, 2048.0
+            Xo = meta.get("Xo", 2048.0)
+            Yo = meta.get("Yo", 2048.0)
             meta['Xo'] = Xo
             meta['Yo'] = Yo
             hst_time  = Time(meta["hst_time_mjd"],format='mjd')
@@ -352,13 +355,9 @@ class BP3MSolver:
             # Jacobian J_i,j: (n, 2, 2) in pix/mas
             J = plane_project_jacobian(ra_g, dec_g, ra0, dec0, pscale)
 
-            # Tangent-point derivatives for Δα0, Δδ0 columns of X_mat
-            #change to Δα0, Δδ0 to be in ARCSEC (not mas) for numerical stability
-            #by using pscale/1000
+            # Tangent-point derivatives for Δα0, Δδ0 columns of X_mat (units: px/mas)
             dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = plane_project_tangent_derivs(
-                ra_g, dec_g, ra0, dec0, pscale/1000)
-            # dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = plane_project_tangent_derivs(
-            #     ra_g, dec_g, ra0, dec0, pscale)
+                ra_g, dec_g, ra0, dec0, pscale)
 
             # Parallax factors: difference between HST epoch and Gaia epoch
             #Gaia has already removed the parallax, so no need to subtract plx at J2016
@@ -576,16 +575,23 @@ class BP3MSolver:
 
             self.gaia_n_hst_used[sidx[use_align | use_astrom]] += 1
 
-            # ── Updated tangent point (ra0 + Δα0, dec0 + Δδ0) ──────────────
-            # r_j[4] = Δα0 arcsec, r_j[5] = Δδ0 arcsec (pscale/1000 scaling in X_mat).
-            ra0_up  = meta["ra0"]  + r_j[4] / 3_600_000.0   # mas → degrees
-            dec0_up = meta["dec0"] + r_j[5] / 3_600_000.0   # mas → degrees
-            # Store for output (final converged tangent point).
-            meta["ra0_final"]  = ra0_up
-            meta["dec0_final"] = dec0_up
-
             pscale   = meta["orig_pixel_scale"]
             hst_time = Time(meta["hst_time_mjd"], format="mjd")
+
+            # ── Accumulate tangent-point correction into ra0_current ──────────
+            # r_j[4] = Δα0 in mas where Δα0 = (ra0_current - ra0_true)*3.6e6,
+            # so ra0_true = ra0_current - Δα0/3.6e6.  Subtract (not add) to
+            # move toward ra0_true.
+            meta["ra0_current"]  -= r_j[4] / 3_600_000.0   # mas → degrees
+            meta["dec0_current"] -= r_j[5] / 3_600_000.0
+            meta["ra0_final"]   = meta["ra0_current"]
+            meta["dec0_final"]  = meta["dec0_current"]
+            # Reset residual in r_hat so next solve starts from Δα0=0 at the new point
+            r_hat[j_idx * nr + 4] = 0.0
+            r_hat[j_idx * nr + 5] = 0.0
+
+            ra0_tp  = meta["ra0_current"]
+            dec0_tp = meta["dec0_current"]
 
             # ── Updated stellar RA/Dec from v_hat[:,0:2] ─────────────────────
             # v_hat[:,0] = Δα* [mas], v_hat[:,1] = Δδ [mas]
@@ -600,16 +606,20 @@ class BP3MSolver:
             t_g   = self.gaia_time[sidx]
             dt_yr = (hst_time - t_g).to(u.year).value
 
-            # ── Recompute projected Gaia positions ────────────────────────────
-            #DO NOT USE THE UPDATED GAIA COORDINATES HERE! Just the RA0,Dec0 updates
-            xs, ys = plane_project(ra_g_orig, dec_g_orig, ra0_up, dec0_up, pscale)
+            # ── Recompute projected Gaia positions at current tangent point ───
+            # xys, J, and tangent-point derivatives are all evaluated at ra0_current
+            # (the accumulated best-fit tangent point).  r_j[4:6] are now 0, so
+            # X_mat @ r_j contributes nothing from the pointing columns, and the
+            # residuals xys - X_mat @ r_j correctly represent the remaining error.
+            # Recomputing J at ra0_current keeps the linearisation accurate when
+            # the total offset is large.
+            xs, ys = plane_project(ra_g_orig, dec_g_orig, ra0_tp, dec0_tp, pscale)
             xys    = np.stack([xs, ys], axis=1)
 
             # ── Recompute Jacobian J and tangent-point derivatives ────────────
-            J = plane_project_jacobian(ra_g_orig, dec_g_orig, ra0_up, dec0_up, pscale)
+            J = plane_project_jacobian(ra_g_orig, dec_g_orig, ra0_tp, dec0_tp, pscale)
             dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = \
-                plane_project_tangent_derivs(ra_g_orig, dec_g_orig, ra0_up, dec0_up,
-                                             pscale / 1000)
+                plane_project_tangent_derivs(ra_g_orig, dec_g_orig, ra0_tp, dec0_tp, pscale)
 
             # ── Recompute parallax factors ────────────────────────────────────
             #DO use the new best fit RA,Dec positions here

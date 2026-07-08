@@ -321,9 +321,12 @@ def _load_bp3m_outputs(
         r_hat[cs + 2] = float(row['c'])
         r_hat[cs + 3] = float(row['d'])
         if nr > 4:
-            r_hat[cs + 4] = float(row.get('delta_ra0_mas',  0.0))
+            # r_j[4] = (ra0_current - ra0_true)*3.6e6.  At ra0_current=ra0_orig,
+            # ra0_true≈ra0_final, so r_j[4] = (ra0_orig - ra0_final)*3.6e6
+            # = -delta_ra0_mas.  Negate the stored offset.
+            r_hat[cs + 4] = -float(row.get('delta_ra0_mas',  0.0))
         if nr > 5:
-            r_hat[cs + 5] = float(row.get('delta_dec0_mas', 0.0))
+            r_hat[cs + 5] = -float(row.get('delta_dec0_mas', 0.0))
         for k in range(6, nr):
             r_hat[cs + k] = float(row.get(f'r_{k}', 0.0))
 
@@ -1520,7 +1523,7 @@ def run_pop_fit(
     v1 r_hat, alpha, and use_for_fit flags are loaded from BP3M_results/.
     """
     from bp3m.data_loader_flc import load_image_data_flc
-    from bp3m.data_loader import build_index_maps, split_images_by_ccd
+    from bp3m.data_loader_flc import build_index_maps, split_images_by_ccd
     from bp3m.solver import BP3MSolver
 
     t_start   = time.time()
@@ -2189,16 +2192,21 @@ def run_pop_fit(
         d_img = solver._img_data.get(img, {}) or {}
         use_ast = d_img.get('use_for_astrom', d_img.get('use_for_fit', np.zeros(0, bool)))
         a, b, c, d = r_j[:4]
+        _meta      = imgs.get(img, {})
+        _ra0_orig  = _meta.get('ra0',  float('nan'))
+        _dec0_orig = _meta.get('dec0', float('nan'))
+        _ra0_final  = _meta.get('ra0_final',  _ra0_orig)
+        _dec0_final = _meta.get('dec0_final', _dec0_orig)
         _rows.append(dict(
             image_name=img,
             n_stars_alignment=int(np.sum(d_img.get('use_for_fit', np.zeros(0, bool)))),
             n_stars_astrometry_only=int(np.sum(
                 use_ast & ~d_img.get('use_for_fit', np.zeros(0, bool)))),
             a=a, b=b, c=c, d=d,
-            delta_ra0_mas=r_j[4] if solver.N_R > 4 else 0.0,
-            delta_dec0_mas=r_j[5] if solver.N_R > 5 else 0.0,
-            ra0_final=imgs.get(img, {}).get('ra0_final', imgs.get(img, {}).get('ra0', float('nan'))),
-            dec0_final=imgs.get(img, {}).get('dec0_final', imgs.get(img, {}).get('dec0', float('nan'))),
+            delta_ra0_mas=(_ra0_final - _ra0_orig) * 3_600_000.0 if solver.N_R > 4 else 0.0,
+            delta_dec0_mas=(_dec0_final - _dec0_orig) * 3_600_000.0 if solver.N_R > 5 else 0.0,
+            ra0_final=_ra0_final,
+            dec0_final=_dec0_final,
             pixel_scale_mas=(np.sqrt(a * d - b * c)
                              * imgs.get(img, {}).get('orig_pixel_scale', 50.0)),
             rotation_deg=np.degrees(np.arctan2(b - c, a + d)),

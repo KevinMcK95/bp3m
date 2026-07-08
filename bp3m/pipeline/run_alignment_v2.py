@@ -676,7 +676,7 @@ def run_alignment_v2(
     """
     _ensure_bp3m(bp3m_dir)
 
-    from bp3m.data_loader import build_index_maps
+    from bp3m.data_loader_flc import build_index_maps
     from bp3m.solver import BP3MSolver
     from bp3m.solver_sparse import BP3MSolverSparse
     import pandas as pd
@@ -735,11 +735,13 @@ def run_alignment_v2(
         v1_df = pd.read_csv(v1_xform_path)
         for _, row in v1_df.iterrows():
             img_key = str(row["image_name"])
+            # r_j[4] = (ra0_current - ra0_true)*3.6e6; at ra0_current=ra0_orig,
+            # r_j[4] = -delta_ra0_mas.  Negate the stored offset.
             v1_abcd[img_key] = np.array([
                 float(row["a"]), float(row["b"]),
                 float(row["c"]), float(row["d"]),
-                float(row.get("delta_ra0_mas", 0.0)),
-                float(row.get("delta_dec0_mas", 0.0)),
+                -float(row.get("delta_ra0_mas", 0.0)),
+                -float(row.get("delta_dec0_mas", 0.0)),
             ])
             v1_alpha[img_key] = float(row["alpha"]) if "alpha" in row.index else 1.0
         n_matched = sum(1 for k in imgs if k in v1_abcd)

@@ -87,7 +87,7 @@ def run_alignment(  # noqa: C901
     _ensure_bp3m(bp3m_dir)
 
     from bp3m.data_loader_flc import load_image_data_flc
-    from bp3m.data_loader import build_index_maps
+    from bp3m.data_loader_flc import build_index_maps
     from bp3m.solver import BP3MSolver
     from bp3m.solver_sparse import BP3MSolverSparse
     from bp3m.checkpointing import save_results
@@ -186,7 +186,7 @@ def run_alignment(  # noqa: C901
 
     # ── Split CCD if requested ────────────────────────────────────────────────
     if split_ccd:
-        from bp3m.data_loader import split_images_by_ccd
+        from bp3m.data_loader_flc import split_images_by_ccd
         imgs, filtered_spi = split_images_by_ccd(
             imgs, filtered_spi, min_stars_per_ccd=min_stars_split_ccd)
         image_names = sorted(filtered_spi.keys())
@@ -349,8 +349,8 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
             n_stars_alignment=n_align,
             n_stars_astrometry_only=n_astrom,
             a=a, b=b, c=c, d=d,
-            delta_ra0_mas=r_j[4],
-            delta_dec0_mas=r_j[5],
+            delta_ra0_mas=(meta.get('ra0_final', meta['ra0']) - meta['ra0']) * 3_600_000.0,
+            delta_dec0_mas=(meta.get('dec0_final', meta['dec0']) - meta['dec0']) * 3_600_000.0,
             ra0_final=meta.get('ra0_final', meta['ra0']),
             dec0_final=meta.get('dec0_final', meta['dec0']),
             pixel_scale_mas=np.sqrt(a*d - b*c) * images[img].get('orig_pixel_scale', 50.0),
@@ -361,6 +361,8 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
             sigma_c=np.sqrt(C_j[2,2]), sigma_d=np.sqrt(C_j[3,3]),
             sigma_dra0_mas=np.sqrt(C_j[4,4]),
             sigma_ddec0_mas=np.sqrt(C_j[5,5]),
+            Xo_pivot=meta.get('Xo', 2048.0),
+            Yo_pivot=meta.get('Yo', 2048.0),
             alpha=alpha_applied,
             **{f'r_{k}': float(r_j[k]) for k in range(6, solver.N_R)},
         ))

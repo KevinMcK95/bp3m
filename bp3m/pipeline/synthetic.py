@@ -898,7 +898,7 @@ def run_conditional_solve(
     """
     # bp3m is installed as a package; no sys.path manipulation needed
     from bp3m.data_loader_flc import load_image_data_flc
-    from bp3m.data_loader import build_index_maps, split_images_by_ccd
+    from bp3m.data_loader_flc import build_index_maps, split_images_by_ccd
     from bp3m.solver import BP3MSolver
 
     field_path = Path(output_dir) / field_name

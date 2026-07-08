@@ -4447,7 +4447,7 @@ def run_alignment_cte(
     -------
     Path to output directory ({output_dir}/{field}/BP3M_cte_results/)
     """
-    from bp3m.data_loader import build_index_maps
+    from bp3m.data_loader_flc import build_index_maps
     from bp3m.solver import BP3MSolver
     from bp3m.solver_sparse import BP3MSolverSparse
     from astropy.time import Time
@@ -4524,11 +4524,13 @@ def run_alignment_cte(
         v1_df = pd.read_csv(v1_xform_path)
         for _, row in v1_df.iterrows():
             img_key = str(row["image_name"])
+            # r_j[4] = (ra0_current - ra0_true)*3.6e6; at ra0_current=ra0_orig,
+            # r_j[4] = -delta_ra0_mas.  Negate the stored offset.
             v1_abcd[img_key] = np.array([
                 float(row["a"]), float(row["b"]),
                 float(row["c"]), float(row["d"]),
-                float(row.get("delta_ra0_mas", 0.0)),
-                float(row.get("delta_dec0_mas", 0.0)),
+                -float(row.get("delta_ra0_mas", 0.0)),
+                -float(row.get("delta_dec0_mas", 0.0)),
             ])
         imgs = {sub: dict(meta) for sub, meta in imgs.items()}
         for sub, meta in imgs.items():
@@ -4942,7 +4944,7 @@ def run_alignment_joint_cte(
     Path to output directory ({output_dir}/{field}/BP3M_joint_cte_results/)
     """
     import time as _time
-    from bp3m.data_loader import build_index_maps
+    from bp3m.data_loader_flc import build_index_maps
     from bp3m.solver import BP3MSolver
     from bp3m.solver_sparse import BP3MSolverSparse
     from astropy.time import Time
@@ -5029,8 +5031,8 @@ def run_alignment_joint_cte(
                 v1_abcd[img_key] = np.array([
                     float(row["a"]), float(row["b"]),
                     float(row["c"]), float(row["d"]),
-                    float(row.get("delta_ra0_mas", 0.0)),
-                    float(row.get("delta_dec0_mas", 0.0)),
+                    -float(row.get("delta_ra0_mas", 0.0)),
+                    -float(row.get("delta_dec0_mas", 0.0)),
                 ])
             imgs = {sub: dict(meta) for sub, meta in imgs.items()}
             for sub, meta in imgs.items():

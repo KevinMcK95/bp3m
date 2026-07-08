@@ -342,6 +342,125 @@ def _build_stars_df(img_dir: Path, img_name: str,
     return df
 
 
+# ── CCD/amplifier split utilities ────────────────────────────────────────────
+# Moved here from data_loader.py so that all active pipeline code imports from
+# data_loader_flc and data_loader.py (GaiaHub-based loader) is unused.
+
+_AMP_SPLITS = {
+    "ACSWFC":   {"x_split": 2048.0, "y_split": 2048.0},
+    "WFC3UVIS": {"x_split": 2048.0, "y_split": 2051.0},
+}
+_AMP_SPLITS_DEFAULT = {"x_split": 2048.0, "y_split": 2048.0}
+
+
+def _get_amp_splits(meta: dict) -> dict:
+    """Return the x_split / y_split dict for the instrument+detector in *meta*."""
+    key = (meta.get("instrument", "") + meta.get("detector", "")).upper()
+    return _AMP_SPLITS.get(key, _AMP_SPLITS_DEFAULT)
+
+
+def split_images_by_ccd(images, stars_per_image, min_stars_per_ccd: int = 20):
+    """
+    Split each image into two independent CCD halves along the Y boundary.
+
+    For ACS/WFC the chips meet at Y_orig = 2048; for WFC3/UVIS at Y_orig = 2051.
+    The boundary is looked up per-image from ``_AMP_SPLITS`` using the
+    ``instrument`` and ``detector`` fields stored in *images*.
+
+    Each half inherits identical pointing/scale metadata from its parent and
+    is initialised from the same r_prior.  Fitting them independently gives
+    each physical CCD its own r_j vector, which is correct because they have
+    independent distortion patterns.
+
+    Naming convention
+    -----------------
+    ``{img}_lo``  — stars with Y_orig ≤ y_split  (lower chip)
+    ``{img}_hi``  — stars with Y_orig >  y_split  (upper chip)
+
+    If all stars in an image fall on one side, only that entry is created.
+    If either half has fewer than *min_stars_per_ccd* stars, the image is kept
+    whole (not split) so the transformation can still be constrained.
+
+    Parameters
+    ----------
+    images : dict[str -> dict]
+        Image metadata (as returned by load_image_data_flc).
+        Must contain ``instrument`` and ``detector`` keys.
+    stars_per_image : dict[str -> pd.DataFrame]
+        Per-image source tables.  Must contain ``Y_orig`` (falls back to ``Y``).
+    min_stars_per_ccd : int
+        Minimum stars required on each CCD half to allow splitting.  Images
+        where either half falls below this threshold are kept unsplit.
+        Default: 20.
+
+    Returns
+    -------
+    new_images, new_stars_per_image : dicts with ``_lo`` / ``_hi`` suffixes
+        for split images, or unchanged keys for images kept whole.
+    """
+    new_images = {}
+    new_spi = {}
+
+    for img in sorted(images.keys()):
+        meta   = images[img]
+        df     = stars_per_image[img]
+        y_col  = 'Y_orig' if 'Y_orig' in df.columns else 'Y'
+        y_vals = df[y_col].to_numpy(float)
+        y_split = _get_amp_splits(meta)["y_split"]
+
+        lo_mask = y_vals <= y_split
+        hi_mask = y_vals >  y_split
+        n_lo, n_hi = lo_mask.sum(), hi_mask.sum()
+
+        if n_lo < min_stars_per_ccd or n_hi < min_stars_per_ccd:
+            print(f"    {img}: lo={n_lo}, hi={n_hi} stars — below "
+                  f"min_stars_per_ccd={min_stars_per_ccd}, keeping unsplit")
+            new_images[img] = dict(meta)
+            new_spi[img]    = df
+            continue
+
+        for suffix, mask in [('_lo', lo_mask), ('_hi', hi_mask)]:
+            sub_df = df[mask].reset_index(drop=True)
+            if len(sub_df) == 0:
+                continue
+            sub_meta = dict(meta)
+            cp = meta.get(f"chip_pointing{suffix}")  # chip_pointing_lo / _hi
+            if cp is not None:
+                sub_meta["ra0"]  = cp["ra0"]
+                sub_meta["dec0"] = cp["dec0"]
+                sub_meta["Xo"]   = cp["Xo"]
+                sub_meta["Yo"]   = cp["Yo"]
+            new_images[img + suffix] = sub_meta
+            new_spi[img + suffix]    = sub_df
+
+    return new_images, new_spi
+
+
+def build_index_maps(stars_per_image, gaia_catalog):
+    """
+    Build integer index maps for vectorized access.
+
+    Returns
+    -------
+    star_id_to_idx : dict[Gaia_id -> int]
+    image_names : list[str]   (sorted)
+    star_in_image : dict[image_name -> np.ndarray of star indices]
+        Maps per-image rows to global star indices.
+    """
+    star_id_to_idx = {gid: i for i, gid in enumerate(gaia_catalog["Gaia_id"])}
+    image_names = sorted(stars_per_image.keys())
+
+    star_in_image = {}
+    for img in image_names:
+        df = stars_per_image[img]
+        idxs = np.array([star_id_to_idx[gid] for gid in df["Gaia_id"]
+                         if gid in star_id_to_idx], dtype=int)
+        mask = df["Gaia_id"].isin(star_id_to_idx)
+        star_in_image[img] = idxs
+
+    return star_id_to_idx, image_names, star_in_image
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def load_image_data_flc(data_root, field_name: str,
