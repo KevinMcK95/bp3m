@@ -4580,14 +4580,6 @@ def run_alignment_cte(
         r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
                                       for img in image_names])
         solver._update_R(r_init_hat)
-        # Save observed positions BEFORE _update_geometry replaces d["xys"] with the
-        # Gaia-projected positions. xys_orig must hold the true HST observations so
-        # that x_resid = xys_orig - X@r carries the stellar-motion signal (≈ JU@v_survey)
-        # rather than being identically zero.
-        for _img in image_names:
-            _d = solver._img_data.get(_img)
-            if _d is not None and 'xys_orig' not in _d:
-                _d['xys_orig'] = _d['xys'].copy()
         solver._update_geometry(r_init_hat, solver.v_survey)
         print("\n  Phase 0: fixed-transform pre-filter (v1 BP3M posterior)")
 
@@ -5074,11 +5066,6 @@ def run_alignment_joint_cte(
         r_init_hat = np.concatenate([solver._img_data[img]["r_init"]
                                       for img in image_names])
         solver._update_R(r_init_hat)
-        # Save observed positions BEFORE _update_geometry replaces d["xys"]
-        for _img in image_names:
-            _d = solver._img_data.get(_img)
-            if _d is not None and 'xys_orig' not in _d:
-                _d['xys_orig'] = _d['xys'].copy()
         solver._update_geometry(r_init_hat, solver.v_survey)
         print("\n  Phase 0: fixed-transform pre-filter")
         n_flag0 = 0
