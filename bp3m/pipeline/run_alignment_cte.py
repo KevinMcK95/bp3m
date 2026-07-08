@@ -5608,7 +5608,9 @@ def run_alignment_joint_cte(
 
 # ── CTE phase appended to bp3m-pop-fit ────────────────────────────────────────
 
-def _collect_solver_residuals(solver, image_names, r_hat, use_orig: bool = False) -> dict:
+def _collect_solver_residuals(solver, image_names, r_hat,
+                              filtered_spi: dict,
+                              use_orig: bool = False) -> dict:
     """
     Build residual arrays in the format expected by _plot_per_image_detector_residuals.
 
@@ -5617,6 +5619,10 @@ def _collect_solver_residuals(solver, image_names, r_hat, use_orig: bool = False
 
     Keys: {img}_X_c, {img}_Y_c, {img}_dx_gdc, {img}_dy_gdc, {img}_mag_inst
     Units: centred detector pixels (same as GDC convention used elsewhere).
+
+    X_c / Y_c are stored as spi['X']-2048 / spi['Y']-2048 so that the
+    position-matching in _plot_per_image_detector_residuals succeeds even for
+    split-chip images where the solver's internal Xo/Yo differs from 2048.
     """
     nr  = solver.N_R
     out = {}
@@ -5631,8 +5637,15 @@ def _collect_solver_residuals(solver, image_names, r_hat, use_orig: bool = False
         dx     = xys[:, 0] - x_pred[:, 0]
         dy     = xys[:, 1] - x_pred[:, 1]
         mag    = d.get('mag_inst')
-        out[f'{img}_X_c']      = d['X_c'].astype(float)
-        out[f'{img}_Y_c']      = d['Y_c'].astype(float)
+        spi    = filtered_spi.get(img)
+        if spi is not None and len(spi) == len(dx):
+            X_c = spi['X'].to_numpy(float) - 2048.0
+            Y_c = spi['Y'].to_numpy(float) - 2048.0
+        else:
+            X_c = d['X_c'].astype(float)
+            Y_c = d['Y_c'].astype(float)
+        out[f'{img}_X_c']      = X_c
+        out[f'{img}_Y_c']      = Y_c
         out[f'{img}_dx_gdc']   = dx.astype(float)
         out[f'{img}_dy_gdc']   = dy.astype(float)
         out[f'{img}_mag_inst'] = (mag.astype(float) if mag is not None
@@ -5795,7 +5808,9 @@ def run_cte_phase_after_popfit(
             print(f"  [warn] _plot_warmstart_cte failed: {_e}")
 
     # Collect before-CTE residuals (xys_orig, re-stabilised r_hat)
-    _arrays_before = (_collect_solver_residuals(solver, image_names, r_hat, use_orig=True)
+    _arrays_before = (_collect_solver_residuals(solver, image_names, r_hat,
+                                                filtered_spi=stars_per_image,
+                                                use_orig=True)
                       if output_dir is not None else None)
 
     # Apply warm-started CTE correction to solver positions
@@ -5887,7 +5902,8 @@ def run_cte_phase_after_popfit(
     if output_dir is not None and _arrays_before is not None:
         try:
             _arrays_after = _collect_solver_residuals(
-                solver, image_names, r_hat, use_orig=False)
+                solver, image_names, r_hat,
+                filtered_spi=stars_per_image, use_orig=False)
             _resid_dir = Path(output_dir) / 'plots' / 'residuals'
             _resid_dir.mkdir(parents=True, exist_ok=True)
             _plot_per_image_detector_residuals(
