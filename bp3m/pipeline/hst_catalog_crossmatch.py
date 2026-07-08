@@ -925,16 +925,20 @@ def _print_all_gaia_residuals(
     print(f"\n  Gaia match residuals after Phase 1+2: {n_tot} unique stars, "
           f"{len(all_seps)} detections across {len(seps_per_sub)} sub-images")
     if all_seps:
-        print(f"  All images: mean={np.mean(all_seps):.2f} px  "
-              f"rms={np.std(all_seps):.2f} px  "
-              f"median={np.median(all_seps):.2f} px  "
-              f"p95={np.percentile(all_seps, 95):.2f} px")
+        _a = np.array(all_seps)
+        _p16, _p84, _p95 = np.percentile(_a, [16, 84, 95])
+        print(f"  All images: mean={np.mean(_a):.2f} px  "
+              f"rms={np.std(_a):.2f} px  "
+              f"median={np.median(_a):.2f} px  "
+              f"σ_68={0.5*(_p84-_p16):.2f} px  "
+              f"p95={_p95:.2f} px")
     print(f"  Per-image (N = matched detections, sep = predicted-vs-detected):")
     for sub in sorted(seps_per_sub):
         ss = np.array(seps_per_sub[sub])
+        _p16s, _p84s = np.percentile(ss, [16, 84])
         print(f"    {sub:35s}  N={len(ss):4d}  "
               f"mean={np.mean(ss):5.2f} px  rms={np.std(ss):5.2f} px  "
-              f"median={np.median(ss):5.2f} px")
+              f"median={np.median(ss):5.2f} px  σ_68={0.5*(_p84s-_p16s):5.2f} px")
 
 
 def _print_phase_residuals(seps_per_sub: dict, phase_label: str) -> None:
