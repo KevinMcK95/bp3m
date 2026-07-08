@@ -5755,6 +5755,24 @@ def run_cte_phase_after_popfit(
     apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
                         filtered_spi=stars_per_image, subtract=True)
 
+    # ── μ-only step: re-establish μ_pop against CTE-corrected positions ────────
+    # After applying γ_warm the residuals shift; without this step the first
+    # joint iteration sees a large effective Δμ and collapses μ_pop → 0.
+    _N_MU_POST = 3
+    print(f"\n  [post-CTE μ-only, {_N_MU_POST} iter]  (μ_pop vs CTE-corrected positions, r fixed)")
+    for _it in range(_N_MU_POST):
+        _, mu_pop_hat, _C_s, _, _, _, _ = _pop_solve(
+            solver, image_names,
+            member_sidx, mu_pop_hat,
+            sigma_pm, plx_pop, sigma_plx_tot,
+            C_pop_prior_inv, mu_pop_prior, r_hat,
+            fix_r=True,
+        )
+        _sr = float(np.sqrt(max(_C_s[0, 0], 0.0)))
+        _sd = float(np.sqrt(max(_C_s[1, 1], 0.0)))
+        print(f"    iter {_it+1}/{_N_MU_POST}: μ_pop=({mu_pop_hat[0]:+.4f}±{_sr:.4f}, "
+              f"{mu_pop_hat[1]:+.4f}±{_sd:.4f}) mas/yr")
+
     # ── Joint loop: update r, γ, μ_pop (alpha and membership frozen) ──────────
     print(f"\n  [CTE joint loop] {n_iter_cte} iterations (α and membership frozen)...")
     gamma_prior    = gamma_warm.copy()
