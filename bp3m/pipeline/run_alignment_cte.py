@@ -5608,6 +5608,38 @@ def run_alignment_joint_cte(
 
 # ── CTE phase appended to bp3m-pop-fit ────────────────────────────────────────
 
+def _collect_solver_residuals(solver, image_names, r_hat, use_orig: bool = False) -> dict:
+    """
+    Build residual arrays in the format expected by _plot_per_image_detector_residuals.
+
+    use_orig=True  → residuals from xys_orig (before CTE)
+    use_orig=False → residuals from xys     (after CTE correction applied)
+
+    Keys: {img}_X_c, {img}_Y_c, {img}_dx_gdc, {img}_dy_gdc, {img}_mag_inst
+    Units: centred detector pixels (same as GDC convention used elsewhere).
+    """
+    nr  = solver.N_R
+    out = {}
+    for j_idx, img in enumerate(image_names):
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        r_j    = r_hat[j_idx * nr:(j_idx + 1) * nr]
+        X      = d['X_mat']
+        x_pred = np.einsum('nkl,l->nk', X, r_j)   # (n_stars, 2)
+        xys    = d.get('xys_orig', d['xys']) if use_orig else d['xys']
+        dx     = xys[:, 0] - x_pred[:, 0]
+        dy     = xys[:, 1] - x_pred[:, 1]
+        mag    = d.get('mag_inst')
+        out[f'{img}_X_c']      = d['X_c'].astype(float)
+        out[f'{img}_Y_c']      = d['Y_c'].astype(float)
+        out[f'{img}_dx_gdc']   = dx.astype(float)
+        out[f'{img}_dy_gdc']   = dy.astype(float)
+        out[f'{img}_mag_inst'] = (mag.astype(float) if mag is not None
+                                  else np.full(len(dx), np.nan))
+    return out
+
+
 def run_cte_phase_after_popfit(
     solver,
     image_names: list[str],
@@ -5762,6 +5794,10 @@ def run_cte_phase_after_popfit(
         except Exception as _e:
             print(f"  [warn] _plot_warmstart_cte failed: {_e}")
 
+    # Collect before-CTE residuals (xys_orig, re-stabilised r_hat)
+    _arrays_before = (_collect_solver_residuals(solver, image_names, r_hat, use_orig=True)
+                      if output_dir is not None else None)
+
     # Apply warm-started CTE correction to solver positions
     apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
                         filtered_spi=stars_per_image, subtract=True)
@@ -5846,6 +5882,30 @@ def run_cte_phase_after_popfit(
     print(f"\n  CTE phase complete.")
     print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}±{_sig_ra:.4f}, "
           f"{mu_pop_hat[1]:+.4f}±{_sig_de:.4f}) mas/yr")
+
+    # ── Per-image before/after residual maps ──────────────────────────────────
+    if output_dir is not None and _arrays_before is not None:
+        try:
+            _arrays_after = _collect_solver_residuals(
+                solver, image_names, r_hat, use_orig=False)
+            _resid_dir = Path(output_dir) / 'plots' / 'residuals'
+            _resid_dir.mkdir(parents=True, exist_ok=True)
+            _plot_per_image_detector_residuals(
+                _resid_dir,
+                image_names, solver, stars_per_image,
+                arrays_stage1=_arrays_before,
+                arrays_stage2=_arrays_before,
+                arrays_stage3=_arrays_after,
+                stage_labels=("pre-CTE", "pre-CTE", "post-CTE"),
+                prefix='cte_popfit',
+                member_gaia_ids=None,
+            )
+            print(f"  Per-image residual maps saved → {_resid_dir}")
+        except Exception as _e:
+            import traceback as _tb
+            print(f"  [warn] per-image residual plots failed: {_e}")
+            _tb.print_exc()
+
     print("─" * 60)
 
     return cte_params, r_hat, mu_pop_hat, a_arr_final
