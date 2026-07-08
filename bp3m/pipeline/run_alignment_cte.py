@@ -5604,3 +5604,172 @@ def run_alignment_joint_cte(
 
     print(f"\n  Joint CTE results written to: {output_dir_joint}")
     return output_dir_joint
+
+
+# ── CTE phase appended to bp3m-pop-fit ────────────────────────────────────────
+
+def run_cte_phase_after_popfit(
+    solver,
+    image_names: list[str],
+    stars_per_image: dict,
+    gaia_catalog,
+    r_hat: np.ndarray,
+    mu_pop_hat: np.ndarray,
+    member_sidx: np.ndarray,
+    sigma_pm: float,
+    plx_pop: float,
+    sigma_plx_tot: float,
+    mu_pop_prior: np.ndarray,
+    C_pop_prior_inv: np.ndarray,
+    mag_poly_order: int = 3,
+    spatial_order: int = 2,
+    time_poly_order: int = 0,
+    n_iter_cte: int = 10,
+    regularize_gamma: float = 1e-8,
+    fit_cte_x: bool = True,
+) -> tuple:
+    """
+    CTE phase appended after bp3m-pop-fit convergence.
+
+    Per-image alpha (uncertainty inflation) is already baked into
+    solver._img_data[img]['C_hst'] and is NOT updated here.  Membership
+    (member_sidx) is frozen at the pop-fit converged value.
+
+    Warm start: one _joint_solve_cte call with r and μ_pop fixed — only γ is
+    extracted from the result.  This gives a clean initial CTE model without
+    the r–γ–μ cross-coupling that corrupts the warm start when all three are
+    free simultaneously.
+
+    Joint loop: n_iter_cte iterations updating (r, γ, μ_pop) jointly with
+    frozen alpha and frozen membership.
+
+    Returns
+    -------
+    cte_params : dict[str, CTEChipParams]
+    r_hat      : (n_r,) converged image transformations
+    mu_pop_hat : (2,) converged population mean PM (mas/yr)
+    a_arr      : (n_stars, 5) stellar astrometry from final iteration
+    """
+    import time as _wtime
+    from astropy.time import Time as _ATime
+
+    t_launch_yr = _ACS_LAUNCH_YR
+
+    print("\n" + "─" * 60)
+    print("  CTE phase (appended to pop-fit)")
+    print(f"  mag_poly_order={mag_poly_order}  spatial_order={spatial_order}  "
+          f"time_poly_order={time_poly_order}  n_iter={n_iter_cte}")
+    print(f"  Starting μ_pop = ({mu_pop_hat[0]:+.4f}, {mu_pop_hat[1]:+.4f}) mas/yr  "
+          f"members={len(member_sidx)}")
+
+    # ── Setup ──────────────────────────────────────────────────────────────────
+    # Save raw (pre-CTE) positions once; apply_cte_to_solver resets from these.
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is not None and 'xys_orig' not in d:
+            d['xys_orig'] = d['xys'].copy()
+
+    _inject_mag_inst(solver, image_names, stars_per_image, gaia_catalog)
+
+    _mag_norm_ref, _mag_norm_scale = _compute_mag_normalization(solver, image_names)
+    cte_template = default_cte_params(
+        mag_poly_order, _mag_norm_ref, _mag_norm_scale,
+        spatial_order, time_poly_order)
+
+    _p0       = cte_template.get('hi', cte_template.get('lo'))
+    _nb       = _cte_n_spatial(spatial_order) * (mag_poly_order + 1) - 1
+    _nb_total = _nb * (time_poly_order + 1)
+
+    solver._update_R(r_hat)
+    solver._update_geometry(r_hat, solver.v_survey)
+
+    # ── CTE warm start: fix r and μ_pop, learn γ only ─────────────────────────
+    print(f"\n  [CTE warm start] learning γ with r and μ_pop fixed...")
+    _t0 = _wtime.time()
+    _ws_result = _joint_solve_cte(
+        solver, image_names, cte_template, t_launch_yr, stars_per_image,
+        member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
+        mu_pop_hat, mu_pop_prior, C_pop_prior_inv, r_hat,
+        regularize_gamma=regularize_gamma,
+        hst_prior_sidx=None,
+        fit_cte_x=fit_cte_x,
+    )
+    # Only take γ — discard r and μ updates (they remain at pop-fit values)
+    _, _, gamma_warm, _, _, _, _, _ = _ws_result
+    cte_params = _gamma_to_cte_params(gamma_warm, cte_template)
+
+    _nb_tot = _nb_total   # alias for norm print
+    gy_hi   = float(np.linalg.norm(gamma_warm[_nb_tot:2*_nb_tot]))
+    gy_lo   = float(np.linalg.norm(gamma_warm[3*_nb_tot:4*_nb_tot]))
+    print(f"  Warm start done ({_wtime.time()-_t0:.1f}s): "
+          f"|γ_y_hi|={gy_hi:.3e}  |γ_y_lo|={gy_lo:.3e}")
+
+    # Apply warm-started CTE correction to solver positions
+    apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
+                        filtered_spi=stars_per_image, subtract=True)
+
+    # ── Joint loop: update r, γ, μ_pop (alpha and membership frozen) ──────────
+    print(f"\n  [CTE joint loop] {n_iter_cte} iterations (α and membership frozen)...")
+    gamma_prior    = gamma_warm.copy()
+    r_current      = r_hat.copy()
+    mu_pop_current = mu_pop_hat.copy()
+    r_prev         = r_current.copy()
+    mu_prev        = mu_pop_current.copy()
+    gamma_prev     = gamma_warm.copy()
+    C_shared_final = None
+    a_arr_final    = None
+
+    for it in range(n_iter_cte):
+        _t0 = _wtime.time()
+        result = _joint_solve_cte(
+            solver, image_names, cte_params, t_launch_yr, stars_per_image,
+            member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
+            mu_pop_current, mu_pop_prior, C_pop_prior_inv, r_current,
+            regularize_gamma=regularize_gamma,
+            gamma_prior=gamma_prior,
+            hst_prior_sidx=None,
+            fit_cte_x=fit_cte_x,
+        )
+        r_hat, _, gamma_hat, mu_pop_hat, C_shared, a_arr, _, _ = result
+
+        cte_params     = _gamma_to_cte_params(gamma_hat, cte_template)
+        r_current      = r_hat
+        mu_pop_current = mu_pop_hat
+        C_shared_final = C_shared
+        a_arr_final    = a_arr
+
+        solver._update_R(r_hat)
+        solver._update_geometry(r_hat, solver.v_survey)
+        apply_cte_to_solver(solver, image_names, cte_params, t_launch_yr,
+                            filtered_spi=stars_per_image, subtract=True)
+
+        dr  = float(np.max(np.abs(r_hat  - r_prev)))
+        dg  = float(np.max(np.abs(gamma_hat - gamma_prev)))
+        dmu = float(np.max(np.abs(mu_pop_hat - mu_prev)))
+
+        _C_mu   = C_shared[-2:, -2:] if C_shared is not None else np.zeros((2, 2))
+        _sig_ra = float(np.sqrt(max(_C_mu[0, 0], 0.0)))
+        _sig_de = float(np.sqrt(max(_C_mu[1, 1], 0.0)))
+        _rho    = float(_C_mu[0, 1] / (_sig_ra * _sig_de + 1e-30))
+        _gy_hi  = float(np.linalg.norm(gamma_hat[_nb_tot:2*_nb_tot]))
+        _gy_lo  = float(np.linalg.norm(gamma_hat[3*_nb_tot:4*_nb_tot]))
+        print(f"    iter {it+1}/{n_iter_cte}: Δr={dr:.3e}  Δγ={dg:.3e}  Δμ={dmu:.4f}  "
+              f"({_wtime.time()-_t0:.1f}s)")
+        print(f"      μ_pop=({mu_pop_hat[0]:+.4f}±{_sig_ra:.4f}, "
+              f"{mu_pop_hat[1]:+.4f}±{_sig_de:.4f}) mas/yr  ρ={_rho:+.3f}  "
+              f"|γ_y_hi|={_gy_hi:.3e}  |γ_y_lo|={_gy_lo:.3e}")
+
+        r_prev     = r_hat.copy()
+        mu_prev    = mu_pop_hat.copy()
+        gamma_prev = gamma_hat.copy()
+
+        if dr < 1e-6 and dg < 1e-6 and dmu < 1e-4:
+            print(f"    Converged at iter {it+1}.")
+            break
+
+    print(f"\n  CTE phase complete.")
+    print(f"  Final μ_pop = ({mu_pop_hat[0]:+.4f}±{_sig_ra:.4f}, "
+          f"{mu_pop_hat[1]:+.4f}±{_sig_de:.4f}) mas/yr")
+    print("─" * 60)
+
+    return cte_params, r_hat, mu_pop_hat, a_arr_final

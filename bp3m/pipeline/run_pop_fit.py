@@ -1514,6 +1514,11 @@ def run_pop_fit(
     mu_pop_init: tuple[float, float] | None = None,
     poly_order: int | None = None,
     no_plots: bool = False,
+    fit_cte: bool = False,
+    cte_mag_poly_order: int = 3,
+    cte_spatial_order: int = 2,
+    cte_time_poly_order: int = 0,
+    cte_n_iter: int = 10,
 ) -> Path:
     """
     Run population PM fitting.
@@ -2479,6 +2484,38 @@ def run_pop_fit(
         except Exception as _exc:
             print(f"  WARNING: _plot_pm_vs_properties failed — {_exc}")
 
+    # ── Optional CTE phase ────────────────────────────────────────────────────
+    if fit_cte:
+        from .run_alignment_cte import run_cte_phase_after_popfit
+        cte_params, r_cte, mu_pop_cte, _ = run_cte_phase_after_popfit(
+            solver=solver,
+            image_names=image_names,
+            stars_per_image=filtered_spi,
+            gaia_catalog=gaia_catalog,
+            r_hat=r_current,
+            mu_pop_hat=mu_pop_current,
+            member_sidx=member_sidx,
+            sigma_pm=sigma_pm,
+            plx_pop=plx_pop,
+            sigma_plx_tot=sigma_plx_tot,
+            mu_pop_prior=mu_pop_prior,
+            C_pop_prior_inv=C_pop_prior_inv,
+            mag_poly_order=cte_mag_poly_order,
+            spatial_order=cte_spatial_order,
+            time_poly_order=cte_time_poly_order,
+            n_iter_cte=cte_n_iter,
+        )
+        import numpy as _np
+        _cte_out = {}
+        for chip in ('hi', 'lo'):
+            p = cte_params.get(chip)
+            if p is not None:
+                _cte_out[f'{chip}_gamma_x'] = p.gamma_x
+                _cte_out[f'{chip}_gamma_y'] = p.gamma_y
+        _cte_path = output_pfr / 'cte_params.npz'
+        _np.savez(_cte_path, **_cte_out)
+        print(f"  Saved CTE params: {_cte_path}")
+
     elapsed = time.time() - t_start
     print(f"\n  Done in {elapsed:.1f}s")
     print(f"  Results: {output_pfr}")
@@ -2552,6 +2589,18 @@ def main():
                              'as the starting point and prior centre. Useful when N_members '
                              'is small or a literature value is available '
                              '(e.g. --mu_pop_init -0.06 -0.11)')
+    parser.add_argument('--fit_cte', action='store_true',
+                        help='After pop-fit convergence, run a CTE phase: warm-start the '
+                             'CTE model (γ only, r and μ_pop fixed), then jointly fit '
+                             '(r, γ, μ_pop) with alpha and membership frozen.')
+    parser.add_argument('--cte_mag_poly_order', type=int, default=3,
+                        help='CTE magnitude polynomial order (default 3)')
+    parser.add_argument('--cte_spatial_order', type=int, default=2,
+                        help='CTE spatial polynomial order (default 2)')
+    parser.add_argument('--cte_time_poly_order', type=int, default=0,
+                        help='CTE time polynomial order (default 0; 1 adds constant-in-time block)')
+    parser.add_argument('--cte_n_iter', type=int, default=10,
+                        help='CTE joint loop iterations (default 10)')
 
     args = parser.parse_args()
 
@@ -2577,4 +2626,9 @@ def main():
         mu_pop_init=tuple(args.mu_pop_init) if args.mu_pop_init is not None else None,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
+        fit_cte=args.fit_cte,
+        cte_mag_poly_order=args.cte_mag_poly_order,
+        cte_spatial_order=args.cte_spatial_order,
+        cte_time_poly_order=args.cte_time_poly_order,
+        cte_n_iter=args.cte_n_iter,
     )
