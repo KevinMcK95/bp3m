@@ -1503,7 +1503,7 @@ def run_pop_fit(
     n_iter_joint: int = 20,
     n_iter_alpha: int = 20,
     alpha_damp: float = 0.5,
-    n_iter_phase4: int = 20,
+    n_iter_phase4: int = 0,
     phase4_mode: str = 'hard',
     student_t_nu: float = 50.0,
     z_threshold: float = 0.8,
@@ -2553,8 +2553,9 @@ def main():
     parser.add_argument('--alpha_damp', type=float, default=0.5,
                         help='Under-relaxation for alpha update: alpha_new = alpha_prev * '
                              'alpha_raw^alpha_damp (0.5=geometric mean; 1.0=full step, may oscillate)')
-    parser.add_argument('--n_iter_phase_4', type=int, default=20,
-                        help='Phase 4 iterations (0 to skip)')
+    parser.add_argument('--n_iter_phase_4', type=int, default=0,
+                        help='Phase 4 iterations (default 0 = skip; Phase 4 is '
+                             'experimental and can diverge)')
     parser.add_argument('--phase4_mode', type=str, default='hard',
                         choices=['hard', 'soft'],
                         help='Phase 4 mode: hard=population-aware Tests 1+2+3 (default), '
