@@ -2501,26 +2501,58 @@ def warm_start_cte(
     )
     # r_ws and mu_ws are NOT updated — diagnostic only.
 
+    # Phase [2/4] uses the same two-phase strategy as the verified bp3m-pop-fit:
+    #   [2/4a] μ-only (fix_r=True)  — avoids r–μ degeneracy when r_init is at
+    #           the v2 (all-star) optimum rather than the Gaia-only optimum.
+    #           Mirrors pop-fit Phase 1.
+    #   [2/4b] joint (r, μ) — fine-tunes both from the stable μ_pop starting
+    #           point obtained in [2/4a].  Mirrors pop-fit Phase 2.
+    #
+    # Using _joint_solve_pop (verified correct) instead of _joint_solve_cte for
+    # this Gaia-only sub-step — identical math at n_gamma=0 (no CTE block).
+    from .run_pop_fit import _joint_solve_pop as _pop_solve_gaia
+
     _r_prev_ws  = r_ws.copy()
     _mu_prev_ws = mu_ws.copy()
+
+    # [2/4a]: μ-only, r fixed — like pop-fit Phase 1
+    print(f"    [μ-only, {n_gaia_warmstart_iters} iter, r fixed]")
     for _ws_it in range(n_gaia_warmstart_iters):
-        _result_g = _joint_solve_cte(
-            solver, image_names, _cte_tmpl_gaia, t_launch_yr, filtered_spi,
-            member_sidx_gaia, sigma_pm, plx_pop, sigma_plx_tot,
-            mu_ws, mu_pop_prior, C_pop_prior_inv, r_ws,
-            regularize_gamma=regularize_gamma,
-            hst_prior_sidx=None,
-            fit_cte_x=fit_cte_x,
-            restrict_align_to_members=False,
+        _, mu_ws, _C_shared_ws, _, _, _, _ = _pop_solve_gaia(
+            solver, image_names,
+            member_sidx_gaia, mu_ws,
+            sigma_pm, plx_pop, sigma_plx_tot,
+            C_pop_prior_inv, mu_pop_prior, r_ws,
+            fix_r=True,
         )
-        r_ws, _, _, mu_ws, _C_shared_ws, _, _, _ = _result_g
+        # C_shared is (2, 2) when fix_r=True
+        _sig_ra_ws = float(np.sqrt(max(_C_shared_ws[0, 0], 0.0)))
+        _sig_de_ws = float(np.sqrt(max(_C_shared_ws[1, 1], 0.0)))
+        _rho_ws    = float(_C_shared_ws[0, 1] / (_sig_ra_ws * _sig_de_ws + 1e-30))
+        _dmu_ws    = float(np.max(np.abs(mu_ws - _mu_prev_ws)))
+        print(f"    iter {_ws_it+1}/{n_gaia_warmstart_iters}: "
+              f"Δr=0  Δμ={_dmu_ws:.4f}  "
+              f"μ_pop=({mu_ws[0]:+.4f}±{_sig_ra_ws:.4f}, "
+              f"{mu_ws[1]:+.4f}±{_sig_de_ws:.4f}) mas/yr  ρ={_rho_ws:+.3f}")
+        _mu_prev_ws = mu_ws.copy()
+
+    # [2/4b]: joint (r, μ) — like pop-fit Phase 2
+    print(f"    [joint r+μ, {n_gaia_warmstart_iters} iter]")
+    for _ws_it in range(n_gaia_warmstart_iters):
+        r_ws, mu_ws, _C_shared_ws, _, _, _, _ = _pop_solve_gaia(
+            solver, image_names,
+            member_sidx_gaia, mu_ws,
+            sigma_pm, plx_pop, sigma_plx_tot,
+            C_pop_prior_inv, mu_pop_prior, r_ws,
+            fix_r=False,
+        )
         solver._update_R(r_ws)
         solver._update_geometry(r_ws, solver.v_survey)
         _dr_ws  = float(np.max(np.abs(r_ws  - _r_prev_ws)))
         _dmu_ws = float(np.max(np.abs(mu_ws - _mu_prev_ws)))
         _C_mu_ws   = _C_shared_ws[-2:, -2:]
-        _sig_ra_ws = float(np.sqrt(_C_mu_ws[0, 0]))
-        _sig_de_ws = float(np.sqrt(_C_mu_ws[1, 1]))
+        _sig_ra_ws = float(np.sqrt(max(_C_mu_ws[0, 0], 0.0)))
+        _sig_de_ws = float(np.sqrt(max(_C_mu_ws[1, 1], 0.0)))
         _rho_ws    = float(_C_mu_ws[0, 1] / (_sig_ra_ws * _sig_de_ws + 1e-30))
         print(f"    iter {_ws_it+1}/{n_gaia_warmstart_iters}: "
               f"Δr={_dr_ws:.3e}  Δμ={_dmu_ws:.4f}  "
@@ -2528,6 +2560,7 @@ def warm_start_cte(
               f"{mu_ws[1]:+.4f}±{_sig_de_ws:.4f}) mas/yr  ρ={_rho_ws:+.3f}")
         _r_prev_ws  = r_ws.copy()
         _mu_prev_ws = mu_ws.copy()
+
     print(f"  [2/4] done ({_wtime.time()-_t0:.1f}s)")
 
     # ── Phase 3: full-member CTE warmstart (two-tier) ─────────────────────────
