@@ -70,6 +70,9 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────
     parser.add_argument('--images', type=str, nargs='+', default=None,
                         help='Restrict to specific image names')
+    parser.add_argument('--bp3m_min_stars', type=int, default=0,
+                        help='Exclude images with fewer than this many matched Gaia stars '
+                             '(applied before the solver; 0 = keep all)')
     parser.add_argument('--skip_run', action='store_true',
                         help='Generate synthetic data but do not run BP3M '
                              '(useful to re-run BP3M manually with different settings)')
@@ -123,6 +126,7 @@ def main():
         split_ccd=not args.no_split_ccd,
         n_iter=args.n_iter,
         poly_order=args.poly_order,
+        bp3m_min_stars=args.bp3m_min_stars,
     )
 
     if args.skip_compare:
