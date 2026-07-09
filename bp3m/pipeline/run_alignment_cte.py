@@ -4004,11 +4004,6 @@ def _run_joint_cte_loop(
     # Single post-convergence alpha update with the final CTE+transform solution.
     _update_image_alpha(solver, image_names, r_hat, a_arr)
 
-    # ── Post-convergence covariance / degeneracy report ───────────────────────
-    if C_shared is not None:
-        _print_covariance_analysis(C_shared, nr, len(image_names), image_names,
-                                   cte_params)
-
     return r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT, cte_params, gamma_history, mu_pop_history, C_mu_history
 
 
