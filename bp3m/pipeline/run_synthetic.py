@@ -106,6 +106,7 @@ def main():
         true_parallax_width=args.true_parallax_width,
         zero_parallax=args.zero_parallax,
         images=args.images,
+        split_ccd=not args.no_split_ccd,
     )
 
     if args.skip_run:

@@ -276,6 +276,7 @@ def generate_synthetic_data(
     true_parallax_center: float | None = None,
     true_parallax_width: float = 0.1,
     syn_name: str = "synthetic",
+    split_ccd: bool = True,
 ) -> Path:
     """
     Generate synthetic HST observations and write a synthetic data tree.
@@ -324,6 +325,12 @@ def generate_synthetic_data(
     syn_name         : subdirectory name for the synthetic output tree (default 'synthetic').
                        Use a distinct name (e.g. 'synthetic_only5p') to avoid overwriting
                        results from a different configuration.
+    split_ccd        : if True (default), generate positions using per-chip tangent points
+                       from the catalog header (CHIP{n}_CRVAL/CRPIX), matching BP3M's
+                       split-CCD mode.  If False, use the full-frame tangent point
+                       (ra_cen/dec_cen from transformation.csv) for ALL stars, matching
+                       BP3M's no-split mode.  Must match the split_ccd flag passed to
+                       run_alignment / bp3m-synthetic --no_split_ccd.
 
     Returns
     -------
@@ -339,6 +346,14 @@ def generate_synthetic_data(
     hst_root   = field_path / tel_upper / "mastDownload" / tel_upper
     gaia_dir   = field_path / "Gaia"
     syn_dir    = field_path / syn_name
+
+    # ── Early exit if synthetic data already exists ───────────────────────────
+    if syn_dir.exists() and not force_regenerate:
+        print(f"\n{'─'*50}")
+        print(f"Synthetic data already exists at {syn_dir}")
+        print(f"  (pass force_regenerate=True / --force_regenerate to regenerate)")
+        print(f"{'─'*50}")
+        return syn_dir
 
     print(f"\n{'─'*50}")
     print("Synthetic: generating synthetic observations")
@@ -632,6 +647,17 @@ def generate_synthetic_data(
     for d in (syn_gaia, syn_hst, syn_truth):
         d.mkdir(parents=True, exist_ok=True)
 
+    # When regenerating with an image filter, remove any stale image dirs from
+    # previous runs that are NOT in the current filter set.  Otherwise BP3M
+    # would discover them and include them in the fit.
+    if images is not None and syn_hst.exists():
+        keep_names = set(per_image.keys())
+        for old_dir in list(syn_hst.iterdir()):
+            if old_dir.is_dir() and old_dir.name not in keep_names:
+                import shutil as _shutil
+                _shutil.rmtree(old_dir)
+                print(f"  Removed stale synthetic image dir: {old_dir.name}")
+
     # Write synthetic Gaia catalog
     syn_gaia_path = syn_gaia / f"{field_name}_synthetic_gaia.csv"
     gaia_syn.to_csv(syn_gaia_path, index=False)
@@ -704,7 +730,10 @@ def generate_synthetic_data(
         chip_lo = info.get("chip_pointing_lo")
         chip_hi = info.get("chip_pointing_hi")
 
-        if chip_lo is not None and chip_hi is not None:
+        # Use per-chip tangent points only when split_ccd=True.  When split_ccd=False
+        # BP3M uses the full-frame ra_cen/dec_cen from transformation.csv, so the
+        # forward model must also use that tangent point to remain consistent.
+        if split_ccd and chip_lo is not None and chip_hi is not None:
             # ── Split-CCD forward model ───────────────────────────────────────
             # Both chips share the same drawn alignment params (rotation, scale,
             # skew, pointing offset).  Each chip has its own nominal tangent point
