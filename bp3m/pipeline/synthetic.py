@@ -214,24 +214,38 @@ def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,
                               hst_idx: np.ndarray,
                               x_syn: np.ndarray, y_syn: np.ndarray) -> None:
     """
-    Copy src_catalog to dst_catalog, replacing x_gdc/y_gdc (and x/y raw) at
-    the given hst_idx rows with the synthetic pixel coordinates.
-    Also clears n_sat for those rows so use_for_alignment is not blocked.
+    Write dst_catalog containing ONLY the hst_idx rows from src_catalog, with
+    x_gdc/y_gdc replaced by the synthetic pixel coordinates and n_sat cleared.
+
+    Trimming to matched rows only keeps catalog size proportional to detections
+    (~500 rows) instead of the full detector catalog (~40k rows).  The row
+    indices in the output are 0..N-1, and the hst_index column in matched_gaia.csv
+    is rewritten (by the caller) to use these compact indices.
     """
     with afits.open(src_catalog, memmap=False) as src:
         bintable = src[1]
         new_cols = []
         for col in bintable.columns:
-            arr = bintable.data[col.name].copy()
+            arr = bintable.data[col.name][hst_idx].copy()
             if col.name == "x_gdc":
-                arr[hst_idx] = x_syn
+                arr[:] = x_syn
             elif col.name == "y_gdc":
-                arr[hst_idx] = y_syn
+                arr[:] = y_syn
             elif col.name == "n_sat":
-                arr[hst_idx] = 0
+                arr[:] = 0
             new_cols.append(afits.Column(name=col.name, format=col.format,
                                           array=arr, unit=col.unit))
         new_bin  = afits.BinTableHDU.from_columns(new_cols)
+        # Copy the catalog header (chip pointing keys etc.) to new extension
+        for key, val in src[1].header.items():
+            if key not in ("XTENSION", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2",
+                           "PCOUNT", "GCOUNT", "TFIELDS", "END") and not key.startswith("TTYPE") \
+                    and not key.startswith("TFORM") and not key.startswith("TUNIT") \
+                    and not key.startswith("TDISP"):
+                try:
+                    new_bin.header[key] = val
+                except Exception:
+                    pass
         new_hdul = afits.HDUList([src[0].copy(), new_bin]
                                  + [ext.copy() for ext in src[2:]])
         new_hdul.writeto(str(dst_catalog), overwrite=True)
@@ -253,6 +267,10 @@ def generate_synthetic_data(
     force_regenerate: bool = False,
     only_5p: bool = False,
     all_5p_gaia: bool = False,
+    rot_sigma: float = 0.01,
+    ratio_sigma: float = 1e-4,
+    skew_sigma: float = 1e-5,
+    pointing_sigma: float = 500.0,
     true_pm_center: tuple[float, float] | None = None,
     true_pm_width: float = 0.1,
     true_parallax_center: float | None = None,
@@ -278,6 +296,10 @@ def generate_synthetic_data(
                        Default 0 = use transformation.csv values unchanged.
     images           : optional explicit list of image names to include
     force_regenerate : regenerate even if synthetic directory already exists
+    rot_sigma        : 1σ uncertainty for true rotation draw (degrees, default 0.01)
+    ratio_sigma      : 1σ uncertainty for true pixel-scale ratio draw (default 1e-4)
+    skew_sigma       : 1σ for true on/off-axis skew draws (default 1e-5)
+    pointing_sigma   : 1σ for true pointing offset draw in RA*cos(dec) and Dec (mas, default 500)
     only_5p          : if True, exclude 2-param Gaia stars (no measured PM/parallax)
                        from the synthetic test — useful for isolating whether 2-param
                        stars affect image parameter estimation
@@ -643,13 +665,13 @@ def generate_synthetic_data(
         # ── Draw true alignment parameters for this image ─────────────────────
         # orig_rot_deg = -orientat  (PA of HST y-axis is negative of BP3M angle)
         orig_rot_deg = -t["orientat"]
-        true_rot_deg    = orig_rot_deg + rng.normal(0.0, 0.01)   # ±0.01° rotation
-        true_ratio      = 1.0 + rng.normal(0.0, 1e-4)            # ≈1 pixel scale
-        true_on_skew    = rng.normal(0.0, 1e-5)                  # diagonal distortion
-        true_off_skew   = rng.normal(0.0, 1e-5)                  # off-diagonal distortion
-        # Pointing offset drawn in RA*cos(dec) and Dec mas; applied equally to all chips.
-        true_delta_racosdec_mas = rng.normal(0.0, 500.0)
-        true_delta_dec0_mas     = rng.normal(0.0, 500.0)
+        true_rot_deg    = orig_rot_deg + rng.normal(0.0, rot_sigma)
+        true_ratio      = 1.0 + rng.normal(0.0, ratio_sigma)
+        true_on_skew    = rng.normal(0.0, skew_sigma)
+        true_off_skew   = rng.normal(0.0, skew_sigma)
+        # Pointing offset in RA*cos(dec) and Dec mas; applied equally to all chips.
+        true_delta_racosdec_mas = rng.normal(0.0, pointing_sigma)
+        true_delta_dec0_mas     = rng.normal(0.0, pointing_sigma)
 
         abcd = _abcd_from_physical(true_rot_deg, true_ratio, true_on_skew, true_off_skew)
         M    = np.array([[abcd["true_a"], abcd["true_b"]],
@@ -784,8 +806,11 @@ def generate_synthetic_data(
             y_syn=y_syn,
         )
 
+        # hst_index must be 0..N-1 after catalog trimming (catalog now only has
+        # the matched rows in the same order as hst_idx).
         match_out = match.copy()
         match_out["gaia_source_id"] = gaia_ids
+        match_out["hst_index"] = np.arange(len(hst_idx), dtype=int)
         match_out.to_csv(syn_img / "matched_gaia.csv", index=False)
         per_image[img_name]["truth_rows"] = truth_rows_this
         n_written += 1
@@ -935,17 +960,39 @@ def compare_synthetic_results(
 
         if img_truth_path.exists():
             img_truth = pd.read_csv(img_truth_path)
-            # New truth tables have per-chip rows (img_lo / img_hi), so try
-            # a direct name match first; fall back to stripping _hi/_lo for
-            # backward compatibility with old single-row truth tables.
+            # Pass 1: direct name match (new per-chip truth tables where names
+            # match exactly: img_lo ↔ img_lo, img_hi ↔ img_hi).
             direct = img_results.merge(
-                img_truth, on="image_name", how="inner", suffixes=("", "_truth"))
-            if len(direct) > 0:
-                img_cmp = direct
-            else:
-                img_cmp = img_results.merge(
-                    img_truth, left_on="image_name_base", right_on="image_name",
-                    how="inner", suffixes=("", "_truth"))
+                img_truth, on="image_name", how="left", suffixes=("", "_truth"))
+            matched_direct = direct[direct["true_a"].notna()]
+            unmatched = direct[direct["true_a"].isna()].drop(
+                columns=[c for c in direct.columns if c.endswith("_truth") or c in img_truth.columns[1:]],
+                errors="ignore")
+
+            # Pass 2: for BP3M images not matched in pass 1, try:
+            #   (a) strip _hi/_lo from the BP3M name and look up the base in truth
+            #       (backward compat: truth has single base-name rows)
+            #   (b) look up img_lo / img_hi rows in truth when BP3M kept the image
+            #       unsplit (BP3M name has no suffix, but truth has lo/hi rows)
+            extra_rows = []
+            truth_name_set = set(img_truth["image_name"])
+            for _, row in unmatched.iterrows():
+                bname = row["image_name_base"]
+                # case (a): base name directly in truth
+                t_rows = img_truth[img_truth["image_name"] == bname]
+                if len(t_rows) == 0:
+                    # case (b): any lo/hi variant of bname in truth
+                    t_rows = img_truth[img_truth["image_name"].str.startswith(bname + "_")]
+                if len(t_rows) > 0:
+                    merged = {**row.to_dict(),
+                              **t_rows.iloc[0].to_dict(),
+                              "image_name": row["image_name"]}
+                    extra_rows.append(merged)
+
+            parts = [matched_direct]
+            if extra_rows:
+                parts.append(pd.DataFrame(extra_rows))
+            img_cmp = pd.concat(parts, ignore_index=True) if len(parts) > 1 else matched_direct
             # Compare BP3M output a,b,c,d,delta_ra0_mas,delta_dec0_mas to fitted truth.
             # Columns: (result_col, truth_col, sigma_col_in_results)
             bp3m_params = [
