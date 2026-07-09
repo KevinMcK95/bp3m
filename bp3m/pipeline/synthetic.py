@@ -754,6 +754,8 @@ def generate_synthetic_data(
                     true_off_skew=true_off_skew,
                     true_delta_ra0_mas=(ra0_t - ra0_nom) * 3.6e6,    # raw RA mas
                     true_delta_dec0_mas=(dec0_t - dec0_nom) * 3.6e6, # Dec mas
+                    warmstart_delta_ra0_mas=ra_off_deg * 3.6e6,       # baked into CHIP CRVAL
+                    warmstart_delta_dec0_mas=dec_off_deg * 3.6e6,
                     **abcd,
                 ))
 
@@ -779,6 +781,8 @@ def generate_synthetic_data(
                 true_off_skew=true_off_skew,
                 true_delta_ra0_mas=(ra0_true - ra_cen) * 3.6e6,
                 true_delta_dec0_mas=(dec0_true - dec_cen) * 3.6e6,
+                warmstart_delta_ra0_mas=ra_off_deg * 3.6e6,   # baked into transformation.csv ra_cen
+                warmstart_delta_dec0_mas=dec_off_deg * 3.6e6,
                 **abcd,
             )]
 
@@ -1038,13 +1042,31 @@ def compare_synthetic_results(
             img_cmp = pd.concat(parts, ignore_index=True) if len(parts) > 1 else matched_direct
             # Compare BP3M output a,b,c,d,delta_ra0_mas,delta_dec0_mas to fitted truth.
             # Columns: (result_col, truth_col, sigma_col_in_results)
+            #
+            # For warm-started runs, delta_ra0_mas and delta_dec0_mas in BP3M are
+            # residuals from the warm-started reference point, not from the original
+            # ra_cen.  image_truth.csv stores warmstart_delta_ra0_mas so we can
+            # compute the correct truth in BP3M's frame:
+            #   bp3m_truth = true_delta_ra0 - warmstart_delta_ra0  (≈ 0 for perfect WS)
+            if ("warmstart_delta_ra0_mas"  in img_cmp.columns and
+                    "warmstart_delta_dec0_mas" in img_cmp.columns):
+                img_cmp["bp3m_true_delta_ra0_mas"]  = (img_cmp["true_delta_ra0_mas"]
+                                                        - img_cmp["warmstart_delta_ra0_mas"])
+                img_cmp["bp3m_true_delta_dec0_mas"] = (img_cmp["true_delta_dec0_mas"]
+                                                        - img_cmp["warmstart_delta_dec0_mas"])
+                dra_truth_col  = "bp3m_true_delta_ra0_mas"
+                ddec_truth_col = "bp3m_true_delta_dec0_mas"
+            else:
+                dra_truth_col  = "true_delta_ra0_mas"
+                ddec_truth_col = "true_delta_dec0_mas"
+
             bp3m_params = [
-                ("a",             "true_a",              "sigma_a"),
-                ("b",             "true_b",              "sigma_b"),
-                ("c",             "true_c",              "sigma_c"),
-                ("d",             "true_d",              "sigma_d"),
-                ("delta_ra0_mas",  "true_delta_ra0_mas",  "sigma_dra0_mas"),
-                ("delta_dec0_mas", "true_delta_dec0_mas", "sigma_ddec0_mas"),
+                ("a",             "true_a",         "sigma_a"),
+                ("b",             "true_b",         "sigma_b"),
+                ("c",             "true_c",         "sigma_c"),
+                ("d",             "true_d",         "sigma_d"),
+                ("delta_ra0_mas",  dra_truth_col,   "sigma_dra0_mas"),
+                ("delta_dec0_mas", ddec_truth_col,  "sigma_ddec0_mas"),
             ]
             for bp3m_col, true_col, _ in bp3m_params:
                 if bp3m_col in img_cmp and true_col in img_cmp:
