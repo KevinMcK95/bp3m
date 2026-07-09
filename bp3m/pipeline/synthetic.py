@@ -72,44 +72,6 @@ def _read_transform(img_dir: Path) -> dict | None:
         return None
 
 
-def _sky_to_pixel(ra: np.ndarray, dec: np.ndarray,
-                  t: dict) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Map sky positions (degrees, at HST epoch) → GDC pixel coordinates.
-
-    Mirrors the exact pipeline used by cross_match_cli.py:
-      1. Gnomonic projection to nominal pixel frame centred at (x_cen, y_cen)
-      2. Initial inverse rotation by ORIENTAT to align with HST detector axes
-      3. Invert A,B,C,D affine transform to obtain GDC pixel (x, y)
-
-    The A,B,C,D values in transformation.csv capture ONLY the residual
-    distortion after the initial ORIENTAT rotation has been applied.
-    """
-    _ensure_fcm()
-    from miracle_match import rd2x, rd2y
-
-    scale_deg = t["pixel_scale"] / 3600.0          # arcsec/pix → deg/pix
-
-    # 1. Gnomonic project sky → nominal pixel
-    x_g = t["x_cen"] - rd2x(ra, dec, t["ra_cen"], t["dec_cen"]) / scale_deg
-    y_g = t["y_cen"] + rd2y(ra, dec, t["ra_cen"], t["dec_cen"]) / scale_deg
-
-    # 2. Initial inverse rotation (same as cross_match_cli init_inv_rot_mat)
-    theta     = np.radians(-t["orientat"])
-    Rinit     = np.array([[ np.cos(theta),  np.sin(theta)],
-                           [-np.sin(theta),  np.cos(theta)]])
-    Rinit_inv = np.linalg.inv(Rinit)
-    dxy       = np.column_stack([x_g - t["x_cen"], y_g - t["y_cen"]])
-    xy_rot    = (Rinit_inv @ dxy.T).T + np.array([t["x_cen"], t["y_cen"]])
-
-    # 3. Invert A,B,C,D
-    M    = np.array([[t["A"], t["B"]], [t["C"], t["D"]]])
-    Minv = np.linalg.inv(M)
-    dW   = xy_rot[:, 0] - t["xt_o"]
-    dZ   = xy_rot[:, 1] - t["yt_o"]
-    dxy_hst = (Minv @ np.vstack([dW, dZ])).T
-    return t["xs_o"] + dxy_hst[:, 0], t["ys_o"] + dxy_hst[:, 1]
-
 
 def _mjd_from_flc(flc_path: Path) -> float:
     """Mid-exposure MJD from FLC FITS primary header."""
@@ -373,6 +335,8 @@ def generate_synthetic_data(
             cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
             cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
             cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
+            cat_x_gdc  = tbl["x_gdc"].astype(float)
+            cat_y_gdc  = tbl["y_gdc"].astype(float)
 
         all_gaia_ids.update(match["gaia_source_id"].values)
         per_image[img_name] = dict(
@@ -380,6 +344,7 @@ def generate_synthetic_data(
             transform=t, mjd=_mjd_from_flc(flc_path),
             match=match,
             cat_cov_xx=cat_cov_xx, cat_cov_yy=cat_cov_yy, cat_cov_xy=cat_cov_xy,
+            cat_x_gdc=cat_x_gdc, cat_y_gdc=cat_y_gdc,
         )
 
     if not per_image:
@@ -620,31 +585,40 @@ def generate_synthetic_data(
             for key in ("A", "B", "C", "D", "xs_o", "ys_o", "xt_o", "yt_o"):
                 t_fwd[key] += float(rng.normal(0.0, jitter_sigma))
 
-        # Propagate true positions to HST epoch
+        # Propagate true (perturbed) positions to HST epoch
         df_prop  = gaia_true.iloc[rows_true].copy().reset_index(drop=True)
         ra_p, dec_p = _propagate(df_prop, mjd)
 
-        # Forward model sky → pixel
-        x_pred, y_pred = _sky_to_pixel(ra_p, dec_p, t_fwd)
+        # Propagate catalog (unperturbed) positions to HST epoch for fitting (a,b,c,d)
+        df_cat = gaia_obs.iloc[rows_true].copy().reset_index(drop=True)
+        ra_cat_p, dec_cat_p = _propagate(df_cat, mjd)
 
-        # Compute Gaia pseudo-image coords (what BP3M uses as the 'observed' xys)
-        # using the same plane_project call as solver.py.
+        # Forward model using BP3M's own plane_project + inv(a,b,c,d):
         #
-        # Note: plane_project(ra_p, dec_p) ≈ plane_project(ra_g, dec_g) + JU @ v_true
-        # to first order (gnomonic linearization), which is exactly the right-hand side
-        # of the BP3M model equation at truth:
-        #   x_survey = X @ r_true - JU @ v_T_true
-        #   => X @ r_true = plane_project(ra_g) + JU @ v_true = plane_project(ra_p)
-        # So using ra_p here is correct — it bakes in the v_true offset as required.
+        # 1. Fit true (a,b,c,d) from real catalog GDC pixels vs plane_project of
+        #    catalog sky positions.  Uses only BP3M's own projection — no miracle_match.
+        # 2. plane_project(ra_p, dec_p) bakes in the v_true offset exactly as BP3M
+        #    models it:  xs_true ≈ plane_project(ra_g) + JU @ v_true = plane_project(ra_p).
+        # 3. Invert (a,b,c,d) to recover noiseless GDC pixel positions:
+        #      xs_true = a*(x_pred-Xo) + b*(y_pred-Yo)  exactly by construction,
+        #    so true_delta_ra0_mas = 0 is exact (no residual constant term).
         _ensure_bp3m()
         from bp3m.astro_utils import plane_project as _plane_project
         pscale_mas = t_fwd["pixel_scale"] * 1000.0   # arcsec/pix → mas/pix
-        xs_bp3m, ys_bp3m = _plane_project(
-            ra_p, dec_p, t_fwd["ra_cen"], t_fwd["dec_cen"], pscale_mas)
+        ra_cen, dec_cen = t_fwd["ra_cen"], t_fwd["dec_cen"]
 
-        # Fit true BP3M a,b,c,d from the noiseless data (exact linear fit)
-        abcd = _fit_abcd(x_pred, y_pred, xs_bp3m, ys_bp3m)
+        xs_cat, ys_cat = _plane_project(ra_cat_p, dec_cat_p, ra_cen, dec_cen, pscale_mas)
+        abcd = _fit_abcd(info["cat_x_gdc"][hst_idx], info["cat_y_gdc"][hst_idx],
+                         xs_cat, ys_cat)
         per_image[img_name]["true_abcd"] = abcd
+
+        xs_bp3m, ys_bp3m = _plane_project(ra_p, dec_p, ra_cen, dec_cen, pscale_mas)
+        M    = np.array([[abcd["true_a"], abcd["true_b"]],
+                         [abcd["true_c"], abcd["true_d"]]])
+        Minv = np.linalg.inv(M)
+        dxy  = (Minv @ np.vstack([xs_bp3m, ys_bp3m])).T
+        x_pred = 2048.0 + dxy[:, 0]
+        y_pred = 2048.0 + dxy[:, 1]
 
         # Draw noise from real per-star covariance
         cov_xx = info["cat_cov_xx"][hst_idx]
