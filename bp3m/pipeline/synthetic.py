@@ -678,6 +678,22 @@ def generate_synthetic_data(
                          [abcd["true_c"], abcd["true_d"]]])
         Minv = np.linalg.inv(M)
 
+        # ── Pointing offset in degrees (shared by both forward model branches) ─
+        cos_dec_cen = np.cos(np.deg2rad(t["dec_cen"]))
+        ra_off_deg  = true_delta_racosdec_mas / (cos_dec_cen * 3.6e6)
+        dec_off_deg = true_delta_dec0_mas / 3.6e6
+
+        # ── True (A,B,C,D) for warm-start transformation.csv ─────────────────
+        # Invert _fcm_to_abcd: [[A,B],[C,D]] = R_cw(rot)^T @ [[a,b],[c,d]]
+        _rr = np.deg2rad(true_rot_deg)
+        _cr, _sr = np.cos(_rr), np.sin(_rr)
+        _R_ccw = np.array([[_cr, -_sr], [_sr, _cr]])
+        _M_abcd = np.array([[abcd["true_a"], abcd["true_b"]],
+                             [abcd["true_c"], abcd["true_d"]]])
+        _M_ABCD = _R_ccw @ _M_abcd
+        ws_A = float(_M_ABCD[0, 0]); ws_B = float(_M_ABCD[0, 1])
+        ws_C = float(_M_ABCD[1, 0]); ws_D = float(_M_ABCD[1, 1])
+
         # Propagate true stellar positions to HST epoch
         _ensure_bp3m()
         from bp3m.astro_utils import plane_project as _plane_project
@@ -694,10 +710,6 @@ def generate_synthetic_data(
             # skew, pointing offset).  Each chip has its own nominal tangent point
             # (chip_pointing_{lo,hi}["ra0/dec0"]) and pixel pivot (Xo, Yo).
             # The same angular pointing offset is applied to both nominal points.
-            cos_dec   = np.cos(np.deg2rad(chip_lo["dec0"]))  # same for both chips
-            ra_off_deg  = true_delta_racosdec_mas / (cos_dec * 3.6e6)
-            dec_off_deg = true_delta_dec0_mas     / 3.6e6
-
             ra0_lo  = chip_lo["ra0"]  + ra_off_deg
             dec0_lo = chip_lo["dec0"] + dec_off_deg
             ra0_hi  = chip_hi["ra0"]  + ra_off_deg
@@ -751,9 +763,8 @@ def generate_synthetic_data(
             dec_cen = t["dec_cen"]
             Xo = t["x_cen"]
             Yo = t["y_cen"]
-            cos_dec = np.cos(np.deg2rad(dec_cen))
-            ra0_true  = ra_cen  + true_delta_racosdec_mas / (cos_dec * 3.6e6)
-            dec0_true = dec_cen + true_delta_dec0_mas / 3.6e6
+            ra0_true  = ra_cen  + ra_off_deg
+            dec0_true = dec_cen + dec_off_deg
 
             xs_bp3m, ys_bp3m = _plane_project(ra_p, dec_p, ra0_true, dec0_true, pscale_mas)
             dxy    = (Minv @ np.vstack([xs_bp3m, ys_bp3m])).T
@@ -791,20 +802,52 @@ def generate_synthetic_data(
         syn_img = syn_hst / img_name
         syn_img.mkdir(parents=True, exist_ok=True)
 
-        for src, dst_name in [(info["flc_path"],        info["flc_path"].name),
-                               (info["img_dir"] / "transformation.csv",
-                                "transformation.csv")]:
-            dst = syn_img / dst_name
-            if not dst.exists():
-                os.symlink(src.resolve(), dst)
+        # Symlink FLC FITS (header only needed; no position data changes)
+        dst_flc = syn_img / info["flc_path"].name
+        if not dst_flc.exists():
+            os.symlink(info["flc_path"].resolve(), dst_flc)
 
+        # Write warm-start transformation.csv with true alignment parameters
+        # (instead of symlinking to the original GaiaHub fit) so that the
+        # solver starts near the truth and Phase 0 sees only noise-level residuals.
+        _orig_tran = pd.read_csv(info["img_dir"] / "transformation.csv",
+                                 index_col="parameter")["value"]
+        _ws_updates = {
+            "A": ws_A, "B": ws_B, "C": ws_C, "D": ws_D,
+            "ra_cen":  t["ra_cen"]  + ra_off_deg,
+            "dec_cen": t["dec_cen"] + dec_off_deg,
+            "orientat": -true_rot_deg,
+            "ratio":    true_ratio,
+            "on_skew":  true_on_skew,
+            "off_skew": true_off_skew,
+        }
+        if "rot_deg" in _orig_tran.index:
+            _ws_updates["rot_deg"] = true_rot_deg
+        _new_tran = _orig_tran.copy()
+        for _k, _v in _ws_updates.items():
+            _new_tran[_k] = _v
+        pd.DataFrame({"parameter": _new_tran.index, "value": _new_tran.values}).to_csv(
+            syn_img / "transformation.csv", index=False)
+
+        dst_cat = syn_img / info["cat_path"].name
         _write_synthetic_catalog(
             src_catalog=info["cat_path"],
-            dst_catalog=syn_img / info["cat_path"].name,
+            dst_catalog=dst_cat,
             hst_idx=hst_idx,
             x_syn=x_syn,
             y_syn=y_syn,
         )
+
+        # Update CHIP{n}_CRVAL1/2 in catalog header with drawn pointing offset
+        # so split-CCD chips get the correct warm-start tangent point.
+        with afits.open(str(dst_cat), mode='update') as _hdu:
+            _hdr = _hdu[1].header
+            for _key in list(_hdr.keys()):
+                if _key.endswith('_CRVAL1'):
+                    _hdr[_key] = float(_hdr[_key]) + ra_off_deg
+                elif _key.endswith('_CRVAL2'):
+                    _hdr[_key] = float(_hdr[_key]) + dec_off_deg
+            _hdu.flush()
 
         # hst_index must be 0..N-1 after catalog trimming (catalog now only has
         # the matched rows in the same order as hst_idx).
