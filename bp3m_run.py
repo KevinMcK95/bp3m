@@ -203,6 +203,10 @@ def _parse_args():
                          'Only applies when --no_split_ccd is not set. (default: 20)')
     bp.add_argument('--no_inflate_hst_errors', action='store_true',
                     help='Disable per-image HST error inflation (default: inflation enabled)')
+    bp.add_argument('--no_align_prior', action='store_true',
+                    help='Disable the alignment parameter prior (a,b,c,d,delta_ra0,delta_dec0). '
+                         'Sets the prior precision to zero so posteriors are determined entirely '
+                         'by the data. Useful for diagnosing prior-driven biases.')
     bp.add_argument('--bp3m_pos_err_floor', type=float, default=5e-3,
                     help='Minimum HST position uncertainty floor in pixels before BP3M '
                          '(default 0.001 px; prevents numerically unstable residuals for '
@@ -806,6 +810,7 @@ def main():
                         influence_d_thresh=args.influence_d_thresh,
                         influence_sigma_min=args.influence_sigma_min,
                         use_two_tier=args.two_tier,
+                        no_align_prior=args.no_align_prior,
                         pos_err_floor=args.bp3m_pos_err_floor,
                         plot_residuals=args.plot_residuals,
                         plot_influence=args.plot_influence,
@@ -850,6 +855,7 @@ def main():
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,
                 use_two_tier=args.two_tier,
+                no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
@@ -900,6 +906,7 @@ def main():
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,
                 use_two_tier=args.two_tier,
+                no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,

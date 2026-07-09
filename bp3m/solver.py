@@ -913,7 +913,8 @@ class BP3MSolver:
             use_soft_weights: bool = False,
             student_t_nu: float = 50.0,
             z_tol: float = 1.0,
-            z_init: dict | None = None):
+            z_init: dict | None = None,
+            no_align_prior: bool = False):
         """
         Iterative BP3M fit with outlier rejection.
 
@@ -1082,6 +1083,13 @@ class BP3MSolver:
             print(f"  {label}: WARNING — did not converge (max|Δr| = {max_str})")
             print(f"    params: {stats_str}")
             return r_hat, C_r_i, a_i, K_i, CvT_i
+
+        # ── Disable alignment prior if requested ─────────────────────────────
+        if no_align_prior:
+            n_r = self.N_R
+            for img in self.image_names:
+                self._img_data[img]["C_r_prior_inv"] = np.zeros((n_r, n_r))
+            print(" no_align_prior=True: alignment priors zeroed out")
 
         # ── Phase 0: pre-filter using one solve + same outlier rejection as Phase 2
         if prefilter and clip_sigma is not None:

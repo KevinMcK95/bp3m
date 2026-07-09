@@ -68,8 +68,8 @@ def main():
     parser.add_argument('--pointing_sigma', type=float, default=500.0,
                         help='1σ width of per-image pointing offset draw (mas)')
     # ─────────────────────────────────────────────────────────────────────────
-    parser.add_argument('--images', type=str, nargs='+', default=None,
-                        help='Restrict to specific image names')
+    parser.add_argument('--images', '--image', type=str, nargs='+', default=None,
+                        help='Restrict to specific image names (both --images and --image work)')
     parser.add_argument('--bp3m_min_stars', type=int, default=0,
                         help='Exclude images with fewer than this many matched Gaia stars '
                              '(applied before the solver; 0 = keep all)')
@@ -78,6 +78,10 @@ def main():
                              '(useful to re-run BP3M manually with different settings)')
     parser.add_argument('--skip_compare', action='store_true',
                         help='Skip the comparison step')
+    parser.add_argument('--no_align_prior', action='store_true',
+                        help='Disable alignment parameter prior during BP3M fit '
+                             '(sets a,b,c,d,delta_ra0,delta_dec0 prior precision to zero). '
+                             'Useful for diagnosing prior-driven biases.')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -128,6 +132,8 @@ def main():
         n_iter=args.n_iter,
         poly_order=args.poly_order,
         bp3m_min_stars=args.bp3m_min_stars,
+        images=args.images,
+        no_align_prior=args.no_align_prior,
     )
 
     if args.skip_compare:
