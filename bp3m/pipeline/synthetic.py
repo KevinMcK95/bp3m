@@ -211,9 +211,9 @@ def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,
         new_cols = []
         for col in bintable.columns:
             arr = bintable.data[col.name].copy()
-            if col.name in ("x_gdc", "x"):
+            if col.name == "x_gdc":
                 arr[hst_idx] = x_syn
-            elif col.name in ("y_gdc", "y"):
+            elif col.name == "y_gdc":
                 arr[hst_idx] = y_syn
             elif col.name == "n_sat":
                 arr[hst_idx] = 0
@@ -724,6 +724,11 @@ def generate_synthetic_data(
         # BP3M-parameterized truth (a,b,c,d fitted from noiseless data)
         if "true_abcd" in info:
             row.update(info["true_abcd"])
+        # True Δα0/Δδ0 = 0.0: synthetic data is generated at the same tangent
+        # point as transformation.csv (ra_cen/dec_cen), so the solver starts and
+        # ends exactly at that point — no accumulated tangent-point shift.
+        row["true_delta_ra0_mas"]  = 0.0
+        row["true_delta_dec0_mas"] = 0.0
         img_truth_rows.append(row)
     pd.DataFrame(img_truth_rows).to_csv(syn_truth / "image_truth.csv", index=False)
 
@@ -837,19 +842,25 @@ def compare_synthetic_results(
             img_cmp = img_results.merge(
                 img_truth, left_on="image_name_base", right_on="image_name",
                 how="inner", suffixes=("", "_truth"))
-            # Compare BP3M output a,b,c,d to the fitted truth
-            bp3m_params = [("a", "true_a"), ("b", "true_b"),
-                           ("c", "true_c"), ("d", "true_d")]
-            for bp3m_col, true_col in bp3m_params:
+            # Compare BP3M output a,b,c,d,delta_ra0_mas,delta_dec0_mas to fitted truth.
+            # Columns: (result_col, truth_col, sigma_col_in_results)
+            bp3m_params = [
+                ("a",             "true_a",              "sigma_a"),
+                ("b",             "true_b",              "sigma_b"),
+                ("c",             "true_c",              "sigma_c"),
+                ("d",             "true_d",              "sigma_d"),
+                ("delta_ra0_mas",  "true_delta_ra0_mas",  "sigma_dra0_mas"),
+                ("delta_dec0_mas", "true_delta_dec0_mas", "sigma_ddec0_mas"),
+            ]
+            for bp3m_col, true_col, _ in bp3m_params:
                 if bp3m_col in img_cmp and true_col in img_cmp:
                     img_cmp[f"resid_{bp3m_col}"] = img_cmp[bp3m_col] - img_cmp[true_col]
             img_cmp.to_csv(bp3m_dir / "synthetic_image_comparison.csv", index=False)
             print(f"\n  Image transformation residuals "
                   f"({len(img_cmp)} CCD halves, {len(img_truth)} images):")
-            print(f"  {'param':<8} {'bias':>10} {'RMS':>10}  {'pull μ':>8} {'pull σ':>8}")
-            for bp3m_col, _ in bp3m_params:
+            print(f"  {'param':<16} {'bias':>10} {'RMS':>10}  {'pull μ':>8} {'pull σ':>8}")
+            for bp3m_col, _, sig_col in bp3m_params:
                 col = f"resid_{bp3m_col}"
-                sig_col = f"sigma_{bp3m_col}"
                 if col in img_cmp:
                     r = img_cmp[col].dropna()
                     if sig_col in img_cmp:
@@ -857,7 +868,7 @@ def compare_synthetic_results(
                         pull_str = f"{pull.mean():>8.3f} {pull.std():>8.3f}"
                     else:
                         pull_str = "     n/a      n/a"
-                    print(f"  {bp3m_col:<8} {r.mean():>10.5f} {r.std():>10.5f}  {pull_str}")
+                    print(f"  {bp3m_col:<16} {r.mean():>10.5f} {r.std():>10.5f}  {pull_str}")
 
             # Per-image chi2 using full 6×6 covariance block from C_r.npy
             C_r_path = bp3m_dir / "C_r.npy"
@@ -934,11 +945,12 @@ def run_conditional_solve(
                         star_id_to_idx, image_names, star_in_image,
                         poly_order=poly_order)
 
-    # Run one EM pass with BP3M's default r_init so geometry is set up,
-    # then immediately override with r_true below.
-    r_init, _, _, _, _, _, _ = solver.fit(n_iter=1, clip_sigma=None,
-                                          inflate_hst_errors=inflate_hst_errors,
-                                          prefilter=False)
+    # Run one converged pass so rolling re-linearization accumulates Δα0/Δδ0
+    # into ra0_current; after convergence r_hat[4:6]=0 per image (true Δα0=0
+    # for synthetic data generated at transformation.csv tangent point).
+    r_hat_converged, _, _, _, _, _, _ = solver.fit(n_iter=1, clip_sigma=None,
+                                                    inflate_hst_errors=inflate_hst_errors,
+                                                    prefilter=False)
 
     # ── Build r_true vector in BP3M ordering ──────────────────────────────────
     img_truth = pd.read_csv(truth_dir / "image_truth.csv")
@@ -946,7 +958,10 @@ def run_conditional_solve(
                      for _, row in img_truth.iterrows()}
 
     nr  = solver.N_R
-    r_true_vec = r_init.copy()   # start from r_init so Δα0/Δδ0 are in place
+    # Start from converged r_hat so solver geometry (ra0_current etc.) is set;
+    # Δα0/Δδ0 (indices 4,5) are already 0 after convergence — correct for
+    # synthetic data whose true tangent point equals transformation.csv ra_cen.
+    r_true_vec = r_hat_converged.copy()
     for j_idx, img in enumerate(solver.image_names):
         # strip _hi/_lo suffix for split_ccd
         base = img.replace("_hi", "").replace("_lo", "")
@@ -1158,11 +1173,11 @@ def _compute_stellar_chi2(cmp: pd.DataFrame, v_cov_marg_path: Path,
 def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
                       bp3m_params: list, out_dir: Path) -> None:
     """
-    For each CCD half (row in img_cmp), compute chi2 for the 6-parameter
-    residual vector (a,b,c,d,w,z) using the per-image diagonal block of C_r.
+    For each CCD half (row in img_cmp), compute chi2 for the image-parameter
+    residual vector using the per-image diagonal block of C_r.
 
-    Also prints the full correlation matrix of all image parameters and saves
-    a histogram of chi2 values.
+    bp3m_params : list of (result_col, truth_col, sigma_col) triples — only
+                  entries with a non-NaN resid_ column in img_cmp are included.
     """
     try:
         import matplotlib
@@ -1172,19 +1187,37 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
         plt = None
 
     C_r = np.load(C_r_path)
-    n_r_per_img = 6          # a,b,c,d,Δα0,Δδ0 (6 params per CCD half, poly_order=1)
-    n_img = len(img_cmp)
     n_tot = C_r.shape[0]
-    param_names = ["a", "b", "c", "d", "Δα0", "Δδ0"]
 
-    print(f"\n  Per-image chi² (6 parameters: a,b,c,d,Δα0,Δδ0):")
+    # Determine n_r_per_img from C_r size and image count; fall back to 6.
+    n_img_rows = len(img_cmp)
+    if n_img_rows > 0 and n_tot % n_img_rows == 0:
+        n_r_per_img = n_tot // n_img_rows
+    else:
+        n_r_per_img = 6   # poly_order=1 default
+
+    # Build the ordered list of result columns that have residuals
+    resid_cols = [col for col, _, _ in bp3m_params
+                  if f"resid_{col}" in img_cmp.columns]
+    n_params = len(resid_cols)
+    if n_params == 0:
+        print("  Per-image chi²: no residual columns found, skipping")
+        return
+
+    # Map result_col → index in the r_j vector (a=0,b=1,c=2,d=3,Δα0=4,Δδ0=5)
+    _col_to_ridx = {"a": 0, "b": 1, "c": 2, "d": 3,
+                    "delta_ra0_mas": 4, "delta_dec0_mas": 5}
+
+    param_label = ",".join(resid_cols)
+    print(f"\n  Per-image chi² ({n_params} parameters: {param_label}):")
     print(f"  {'image':<22} {'chi2':>8}  {'dof':>4}  {'p-val':>7}")
 
+    img_sorted = img_cmp["image_name"].tolist()
     chi2_vals = []
+    row_indices_used = []
+
     for row_idx, row in img_cmp.iterrows():
         img_name = row["image_name"]
-        # Find position in the concatenated r vector
-        img_sorted = img_cmp["image_name"].tolist()
         j = img_sorted.index(img_name)
         cs = j * n_r_per_img
 
@@ -1192,12 +1225,16 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
             print(f"  {img_name:<22}  C_r too small for this image, skipping")
             continue
 
-        # 6×6 block for a,b,c,d,w,z (first 6 of 8 params)
-        C_j = C_r[cs:cs+6, cs:cs+6]
-        resid = np.array([row.get(f"resid_{p}", np.nan) for p in param_names])
+        resid = np.array([row.get(f"resid_{col}", np.nan) for col in resid_cols])
         if np.any(np.isnan(resid)):
             print(f"  {img_name:<22}  missing residuals, skipping")
             continue
+
+        # Extract the sub-block of C_r for these parameters
+        ridxs = [_col_to_ridx.get(col, k) for k, col in enumerate(resid_cols)]
+        block_idxs = [cs + ri for ri in ridxs]
+        C_j = C_r[np.ix_(block_idxs, block_idxs)]
+
         try:
             C_j_inv = np.linalg.inv(C_j)
             chi2 = float(resid @ C_j_inv @ resid)
@@ -1206,9 +1243,10 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
             continue
 
         from scipy.stats import chi2 as chi2_dist
-        pval = 1.0 - chi2_dist.cdf(chi2, df=6)
-        print(f"  {img_name:<22} {chi2:>8.3f}  {6:>4}  {pval:>7.4f}")
+        pval = 1.0 - chi2_dist.cdf(chi2, df=n_params)
+        print(f"  {img_name:<22} {chi2:>8.3f}  {n_params:>4}  {pval:>7.4f}")
         chi2_vals.append(chi2)
+        row_indices_used.append(j)
 
     if chi2_vals and plt is not None:
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -1216,9 +1254,9 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
                 label=f"N={len(chi2_vals)}")
         x = np.linspace(0, max(chi2_vals) * 1.2, 200)
         from scipy.stats import chi2 as chi2_dist
-        ax.plot(x, chi2_dist.pdf(x, df=6) * len(chi2_vals) * (x[1]-x[0]),
-                "k--", lw=1.5, label="χ²(6) expected")
-        ax.set_xlabel("χ² per image (6 dof: a,b,c,d,w,z)")
+        ax.plot(x, chi2_dist.pdf(x, df=n_params) * len(chi2_vals) * (x[1]-x[0]),
+                "k--", lw=1.5, label=f"χ²({n_params}) expected")
+        ax.set_xlabel(f"χ² per image ({n_params} dof: {param_label})")
         ax.set_ylabel("count")
         ax.legend()
         ax.set_title("Per-image transformation χ²")
@@ -1227,30 +1265,22 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
         plt.close(fig)
         print(f"  Saved: {out_dir / 'plots_syn_image_chi2.png'}")
 
-    # Global chi2 using full n_images*6 × n_images*6 joint covariance
-    img_sorted = img_cmp["image_name"].tolist()
+    # Global chi2 using full joint covariance block
     resid_all = []
-    row_indices = []
-    for img_name in img_sorted:
-        j = img_sorted.index(img_name)
+    idx_all = []
+    for j in row_indices_used:
         cs = j * n_r_per_img
-        if cs + n_r_per_img > n_tot:
-            continue
-        row = img_cmp[img_cmp["image_name"] == img_name].iloc[0]
-        rv = np.array([row.get(f"resid_{p}", np.nan) for p in param_names])
+        row = img_cmp[img_cmp["image_name"] == img_sorted[j]].iloc[0]
+        rv = np.array([row.get(f"resid_{col}", np.nan) for col in resid_cols])
         if np.any(np.isnan(rv)):
             continue
+        ridxs = [_col_to_ridx.get(col, k) for k, col in enumerate(resid_cols)]
         resid_all.append(rv)
-        row_indices.append(j)
+        idx_all.extend([cs + ri for ri in ridxs])
 
     if len(resid_all) >= 2:
         resid_vec = np.concatenate(resid_all)
-        # Build index list for the full covariance block
-        idx = []
-        for j in row_indices:
-            cs = j * n_r_per_img
-            idx.extend(range(cs, cs + 6))
-        C_full_block = C_r[np.ix_(idx, idx)]
+        C_full_block = C_r[np.ix_(idx_all, idx_all)]
         try:
             C_inv = np.linalg.inv(C_full_block)
             chi2_global = float(resid_vec @ C_inv @ resid_vec)
