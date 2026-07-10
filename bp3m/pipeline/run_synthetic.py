@@ -90,6 +90,10 @@ def main():
                         help='Scale all Gaia position/PM/parallax uncertainties in the '
                              'synthetic catalog by this factor before the solver run '
                              '(values << 1 make Gaia effectively perfect). Default 1.0.')
+    parser.add_argument('--scale_hst_errors', type=float, default=1.0,
+                        help='Scale all HST pixel position uncertainties (cov_xx/yy/xy_gdc) '
+                             'by this factor during synthetic data generation '
+                             '(values << 1 make HST positions effectively perfect). Default 1.0.')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -120,25 +124,58 @@ def main():
         images=args.images,
         split_ccd=not args.no_split_ccd,
         true_gaia=args.true_gaia,
+        scale_hst_errors=args.scale_hst_errors,
     )
 
     # ── Optional: scale Gaia errors in synthetic catalog ─────────────────────
     if args.scale_gaia_errors != 1.0:
         import pandas as pd
+        import numpy as np
         gaia_dir = syn_dir / "Gaia"
+
+        # When scale << 1 without --true_gaia, the original Gaia catalog values
+        # (which can have negative parallaxes) would create priors inconsistent
+        # with the positive true parallaxes we drew.  Fix by syncing observed
+        # values (ra/dec/pmra/pmdec/parallax) to the drawn truth first.
+        if not args.true_gaia:
+            truth_path = syn_dir / "truth" / "stellar_truth.csv"
+            if truth_path.exists():
+                # truth_df contains v_true offsets: for 5p stars, v_true = truth - catalog;
+                # we add them to the catalog to recover the physical truth used in forward model.
+                truth_df = pd.read_csv(truth_path)
+                truth_df["gaia_source_id"] = truth_df["gaia_source_id"].astype(np.int64)
+                truth_idx = truth_df.set_index("gaia_source_id")
+                n_neg = 0
+                for csv_path in gaia_dir.glob("*_synthetic_gaia.csv"):
+                    gaia_df = pd.read_csv(csv_path)
+                    # Align truth rows to Gaia catalog rows (both keyed by source_id)
+                    t = truth_idx.reindex(gaia_df["source_id"].values)
+                    cos_dec = np.cos(np.radians(gaia_df["dec"].values))
+                    gaia_df["ra"]  = gaia_df["ra"]  + t["true_delta_racosdec"].values / (cos_dec * 3.6e6)
+                    gaia_df["dec"] = gaia_df["dec"] + t["true_delta_dec"].values / 3.6e6
+                    # Update PM/parallax for 5p stars (non-NaN pmra in Gaia catalog)
+                    has_pm = gaia_df["pmra"].notna().values
+                    if has_pm.any():
+                        gaia_df.loc[has_pm, "pmra"]     = (gaia_df["pmra"].values[has_pm]
+                                                           + t["true_pmra"].values[has_pm])
+                        gaia_df.loc[has_pm, "pmdec"]    = (gaia_df["pmdec"].values[has_pm]
+                                                           + t["true_pmdec"].values[has_pm])
+                        gaia_df.loc[has_pm, "parallax"] = (gaia_df["parallax"].values[has_pm]
+                                                           + t["true_parallax"].values[has_pm])
+                    n_neg += int((gaia_df["parallax"].dropna() < 0).sum())
+                    gaia_df.to_csv(csv_path, index=False)
+                print(f"  Synced Gaia observed values to drawn truth "
+                      f"({n_neg} negative parallaxes remaining after sync)")
+            else:
+                print("  WARNING: stellar_truth.csv not found; Gaia observed values "
+                      "may be inconsistent with drawn truth (negative parallaxes possible)")
+
         for csv_path in gaia_dir.glob("*_synthetic_gaia.csv"):
             gaia_df = pd.read_csv(csv_path)
             err_cols = [c for c in gaia_df.columns
                         if c.endswith('_error') or c in ('ra_error', 'dec_error')]
             for col in err_cols:
                 gaia_df[col] = gaia_df[col] * args.scale_gaia_errors
-            # Also scale covariance entries (they go as scale²)
-            cov_cols = [c for c in gaia_df.columns
-                        if 'corr' not in c and any(
-                            c.startswith(p) for p in
-                            ('pmra_pmdec', 'ra_dec', 'ra_pmra', 'ra_pmdec',
-                             'dec_pmra', 'dec_pmdec', 'pmra_parallax', 'pmdec_parallax',
-                             'ra_parallax', 'dec_parallax'))]
             # correlation columns are dimensionless — leave them unchanged
             gaia_df.to_csv(csv_path, index=False)
             print(f"  Scaled Gaia errors by {args.scale_gaia_errors:.3g} in {csv_path.name}")

@@ -212,7 +212,8 @@ def _propagate(df: pd.DataFrame, mjd: float) -> tuple[np.ndarray, np.ndarray]:
 
 def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,
                               hst_idx: np.ndarray,
-                              x_syn: np.ndarray, y_syn: np.ndarray) -> None:
+                              x_syn: np.ndarray, y_syn: np.ndarray,
+                              scale_hst_errors: float = 1.0) -> None:
     """
     Write dst_catalog containing ONLY the hst_idx rows from src_catalog, with
     x_gdc/y_gdc replaced by the synthetic pixel coordinates and n_sat cleared.
@@ -221,7 +222,10 @@ def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,
     (~500 rows) instead of the full detector catalog (~40k rows).  The row
     indices in the output are 0..N-1, and the hst_index column in matched_gaia.csv
     is rewritten (by the caller) to use these compact indices.
+
+    scale_hst_errors: multiply all cov_xx/yy/xy_gdc entries by scale_hst_errors².
     """
+    cov_scale2 = scale_hst_errors ** 2
     with afits.open(src_catalog, memmap=False) as src:
         bintable = src[1]
         new_cols = []
@@ -233,6 +237,8 @@ def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,
                 arr[:] = y_syn
             elif col.name == "n_sat":
                 arr[:] = 0
+            elif col.name in ("cov_xx_gdc", "cov_yy_gdc", "cov_xy_gdc") and cov_scale2 != 1.0:
+                arr[:] = arr * cov_scale2
             new_cols.append(afits.Column(name=col.name, format=col.format,
                                           array=arr, unit=col.unit))
         new_bin  = afits.BinTableHDU.from_columns(new_cols)
@@ -277,6 +283,7 @@ def generate_synthetic_data(
     true_parallax_width: float = 0.1,
     syn_name: str = "synthetic",
     split_ccd: bool = True,
+    scale_hst_errors: float = 1.0,
 ) -> Path:
     """
     Generate synthetic HST observations and write a synthetic data tree.
@@ -865,10 +872,11 @@ def generate_synthetic_data(
                 **abcd,
             )]
 
-        # Draw noise from real per-star covariance
+        # Draw noise from real per-star covariance (optionally scaled)
         cov_xx = info["cat_cov_xx"][hst_idx]
         cov_yy = info["cat_cov_yy"][hst_idx]
         cov_xy = info["cat_cov_xy"][hst_idx]
+        _hst_cov_scale2 = scale_hst_errors ** 2
         noise_xy = np.zeros((len(hst_idx), 2))
         for k in range(len(hst_idx)):
             C_k = np.array([[max(cov_xx[k], 1e-8), cov_xy[k]],
@@ -876,7 +884,7 @@ def generate_synthetic_data(
             eigv = np.linalg.eigvalsh(C_k)
             if eigv[0] < 0:
                 C_k += (-eigv[0] + 1e-10) * np.eye(2)
-            noise_xy[k] = rng.multivariate_normal([0., 0.], C_k)
+            noise_xy[k] = rng.multivariate_normal([0., 0.], C_k * _hst_cov_scale2)
 
         x_syn = x_pred + noise_xy[:, 0]
         y_syn = y_pred + noise_xy[:, 1]
@@ -919,6 +927,7 @@ def generate_synthetic_data(
             hst_idx=hst_idx,
             x_syn=x_syn,
             y_syn=y_syn,
+            scale_hst_errors=scale_hst_errors,
         )
 
         # Update CHIP{n}_CRVAL1/2 in catalog header with drawn pointing offset
