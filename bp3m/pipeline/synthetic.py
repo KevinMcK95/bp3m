@@ -480,17 +480,26 @@ def generate_synthetic_data(
         # Useful only to verify BP3M is unbiased when handed perfect data.
         print(f"  true_gaia mode: truth = Gaia catalog values, no prior draw")
     else:
+        from scipy.stats import truncnorm as _truncnorm
+
         # Default: draw the full 5D offset from the Gaia covariance.
         # For 5/6-param stars: full 5D draw from inflated Gaia covariance.
-        # No positive-parallax enforcement: for Leo I (d~258 kpc) the true parallax
-        # is ~0.004 mas, unresolvable by either HST or Gaia, so whether the drawn
-        # "true parallax" is slightly negative is irrelevant to the astrometric test.
-        # Enforcing positivity biases v_true[4] positive for the ~50% of stars with
-        # negative Gaia parallax measurements, creating a systematic pull_parallax
-        # bias that does not reflect any real pipeline issue.
+        # Enforce: true parallax (= gaia_plx + v_true[4]) must be positive.
         plx_gaia_5p = gaia_obs["parallax"].values.astype(float)
+        n_plx_truncated = 0
         for i in np.where(has_pm)[0]:
             v_true[i] = rng.multivariate_normal(np.zeros(5), C_gaia[i])
+            # Truncate parallax component if needed so true_plx > 0
+            plx_sigma = float(np.sqrt(max(C_gaia[i, 4, 4], 1e-20)))
+            if plx_gaia_5p[i] + v_true[i, 4] <= 0.0:
+                a_lo = -plx_gaia_5p[i] / plx_sigma   # lower truncation in σ units
+                v_true[i, 4] = float(
+                    _truncnorm.rvs(a_lo, np.inf, loc=0.0, scale=plx_sigma,
+                                   random_state=rng))
+                n_plx_truncated += 1
+        if n_plx_truncated:
+            print(f"  {n_plx_truncated} 5p star(s) had plx component resampled "
+                  f"to enforce true_plx > 0")
 
         # For 2-param stars: position from 2×2 Gaia covariance; PMs and parallax
         # drawn to match the empirical distribution of the 5p/6p stars' true values.
@@ -522,14 +531,17 @@ def generate_synthetic_data(
             v_true[no_pm_idx, 2] = rng.normal(pmra_med,  pmra_sig,  n_no_pm)
             v_true[no_pm_idx, 3] = rng.normal(pmdec_med, pmdec_sig, n_no_pm)
 
-            # Parallax: unconstrained Gaussian matching 5p distribution.
-            # No positive enforcement — see comment on 5p draw above.
-            v_true[no_pm_idx, 4] = rng.normal(plx_med, plx_sig, n_no_pm)
+            # Parallax: truncated normal with lower bound at 0 (true plx must be > 0)
+            # For 2p stars v_true[i, 4] IS the true parallax (no Gaia measurement).
+            a_lo_plx = -plx_med / plx_sig
+            v_true[no_pm_idx, 4] = _truncnorm.rvs(
+                a_lo_plx, np.inf, loc=plx_med, scale=plx_sig,
+                size=n_no_pm, random_state=rng)
 
             print(f"  {n_no_pm} 2-param stars: position from Gaia 2×2 cov; "
                   f"PM from 5p empirical N({pmra_med:.2f},{pmdec_med:.2f}) "
                   f"±({pmra_sig:.2f},{pmdec_sig:.2f}) mas/yr; "
-                  f"plx from N({plx_med:.3f}, {plx_sig:.3f}) mas (no truncation)")
+                  f"plx from TN({plx_med:.3f}, {plx_sig:.3f}, >0) mas")
 
         pos_rms = float(np.sqrt(np.mean(v_true[:, 0]**2 + v_true[:, 1]**2) / 2))
         print(f"  True astrometry offset drawn from Gaia covariance "
