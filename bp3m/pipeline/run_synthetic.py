@@ -82,6 +82,14 @@ def main():
                         help='Disable alignment parameter prior during BP3M fit '
                              '(sets a,b,c,d,delta_ra0,delta_dec0 prior precision to zero). '
                              'Useful for diagnosing prior-driven biases.')
+    parser.add_argument('--true_gaia', action='store_true',
+                        help='Set true stellar values = Gaia catalog (no stellar noise in '
+                             'truth). Useful for isolating image-transformation bias from '
+                             'stellar estimation noise.')
+    parser.add_argument('--scale_gaia_errors', type=float, default=1.0,
+                        help='Scale all Gaia position/PM/parallax uncertainties in the '
+                             'synthetic catalog by this factor before the solver run '
+                             '(values << 1 make Gaia effectively perfect). Default 1.0.')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -111,7 +119,29 @@ def main():
         zero_parallax=args.zero_parallax,
         images=args.images,
         split_ccd=not args.no_split_ccd,
+        true_gaia=args.true_gaia,
     )
+
+    # ── Optional: scale Gaia errors in synthetic catalog ─────────────────────
+    if args.scale_gaia_errors != 1.0:
+        import pandas as pd
+        gaia_dir = syn_dir / "Gaia"
+        for csv_path in gaia_dir.glob("*_synthetic_gaia.csv"):
+            gaia_df = pd.read_csv(csv_path)
+            err_cols = [c for c in gaia_df.columns
+                        if c.endswith('_error') or c in ('ra_error', 'dec_error')]
+            for col in err_cols:
+                gaia_df[col] = gaia_df[col] * args.scale_gaia_errors
+            # Also scale covariance entries (they go as scale²)
+            cov_cols = [c for c in gaia_df.columns
+                        if 'corr' not in c and any(
+                            c.startswith(p) for p in
+                            ('pmra_pmdec', 'ra_dec', 'ra_pmra', 'ra_pmdec',
+                             'dec_pmra', 'dec_pmdec', 'pmra_parallax', 'pmdec_parallax',
+                             'ra_parallax', 'dec_parallax'))]
+            # correlation columns are dimensionless — leave them unchanged
+            gaia_df.to_csv(csv_path, index=False)
+            print(f"  Scaled Gaia errors by {args.scale_gaia_errors:.3g} in {csv_path.name}")
 
     if args.skip_run:
         print(f"\nSynthetic data written to {syn_dir}")
