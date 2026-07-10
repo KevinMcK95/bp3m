@@ -1519,6 +1519,28 @@ def _plot_cond_pulls(pull_cond: np.ndarray, param_labels: list, out_dir: Path) -
     plt.close(fig)
 
 
+# ── covariance inversion helper ──────────────────────────────────────────────
+
+def _scaled_cov_chi2(C: np.ndarray, resid: np.ndarray) -> float:
+    """
+    Compute resid^T C^{-1} resid with diagonal pre-scaling for numerical stability.
+
+    Equivalent to working in the correlation matrix space:
+        sigma = sqrt(diag(C))
+        C_corr = C / outer(sigma, sigma)   (condition number ~O(10) vs ~O(10^14))
+        resid_s = resid / sigma
+        chi2 = resid_s @ solve(C_corr, resid_s)
+
+    Raises np.linalg.LinAlgError if C_corr is singular.
+    """
+    sigma = np.sqrt(np.diag(C))
+    if np.any(sigma == 0):
+        raise np.linalg.LinAlgError("zero diagonal in covariance block")
+    C_corr = C / np.outer(sigma, sigma)
+    resid_s = resid / sigma
+    return float(resid_s @ np.linalg.solve(C_corr, resid_s))
+
+
 # ── stellar 5D chi2 ──────────────────────────────────────────────────────────
 
 def _compute_stellar_chi2(cmp: pd.DataFrame, v_cov_marg_path: Path,
@@ -1569,7 +1591,7 @@ def _compute_stellar_chi2(cmp: pd.DataFrame, v_cov_marg_path: Path,
             continue
         C_i = C_full[bp3m_row]
         try:
-            chi2_vals[k] = float(dv @ np.linalg.inv(C_i) @ dv)
+            chi2_vals[k] = _scaled_cov_chi2(C_i, dv)
         except np.linalg.LinAlgError:
             pass
 
@@ -1596,7 +1618,8 @@ def _compute_stellar_chi2(cmp: pd.DataFrame, v_cov_marg_path: Path,
         print(f"  Saved: {out_dir / 'plots_syn_stellar_chi2.png'}")
 
 
-# ── image chi2 and covariance ─────────────────────────────────────────────────
+# ── image chi2 ────────────────────────────────────────────────────────────────
+
 
 def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
                       bp3m_params: list, out_dir: Path) -> None:
@@ -1664,8 +1687,7 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
         C_j = C_r[np.ix_(block_idxs, block_idxs)]
 
         try:
-            C_j_inv = np.linalg.inv(C_j)
-            chi2 = float(resid @ C_j_inv @ resid)
+            chi2 = _scaled_cov_chi2(C_j, resid)
         except np.linalg.LinAlgError:
             print(f"  {img_name:<22}  singular C_r block, skipping")
             continue
@@ -1711,8 +1733,7 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
         resid_vec = np.concatenate(resid_all)
         C_full_block = C_r[np.ix_(idx_all, idx_all)]
         try:
-            C_inv = np.linalg.inv(C_full_block)
-            chi2_global = float(resid_vec @ C_inv @ resid_vec)
+            chi2_global = _scaled_cov_chi2(C_full_block, resid_vec)
             dof_global = len(resid_vec)
             from scipy.stats import chi2 as chi2_dist
             pval_global = 1.0 - chi2_dist.cdf(chi2_global, df=dof_global)
