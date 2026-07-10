@@ -1260,7 +1260,18 @@ def compare_synthetic_results(
             for bp3m_col, true_col, _ in bp3m_params:
                 if bp3m_col in img_cmp and true_col in img_cmp:
                     img_cmp[f"resid_{bp3m_col}"] = img_cmp[bp3m_col] - img_cmp[true_col]
-            img_cmp.to_csv(bp3m_dir / "synthetic_image_comparison.csv", index=False)
+
+            # Pulls (resid / sigma) and diagonal chi2_6d
+            for bp3m_col, _, sig_col in bp3m_params:
+                rcol = f"resid_{bp3m_col}"
+                pcol = f"pull_{bp3m_col}"
+                if rcol in img_cmp.columns and sig_col in img_cmp.columns:
+                    img_cmp[pcol] = img_cmp[rcol] / img_cmp[sig_col].replace(0, np.nan)
+            pull_cols = [f"pull_{col}" for col, _, _ in bp3m_params
+                         if f"pull_{col}" in img_cmp.columns]
+            if pull_cols:
+                img_cmp["chi2_6d"] = img_cmp[pull_cols].pow(2).sum(axis=1, min_count=1)
+
             print(f"\n  Image transformation residuals "
                   f"({len(img_cmp)} CCD halves, {len(img_truth)} images):")
             print(f"  {'param':<16} {'bias':>10} {'RMS':>10}  {'pull μ':>8} {'pull σ':>8}")
@@ -1276,9 +1287,12 @@ def compare_synthetic_results(
                     print(f"  {bp3m_col:<16} {r.mean():>10.5f} {r.std():>10.5f}  {pull_str}")
 
             # Per-image chi2 using full 6×6 covariance block from C_r.npy
+            # (adds chi2_Cr column to img_cmp in-place)
             C_r_path = bp3m_dir / "C_r.npy"
             if C_r_path.exists():
                 _print_image_chi2(img_cmp, C_r_path, bp3m_params, bp3m_dir)
+
+            img_cmp.to_csv(bp3m_dir / "synthetic_image_comparison.csv", index=False)
 
         else:
             img_results.to_csv(bp3m_dir / "synthetic_image_comparison.csv", index=False)
@@ -1661,6 +1675,7 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
         print(f"  {img_name:<22} {chi2:>8.3f}  {n_params:>4}  {pval:>7.4f}")
         chi2_vals.append(chi2)
         row_indices_used.append(j)
+        img_cmp.loc[row_idx, "chi2_Cr"] = chi2
 
     if chi2_vals and plt is not None:
         fig, ax = plt.subplots(figsize=(6, 4))
