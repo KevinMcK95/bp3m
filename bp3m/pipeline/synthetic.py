@@ -213,10 +213,13 @@ def _propagate(df: pd.DataFrame, mjd: float) -> tuple[np.ndarray, np.ndarray]:
 def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,
                               hst_idx: np.ndarray,
                               x_syn: np.ndarray, y_syn: np.ndarray,
+                              x_raw_new: np.ndarray | None = None,
+                              y_raw_new: np.ndarray | None = None,
                               scale_hst_errors: float = 1.0) -> None:
     """
     Write dst_catalog containing ONLY the hst_idx rows from src_catalog, with
-    x_gdc/y_gdc replaced by the synthetic pixel coordinates and n_sat cleared.
+    x_gdc/y_gdc replaced by the synthetic pixel coordinates, x/y raw columns
+    updated from the inverse GDC approximation, and n_sat cleared.
 
     Trimming to matched rows only keeps catalog size proportional to detections
     (~500 rows) instead of the full detector catalog (~40k rows).  The row
@@ -224,6 +227,8 @@ def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,
     is rewritten (by the caller) to use these compact indices.
 
     scale_hst_errors: multiply all cov_xx/yy/xy_gdc entries by scale_hst_errors².
+    x_raw_new / y_raw_new: updated raw detector coords from inverse GDC; if None,
+    the original raw coords are preserved (backward-compatible default).
     """
     cov_scale2 = scale_hst_errors ** 2
     with afits.open(src_catalog, memmap=False) as src:
@@ -235,6 +240,10 @@ def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,
                 arr[:] = x_syn
             elif col.name == "y_gdc":
                 arr[:] = y_syn
+            elif col.name == "x" and x_raw_new is not None:
+                arr[:] = x_raw_new
+            elif col.name == "y" and y_raw_new is not None:
+                arr[:] = y_raw_new
             elif col.name == "n_sat":
                 arr[:] = 0
             elif col.name in ("cov_xx_gdc", "cov_yy_gdc", "cov_xy_gdc") and cov_scale2 != 1.0:
@@ -431,6 +440,7 @@ def generate_synthetic_data(
             cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
             cat_x_gdc  = tbl["x_gdc"].astype(float)
             cat_y_gdc  = tbl["y_gdc"].astype(float)
+            cat_x_raw  = tbl["x"].astype(float)    # raw detector X for inverse GDC
             cat_y_raw  = tbl["y"].astype(float)    # raw detector Y for chip assignment
 
         chip_info = _read_chip_info(flc_path, cat_path)
@@ -441,7 +451,8 @@ def generate_synthetic_data(
             transform=t, mjd=_mjd_from_flc(flc_path),
             match=match,
             cat_cov_xx=cat_cov_xx, cat_cov_yy=cat_cov_yy, cat_cov_xy=cat_cov_xy,
-            cat_x_gdc=cat_x_gdc, cat_y_gdc=cat_y_gdc, cat_y_raw=cat_y_raw,
+            cat_x_gdc=cat_x_gdc, cat_y_gdc=cat_y_gdc,
+            cat_x_raw=cat_x_raw, cat_y_raw=cat_y_raw,
             **chip_info,  # y_split, chip_pointing_lo, chip_pointing_hi
         )
 
@@ -697,6 +708,48 @@ def generate_synthetic_data(
               f"(σ_pmra={med_pmra_err:.3f}, σ_pmdec={med_pmdec_err:.3f}, "
               f"σ_plx={med_plx_err:.3f} mas)")
 
+    # ── Draw fresh Gaia observations from N(gaia_true, C_gaia) ──────────────────
+    # The synthetic Gaia catalog (gaia_syn) must be a proper noisy measurement
+    # of the physical truth (gaia_true).  After truncnorm enforcement on parallax,
+    # gaia_obs (used as gaia_syn so far) is no longer consistent with gaia_true:
+    # the "noise" = gaia_obs − gaia_true = −v_true is biased.  Fix: draw fresh
+    # noise from N(0, C_gaia), add to gaia_true, and update v_true = −noise.
+    # Result: v_true is zero-mean by construction.
+    # Skip: (a) true_gaia — no Gaia noise at all; (b) _pm_parallax_override —
+    # already uses the correct generative model for PM/parallax parameters.
+    if not true_gaia and not _pm_parallax_override:
+        fresh_noise = np.zeros((N, 5))
+        for _i in range(N):
+            fresh_noise[_i] = rng.multivariate_normal(np.zeros(5), C_gaia[_i])
+
+        gt_ra  = gaia_true["ra"].values
+        gt_dec = gaia_true["dec"].values
+
+        # Position update for ALL stars (5p and 2p)
+        gaia_syn["ra"]  = gt_ra  + fresh_noise[:, 0] / (cos_dec * 3.6e6)
+        gaia_syn["dec"] = gt_dec + fresh_noise[:, 1] / 3.6e6
+        v_true[:, 0] = -fresh_noise[:, 0]
+        v_true[:, 1] = -fresh_noise[:, 1]
+
+        # 5p/6p stars: also refresh PM and parallax
+        if has_pm.any():
+            pm_idx = np.where(has_pm)[0]
+            gt_pmra  = gaia_true["pmra"].values[pm_idx]
+            gt_pmdec = gaia_true["pmdec"].values[pm_idx]
+            gt_plx   = gaia_true["parallax"].values[pm_idx]
+            gaia_syn.loc[has_pm, "pmra"]     = gt_pmra  + fresh_noise[pm_idx, 2]
+            gaia_syn.loc[has_pm, "pmdec"]    = gt_pmdec + fresh_noise[pm_idx, 3]
+            gaia_syn.loc[has_pm, "parallax"] = gt_plx   + fresh_noise[pm_idx, 4]
+            v_true[pm_idx, 2] = -fresh_noise[pm_idx, 2]
+            v_true[pm_idx, 3] = -fresh_noise[pm_idx, 3]
+            v_true[pm_idx, 4] = -fresh_noise[pm_idx, 4]
+            # 2p star v_true[2:5] (population PM/parallax draw) is unchanged
+
+        n_5p_fresh = int(has_pm.sum())
+        n_2p_fresh = N - n_5p_fresh
+        print(f"  Fresh Gaia draw from N(truth, C_gaia): "
+              f"{n_5p_fresh} 5p (all 5 params) + {n_2p_fresh} 2p (position only)")
+
     # ── Create output directories ─────────────────────────────────────────────
     syn_gaia  = syn_dir / "Gaia"
     syn_hst   = syn_dir / tel_upper / "mastDownload" / tel_upper
@@ -889,6 +942,52 @@ def generate_synthetic_data(
         x_syn = x_pred + noise_xy[:, 0]
         y_syn = y_pred + noise_xy[:, 1]
 
+        # ── Compute raw (x, y) from synthetic GDC positions ───────────────────
+        # Inverse GDC approximation: the per-star GDC correction (gdc − raw) is
+        # treated as locally constant.  This correctly propagates PM/parallax
+        # motion into the raw pixel coordinate used for hi/lo chip assignment.
+        x_gdc_orig = info["cat_x_gdc"][hst_idx]
+        y_gdc_orig = info["cat_y_gdc"][hst_idx]
+        x_raw_orig = info["cat_x_raw"][hst_idx]
+        y_raw_orig = info["cat_y_raw"][hst_idx]
+        delta_x_gdc = x_gdc_orig - x_raw_orig   # GDC correction in x
+        delta_y_gdc = y_gdc_orig - y_raw_orig   # GDC correction in y
+        x_raw_new = x_syn - delta_x_gdc
+        y_raw_new = y_syn - delta_y_gdc
+
+        # In split-CCD mode, check whether any star's new raw y crosses the
+        # chip boundary and recompute those stars with the correct tangent point.
+        if split_ccd and chip_lo is not None and chip_hi is not None:
+            y_split_val = info.get("y_split", 2048.0)
+            is_lo_new = y_raw_new <= y_split_val
+            crossed = is_lo_mask != is_lo_new
+            if crossed.any():
+                n_crossed = int(crossed.sum())
+                print(f"    {img_name}: {n_crossed} star(s) crossed chip boundary "
+                      f"after PM/parallax propagation — recomputing with correct chip")
+                # Stars that were lo but are now hi
+                to_hi = crossed & ~is_lo_new
+                if to_hi.any():
+                    xs_h, ys_h = _plane_project(
+                        ra_p[to_hi], dec_p[to_hi], ra0_hi, dec0_hi, pscale_mas)
+                    dxy_h = (Minv @ np.vstack([xs_h, ys_h])).T
+                    x_pred[to_hi] = Xo_hi + dxy_h[:, 0]
+                    y_pred[to_hi] = Yo_hi + dxy_h[:, 1]
+                # Stars that were hi but are now lo
+                to_lo = crossed & is_lo_new
+                if to_lo.any():
+                    xs_l, ys_l = _plane_project(
+                        ra_p[to_lo], dec_p[to_lo], ra0_lo, dec0_lo, pscale_mas)
+                    dxy_l = (Minv @ np.vstack([xs_l, ys_l])).T
+                    x_pred[to_lo] = Xo_lo + dxy_l[:, 0]
+                    y_pred[to_lo] = Yo_lo + dxy_l[:, 1]
+                # Recompute x/y_syn for crossed stars (keep same noise draw)
+                x_syn[crossed] = x_pred[crossed] + noise_xy[crossed, 0]
+                y_syn[crossed] = y_pred[crossed] + noise_xy[crossed, 1]
+                # Recompute raw coords for crossed stars
+                x_raw_new[crossed] = x_syn[crossed] - delta_x_gdc[crossed]
+                y_raw_new[crossed] = y_syn[crossed] - delta_y_gdc[crossed]
+
         # Write synthetic image directory
         syn_img = syn_hst / img_name
         syn_img.mkdir(parents=True, exist_ok=True)
@@ -927,6 +1026,8 @@ def generate_synthetic_data(
             hst_idx=hst_idx,
             x_syn=x_syn,
             y_syn=y_syn,
+            x_raw_new=x_raw_new,
+            y_raw_new=y_raw_new,
             scale_hst_errors=scale_hst_errors,
         )
 
