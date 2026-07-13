@@ -456,3 +456,24 @@ def download_gaia_qso_candidates(
     except Exception as e:
         print(f"  WARNING: qso_candidates download failed — {e}")
         return None
+
+
+def find_qso_catalogs(lib_dir: Path | None) -> dict[str, Path | None]:
+    """Return paths to the MILLIQUAS and Quaia FITS files in lib_dir.
+
+    Returns a dict with keys 'quaia' and 'milliquas', each either a Path to
+    the FITS file or None if not found.  Call from the field cross-match step
+    to locate the reference catalogs for QSO vetting.
+    """
+    result: dict[str, Path | None] = {'quaia': None, 'milliquas': None}
+    if lib_dir is None:
+        return result
+    qso_dir = Path(lib_dir) / "qso_catalogs"
+    if not qso_dir.exists():
+        return result
+    for name, filename in (('quaia', 'quaia_G20.5.fits'),
+                            ('milliquas', 'milliquas.fits')):
+        p = qso_dir / filename
+        if p.exists():
+            result[name] = p
+    return result

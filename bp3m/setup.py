@@ -1,13 +1,32 @@
-"""bp3m-setup: Download HST PSF and GDC library files from STScI."""
+"""bp3m-setup: Download HST PSF/GDC library files and QSO reference catalogs."""
 
 import argparse
 import re
 import sys
+import zipfile
 from pathlib import Path
 from urllib.request import urlopen, urlretrieve
 from urllib.error import URLError
 
 BASE_URL = "https://www.stsci.edu/~jayander/HST1PASS/LIB"
+
+# ── QSO reference catalog URLs ───────────────────────────────────────────────
+# Quaia: Storey-Fisher et al. 2024 (Gaia DR3 + unWISE photometric QSOs).
+# Zenodo DOI 10.5281/zenodo.10403370 — stable version-locked URL.
+# Key columns: source_id (Gaia DR3 int64), ra, dec, redshift_quaia,
+#              phot_g_mean_mag, mag_w1_vg, mag_w2_vg.
+_QUAIA_URL = (
+    "https://zenodo.org/records/10403370/files/quaia_G20.5.fits?download=1"
+)
+_QUAIA_FILENAME = "quaia_G20.5.fits"
+
+# MILLIQUAS v8: Flesch 2023 — Final Edition (~907 k spectroscopic + ~66 k
+# radio/X-ray candidates).  No Gaia source_id; positions for ~61% of sources
+# use Gaia EDR3 astrometry (flagged by 'G' in the Comment column), giving
+# sub-arcsec accuracy.  Cross-match against Gaia must be positional.
+# Key columns: RA/RAdeg, Dec/DEdeg, Name, Type, z/Redshift, Comment.
+_MILLIQUAS_URL = "https://quasars.org/milliquas.fits.zip"
+_MILLIQUAS_FILENAME = "milliquas.fits"
 
 def _bp3m_home() -> Path:
     """Base directory for bp3m config and default lib. Override with BP3M_HOME."""
@@ -48,6 +67,55 @@ def _download(url: str, dest: Path) -> bool:
         print(f"  ERROR downloading {url}: {e}")
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+        return False
+
+
+def _download_large(url: str, dest: Path, label: str = '') -> bool:
+    """Download a large file with MB-progress display. Returns True on success."""
+    import urllib.request
+    tmp = dest.with_suffix('.tmp')
+    try:
+        shown_mb = [0]
+        def _hook(block, block_size, total):
+            mb = block * block_size / 1e6
+            if mb - shown_mb[0] >= 20:
+                shown_mb[0] = int(mb / 20) * 20
+                tot = f'/{total/1e6:.0f} MB' if total > 0 else ''
+                print(f'    {label}: {mb:.0f}{tot} MB...', end='\r', flush=True)
+        urllib.request.urlretrieve(url, str(tmp), _hook)
+        print()
+        tmp.rename(dest)
+        return True
+    except Exception as e:
+        print(f'\n  ERROR downloading {label}: {e}')
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        return False
+
+
+def _download_and_extract_zip(url: str, dest_fits: Path, label: str = '') -> bool:
+    """Download a zip, extract the first .fits inside, delete the zip."""
+    zip_tmp = dest_fits.with_suffix('.zip.tmp')
+    if not _download_large(url, zip_tmp, label):
+        return False
+    try:
+        with zipfile.ZipFile(zip_tmp) as zf:
+            fits_names = [n for n in zf.namelist() if n.lower().endswith('.fits')]
+            if not fits_names:
+                print(f'  ERROR: no .fits file found inside {zip_tmp.name}')
+                zip_tmp.unlink(missing_ok=True)
+                return False
+            name = fits_names[0]
+            print(f'    Extracting {name}...')
+            tmp = dest_fits.with_suffix('.extract.tmp')
+            with zf.open(name) as src, open(tmp, 'wb') as dst:
+                dst.write(src.read())
+            tmp.rename(dest_fits)
+        zip_tmp.unlink(missing_ok=True)
+        return True
+    except Exception as e:
+        print(f'  ERROR extracting {label}: {e}')
+        zip_tmp.unlink(missing_ok=True)
         return False
 
 
@@ -96,6 +164,13 @@ def main():
         "--force",
         action="store_true",
         help="Re-download files that already exist locally",
+    )
+    p.add_argument(
+        "--no-qso-catalogs",
+        action="store_true",
+        help="Skip downloading MILLIQUAS v8 and Quaia QSO reference catalogs "
+             "(saved to lib_dir/qso_catalogs/; used to vet Gaia qso_candidates "
+             "before assigning QSO anchor status)",
     )
     args = p.parse_args()
 
@@ -168,6 +243,43 @@ def main():
                     n_ok += 1
                 else:
                     n_err += 1
+        print()
+
+    # ── QSO reference catalogs ────────────────────────────────────────────────
+    if not args.no_qso_catalogs:
+        print("Downloading QSO reference catalogs...")
+        qso_dir = lib_dir / "qso_catalogs"
+        qso_dir.mkdir(parents=True, exist_ok=True)
+
+        # Quaia — Gaia DR3 + unWISE photometric QSO catalog (~171 MB FITS)
+        quaia_dest = qso_dir / _QUAIA_FILENAME
+        if quaia_dest.exists() and not args.force:
+            sz = quaia_dest.stat().st_size / 1e6
+            print(f"  Quaia: already present ({sz:.0f} MB)")
+            n_skip += 1
+        else:
+            print(f"  Quaia G<20.5 (Storey-Fisher et al. 2024, ~171 MB FITS):")
+            if _download_large(_QUAIA_URL, quaia_dest, 'Quaia'):
+                sz = quaia_dest.stat().st_size / 1e6
+                print(f"  Saved: {quaia_dest} ({sz:.0f} MB)")
+                n_ok += 1
+            else:
+                n_err += 1
+
+        # MILLIQUAS v8 — spectroscopic + photometric QSOs (~40 MB zip → FITS)
+        milliquas_dest = qso_dir / _MILLIQUAS_FILENAME
+        if milliquas_dest.exists() and not args.force:
+            sz = milliquas_dest.stat().st_size / 1e6
+            print(f"  MILLIQUAS: already present ({sz:.0f} MB)")
+            n_skip += 1
+        else:
+            print(f"  MILLIQUAS v8 (Flesch 2023, ~40 MB zip → FITS):")
+            if _download_and_extract_zip(_MILLIQUAS_URL, milliquas_dest, 'MILLIQUAS'):
+                sz = milliquas_dest.stat().st_size / 1e6
+                print(f"  Saved: {milliquas_dest} ({sz:.0f} MB)")
+                n_ok += 1
+            else:
+                n_err += 1
         print()
 
     print(f"Done: {n_ok} downloaded, {n_skip} already present, {n_err} errors.")
