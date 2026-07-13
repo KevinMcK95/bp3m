@@ -540,6 +540,84 @@ def build_global_catalog(images, target, data_dir):
 
 
 # ---------------------------------------------------------------------------
+# Photometry CMD / colour-colour plots
+# ---------------------------------------------------------------------------
+
+def plot_photometry_catalog(data_dir, target):
+    """
+    Read cross_match_catalog.csv, pivot to wide format, and produce CMDs
+    and colour-colour diagrams using the same _plot_cmds layout as the v2
+    catalogue code.  Saved as {data_dir}/{target}/plots_validate_cmds.png.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+    except ImportError:
+        print('  plot_photometry_catalog: matplotlib not available, skipping')
+        return
+
+    cat_path = os.path.join(data_dir, target, 'cross_match_catalog.csv')
+    if not os.path.exists(cat_path):
+        print(f'  plot_photometry_catalog: {cat_path} not found, skipping')
+        return
+
+    cat = pd.read_csv(cat_path)
+
+    # Extract filter name from filter_camera (e.g. "F814W/WFC3/UVIS" → "F814W")
+    cat['_filter'] = cat['filter_camera'].str.split('/').str[0]
+
+    # When the same filter appears from multiple cameras, keep the row
+    # with the most trustworthy observations per (source, filter).
+    cat_best = (cat
+                .sort_values('n_trustworthy', ascending=False)
+                .drop_duplicates(subset=['gaia_source_id', '_filter'])
+                .copy())
+
+    # Pivot to wide: one row per source, one mag_wmean_{FILTER} column per filter.
+    wide = (cat_best
+            .pivot_table(index='gaia_source_id',
+                         columns='_filter',
+                         values='mag_norm_wmean',
+                         aggfunc='first')
+            .reset_index())
+    wide.columns.name = None
+    filter_cols = [c for c in wide.columns if c != 'gaia_source_id']
+    wide = wide.rename(columns={c: f'mag_wmean_{c}' for c in filter_cols})
+
+    # Merge source-level Gaia photometry back in.
+    gaia_meta_cols = ['gaia_source_id', 'gaia_gmag', 'gaia_bpmag', 'gaia_rpmag']
+    gaia_meta_cols = [c for c in gaia_meta_cols if c in cat.columns]
+    gaia_meta = (cat_best[gaia_meta_cols]
+                 .drop_duplicates(subset=['gaia_source_id']))
+    wide = wide.merge(gaia_meta, on='gaia_source_id', how='left')
+
+    # Build a minimal gaia_df so _plot_cmds can draw the Gaia CMD panel.
+    gaia_df = None
+    if {'gaia_gmag', 'gaia_bpmag', 'gaia_rpmag'}.issubset(wide.columns):
+        gaia_df = (wide[['gaia_source_id', 'gaia_gmag', 'gaia_bpmag', 'gaia_rpmag']]
+                   .rename(columns={'gaia_source_id': 'source_id',
+                                    'gaia_gmag':      'gmag'})
+                   .copy())
+        gaia_df['bp_rp'] = gaia_df['gaia_bpmag'] - gaia_df['gaia_rpmag']
+        gaia_df = gaia_df.drop(columns=['gaia_bpmag', 'gaia_rpmag'])
+
+    try:
+        from bp3m.pipeline.hst_catalog_crossmatch import _plot_cmds
+    except ImportError:
+        print('  plot_photometry_catalog: bp3m not importable, skipping CMD plot')
+        return
+
+    n_filters = len([c for c in wide.columns if c.startswith('mag_wmean_')])
+    out_path = os.path.join(data_dir, target, 'plots_validate_cmds.png')
+    try:
+        _plot_cmds(wide, gaia_df, out_path,
+                   title=f'{target}  —  validate photometry ({n_filters} HST filters)')
+        print(f'  CMDs: {out_path}')
+    except Exception as e:
+        print(f'  Warning: plots_validate_cmds.png failed: {e}')
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -664,6 +742,9 @@ def validate_target(target, data_dir, mag_scatter_thr=0.1,
         n_multi   = int((cat['n_images'] > 1).sum())
         print(f'  Global catalog: {n_sources} source/filter entries '
               f'({n_multi} seen in >1 image) → {out}')
+
+    # CMD / colour-colour plots from the enriched catalog
+    plot_photometry_catalog(data_dir, target)
 
 
 if __name__ == '__main__':
