@@ -62,7 +62,34 @@ _QUALITY_COLS = (
     "(phot_bp_n_obs+phot_rp_n_obs) AS beta, "
     "ipd_gof_harmonic_amplitude, "
     "phot_bp_n_contaminated_transits, phot_rp_n_contaminated_transits, "
-    "ref_epoch"
+    "ref_epoch, "
+    "classprob_dsc_combmod_quasar, classprob_dsc_combmod_galaxy, "
+    "classprob_dsc_combmod_star, in_qso_candidates, in_galaxy_candidates"
+)
+
+# Columns added in the 2025-07 update; used to detect stale no-sidecar caches.
+_DSC_COLS = ('classprob_dsc_combmod_quasar', 'in_qso_candidates')
+
+# Columns to SELECT from gaiadr3.qso_candidates (excludes array-type
+# morph_params_corr_vec which cannot be serialised to CSV).
+_QSO_CANDIDATES_COLS = (
+    "source_id, gaia_crf_source, astrometric_selection_flag, "
+    "vari_best_class_name, vari_best_class_score, "
+    "classprob_dsc_combmod_quasar, classprob_dsc_combmod_galaxy, "
+    "classlabel_dsc, classlabel_dsc_joint, classlabel_oa, "
+    "fractional_variability_g, structure_function_index, "
+    "structure_function_index_scatter, qso_variability, non_qso_variability, "
+    "vari_agn_membership_score, "
+    "redshift_qsoc, redshift_qsoc_lower, redshift_qsoc_upper, "
+    "ccfratio_qsoc, zscore_qsoc, flags_qsoc, "
+    "n_transits, intensity_quasar, intensity_quasar_error, "
+    "intensity_hostgalaxy, intensity_hostgalaxy_error, "
+    "radius_hostgalaxy, radius_hostgalaxy_error, "
+    "sersic_index, sersic_index_error, "
+    "ellipticity_hostgalaxy, ellipticity_hostgalaxy_error, "
+    "posangle_hostgalaxy, posangle_hostgalaxy_error, "
+    "host_galaxy_detected, host_galaxy_flag, "
+    "l2_norm, source_selection_flags"
 )
 
 
@@ -289,9 +316,14 @@ def download_gaia(
             return pd.read_csv(out_path)
         elif out_path.exists():
             if diffs == ["no sidecar — cannot verify query match"]:
-                print(f"[Gaia] WARNING: cached CSV found but no query sidecar — "
-                      f"loading anyway: {out_path}")
-                return pd.read_csv(out_path)
+                _header = pd.read_csv(out_path, nrows=0)
+                if all(c in _header.columns for c in _DSC_COLS):
+                    print(f"[Gaia] WARNING: cached CSV found but no query sidecar — "
+                          f"loading anyway: {out_path}")
+                    return pd.read_csv(out_path)
+                else:
+                    print(f"[Gaia] Cached CSV is missing DSC classification columns "
+                          f"— re-downloading to add them.")
             else:
                 print(f"[Gaia] Cached query differs from current request "
                       f"— re-downloading:")
@@ -356,4 +388,71 @@ def download_gaia(
     print(f"  Stars after quality filter: {n_clean} / {len(df)}")
     print(f"  Saved: {out_path}")
     print(f"  Query metadata: {meta_path}")
+
+    download_gaia_qso_candidates(ra, dec, search_width, search_height,
+                                  output_dir, field_name,
+                                  force_redownload=force_redownload)
     return df
+
+
+def download_gaia_qso_candidates(
+    ra: float,
+    dec: float,
+    search_width: float,
+    search_height: float,
+    output_dir: Path,
+    field_name: str,
+    force_redownload: bool = False,
+) -> pd.DataFrame | None:
+    """Download Gaia DR3 qso_candidates for the same sky region.
+
+    Saves to:
+        {output_dir}/{field_name}/Gaia/{field_name}_ra{ra}_dec{dec}_w{w}_h{h}_qso_candidates.csv
+
+    Returns the DataFrame, or None if the query fails.  The result is always
+    cached — pass ``force_redownload=True`` to re-query the archive.
+
+    Key columns unique to this table (not in gaiadr3.gaia_source):
+      gaia_crf_source          — Gaia CRF3 membership (highest-quality anchors)
+      redshift_qsoc            — photometric redshift
+      fractional_variability_g — G-band flux variability amplitude
+      structure_function_index — AGN variability structure function exponent
+      vari_agn_membership_score — combined AGN membership score
+      classlabel_dsc_joint     — string classification label
+      host_galaxy_detected     — resolved host galaxy flag (unresolved preferred)
+      qso_variability          — variability-based QSO probability score
+    """
+    gaia_dir = Path(output_dir) / field_name / "Gaia"
+    gaia_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = (gaia_dir /
+                f"{field_name}_ra{ra:.4f}_dec{dec:+.4f}"
+                f"_w{search_width:.4f}_h{search_height:.4f}_qso_candidates.csv")
+
+    if not force_redownload and out_path.exists():
+        print(f"[Gaia] Loading cached qso_candidates: {out_path}")
+        return pd.read_csv(out_path)
+
+    box = (f"CONTAINS(POINT('ICRS',g.ra,g.dec),"
+           f"BOX('ICRS',{ra:.8f},{dec:.8f},{search_width:.8f},{search_height:.8f}))=1")
+    # Include g.ra/dec so the output CSV is self-contained for spatial cross-matching.
+    query = (f"SELECT q.{_QSO_CANDIDATES_COLS.replace(', ', ', q.')}, g.ra, g.dec "
+             f"FROM gaiadr3.qso_candidates AS q "
+             f"JOIN gaiadr3.gaia_source AS g ON q.source_id = g.source_id "
+             f"WHERE {box}")
+
+    print(f"\n[Gaia] Downloading qso_candidates for {field_name}...")
+    try:
+        from astroquery.gaia import Gaia
+        job = Gaia.launch_job_async(query)
+        result = job.get_results().to_pandas()
+        try:
+            Gaia.remove_jobs([job.jobid])
+        except Exception:
+            pass
+        result.to_csv(out_path, index=False)
+        print(f"  qso_candidates: {len(result)} sources → {out_path}")
+        return result
+    except Exception as e:
+        print(f"  WARNING: qso_candidates download failed — {e}")
+        return None
