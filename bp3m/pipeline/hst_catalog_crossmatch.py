@@ -5029,6 +5029,192 @@ def _plot_cmds(combined_df: pd.DataFrame, gaia_df: Optional[pd.DataFrame],
     plt.close(fig)
 
 
+def _plot_color_color(combined_df: pd.DataFrame, gaia_df: Optional[pd.DataFrame],
+                      output_path: Path, title: str = '') -> None:
+    """All pairwise colour-colour panels from available HST filters plus Gaia.
+
+    For the Gaia panel (always first when available): x = BP−G, y = G−RP.
+    For each triplet of bands (i < j < k by effective wavelength), plots
+    (band_i − band_j) on x vs (band_j − band_k) on y.
+
+    ``gaia_df`` must have columns ``source_id``, ``gmag``, ``bpmag``, ``rpmag``
+    (the latter two are used to compute BP−G and G−RP independently).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    _WL: dict[str, float] = {
+        'F225W': 237, 'F275W': 271, 'F300X': 282, 'F336W': 336,
+        'F390W': 392, 'F435W': 432, 'F438W': 438, 'F475W': 476,
+        'F555W': 531, 'F606W': 592, 'F600LP': 747, 'F625W': 626,
+        'F775W': 764, 'F814W': 803, 'F850LP': 918,
+        'G': 673,
+    }
+
+    def _wl(band: str) -> float:
+        if band in _WL:
+            return _WL[band]
+        import re
+        m = re.search(r'(\d{3,4})', band)
+        return float(m.group(1)) if m else 1000.0
+
+    # ── Collect HST magnitude arrays ─────────────────────────────────────────
+    mag_cols    = sorted(c for c in combined_df.columns if c.startswith('mag_wmean_'))
+    band_labels = [c.replace('mag_wmean_', '') for c in mag_cols]
+    mags: dict[str, np.ndarray] = {
+        lbl: combined_df[col].values.astype(float)
+        for lbl, col in zip(band_labels, mag_cols)
+    }
+
+    # Optionally add Gaia G band (same logic as _plot_cmds)
+    g_added = False
+    if gaia_df is not None and 'gaia_source_id' in combined_df.columns:
+        gdf_lower = gaia_df.rename(columns=str.lower)
+        sids = combined_df['gaia_source_id'].values
+        if 'gmag' in gdf_lower.columns and 'source_id' in gdf_lower.columns:
+            g_lookup = gdf_lower.set_index('source_id')['gmag']
+            g_vals = np.where(sids != 0,
+                              pd.Series(sids).map(g_lookup).values.astype(float),
+                              np.nan)
+            if np.isfinite(g_vals).sum() > 10:
+                mags['G'] = g_vals
+                band_labels.append('G')
+                g_added = True
+    if not g_added and 'gaia_gmag' in combined_df.columns:
+        g_vals = combined_df['gaia_gmag'].values.astype(float)
+        if np.isfinite(g_vals).sum() > 10:
+            mags['G'] = g_vals
+            band_labels.append('G')
+            g_added = True
+
+    bands = sorted(band_labels, key=_wl)
+    n = len(bands)
+    if n < 3:
+        return  # need at least 3 bands for any colour-colour panel
+
+    # ── Build Gaia BP-G and G-RP arrays (Gaia-only colour-colour first panel) ─
+    bp_g_vals: Optional[np.ndarray] = None
+    g_rp_vals: Optional[np.ndarray] = None
+    if gaia_df is not None and 'gaia_source_id' in combined_df.columns:
+        gdf_lower = gaia_df.rename(columns=str.lower)
+        sids = combined_df['gaia_source_id'].values
+        has_bp = 'bpmag' in gdf_lower.columns
+        has_rp = 'rpmag' in gdf_lower.columns
+        if g_added and has_bp and has_rp and 'source_id' in gdf_lower.columns:
+            idx = gdf_lower.set_index('source_id')
+            bp_lookup = idx['bpmag']
+            rp_lookup = idx['rpmag']
+            bp_vals = np.where(sids != 0,
+                               pd.Series(sids).map(bp_lookup).values.astype(float),
+                               np.nan)
+            rp_vals = np.where(sids != 0,
+                               pd.Series(sids).map(rp_lookup).values.astype(float),
+                               np.nan)
+            g_arr = mags['G']
+            _bp_g = bp_vals - g_arr   # positive for red stars
+            _g_rp = g_arr  - rp_vals  # positive for red stars
+            if np.isfinite(_bp_g).sum() > 10 and np.isfinite(_g_rp).sum() > 10:
+                bp_g_vals = _bp_g
+                g_rp_vals = _g_rp
+
+    # ── Build panel list ──────────────────────────────────────────────────────
+    # Each entry: (x_label, y_label, x_vals, y_vals, ok_mask)
+    panel_data = []
+
+    if bp_g_vals is not None and g_rp_vals is not None:
+        ok = np.isfinite(bp_g_vals) & np.isfinite(g_rp_vals)
+        if ok.sum() >= 2:
+            panel_data.append(('BP−G', 'G−RP', bp_g_vals, g_rp_vals, ok))
+
+    # All triplets (i, j, k) with i < j < k
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                bi, bj, bk = bands[i], bands[j], bands[k]
+                c_x = mags[bi] - mags[bj]
+                c_y = mags[bj] - mags[bk]
+                ok  = np.isfinite(c_x) & np.isfinite(c_y)
+                if ok.sum() < 2:
+                    continue
+                xlabel = f'{bi}−{bj}'
+                ylabel = f'{bj}−{bk}'
+                panel_data.append((xlabel, ylabel, c_x, c_y, ok))
+
+    n_panels = len(panel_data)
+    if n_panels == 0:
+        return
+
+    ncols       = min(4, n_panels)
+    nrows_sc    = (n_panels + ncols - 1) // ncols
+    nrows_total = 2 * nrows_sc
+
+    fig, axes = plt.subplots(nrows_total, ncols,
+                             figsize=(4 * ncols, 4 * nrows_total),
+                             squeeze=False)
+    axes_sc = axes[:nrows_sc].ravel()
+    axes_h2 = axes[nrows_sc:].ravel()
+    for _ax in axes.ravel():
+        _ax.set_facecolor('#e8e8e8')
+
+    panel_xlim: dict[int, tuple[float, float]] = {}
+    panel_ylim: dict[int, tuple[float, float]] = {}
+
+    for k, (xlabel, ylabel, c_x, c_y, ok) in enumerate(panel_data):
+        ax = axes_sc[k]
+        ax.scatter(c_x[ok], c_y[ok], s=1.5, alpha=0.35,
+                   color='steelblue', rasterized=True)
+        cx_lo, cx_hi = np.percentile(c_x[ok], [0.5, 99.5])
+        cy_lo, cy_hi = np.percentile(c_y[ok], [0.5, 99.5])
+        pad_x = 0.25 * (cx_hi - cx_lo) if cx_hi > cx_lo else 0.5
+        pad_y = 0.25 * (cy_hi - cy_lo) if cy_hi > cy_lo else 0.5
+        xlim = (cx_lo - pad_x, cx_hi + pad_x)
+        ylim = (cy_lo - pad_y, cy_hi + pad_y)
+        ax.set_xlim(*xlim); ax.set_ylim(*ylim)
+        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+        panel_xlim[k] = xlim
+        panel_ylim[k] = ylim
+
+    for k in range(n_panels, len(axes_sc)):
+        axes_sc[k].set_visible(False)
+        axes_h2[k].set_visible(False)
+
+    last_h2d = None
+    for k, (xlabel, ylabel, c_x, c_y, ok) in enumerate(panel_data):
+        ax = axes_h2[k]
+        xlim = panel_xlim[k]
+        ylim = panel_ylim[k]
+        xlo, xhi = min(xlim), max(xlim)
+        ylo, yhi = min(ylim), max(ylim)
+        if xhi <= xlo or yhi <= ylo:
+            ax.set_visible(False)
+            continue
+        _, _, _, img = ax.hist2d(
+            c_x[ok], c_y[ok], bins=80,
+            range=[[xlo, xhi], [ylo, yhi]],
+            norm=LogNorm(vmin=1), cmap='viridis', rasterized=True)
+        ax.set_xlim(*xlim); ax.set_ylim(*ylim)
+        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+        last_h2d = img
+
+    for k in range(n_panels):
+        for ax in (axes_sc[k], axes_h2[k]):
+            if ax.get_visible():
+                ax.grid(True, which='major', lw=0.4, alpha=0.5)
+                ax.grid(True, which='minor', lw=0.2, alpha=0.3, linestyle=':')
+                ax.minorticks_on()
+
+    if last_h2d is not None:
+        last_h2_k = max(k for k in range(n_panels) if axes_h2[k].get_visible())
+        fig.colorbar(last_h2d, ax=axes_h2[last_h2_k],
+                     label='N', fraction=0.046, pad=0.04)
+
+    if title:
+        fig.suptitle(title, y=1.01)
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
 def _plot_gaia_comparison(combined_df: pd.DataFrame, gaia_df: pd.DataFrame,
                            output_path: Path, title: str = '') -> None:
     """Compare new xmatch PMs to Gaia PMs for sources with Gaia matches.

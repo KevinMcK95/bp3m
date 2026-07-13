@@ -629,12 +629,6 @@ def load_image_data_flc(data_root, field_name: str,
     if xm_path.exists():
         xm = pd.read_csv(xm_path, dtype={"gaia_source_id": str})
         has_star_cols = "is_star_any_image" in xm.columns
-        _new_phot_cols = ('gaia_gmag_error', 'gaia_bpmag', 'gaia_bpmag_error',
-                          'gaia_rpmag', 'gaia_rpmag_error')
-        if not all(c in xm.columns for c in _new_phot_cols):
-            print(f"  WARNING: {xm_path.name} is missing Gaia BP/RP photometry columns. "
-                  f"Re-run the validate step to add them: "
-                  f"bp3m-validate --name {field_path.name}")
 
         def _parse_imglist(raw) -> set:
             if pd.isna(raw) or str(raw).strip() == "":

@@ -591,30 +591,44 @@ def plot_photometry_catalog(data_dir, target):
                  .drop_duplicates(subset=['gaia_source_id']))
     wide = wide.merge(gaia_meta, on='gaia_source_id', how='left')
 
-    # Build a minimal gaia_df so _plot_cmds can draw the Gaia CMD panel.
-    gaia_df = None
+    # gaia_df for _plot_cmds: source_id, gmag, bp_rp
+    # gaia_cc_df for _plot_color_color: source_id, gmag, bpmag, rpmag (separate)
+    gaia_df    = None
+    gaia_cc_df = None
     if {'gaia_gmag', 'gaia_bpmag', 'gaia_rpmag'}.issubset(wide.columns):
-        gaia_df = (wide[['gaia_source_id', 'gaia_gmag', 'gaia_bpmag', 'gaia_rpmag']]
-                   .rename(columns={'gaia_source_id': 'source_id',
-                                    'gaia_gmag':      'gmag'})
-                   .copy())
-        gaia_df['bp_rp'] = gaia_df['gaia_bpmag'] - gaia_df['gaia_rpmag']
-        gaia_df = gaia_df.drop(columns=['gaia_bpmag', 'gaia_rpmag'])
+        _gaia_base = (wide[['gaia_source_id', 'gaia_gmag', 'gaia_bpmag', 'gaia_rpmag']]
+                      .rename(columns={'gaia_source_id': 'source_id',
+                                       'gaia_gmag':      'gmag',
+                                       'gaia_bpmag':     'bpmag',
+                                       'gaia_rpmag':     'rpmag'})
+                      .copy())
+        gaia_df = _gaia_base.copy()
+        gaia_df['bp_rp'] = gaia_df['bpmag'] - gaia_df['rpmag']
+        gaia_df = gaia_df.drop(columns=['bpmag', 'rpmag'])
+        gaia_cc_df = _gaia_base  # keeps bpmag/rpmag for colour-colour
 
     try:
-        from bp3m.pipeline.hst_catalog_crossmatch import _plot_cmds
+        from bp3m.pipeline.hst_catalog_crossmatch import _plot_cmds, _plot_color_color
     except ImportError:
-        print('  plot_photometry_catalog: bp3m not importable, skipping CMD plot')
+        print('  plot_photometry_catalog: bp3m not importable, skipping plots')
         return
 
     n_filters = len([c for c in wide.columns if c.startswith('mag_wmean_')])
-    out_path = os.path.join(data_dir, target, 'plots_validate_cmds.png')
+    out_cmds = os.path.join(data_dir, target, 'plots_validate_cmds.png')
     try:
-        _plot_cmds(wide, gaia_df, out_path,
+        _plot_cmds(wide, gaia_df, out_cmds,
                    title=f'{target}  —  validate photometry ({n_filters} HST filters)')
-        print(f'  CMDs: {out_path}')
+        print(f'  CMDs: {out_cmds}')
     except Exception as e:
         print(f'  Warning: plots_validate_cmds.png failed: {e}')
+
+    out_cc = os.path.join(data_dir, target, 'plots_validate_cc.png')
+    try:
+        _plot_color_color(wide, gaia_cc_df, out_cc,
+                          title=f'{target}  —  colour-colour ({n_filters} HST filters)')
+        print(f'  Colour-colour: {out_cc}')
+    except Exception as e:
+        print(f'  Warning: plots_validate_cc.png failed: {e}')
 
 
 # ---------------------------------------------------------------------------
