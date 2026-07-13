@@ -397,6 +397,54 @@ def write_solo_quality(data):
 
 
 # ---------------------------------------------------------------------------
+# Gaia photometry enrichment
+# ---------------------------------------------------------------------------
+
+# Columns to pull from the Gaia catalog and how to rename them in the output.
+_GAIA_PHOT_COLS = {
+    'gmag_error':                   'gaia_gmag_error',
+    'bpmag':                        'gaia_bpmag',
+    'bpmag_error':                  'gaia_bpmag_error',
+    'rpmag':                        'gaia_rpmag',
+    'rpmag_error':                  'gaia_rpmag_error',
+    'phot_bp_rp_excess_factor':     'gaia_bp_rp_excess_factor',
+    'corrected_flux_excess_factor': 'gaia_corrected_excess_factor',
+    'ruwe':                         'gaia_ruwe',
+}
+
+
+def _load_gaia_phot(data_dir, target):
+    """
+    Locate Gaia catalog CSV(s) under {data_dir}/{target}/Gaia/ and return a
+    DataFrame indexed by int64 source_id containing photometric columns from
+    _GAIA_PHOT_COLS (only those present in the file(s) are included; missing
+    columns are silently skipped).  Returns None if no suitable file is found.
+    """
+    import glob as _glob
+    gaia_dir = os.path.join(data_dir, target, 'Gaia')
+    gaia_files = sorted(_glob.glob(os.path.join(gaia_dir, '*_gaia.csv')))
+    if not gaia_files:
+        return None
+
+    want = set(_GAIA_PHOT_COLS.keys()) | {'source_id'}
+    frames = []
+    for path in gaia_files:
+        try:
+            df = pd.read_csv(path, usecols=lambda c: c in want)
+            if 'source_id' in df.columns:
+                frames.append(df)
+        except Exception:
+            pass
+
+    if not frames:
+        return None
+
+    combined = pd.concat(frames, ignore_index=True).drop_duplicates(subset='source_id')
+    combined['source_id'] = combined['source_id'].astype(np.int64)
+    return combined.set_index('source_id')
+
+
+# ---------------------------------------------------------------------------
 # Global target-level catalog
 # ---------------------------------------------------------------------------
 
@@ -470,6 +518,21 @@ def build_global_catalog(images, target, data_dir):
                .groupby(['gaia_source_id', 'filter_camera'])
                .apply(agg_group)
                .reset_index())
+
+    # Enrich with Gaia photometry (BP/RP mags + errors, excess factor, RUWE).
+    # These are source-level constants; the join is on gaia_source_id.
+    gaia_phot = _load_gaia_phot(data_dir, target)
+    if gaia_phot is not None:
+        present = {src: dst for src, dst in _GAIA_PHOT_COLS.items()
+                   if src in gaia_phot.columns}
+        if present:
+            phot_df = (gaia_phot[list(present.keys())]
+                       .rename(columns=present)
+                       .reset_index()
+                       .rename(columns={'source_id': 'gaia_source_id'}))
+            phot_df['gaia_source_id'] = phot_df['gaia_source_id'].astype(np.int64)
+            catalog['gaia_source_id'] = catalog['gaia_source_id'].astype(np.int64)
+            catalog = catalog.merge(phot_df, on='gaia_source_id', how='left')
 
     out = os.path.join(data_dir, target, 'cross_match_catalog.csv')
     catalog.to_csv(out, index=False)
