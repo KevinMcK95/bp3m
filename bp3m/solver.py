@@ -708,6 +708,12 @@ class BP3MSolver:
     def _add_gaia_epoch_obs(self, epoch_obs_preprocessed: dict) -> None:
         """Register precomputed Gaia DR4 AL normal-equation contributions.
 
+        For each star with epoch data:
+          - Removes the Gaia 5p summary-solution prior from C_survey_inv /
+            C_survey_inv_dot_v (to avoid double-counting the epoch information)
+          - Replaces it with the same diffuse prior used for 2p/HST-only stars
+            (flat position, 100 mas/yr PM, Michalik parallax prior)
+
         Parameters
         ----------
         epoch_obs_preprocessed
@@ -716,11 +722,44 @@ class BP3MSolver:
             bp3m.pipeline.download_gaia_epoch.prepare_epoch_obs_for_solver().
         """
         self._gaia_epoch_contrib = epoch_obs_preprocessed
-        n_src = len(epoch_obs_preprocessed)
-        n_matched = sum(1 for sid in epoch_obs_preprocessed
-                        if sid in self.star_id_to_idx)
-        print(f"[Solver] Gaia DR4 epoch obs registered: "
-              f"{n_src} sources ({n_matched} matched in catalog)")
+
+        epoch_indices = [self.star_id_to_idx[sid] for sid in epoch_obs_preprocessed
+                         if sid in self.star_id_to_idx]
+        if not epoch_indices:
+            print("[Solver] Gaia DR4 epoch obs: no matched sources in catalog")
+            return
+
+        idx = np.array(epoch_indices, dtype=int)
+
+        # ── Replace Gaia 5p prior with diffuse prior for epoch stars ──────────
+        # Remove Gaia summary-solution precision and its weighted center
+        self.C_survey_inv[idx]         = 0.0
+        self.C_survey_inv_dot_v[idx]   = 0.0
+
+        # Compute Michalik parallax prior for these stars
+        sigma_plx = michalik_sigma_plx_prior(
+            self.gaia_ra[idx], self.gaia_dec[idx], self.gaia_g[idx]
+        )
+
+        # Install diffuse prior into _C_VG_inv_per_star (same as 2p stars)
+        self._C_VG_inv_per_star[idx, 0] = _SIGMA_POS**-2
+        self._C_VG_inv_per_star[idx, 1] = _SIGMA_POS**-2
+        self._C_VG_inv_per_star[idx, 2] = _SIGMA_PM**-2
+        self._C_VG_inv_per_star[idx, 3] = _SIGMA_PM**-2
+        finite_plx = np.isfinite(sigma_plx)
+        self._C_VG_inv_per_star[idx[finite_plx], 4] = sigma_plx[finite_plx]**-2
+
+        # Update _sigma_diff_per_star so outlier tests work correctly
+        self._sigma_diff_per_star[idx, 0] = 1e4
+        self._sigma_diff_per_star[idx, 1] = 1e4
+        self._sigma_diff_per_star[idx, 2] = _SIGMA_PM
+        self._sigma_diff_per_star[idx, 3] = _SIGMA_PM
+        self._sigma_diff_per_star[idx[finite_plx], 4] = sigma_plx[finite_plx]
+
+        n_src     = len(epoch_obs_preprocessed)
+        n_matched = len(epoch_indices)
+        print(f"[Solver] Gaia DR4 epoch obs: {n_src} sources, "
+              f"{n_matched} matched — Gaia 5p prior replaced with diffuse prior")
 
     # ── Core solver ────────────────────────────────────────────────────────────
 
