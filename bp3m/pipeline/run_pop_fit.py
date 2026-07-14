@@ -440,6 +440,9 @@ def _joint_solve_pop(
     r_current: np.ndarray,
     fix_r: bool = False,
     z_weights: dict | None = None,
+    qso_sidx: "np.ndarray | None" = None,
+    qso_pmra: "np.ndarray | None" = None,
+    qso_pmdec: "np.ndarray | None" = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     One Newton step for (Δr, Δμ_pop) with stellar astrometry marginalised out.
@@ -507,6 +510,22 @@ def _joint_solve_pop(
     h_all  [member_sidx, 3] += sigma_pm_inv_sq * mu_pop_current[1]
     h_align[member_sidx, 4] += sigma_plx_inv_sq * plx_pop
     h_all  [member_sidx, 4] += sigma_plx_inv_sq * plx_pop
+
+    # QSO anchor prior: per-source secular aberration PM + zero parallax.
+    # sigma_qso_pm = 0.35 µas/yr = 3.5e-4 mas/yr (σ_κ, Klioner 2021)
+    # sigma_qso_plx = 1 µas = 1e-3 mas (cosmological source)
+    # Prior is independent of mu_pop (NOT coupled to the free μ_pop parameter).
+    if qso_sidx is not None and len(qso_sidx) > 0:
+        _sigma_qso_pm_inv_sq  = (3.5e-4) ** -2
+        _sigma_qso_plx_inv_sq = (1.0e-3) ** -2
+        H_vv[qso_sidx, 2, 2] += _sigma_qso_pm_inv_sq
+        H_vv[qso_sidx, 3, 3] += _sigma_qso_pm_inv_sq
+        H_vv[qso_sidx, 4, 4] += _sigma_qso_plx_inv_sq
+        h_align[qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
+        h_align[qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
+        h_all  [qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
+        h_all  [qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
+        # RHS for parallax prior: 0 (plx_pop_qso = 0, so += 0)
 
     # ── Per-image accumulation ─────────────────────────────────────────────────
     K_img       = {}
@@ -1021,6 +1040,7 @@ def _plot_pm_vs_properties(
     mu_pop: np.ndarray,
     sigma_pm: float,
     field_name: str,
+    qso_sidx: "np.ndarray | None" = None,
 ) -> None:
     """
     2×6 figure: diffuse-prior posterior PMs for member stars vs
@@ -1039,6 +1059,13 @@ def _plot_pm_vs_properties(
         return
 
     # ── Per-member arrays ─────────────────────────────────────────────────────
+    # QSOs with tight priors have artificially small posterior σ — exclude from
+    # the normalised row (row 1) so the comparison does not blow up.
+    _is_qso_member = np.zeros(len(member_sidx), dtype=bool)
+    if qso_sidx is not None and len(qso_sidx) > 0:
+        _qso_set = set(qso_sidx.tolist())
+        _is_qso_member = np.array([int(s) in _qso_set for s in member_sidx])
+
     pmra_m  = a_free[member_sidx, 2]
     pmdec_m = a_free[member_sidx, 3]
     sig_ra  = np.sqrt(np.maximum(C_vT_free[member_sidx, 2, 2], 0.0))
@@ -1145,12 +1172,14 @@ def _plot_pm_vs_properties(
         if col == 0:
             ax0.legend(fontsize=7, loc='upper right')
 
-        # ── Row 1: normalised ─────────────────────────────────────────────────
+        # ── Row 1: normalised (QSOs excluded — tight prior makes σ meaningless) ─
         ax1 = axes[1, col]
         norm_pm  = (pm - mu_ref) / err
         norm_err = np.ones(len(pm))
-        if finite.any():
-            _draw_colored(ax1, x, norm_pm, norm_err, cols, finite)
+        # Exclude QSO members from normalised plot
+        finite_nonqso = finite & ~_is_qso_member
+        if finite_nonqso.any():
+            _draw_colored(ax1, x, norm_pm, norm_err, cols, finite_nonqso)
         ax1.axhline(0,  color='firebrick', lw=1.2, ls='-')
         ax1.axhspan(-1, 1, alpha=0.15, color='firebrick')
         ax1.axhline(-3, color='grey', lw=0.7, ls='--')
@@ -1159,6 +1188,8 @@ def _plot_pm_vs_properties(
         ax1.set_xlabel(xlabs[col], fontsize=8)
         ax1.set_ylabel(ylabs_nrm[col], fontsize=8)
         ax1.tick_params(labelsize=7)
+        if col == 0 and _is_qso_member.any():
+            ax1.set_title(f'QSOs excluded (N={_is_qso_member.sum()})', fontsize=7)
 
     # Shared colorbar
     sm = cm.ScalarMappable(cmap=cmap, norm=norm)
@@ -1169,6 +1200,149 @@ def _plot_pm_vs_properties(
     cbar.ax.tick_params(labelsize=8)
 
     out_path = output_dir / 'pm_vs_properties.png'
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
+# ── QSO anchor diagnostic plots ──────────────────────────────────────────────
+
+def _plot_qso_diagnostics(
+    plot_dir,
+    solver,
+    gaia_catalog,
+    a_free: np.ndarray,
+    C_vT_free: np.ndarray,
+    member_sidx: np.ndarray,
+    qso_sidx: np.ndarray,
+    qso_pmra_mas: np.ndarray,
+    qso_pmdec_mas: np.ndarray,
+    mu_pop: np.ndarray,
+    field_name: str,
+) -> None:
+    """
+    Three-panel QSO diagnostic figure:
+      Panel 1 — All-star VPD with QSO anchors highlighted in gold
+      Panel 2 — QSO-only VPD with secular-aberration prediction arrows
+      Panel 3 — CMD (BP−RP vs G) with QSO anchors highlighted
+
+    QSOs should appear near (pmra~0, pmdec~0) in the VPD, not at the cluster
+    pop mean.  In the CMD they should occupy the blue, faint region (point-like
+    AGN) rather than the cluster RGB/MS.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    pmra_all  = a_free[:, 2]
+    pmdec_all = a_free[:, 3]
+
+    is_member = np.zeros(solver.n_stars, dtype=bool)
+    is_member[member_sidx] = True
+
+    gmag    = gaia_catalog['gmag'].to_numpy(float)
+    bp_rp   = (gaia_catalog.get('bp_rp', gaia_catalog.get('bpmag', None)) if True
+               else None)
+    if bp_rp is None:
+        if 'bpmag' in gaia_catalog.columns and 'rpmag' in gaia_catalog.columns:
+            bp_rp = gaia_catalog['bpmag'].to_numpy(float) - gaia_catalog['rpmag'].to_numpy(float)
+        elif 'bp_rp' in gaia_catalog.columns:
+            bp_rp = gaia_catalog['bp_rp'].to_numpy(float)
+        else:
+            bp_rp = np.full(solver.n_stars, np.nan)
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5.5), constrained_layout=True)
+    fig.suptitle(f'{field_name} — QSO anchor diagnostics  (N_qso={len(qso_sidx)})',
+                 fontsize=11)
+
+    # ── Panel 1: all-star VPD ─────────────────────────────────────────────────
+    ax = axes[0]
+    _ok_all    = np.isfinite(pmra_all) & np.isfinite(pmdec_all)
+    _ok_mem    = _ok_all & is_member
+    _ok_nomem  = _ok_all & ~is_member
+    _ok_qso    = np.zeros(solver.n_stars, dtype=bool)
+    _ok_qso[qso_sidx] = True
+    _ok_qso   &= _ok_all
+
+    ax.scatter(pmra_all[_ok_nomem],  pmdec_all[_ok_nomem],
+               s=4, c='#aaaaaa', alpha=0.4, zorder=1, label='non-members')
+    ax.scatter(pmra_all[_ok_mem],    pmdec_all[_ok_mem],
+               s=6, c='steelblue', alpha=0.7, zorder=2, label=f'members (N={_ok_mem.sum()})')
+    if _ok_qso.any():
+        ax.scatter(pmra_all[_ok_qso], pmdec_all[_ok_qso],
+                   s=60, c='gold', edgecolors='darkorange', linewidths=0.8,
+                   zorder=5, marker='*', label=f'QSO anchors (N={_ok_qso.sum()})')
+    ax.axhline(0, c='k', lw=0.5, ls='--', alpha=0.3)
+    ax.axvline(0, c='k', lw=0.5, ls='--', alpha=0.3)
+    ax.scatter(*mu_pop, s=120, c='firebrick', marker='+', linewidths=2.5,
+               zorder=6, label=r'$\mu_{\rm pop}$')
+    _pm_range = max(abs(mu_pop[0]), abs(mu_pop[1]), 3.0) * 2.5
+    ax.set_xlim(-_pm_range, _pm_range)
+    ax.set_ylim(-_pm_range, _pm_range)
+    ax.set_xlabel(r'$\mu_{\alpha*}$ [mas/yr]', fontsize=9)
+    ax.set_ylabel(r'$\mu_\delta$ [mas/yr]', fontsize=9)
+    ax.set_title('All-star VPD', fontsize=10)
+    ax.legend(fontsize=7, loc='upper right')
+    ax.set_aspect('equal')
+
+    # ── Panel 2: QSO-only VPD with secular aberration arrows ─────────────────
+    ax2 = axes[1]
+    qso_pm_ra  = pmra_all[qso_sidx]
+    qso_pm_dec = pmdec_all[qso_sidx]
+    ok_q = np.isfinite(qso_pm_ra) & np.isfinite(qso_pm_dec)
+
+    if ok_q.any():
+        ax2.scatter(qso_pm_ra[ok_q], qso_pm_dec[ok_q],
+                    s=50, c='gold', edgecolors='darkorange', linewidths=0.8,
+                    zorder=4, label='QSO bp3m PM')
+        # Draw arrow from expected aberration to observed bp3m PM
+        for ra_obs, dec_obs, ra_exp, dec_exp in zip(
+                qso_pm_ra[ok_q], qso_pm_dec[ok_q],
+                qso_pmra_mas[ok_q], qso_pmdec_mas[ok_q]):
+            ax2.annotate('', xy=(ra_obs, dec_obs), xytext=(ra_exp, dec_exp),
+                         arrowprops=dict(arrowstyle='->', color='darkorange',
+                                         lw=0.8, alpha=0.7))
+        ax2.scatter(qso_pmra_mas[ok_q], qso_pmdec_mas[ok_q],
+                    s=30, c='white', edgecolors='darkorange', linewidths=1.0,
+                    zorder=5, marker='o', label='secular aberration pred.')
+
+    ax2.axhline(0, c='k', lw=0.5, ls='--', alpha=0.3)
+    ax2.axvline(0, c='k', lw=0.5, ls='--', alpha=0.3)
+    # Small VPD range centred near 0 (QSO PMs are ~0)
+    _q_lim = 1.5
+    ax2.set_xlim(-_q_lim, _q_lim)
+    ax2.set_ylim(-_q_lim, _q_lim)
+    ax2.set_xlabel(r'$\mu_{\alpha*}$ [mas/yr]', fontsize=9)
+    ax2.set_ylabel(r'$\mu_\delta$ [mas/yr]', fontsize=9)
+    ax2.set_title('QSO-only VPD  (arrows: pred → observed)', fontsize=10)
+    ax2.legend(fontsize=7, loc='upper right')
+    ax2.set_aspect('equal')
+
+    # ── Panel 3: CMD with QSO markers ─────────────────────────────────────────
+    ax3 = axes[2]
+    bp_rp_arr = np.asarray(bp_rp, dtype=float)
+    has_cmd   = np.isfinite(gmag) & np.isfinite(bp_rp_arr)
+
+    ax3.scatter(bp_rp_arr[has_cmd & _ok_nomem], gmag[has_cmd & _ok_nomem],
+                s=4, c='#aaaaaa', alpha=0.4, zorder=1)
+    ax3.scatter(bp_rp_arr[has_cmd & _ok_mem], gmag[has_cmd & _ok_mem],
+                s=6, c='steelblue', alpha=0.7, zorder=2)
+    _cmd_qso = has_cmd & _ok_qso
+    if _cmd_qso.any():
+        ax3.scatter(bp_rp_arr[_cmd_qso], gmag[_cmd_qso],
+                    s=80, c='gold', edgecolors='darkorange', linewidths=0.8,
+                    zorder=5, marker='*', label=f'QSO anchors (N={_cmd_qso.sum()})')
+        ax3.legend(fontsize=7, loc='lower right')
+    ax3.invert_yaxis()
+    ax3.set_xlabel('BP − RP [mag]', fontsize=9)
+    ax3.set_ylabel('G [mag]', fontsize=9)
+    ax3.set_title('CMD with QSO anchors', fontsize=10)
+
+    out_path = plot_dir / 'qso_diagnostics.png'
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {out_path.name}")
@@ -1519,6 +1693,8 @@ def run_pop_fit(
     cte_spatial_order: int = 2,
     cte_time_poly_order: int = 0,
     cte_n_iter: int = 10,
+    lib_dir: "Path | None" = None,
+    use_qso_anchors: bool = True,
 ) -> Path:
     """
     Run population PM fitting.
@@ -1626,6 +1802,69 @@ def run_pop_fit(
                   f"{sorted(missing)[:5]} ...")
 
     print(f"  Images: {len(image_names)}  ", end='')
+
+    # ── QSO anchor loading ────────────────────────────────────────────────────
+    _qso_sidx      = None
+    _qso_pmra_mas  = None
+    _qso_pmdec_mas = None
+    _n_qso_anchors = 0
+
+    if use_qso_anchors:
+        _qso_path = data_root / field_name / 'Gaia' / f'{field_name}_qso_anchors.csv'
+        if _qso_path.exists():
+            try:
+                _qdf = pd.read_csv(_qso_path, dtype={'source_id': 'int64'})
+                _qdf_anchors = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+                _qso_idx_list = []
+                _qso_pmra_list = []
+                _qso_pmdec_list = []
+                for _, _row in _qdf_anchors.iterrows():
+                    _sidx = star_id_to_idx.get(int(_row['source_id']))
+                    if _sidx is not None:
+                        _qso_idx_list.append(_sidx)
+                        # secular aberration in mas/yr (stored as µas/yr in CSV)
+                        _qso_pmra_list.append(float(_row['pmra_aberr_uas']) * 1e-3)
+                        _qso_pmdec_list.append(float(_row['pmdec_aberr_uas']) * 1e-3)
+                if _qso_idx_list:
+                    _qso_sidx      = np.array(_qso_idx_list,  dtype=int)
+                    _qso_pmra_mas  = np.array(_qso_pmra_list, dtype=float)
+                    _qso_pmdec_mas = np.array(_qso_pmdec_list, dtype=float)
+                    _n_qso_anchors = len(_qso_sidx)
+                print(f"  QSO anchors found in catalog: {len(_qdf_anchors)}, "
+                      f"matched to solver: {_n_qso_anchors}")
+            except Exception as _qexc:
+                print(f"  WARNING: could not load QSO anchors — {_qexc}")
+        elif lib_dir is not None:
+            # Run vetting on demand if anchors CSV is missing but lib_dir given
+            try:
+                from .qso_vetting import vet_qso_candidates
+                print("  QSO anchor file not found — running vetting now...")
+                _qdf = vet_qso_candidates(
+                    field_name=field_name, output_dir=data_root, lib_dir=lib_dir
+                )
+                if _qdf is not None:
+                    _qdf_anchors = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+                    _qso_idx_list = []
+                    _qso_pmra_list = []
+                    _qso_pmdec_list = []
+                    for _, _row in _qdf_anchors.iterrows():
+                        _sidx = star_id_to_idx.get(int(_row['source_id']))
+                        if _sidx is not None:
+                            _qso_idx_list.append(_sidx)
+                            _qso_pmra_list.append(float(_row['pmra_aberr_uas']) * 1e-3)
+                            _qso_pmdec_list.append(float(_row['pmdec_aberr_uas']) * 1e-3)
+                    if _qso_idx_list:
+                        _qso_sidx      = np.array(_qso_idx_list,  dtype=int)
+                        _qso_pmra_mas  = np.array(_qso_pmra_list, dtype=float)
+                        _qso_pmdec_mas = np.array(_qso_pmdec_list, dtype=float)
+                        _n_qso_anchors = len(_qso_sidx)
+                    print(f"  QSO anchors: {_n_qso_anchors} matched to solver")
+            except Exception as _qexc:
+                print(f"  WARNING: on-demand QSO vetting failed — {_qexc}")
+        else:
+            print("  QSO anchor file not found; run cross-match first or pass --lib_dir")
+    else:
+        print("  QSO anchors disabled (--no_qso_anchors)")
 
     # ── Build solver ──────────────────────────────────────────────────────────
     solver = BP3MSolver(imgs, filtered_spi, gaia_catalog,
@@ -1797,17 +2036,27 @@ def run_pop_fit(
         _use_any = _d['use_for_fit'] | _d.get('use_for_astrom', _d['use_for_fit'])
         np.add.at(solver.gaia_n_hst_used, _d['sidx'][_use_any], 1)
 
+    # ── Convenience wrapper: inject QSO anchor args into every _joint_solve call
+    def _solve(member_sidx_arg, mu_pop_arg, r_arg,
+               fix_r_arg=False, z_weights_arg=None):
+        return _joint_solve_pop(
+            solver, image_names,
+            member_sidx_arg, mu_pop_arg,
+            sigma_pm, plx_pop, sigma_plx_tot,
+            C_pop_prior_inv, mu_pop_prior,
+            r_arg, fix_r=fix_r_arg, z_weights=z_weights_arg,
+            qso_sidx=_qso_sidx,
+            qso_pmra=_qso_pmra_mas,
+            qso_pmdec=_qso_pmdec_mas,
+        )
+
     # ── Phase 1: μ-only solve (r fixed at v1 values) ──────────────────────────
     print(f"\n  Phase 1: μ-only solve ({n_iter_mu} iterations, r fixed)...")
     r_current = r_bp3m.copy()
     C_shared_mu = None
     for mu_iter in range(n_iter_mu):
-        _, mu_pop_new, C_shared_mu, C_vT, a_arr, _, _ = _joint_solve_pop(
-            solver, image_names,
-            member_sidx, mu_pop_current,
-            sigma_pm, plx_pop, sigma_plx_tot,
-            C_pop_prior_inv, mu_pop_prior,
-            r_current, fix_r=True,
+        _, mu_pop_new, C_shared_mu, C_vT, a_arr, _, _ = _solve(
+            member_sidx, mu_pop_current, r_current, fix_r_arg=True,
         )
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
         _mu_pop_used = mu_pop_current.copy()   # mu_pop baked into a_arr
@@ -1835,12 +2084,8 @@ def run_pop_fit(
     print(f"\n  Phase 2: joint solve ({n_iter_joint} iterations)...")
     C_shared_joint = None
     for jt_iter in range(n_iter_joint):
-        r_new, mu_pop_new, C_shared_joint, C_vT, a_arr, _, _ = _joint_solve_pop(
-            solver, image_names,
-            member_sidx, mu_pop_current,
-            sigma_pm, plx_pop, sigma_plx_tot,
-            C_pop_prior_inv, mu_pop_prior,
-            r_current, fix_r=False,
+        r_new, mu_pop_new, C_shared_joint, C_vT, a_arr, _, _ = _solve(
+            member_sidx, mu_pop_current, r_current,
         )
         delta_r  = float(np.max(np.abs(r_new - r_current)))
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
@@ -1870,12 +2115,8 @@ def run_pop_fit(
         print(f"\n  Phase 3: joint solve + alpha update ({n_iter_alpha} iterations)...")
         C_shared_joint_p3 = C_shared_joint   # may be updated in loop
         for al_iter in range(n_iter_alpha):
-            r_new, mu_pop_new, C_shared_joint_p3, C_vT, a_arr, _, _ = _joint_solve_pop(
-                solver, image_names,
-                member_sidx, mu_pop_current,
-                sigma_pm, plx_pop, sigma_plx_tot,
-                C_pop_prior_inv, mu_pop_prior,
-                r_current, fix_r=False,
+            r_new, mu_pop_new, C_shared_joint_p3, C_vT, a_arr, _, _ = _solve(
+                member_sidx, mu_pop_current, r_current,
             )
             solver._update_R(r_new)
             solver._update_geometry(r_new, a_arr)
@@ -1973,12 +2214,8 @@ def run_pop_fit(
         ok_star_prev = None
 
         for h_iter in range(n_iter_phase4):
-            r_new, mu_pop_new, C_shared_joint_p4, C_vT_p4, a_arr_p4, _, _ = _joint_solve_pop(
-                solver, image_names,
-                member_sidx, mu_pop_current,
-                sigma_pm, plx_pop, sigma_plx_tot,
-                C_pop_prior_inv, mu_pop_prior,
-                r_current, fix_r=False,
+            r_new, mu_pop_new, C_shared_joint_p4, C_vT_p4, a_arr_p4, _, _ = _solve(
+                member_sidx, mu_pop_current, r_current,
             )
             solver._update_R(r_new)
             solver._update_geometry(r_new, a_arr_p4)
@@ -2064,13 +2301,8 @@ def run_pop_fit(
         C_shared_joint_sw = C_shared_joint
 
         for sw_iter in range(n_iter_phase4):
-            r_new, mu_pop_new, C_shared_joint_sw, C_vT_sw, a_arr_sw, _, _ = _joint_solve_pop(
-                solver, image_names,
-                member_sidx, mu_pop_current,
-                sigma_pm, plx_pop, sigma_plx_tot,
-                C_pop_prior_inv, mu_pop_prior,
-                r_current, fix_r=False,
-                z_weights=z_weights_final,
+            r_new, mu_pop_new, C_shared_joint_sw, C_vT_sw, a_arr_sw, _, _ = _solve(
+                member_sidx, mu_pop_current, r_current, z_weights_arg=z_weights_final,
             )
             solver._update_R(r_new)
             solver._update_geometry(r_new, a_arr_sw)
@@ -2122,13 +2354,8 @@ def run_pop_fit(
 
     # ── Final posterior pass at convergence ───────────────────────────────────
     print("\n  Final posterior pass...")
-    _, _, C_shared_final, C_vT_final, v_mean, _, K_img_final = _joint_solve_pop(
-        solver, image_names,
-        member_sidx, mu_pop_current,
-        sigma_pm, plx_pop, sigma_plx_tot,
-        C_pop_prior_inv, mu_pop_prior,
-        r_current, fix_r=False,
-        z_weights=z_weights_final,
+    _, _, C_shared_final, C_vT_final, v_mean, _, K_img_final = _solve(
+        member_sidx, mu_pop_current, r_current, z_weights_arg=z_weights_final,
     )
 
     # ── Analytic marginalised posteriors (joint r + μ_pop propagation) ──────────
@@ -2172,13 +2399,9 @@ def run_pop_fit(
 
     # ── Diffuse-prior stellar posteriors (no population prior for any star) ──────
     print("\n  Computing diffuse-prior (free) stellar posteriors...")
-    _, _, _, C_vT_free_sol, v_mean_free_cond, _, K_img_free = _joint_solve_pop(
-        solver, image_names,
+    _, _, _, C_vT_free_sol, v_mean_free_cond, _, K_img_free = _solve(
         np.array([], dtype=int),   # no members → no population prior
-        mu_pop_current,
-        sigma_pm, plx_pop, sigma_plx_tot,
-        C_pop_prior_inv, mu_pop_prior,
-        r_current, fix_r=True,
+        mu_pop_current, r_current, fix_r_arg=True,
     )
     v_mean_free_marg, v_cov_free_sol = solver.compute_analytic_posteriors(
         r_current, C_r, v_mean_free_cond, K_img_free, C_vT_free_sol)
@@ -2480,9 +2703,22 @@ def run_pop_fit(
                 _plot_dir, solver, image_names, gaia_catalog,
                 v_mean_free_marg, C_vT_free_sol,
                 member_sidx, mu_pop_current, sigma_pm, field_name,
+                qso_sidx=_qso_sidx,
             )
         except Exception as _exc:
             print(f"  WARNING: _plot_pm_vs_properties failed — {_exc}")
+
+        # QSO-only VPD + CMD diagnostic plot
+        if _qso_sidx is not None and len(_qso_sidx) > 0:
+            try:
+                _plot_qso_diagnostics(
+                    _plot_dir, solver, gaia_catalog,
+                    v_mean_free_marg, C_vT_free_sol,
+                    member_sidx, _qso_sidx, _qso_pmra_mas, _qso_pmdec_mas,
+                    mu_pop_current, field_name,
+                )
+            except Exception as _exc:
+                print(f"  WARNING: _plot_qso_diagnostics failed — {_exc}")
 
     # ── Optional CTE phase ────────────────────────────────────────────────────
     if fit_cte:
@@ -2603,8 +2839,31 @@ def main():
                         help='CTE time polynomial order (default 0; 1 adds constant-in-time block)')
     parser.add_argument('--cte_n_iter', type=int, default=10,
                         help='CTE joint loop iterations (default 10)')
+    parser.add_argument('--lib_dir', type=str, default=None,
+                        help='BP3M library directory (from bp3m-setup).  Used to run QSO '
+                             'vetting on demand if {field}/Gaia/{field}_qso_anchors.csv '
+                             'is not yet present.  Reads config.toml if omitted.')
+    parser.add_argument('--no_qso_anchors', action='store_true',
+                        help='Disable QSO anchor priors.  By default the solver loads '
+                             '{field}/Gaia/{field}_qso_anchors.csv (produced by the '
+                             'cross-match step) and applies tight secular-aberration '
+                             'PM + zero-parallax priors to vetted QSOs.')
 
     args = parser.parse_args()
+
+    # Resolve lib_dir: CLI arg > config.toml
+    _lib_dir_arg = args.lib_dir
+    if _lib_dir_arg is None:
+        try:
+            import re, os
+            _cfg = Path(os.environ.get('BP3M_HOME', Path.home() / '.bp3m')) / 'config.toml'
+            if _cfg.exists():
+                _m = re.search(r'^lib_dir\s*=\s*["\']([^"\']+)["\']',
+                               _cfg.read_text(), re.MULTILINE)
+                if _m:
+                    _lib_dir_arg = _m.group(1)
+        except Exception:
+            pass
 
     run_pop_fit(
         output_dir=Path(args.output_dir).resolve(),
@@ -2633,4 +2892,6 @@ def main():
         cte_spatial_order=args.cte_spatial_order,
         cte_time_poly_order=args.cte_time_poly_order,
         cte_n_iter=args.cte_n_iter,
+        lib_dir=Path(_lib_dir_arg) if _lib_dir_arg else None,
+        use_qso_anchors=not args.no_qso_anchors,
     )

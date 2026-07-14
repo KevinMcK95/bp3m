@@ -206,6 +206,8 @@ def run_cross_match(
     force_rematch: bool = False,
     image_id: str | None = None,
     restrict_to_obsids: list[str] | None = None,
+    lib_dir: "Path | None" = None,
+    run_qso_vetting: bool = True,
 ) -> list[Path]:
     """
     Cross-match all PSF-fit HST catalogs in a field against Gaia.
@@ -382,4 +384,22 @@ def run_cross_match(
             results.append(p)
 
     print(f"  Cross-match complete: {len(results)}/{len(folders)} available.")
+
+    # ── QSO anchor vetting (Quaia + MILLIQUAS + astrometric cut) ─────────────
+    if run_qso_vetting:
+        try:
+            from .qso_vetting import vet_qso_candidates
+            print("\n" + "─" * 50)
+            print("Step 4b: QSO anchor vetting")
+            print("─" * 50)
+            vet_qso_candidates(
+                field_name=field_name,
+                output_dir=output_dir,
+                lib_dir=lib_dir,
+            )
+        except Exception as _qexc:
+            print(f"  WARNING: QSO vetting failed — {_qexc}")
+    else:
+        print("  QSO vetting skipped (--no_qso_anchors)")
+
     return results

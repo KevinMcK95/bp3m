@@ -53,6 +53,7 @@ def run_alignment(  # noqa: C901
     pos_err_floor: float = 5e-3,
     plot_residuals: bool = False,
     plot_influence: bool = False,
+    use_qso_anchors: bool = True,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -202,6 +203,51 @@ def run_alignment(  # noqa: C901
                           poly_order=poly_order)
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
+
+    # ── QSO anchor prior injection ────────────────────────────────────────────
+    # Replace the diffuse global prior on PM+parallax with the tight secular-
+    # aberration prior for vetted QSO anchors.  Adds σ_κ^{-2} to the PM rows
+    # of C_survey_inv and the matching secular-aberration RHS to
+    # C_survey_inv_dot_v — the Gaia measurement contribution stays unchanged.
+    if use_qso_anchors:
+        _qso_anchor_path = (Path(output_dir) / field_name / 'Gaia'
+                            / f'{field_name}_qso_anchors.csv')
+        if _qso_anchor_path.exists():
+            import pandas as _qpd
+            import numpy as _qnp
+            from bp3m.pipeline.secular_aberration import secular_aberration_pm as _sa_pm
+
+            _qdf = _qpd.read_csv(_qso_anchor_path, dtype={'source_id': 'int64'})
+            _qdf_ok = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+
+            _sigma_qso_pm_inv_sq  = (3.5e-4) ** -2   # (σ_κ = 0.35 µas/yr in mas/yr)^{-2}
+            _sigma_qso_plx_inv_sq = (1.0e-3) ** -2   # (1 µas in mas)^{-2}
+            _n_injected = 0
+
+            for _, _qrow in _qdf_ok.iterrows():
+                _sidx = star_id_to_idx.get(int(_qrow['source_id']))
+                if _sidx is None:
+                    continue
+                _pmra_ab  = float(_qrow['pmra_aberr_uas'])  * 1e-3  # µas → mas/yr
+                _pmdec_ab = float(_qrow['pmdec_aberr_uas']) * 1e-3
+
+                # Add tight prior to information matrix
+                solver.C_survey_inv[_sidx, 2, 2] += _sigma_qso_pm_inv_sq
+                solver.C_survey_inv[_sidx, 3, 3] += _sigma_qso_pm_inv_sq
+                solver.C_survey_inv[_sidx, 4, 4] += _sigma_qso_plx_inv_sq
+
+                # Add prior RHS: h_new[2] += σ_κ^{-2} * μ_aberr (parallax prior mean = 0)
+                solver.C_survey_inv_dot_v[_sidx, 2] += _sigma_qso_pm_inv_sq * _pmra_ab
+                solver.C_survey_inv_dot_v[_sidx, 3] += _sigma_qso_pm_inv_sq * _pmdec_ab
+                _n_injected += 1
+
+            if _n_injected > 0:
+                print(f"  QSO anchor priors injected for {_n_injected} stars "
+                      f"(σ_κ = 0.35 µas/yr, σ_plx = 1 µas)")
+            else:
+                print("  QSO anchor file found but no anchors matched to solver stars")
+        else:
+            print("  No QSO anchor file found — run cross-match first to generate it")
 
     # ── Fit ───────────────────────────────────────────────────────────────────
     clip = clip_sigma if clip_sigma > 0 else None

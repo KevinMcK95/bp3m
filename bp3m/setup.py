@@ -82,7 +82,24 @@ def _download_large(url: str, dest: Path, label: str = '') -> bool:
                 shown_mb[0] = int(mb / 20) * 20
                 tot = f'/{total/1e6:.0f} MB' if total > 0 else ''
                 print(f'    {label}: {mb:.0f}{tot} MB...', end='\r', flush=True)
-        urllib.request.urlretrieve(url, str(tmp), _hook)
+        # Use a browser User-Agent — some servers (e.g. quasars.org) return 406
+        # when the default Python UA string is detected.
+        req = urllib.request.Request(
+            url,
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; bp3m-setup/1.0)'},
+        )
+        with urllib.request.urlopen(req) as resp:
+            total_size = int(resp.headers.get('Content-Length', 0))
+            block_size = 65536
+            block_num  = 0
+            with open(tmp, 'wb') as f:
+                while True:
+                    chunk = resp.read(block_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    block_num += 1
+                    _hook(block_num, block_size, total_size)
         print()
         tmp.rename(dest)
         return True
