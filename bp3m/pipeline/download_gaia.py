@@ -71,25 +71,30 @@ _QUALITY_COLS = (
 _DSC_COLS = ('classprob_dsc_combmod_quasar', 'in_qso_candidates')
 
 # Columns to SELECT from gaiadr3.galaxy_candidates.
-# Sérsic profile parameters are the key morphology indicators:
-#   radius_sersic  — effective half-light radius (arcsec); use for PSF
-#                    inflation: large radius → position less reliable
-#   sersic_index   — n; n≈1=disk, n≈4=de Vaucouleurs (elliptical)
-#   chi2_sersic    — Sérsic fit quality; outliers → unreliable morphology
-#   flags_sersic   — bit flags for fit quality/convergence
-# Excludes array-type columns that cannot be serialised to CSV.
+# Key morphology columns:
+#   radius_sersic — effective half-light radius (arcsec); primary extent indicator
+#   n_sersic      — Sérsic index (n≈1=disk, n≈4=de Vaucouleurs elliptical)
+#   l2_sersic     — L2 norm of Sérsic fit residuals (quality; lower = better)
+#   flags_sersic  — bit flags for fit convergence/quality
+# Both Sérsic and de Vaucouleurs fits are included.
+# Excludes morph_params_corr_vec_sersic and morph_params_corr_vec_de_vaucouleurs
+# (array types, cannot be serialised to CSV).
 _GALAXY_CANDIDATES_COLS = (
     "source_id, "
+    "vari_best_class_name, vari_best_class_score, "
     "classprob_dsc_combmod_galaxy, classprob_dsc_combmod_quasar, "
     "classlabel_dsc, classlabel_dsc_joint, classlabel_oa, "
-    "n_transits, astrometric_selection_flag, source_selection_flags, "
-    "mag_g_sersic, mag_g_sersic_error, "
+    "redshift_ugc, redshift_ugc_lower, redshift_ugc_upper, "
+    "n_transits, source_selection_flags, "
     "radius_sersic, radius_sersic_error, "
-    "sersic_index, sersic_index_error, "
+    "n_sersic, n_sersic_error, "
     "ellipticity_sersic, ellipticity_sersic_error, "
-    "angle_sersic, angle_sersic_error, "
-    "chi2_sersic, flags_sersic, "
-    "l2_norm"
+    "posangle_sersic, posangle_sersic_error, "
+    "intensity_sersic, intensity_sersic_error, "
+    "l2_sersic, flags_sersic, "
+    "radius_de_vaucouleurs, radius_de_vaucouleurs_error, "
+    "ellipticity_de_vaucouleurs, ellipticity_de_vaucouleurs_error, "
+    "l2_de_vaucouleurs, flags_de_vaucouleurs"
 )
 
 # Columns to SELECT from gaiadr3.qso_candidates (excludes array-type
@@ -525,10 +530,11 @@ def download_gaia_galaxy_candidates(
                          Use to set position uncertainty inflation in the solver:
                          compact (< ~0.3″) sources are nearly stellar; larger
                          sources degrade PSF-fit centroid reliability.
-      sersic_index     — profile shape (n≈1 disk, n≈4 elliptical)
-      chi2_sersic      — Sérsic fit quality; poor fits → unreliable morphology
+      n_sersic         — Sérsic index (n≈1 disk, n≈4 de Vaucouleurs elliptical)
+      l2_sersic        — L2 norm of Sérsic fit residuals; outliers → poor fit
       flags_sersic     — bit flags for convergence / fit quality
       classprob_dsc_combmod_galaxy — DSC galaxy probability (cut at e.g. > 0.5)
+      redshift_ugc     — photometric redshift from the UGC module
     """
     gaia_dir = Path(output_dir) / field_name / "Gaia"
     gaia_dir.mkdir(parents=True, exist_ok=True)
