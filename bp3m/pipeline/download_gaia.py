@@ -71,11 +71,13 @@ _QUALITY_COLS = (
 _DSC_COLS = ('classprob_dsc_combmod_quasar', 'in_qso_candidates')
 
 # Columns to SELECT from gaiadr3.galaxy_candidates.
-# Key morphology columns:
-#   radius_sersic — effective half-light radius (arcsec); primary extent indicator
+# Key morphology columns (UNITS: radius_sersic / radius_de_vaucouleurs are in MAS):
+#   radius_sersic — effective half-light radius in MAS; primary extent indicator.
+#                   Divide by 1000 to get arcsec.  Only populated when the Sérsic
+#                   fit converged; NULL for many sources (fit did not converge).
 #   n_sersic      — Sérsic index (n≈1=disk, n≈4=de Vaucouleurs elliptical)
 #   l2_sersic     — L2 norm of Sérsic fit residuals (quality; lower = better)
-#   flags_sersic  — bit flags for fit convergence/quality
+#   flags_sersic  — bit flags for fit convergence/quality (non-zero = caveats)
 # Both Sérsic and de Vaucouleurs fits are included.
 # Excludes morph_params_corr_vec_sersic and morph_params_corr_vec_de_vaucouleurs
 # (array types, cannot be serialised to CSV).
@@ -525,11 +527,10 @@ def download_gaia_galaxy_candidates(
     cached — pass ``force_redownload=True`` to re-query the archive.
 
     Key morphology columns for astrometric use:
-      radius_sersic    — effective half-light radius (arcsec); primary indicator
-                         of how extended the source is in Gaia imaging.
-                         Use to set position uncertainty inflation in the solver:
-                         compact (< ~0.3″) sources are nearly stellar; larger
-                         sources degrade PSF-fit centroid reliability.
+      radius_sersic    — effective half-light radius in MAS (divide by 1000 for
+                         arcsec); primary indicator of how extended the source is.
+                         NULL when the Sérsic fit did not converge (~most sources).
+                         Use to set position uncertainty inflation in the solver.
       n_sersic         — Sérsic index (n≈1 disk, n≈4 de Vaucouleurs elliptical)
       l2_sersic        — L2 norm of Sérsic fit residuals; outliers → poor fit
       flags_sersic     — bit flags for convergence / fit quality
