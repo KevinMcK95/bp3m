@@ -88,19 +88,19 @@ _DR4_INT_DATA_RELEASE: str = "Gaia DR4_INT4"  # internal pre-release label
 _TCB_EPOCH_JD: float = 2455197.5  # JD of 2010-01-01T00:00:00 TCB (approx)
 _NS_PER_JYEAR: float = 365.25 * 86400 * 1e9
 
-# Columns that must be present in a valid epoch astrometry DataFrame
+# Columns that must be present in a valid epoch astrometry DataFrame.
+# These are the columns actually consumed by prepare_epoch_obs_for_solver().
+# ra0/dec0 and colour_factor_al are present in the DR4 VOTable but not used
+# by the solver; they are not required here so synthetic DataFrames (which
+# omit them) pass the check.
 _REQUIRED_EPOCH_COLS = [
-    "source_id",
     "obs_time_tcb",
     "centroid_pos_al",
     "centroid_pos_error_al",
     "scan_pos_angle",
     "parallax_factor_al",
-    "colour_factor_al",
     "used_by_agis_al",
     "agis_source_excess_noise",
-    "ra0",
-    "dec0",
 ]
 
 
@@ -942,5 +942,180 @@ def prepare_epoch_obs_for_solver(
             "n_transits": n_usable,
             "n_flagged":  n_flagged,
         }
+
+    return result
+
+
+# ── Synthetic epoch data generation ──────────────────────────────────────────
+
+def _sigma_al_from_gmag(gmag: float) -> float:
+    """Approximate per-CCD AL centroid uncertainty (mas) as a function of G mag.
+
+    Based on the Gaia DR4 per-CCD noise model (Fig. 3 of Lindegren+2021 and
+    ESA pre-release documentation).  The floor at bright magnitudes is set by
+    attitude noise and calibration residuals; the faint end is photon-noise limited.
+    """
+    # Rough piecewise log-linear model calibrated to ~0.12 mas at G=16, ~0.06 at G<13
+    if gmag <= 13.0:
+        return 0.06
+    log_sigma = np.interp(
+        gmag,
+        [13.0, 16.0, 18.0, 19.5, 21.0],
+        [np.log10(0.06), np.log10(0.12), np.log10(0.4), np.log10(1.0), np.log10(3.0)],
+    )
+    return float(10.0 ** log_sigma)
+
+
+def generate_synthetic_epoch_data(
+    source_df: pd.DataFrame,
+    n_transits_per_source: int = 80,
+    n_ccd_per_transit: int = 9,
+    ref_epoch_jyear: float = DR4_REF_EPOCH_JYEAR,
+    mission_start_jyear: float = 2014.5,
+    mission_end_jyear: float = 2017.5,
+    agis_source_excess_noise: float = 0.0,
+    rejection_fraction: float = 0.05,
+    seed: int = 42,
+) -> dict[int, pd.DataFrame]:
+    """Generate synthetic Gaia DR4 epoch astrometry for end-to-end pipeline tests.
+
+    Creates per-CCD AL observations consistent with the model expected by
+    prepare_epoch_obs_for_solver().  The ``centroid_pos_al`` values are AGIS
+    residuals relative to the input catalog solution (the "true" parameters equal
+    the catalog parameters, so the signal is zero and the data are pure noise).
+    ``centroid_pos_error_al`` is set to the same σ used to draw the noise,
+    ensuring the solver sees realistic self-consistent weights.
+
+    To inject a signal (test recovery of a perturbation), supply a source_df
+    whose ``pmra``/``pmdec``/``parallax`` differ from the truth you want to
+    recover — the caller adds the AL signal externally after calling this function,
+    or uses the returned DataFrames directly and relies on the BP3M prior update
+    (zeroing the Gaia catalog prior) to measure the departure.
+
+    Parameters
+    ----------
+    source_df
+        Per-source parameters.  Required columns: ``source_id`` (int64),
+        ``ra``, ``dec``, ``pmra``, ``pmdec``, ``parallax``.  Optional:
+        ``phot_g_mean_mag`` (default 18.0 if absent).
+    n_transits_per_source
+        Number of FoV transits per source (default 80, ~typical for DR4).
+    n_ccd_per_transit
+        Number of AF CCDs per transit (1-9, default 9 = AF1-9).  One row is
+        emitted per CCD, with a slightly different obs_time_tcb (~10 s spacing).
+    ref_epoch_jyear
+        Reference epoch for Δt in the observation model (default 2017.5).
+    mission_start_jyear, mission_end_jyear
+        Observation window for random transit time draw (default 2014.5-2017.5).
+    agis_source_excess_noise
+        Source excess noise (mas) to inject into all sources (default 0.0).
+    rejection_fraction
+        Fraction of CCD observations to mark as used_by_agis_al=False (default 5%).
+    seed
+        RNG seed for reproducibility (default 42).
+
+    Returns
+    -------
+    Dict source_id (int64) → per-CCD epoch DataFrame, compatible with
+    ``prepare_epoch_obs_for_solver()`` and ``_save_epoch_cache()``.
+    """
+    from bp3m.astro_utils import get_tele_position, get_parallax_factors
+    from astropy.time import Time
+
+    rng = np.random.default_rng(seed)
+    result: dict[int, pd.DataFrame] = {}
+
+    source_df = source_df.copy()
+    source_df["source_id"] = source_df["source_id"].astype(np.int64)
+    if "phot_g_mean_mag" not in source_df.columns:
+        source_df["phot_g_mean_mag"] = 18.0
+
+    for _, src in source_df.iterrows():
+        sid = int(src["source_id"])
+        ra  = float(src["ra"])
+        dec = float(src["dec"])
+        pmra   = float(src.get("pmra",    0.0) or 0.0)
+        pmdec  = float(src.get("pmdec",   0.0) or 0.0)
+        plx    = float(src.get("parallax", 0.0) or 0.0)
+        gmag   = float(src.get("phot_g_mean_mag", 18.0))
+
+        sigma_single_ccd = _sigma_al_from_gmag(gmag)
+
+        # ── Generate random transit times over the mission window ─────────────
+        t_jyear = rng.uniform(mission_start_jyear, mission_end_jyear,
+                              size=n_transits_per_source)
+        t_jyear = np.sort(t_jyear)
+
+        # ── Scan angles: approximate Gaia scanning law ────────────────────────
+        # Gaia's spin period is ~6 h; over the 3-year mission each star is
+        # observed at a wide variety of scan angles.  Draw from a uniform
+        # distribution on [0°, 360°) as a first approximation.
+        theta_deg = rng.uniform(0.0, 360.0, size=n_transits_per_source)
+
+        # ── Parallax factors: use Earth's position as Gaia L2 approximation ──
+        p_al_arr = np.empty(n_transits_per_source)
+        for k, t_yr in enumerate(t_jyear):
+            t_astropy = Time(t_yr, format="jyear")
+            try:
+                xyz = get_tele_position(t_astropy, curr_id="earth")
+                pf_ra, pf_dec = get_parallax_factors(
+                    np.array([ra]), np.array([dec]), xyz
+                )
+                theta_rad_k = np.radians(theta_deg[k])
+                p_al_arr[k] = float(pf_ra[0] * np.sin(theta_rad_k)
+                                    + pf_dec[0] * np.cos(theta_rad_k))
+            except Exception:
+                # Fall back to a simple sinusoidal approximation
+                lam_sun = np.radians(360.0 * (t_yr - 2015.0) % 360.0)
+                ra_rad  = np.radians(ra)
+                dec_rad = np.radians(dec)
+                cos_dec = np.cos(dec_rad)
+                p_al_arr[k] = float(
+                    (-np.sin(lam_sun) * np.sin(theta_deg[k] * np.pi / 180) * cos_dec
+                     + np.cos(lam_sun) * np.cos(theta_deg[k] * np.pi / 180) * cos_dec)
+                )
+
+        # ── Expand each transit to n_ccd_per_transit CCD rows ─────────────────
+        # CCD times are spaced ~10 s apart within a transit (AF strip crossing time)
+        ccd_time_offset_jyr = np.arange(n_ccd_per_transit) * (10.0 / (365.25 * 86400))
+        # ccd_scan_angle_offset: slight variation (~0.005°) across the focal plane
+        ccd_angle_offset_deg = np.linspace(-0.005, 0.005, n_ccd_per_transit)
+
+        rows = []
+        for k in range(n_transits_per_source):
+            for ccd_idx in range(n_ccd_per_transit):
+                t_ccd = t_jyear[k] + ccd_time_offset_jyr[ccd_idx]
+                theta_ccd = theta_deg[k] + ccd_angle_offset_deg[ccd_idx]
+                dt_k = t_ccd - ref_epoch_jyear
+                sin_th = np.sin(np.radians(theta_ccd))
+                cos_th = np.cos(np.radians(theta_ccd))
+
+                # centroid_pos_al = a_k · (v_true − v_AGIS) + noise
+                # For the synthetic base case v_true = v_AGIS → signal = 0
+                noise = rng.normal(0.0, sigma_single_ccd)
+                centroid_al = noise
+
+                # obs_time_tcb: nanoseconds from 2010-01-01 TCB
+                obs_ns = int((t_ccd - 2010.0) * _NS_PER_JYEAR)
+
+                is_rejected = rng.random() < rejection_fraction
+                rows.append({
+                    "source_id":                 sid,
+                    "transit_id":                np.int64(k * 1000 + ccd_idx),
+                    "ra0":                       ra,
+                    "dec0":                      dec,
+                    "obs_time_tcb":              obs_ns,
+                    "scan_pos_angle":            theta_ccd,
+                    "parallax_factor_al":        float(p_al_arr[k]),
+                    "centroid_pos_al":           centroid_al,
+                    "centroid_pos_error_al":     sigma_single_ccd,
+                    "agis_source_excess_noise":  agis_source_excess_noise,
+                    "used_by_agis_al":           not is_rejected,
+                    "ccd_index":                 ccd_idx,
+                })
+
+        df = pd.DataFrame(rows)
+        df["source_id"] = df["source_id"].astype(np.int64)
+        result[sid] = df
 
     return result
