@@ -1815,6 +1815,20 @@ def run_pop_fit(
             try:
                 _qdf = pd.read_csv(_qso_path, dtype={'source_id': 'int64'})
                 _qdf_anchors = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+
+                # Vetting summary
+                _nq_total = len(_qdf)
+                _nq_5p    = int(_qdf['has_5p_solution'].sum())
+                _nq_astro = int(_qdf['astrometric_pass'].sum())
+                _nq_cat   = int(_qdf['catalog_match'].sum())
+                _nq_anch  = len(_qdf_anchors)
+                print(f"  QSO vetting summary:")
+                print(f"    Gaia qso_candidates:          {_nq_total}")
+                print(f"    With 5p/6p solution:          {_nq_5p}")
+                print(f"    Astrometric cut (<3σ):        {_nq_astro}")
+                print(f"    Catalog match (Quaia/MILLIQUAS/CRF3): {_nq_cat}")
+                print(f"    Vetted QSO anchors:           {_nq_anch}")
+
                 _qso_idx_list = []
                 _qso_pmra_list = []
                 _qso_pmdec_list = []
@@ -1822,7 +1836,6 @@ def run_pop_fit(
                     _sidx = star_id_to_idx.get(int(_row['source_id']))
                     if _sidx is not None:
                         _qso_idx_list.append(_sidx)
-                        # secular aberration in mas/yr (stored as µas/yr in CSV)
                         _qso_pmra_list.append(float(_row['pmra_aberr_uas']) * 1e-3)
                         _qso_pmdec_list.append(float(_row['pmdec_aberr_uas']) * 1e-3)
                 if _qso_idx_list:
@@ -1830,8 +1843,9 @@ def run_pop_fit(
                     _qso_pmra_mas  = np.array(_qso_pmra_list, dtype=float)
                     _qso_pmdec_mas = np.array(_qso_pmdec_list, dtype=float)
                     _n_qso_anchors = len(_qso_sidx)
-                print(f"  QSO anchors found in catalog: {len(_qdf_anchors)}, "
-                      f"matched to solver: {_n_qso_anchors}")
+                print(f"    In HST field (in solver):     {_n_qso_anchors}  "
+                      + ("← tight σ_κ prior applied" if _n_qso_anchors > 0
+                         else "(none in HST FOV — prior not applied)"))
             except Exception as _qexc:
                 print(f"  WARNING: could not load QSO anchors — {_qexc}")
         elif lib_dir is not None:

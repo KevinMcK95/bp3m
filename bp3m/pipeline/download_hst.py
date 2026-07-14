@@ -514,19 +514,29 @@ def download_hst_images(
     print(f"\n  Found {len(obs_df)} observation(s):")
     _print_obs_table(obs_df)
 
-    # Save footprint plot — try to load qso_candidates alongside Gaia stars
+    # Save footprint plot — load qso_candidates + vetted qso_anchors if available
     footprint_png = hst_dir / f"{field_name}_footprints.png"
-    _qso_df = None
-    _gaia_dir = Path(output_dir) / field_name / "Gaia"
-    _qso_csvs = sorted(_gaia_dir.glob("*_qso_candidates.csv"))
+    _qso_df     = None
+    _anchor_df  = None
+    _gaia_dir   = Path(output_dir) / field_name / "Gaia"
+    _qso_csvs   = sorted(_gaia_dir.glob("*_qso_candidates.csv"))
     if _qso_csvs:
         try:
             _qso_df = pd.read_csv(_qso_csvs[0])
         except Exception:
             pass
+    _anchor_csv = _gaia_dir / f"{field_name}_qso_anchors.csv"
+    if _anchor_csv.exists():
+        try:
+            _adf = pd.read_csv(_anchor_csv, dtype={'source_id': 'int64'})
+            _anchor_df = _adf[_adf['is_qso_anchor'].fillna(False)].copy()
+            if len(_anchor_df) == 0:
+                _anchor_df = None
+        except Exception:
+            pass
     try:
         plot_footprints(obs_df, footprint_png,
-                        gaia_df=gaia_df, qso_df=_qso_df,
+                        gaia_df=gaia_df, qso_df=_qso_df, anchor_df=_anchor_df,
                         field_name=field_name,
                         ra=ra, dec=dec,
                         search_width=search_width,
@@ -716,6 +726,7 @@ def plot_footprints(
     save_path: str | Path,
     gaia_df: 'pd.DataFrame | None' = None,
     qso_df: 'pd.DataFrame | None' = None,
+    anchor_df: 'pd.DataFrame | None' = None,
     field_name: str = '',
     ra: float | None = None,
     dec: float | None = None,
@@ -735,8 +746,12 @@ def plot_footprints(
                     proposal_id, instrument_name, obs_time.
     save_path     : output PNG path.
     gaia_df       : optional Gaia catalogue; plotted as background scatter.
-    qso_df        : optional Gaia qso_candidates catalogue; plotted as orange
-                    star markers on top of the Gaia scatter.
+    qso_df        : optional Gaia qso_candidates catalogue (all Gaia-flagged
+                    possible QSOs, before external catalog vetting); plotted as
+                    small orange circles.
+    anchor_df     : optional vetted QSO anchors (survived Quaia/MILLIQUAS
+                    cross-match + astrometric cut); plotted as larger gold stars
+                    on top of the raw candidates.
     field_name    : used in the figure title.
     ra, dec       : field centre (degrees).  When provided together with
                     search_width / search_height, the axes are fixed to the
@@ -758,12 +773,24 @@ def plot_footprints(
                    c=gmag, cmap='Greys', vmin=16, vmax=22,
                    s=2, alpha=0.5, rasterized=True, zorder=1)
 
-    # ── QSO candidates ────────────────────────────────────────────────────────
+    # ── QSO candidates (all Gaia-flagged, before external vetting) ───────────
     if qso_df is not None and len(qso_df) > 0 and 'ra' in qso_df.columns:
+        # If we also have anchors, show raw candidates as lighter background markers
+        _qso_alpha = 0.45 if anchor_df is not None else 0.8
         ax.scatter(qso_df['ra'].values, qso_df['dec'].values,
-                   marker='*', s=40, color='darkorange', alpha=0.8,
-                   linewidths=0.3, zorder=3,
-                   label=f'QSO candidates ({len(qso_df)})')
+                   marker='o', s=18, color='#f4a261', alpha=_qso_alpha,
+                   linewidths=0.2, zorder=3,
+                   label=f'Gaia QSO candidates ({len(qso_df)})')
+
+    # ── Vetted QSO anchors (Quaia/MILLIQUAS + astrometric cut) ───────────────
+    if anchor_df is not None and len(anchor_df) > 0:
+        _acol = 'ra' if 'ra' in anchor_df.columns else None
+        _dcol = 'dec' if 'dec' in anchor_df.columns else None
+        if _acol and _dcol:
+            ax.scatter(anchor_df[_acol].values, anchor_df[_dcol].values,
+                       marker='*', s=90, color='gold', edgecolors='darkorange',
+                       linewidths=0.6, alpha=0.95, zorder=5,
+                       label=f'Vetted QSO anchors ({len(anchor_df)})')
 
     # ── Footprint polygons ────────────────────────────────────────────────────
     filter_patches: dict[str, mpatches.Patch] = {}   # for legend
@@ -876,16 +903,22 @@ def plot_footprints(
     ax.set_aspect(1.0 / np.cos(np.deg2rad(center_dec)), adjustable='box')
 
     # ── Legend, labels, title ─────────────────────────────────────────────────
+    import matplotlib.lines as mlines
     legend_handles = list(filter_patches.values())
     if qso_df is not None and len(qso_df) > 0 and 'ra' in qso_df.columns:
-        import matplotlib.lines as mlines
         legend_handles.append(
-            mlines.Line2D([], [], marker='*', color='darkorange',
-                          markersize=8, linestyle='None',
-                          label=f'QSO candidates ({len(qso_df)})'))
+            mlines.Line2D([], [], marker='o', color='#f4a261',
+                          markersize=6, linestyle='None', alpha=0.7,
+                          label=f'Gaia QSO candidates ({len(qso_df)})'))
+    if anchor_df is not None and len(anchor_df) > 0:
+        legend_handles.append(
+            mlines.Line2D([], [], marker='*', color='gold',
+                          markeredgecolor='darkorange', markeredgewidth=0.6,
+                          markersize=10, linestyle='None',
+                          label=f'Vetted QSO anchors ({len(anchor_df)})'))
     if legend_handles:
         ax.legend(handles=legend_handles,
-                  title='Filter', fontsize=8, title_fontsize=8,
+                  title='Filter / sources', fontsize=8, title_fontsize=8,
                   loc='best', framealpha=0.8)
 
     ax.set_xlabel('R.A. (deg)')

@@ -205,49 +205,71 @@ def run_alignment(  # noqa: C901
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
 
     # ── QSO anchor prior injection ────────────────────────────────────────────
-    # Replace the diffuse global prior on PM+parallax with the tight secular-
+    # Replaces the diffuse global prior on PM+parallax with a tight secular-
     # aberration prior for vetted QSO anchors.  Adds σ_κ^{-2} to the PM rows
     # of C_survey_inv and the matching secular-aberration RHS to
     # C_survey_inv_dot_v — the Gaia measurement contribution stays unchanged.
+    print("\n  QSO anchor priors:")
     if use_qso_anchors:
         _qso_anchor_path = (Path(output_dir) / field_name / 'Gaia'
                             / f'{field_name}_qso_anchors.csv')
         if _qso_anchor_path.exists():
             import pandas as _qpd
-            import numpy as _qnp
-            from bp3m.pipeline.secular_aberration import secular_aberration_pm as _sa_pm
 
-            _qdf = _qpd.read_csv(_qso_anchor_path, dtype={'source_id': 'int64'})
-            _qdf_ok = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+            _qdf     = _qpd.read_csv(_qso_anchor_path, dtype={'source_id': 'int64'})
+            _n_gaia_candidates = len(_qdf)
+            _qdf_ok  = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+            _n_anchors = len(_qdf_ok)
 
-            _sigma_qso_pm_inv_sq  = (3.5e-4) ** -2   # (σ_κ = 0.35 µas/yr in mas/yr)^{-2}
-            _sigma_qso_plx_inv_sq = (1.0e-3) ** -2   # (1 µas in mas)^{-2}
+            # Breakdown: quaia / milliquas / crf
+            _n_quaia  = int(_qdf_ok.get('quaia_match',   _qpd.Series(False)).sum())
+            _n_mq     = int(_qdf_ok.get('milliquas_match', _qpd.Series(False)).sum())
+            _n_crf    = int(_qdf_ok.get('gaia_crf_source', _qpd.Series(False)).sum())
+            _n_5p     = int(_qdf['has_5p_solution'].sum())
+            _n_astrom = int(_qdf['astrometric_pass'].sum())
+
+            print(f"    Gaia qso_candidates in field:  {_n_gaia_candidates}")
+            print(f"    With 5p/6p Gaia solution:      {_n_5p}")
+            print(f"    Astrometric cut survivors:     {_n_astrom}  "
+                  f"(|Δv|_Mahal < 3σ vs secular aberration + zero parallax)")
+            print(f"    Quaia (source_id match):       "
+                  f"{int(_qdf['quaia_match'].sum())} candidates  →  {_n_quaia} anchors")
+            print(f"    MILLIQUAS (RA/Dec match):      "
+                  f"{int(_qdf['milliquas_match'].sum())} candidates  →  {_n_mq} anchors")
+            if _n_crf:
+                print(f"    Gaia CRF3 (highest purity):    {_n_crf} anchors")
+            print(f"    Vetted QSO anchors total:      {_n_anchors}  "
+                  f"(catalog match AND astrometric pass)")
+
+            _sigma_qso_pm_inv_sq  = (3.5e-4) ** -2
+            _sigma_qso_plx_inv_sq = (1.0e-3) ** -2
             _n_injected = 0
 
             for _, _qrow in _qdf_ok.iterrows():
                 _sidx = star_id_to_idx.get(int(_qrow['source_id']))
                 if _sidx is None:
                     continue
-                _pmra_ab  = float(_qrow['pmra_aberr_uas'])  * 1e-3  # µas → mas/yr
+                _pmra_ab  = float(_qrow['pmra_aberr_uas'])  * 1e-3
                 _pmdec_ab = float(_qrow['pmdec_aberr_uas']) * 1e-3
 
-                # Add tight prior to information matrix
                 solver.C_survey_inv[_sidx, 2, 2] += _sigma_qso_pm_inv_sq
                 solver.C_survey_inv[_sidx, 3, 3] += _sigma_qso_pm_inv_sq
                 solver.C_survey_inv[_sidx, 4, 4] += _sigma_qso_plx_inv_sq
-
-                # Add prior RHS: h_new[2] += σ_κ^{-2} * μ_aberr (parallax prior mean = 0)
                 solver.C_survey_inv_dot_v[_sidx, 2] += _sigma_qso_pm_inv_sq * _pmra_ab
                 solver.C_survey_inv_dot_v[_sidx, 3] += _sigma_qso_pm_inv_sq * _pmdec_ab
                 _n_injected += 1
 
             if _n_injected > 0:
-                print(f"  QSO anchor priors injected for {_n_injected} stars "
+                print(f"    Injected into alignment:       {_n_injected}  "
                       f"(σ_κ = 0.35 µas/yr, σ_plx = 1 µas)")
             else:
-                print("  QSO anchor file found but no anchors matched to solver stars")
+                print(f"    Injected into alignment:       0  "
+                      f"(none of the {_n_anchors} vetted anchors are in the HST field)")
         else:
-            print("  No QSO anchor file found — run cross-match first to generate it")
+            print(f"    QSO anchor file not found at {_qso_anchor_path.name}")
+            print(f"    Run cross-match step first to generate it (or pass --no_qso_anchors)")
+    else:
+        print("    Disabled (--no_qso_anchors)")
 
     # ── Fit ───────────────────────────────────────────────────────────────────
     clip = clip_sigma if clip_sigma > 0 else None
