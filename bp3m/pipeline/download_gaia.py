@@ -210,6 +210,7 @@ def _query_mag_bin(args):
             return pd.read_csv(cache_path)
 
     print(f"  Bin {n}/{n_total}: querying G {min_g:.2f}–{max_g:.2f} ...", flush=True)
+    print(f"  ADQL: {full_q}", flush=True)
     last_exc = None
     for attempt in range(_QUERY_RETRIES):
         try:
