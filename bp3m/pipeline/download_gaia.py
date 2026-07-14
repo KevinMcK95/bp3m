@@ -429,9 +429,17 @@ def download_gaia_qso_candidates(
                 f"{field_name}_ra{ra:.4f}_dec{dec:+.4f}"
                 f"_w{search_width:.4f}_h{search_height:.4f}_qso_candidates.csv")
 
+    _ABERR_COLS = ('pmra_aberr_uas', 'pmdec_aberr_uas')
+
     if not force_redownload and out_path.exists():
-        print(f"[Gaia] Loading cached qso_candidates: {out_path}")
-        return pd.read_csv(out_path)
+        result = pd.read_csv(out_path)
+        if not all(c in result.columns for c in _ABERR_COLS):
+            print(f"[Gaia] Adding secular aberration columns to cached qso_candidates...")
+            result = _add_secular_aberration(result)
+            result.to_csv(out_path, index=False)
+        else:
+            print(f"[Gaia] Loading cached qso_candidates: {out_path}")
+        return result
 
     box = (f"CONTAINS(POINT('ICRS',g.ra,g.dec),"
            f"BOX('ICRS',{ra:.8f},{dec:.8f},{search_width:.8f},{search_height:.8f}))=1")
@@ -450,12 +458,23 @@ def download_gaia_qso_candidates(
             Gaia.remove_jobs([job.jobid])
         except Exception:
             pass
+        result = _add_secular_aberration(result)
         result.to_csv(out_path, index=False)
         print(f"  qso_candidates: {len(result)} sources → {out_path}")
         return result
     except Exception as e:
         print(f"  WARNING: qso_candidates download failed — {e}")
         return None
+
+
+def _add_secular_aberration(df: pd.DataFrame) -> pd.DataFrame:
+    """Add pmra_aberr_uas / pmdec_aberr_uas columns (µas/yr) in place."""
+    from .secular_aberration import secular_aberration_pm
+    pmra, pmdec = secular_aberration_pm(df['ra'].values, df['dec'].values)
+    df = df.copy()
+    df['pmra_aberr_uas']  = pmra
+    df['pmdec_aberr_uas'] = pmdec
+    return df
 
 
 def find_qso_catalogs(lib_dir: Path | None) -> dict[str, Path | None]:
