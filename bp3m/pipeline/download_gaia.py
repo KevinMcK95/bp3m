@@ -177,9 +177,27 @@ def _mag_bins(min_mag, max_mag, area):
         log10(1.0), log10(1.0 + max_mag - min_mag), num=int(n))
 
 
+_QUERY_TIMEOUT = 300   # seconds per attempt
+_QUERY_RETRIES = 3
+
+
+def _submit_gaia_async(full_q: str) -> pd.DataFrame:
+    """Submit one Gaia TAP async job and return the result as a DataFrame."""
+    from astroquery.gaia import Gaia
+    job = Gaia.launch_job_async(full_q)
+    result = job.get_results().to_pandas()
+    try:
+        Gaia.remove_jobs([job.jobid])
+    except Exception:
+        pass
+    return result
+
+
 def _query_mag_bin(args):
     """Worker: launch one Gaia TAP query for a magnitude slice."""
-    from astroquery.gaia import Gaia
+    import concurrent.futures
+    import time
+
     query, min_g, max_g, ind_dir, field, n, n_total = args
     full_q = (query +
               f" AND (phot_g_mean_mag > {min_g:.4f})"
@@ -191,17 +209,37 @@ def _query_mag_bin(args):
         if cache_path.exists():
             return pd.read_csv(cache_path)
 
-    job = Gaia.launch_job_async(full_q)
-    result = job.get_results().to_pandas()
-    try:
-        Gaia.remove_jobs([job.jobid])
-    except Exception:
-        pass
-
-    if cache_path is not None:
-        result.to_csv(cache_path, index=False)
-    print(f"  Bin {n}/{n_total}: {len(result)} stars  (G {min_g:.2f}–{max_g:.2f})")
-    return result
+    print(f"  Bin {n}/{n_total}: querying G {min_g:.2f}–{max_g:.2f} ...", flush=True)
+    last_exc = None
+    for attempt in range(_QUERY_RETRIES):
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+                future = exe.submit(_submit_gaia_async, full_q)
+                result = future.result(timeout=_QUERY_TIMEOUT)
+            if cache_path is not None:
+                result.to_csv(cache_path, index=False)
+            print(f"  Bin {n}/{n_total}: {len(result)} stars  (G {min_g:.2f}–{max_g:.2f})")
+            return result
+        except concurrent.futures.TimeoutError:
+            last_exc = TimeoutError(
+                f"Gaia TAP query timed out after {_QUERY_TIMEOUT}s"
+            )
+            wait = 30 * (attempt + 1)
+            if attempt < _QUERY_RETRIES - 1:
+                print(f"    Timeout (attempt {attempt+1}/{_QUERY_RETRIES}), "
+                      f"retrying in {wait}s ...", flush=True)
+                time.sleep(wait)
+        except Exception as e:
+            last_exc = e
+            wait = 15 * (attempt + 1)
+            if attempt < _QUERY_RETRIES - 1:
+                print(f"    Error: {e} (attempt {attempt+1}/{_QUERY_RETRIES}), "
+                      f"retrying in {wait}s ...", flush=True)
+                time.sleep(wait)
+    raise RuntimeError(
+        f"Gaia query for bin {n}/{n_total} (G {min_g:.2f}–{max_g:.2f}) "
+        f"failed after {_QUERY_RETRIES} attempts: {last_exc}"
+    ) from last_exc
 
 
 # ── Cache helpers ────────────────────────────────────────────────────────────

@@ -1115,12 +1115,18 @@ def _render_sersic_psf(
     y_src: float,
     sci_shape: tuple[int, int],
     hw: int = _CUTOUT_HALF,
+    cx_sub: float = 0.0,
+    cy_sub: float = 0.0,
 ) -> np.ndarray | None:
     """Render one normalised PSF-convolved Sérsic model cutout in raw pixels.
 
     sersic_params : (Re_arcsec, n, q, PA_deg)
-    M_raw_to_sky  : (2,2) matrix — raw pixel offset → sky offset (arcsec)
-    Returns (2*hw+1, 2*hw+1) normalised model (unit total flux) or None on error.
+    M_raw_to_sky  : (2,2) — raw pixel offset (col=x, row=y) → sky (arcsec)
+    cx_sub, cy_sub: sub-pixel offset of source within the integer-pixel cutout,
+                    in raw pixels.  Pass (x_src - round(x_src), y_src - round(y_src))
+                    so the Sérsic peak lands at the correct position in obs_cut.
+    Returns (2*hw+1, 2*hw+1) model in (row=y, col=x) convention matching obs_cut,
+    normalised to unit total flux, or None on error.
     """
     from scipy.signal import fftconvolve
     try:
@@ -1134,47 +1140,53 @@ def _render_sersic_psf(
     psf_size = psf_cube.shape[-1]   # 101 for ACS/WFC at psf_scale=4
     half_ss  = psf_size // 2        # 50
 
-    # Build a supersampled grid large enough for the convolution.
-    # N_ss must accommodate the Sérsic extent plus one full PSF half-width of margin.
-    # We use (2*hw+1)*psf_scale + 2*half_ss + 1 (always odd for symmetry).
+    # Supersampled grid: (2*hw+1)*psf_scale core + PSF half-width padding on each side.
     raw_pixels = 2 * hw + 1
     ss_core    = raw_pixels * psf_scale
-    N_ss       = ss_core + 2 * half_ss   # padded grid in supersampled units
+    N_ss       = ss_core + 2 * half_ss
     if N_ss % 2 == 0:
         N_ss += 1
     half_N = N_ss // 2
 
-    # Supersampled pixel offsets from source center, in raw-pixel units
-    # Spacing = 1/psf_scale raw px
+    # Build per-axis offset grids with sub-pixel correction.
+    # dk_raw_x[k] = raw-pixel x-offset of supersampled point k from the source center.
+    # dk_raw_y[k] = same for y. The source sits at (round(x_src)+cx_sub, ...) in raw px.
     k = np.arange(N_ss) - half_N
-    dk_raw = k / float(psf_scale)             # raw pixel offset per supersampled pixel
-    DX_ss, DY_ss = np.meshgrid(dk_raw, dk_raw, indexing='ij')  # (N_ss, N_ss) in raw px
+    dk_raw_x = k / float(psf_scale) - cx_sub   # x offsets from source (East direction)
+    dk_raw_y = k / float(psf_scale) - cy_sub   # y offsets from source (North direction)
 
-    # Map raw pixel offsets → sky offsets (arcsec) via M_raw_to_sky
-    sky = M_raw_to_sky @ np.stack([DX_ss.ravel(), DY_ss.ravel()])  # (2, N²)
-    dra_ss  = sky[0].reshape(N_ss, N_ss)   # East arcsec
-    ddec_ss = sky[1].reshape(N_ss, N_ss)   # North arcsec
+    # Default meshgrid indexing='xy': DX[i,j] = dk_raw_x[j] (x varies along cols),
+    # DY[i,j] = dk_raw_y[i] (y varies along rows) → arrays in (row=y, col=x) convention.
+    DX_ss, DY_ss = np.meshgrid(dk_raw_x, dk_raw_y)   # each (N_ss, N_ss)
 
-    # Evaluate Sérsic on the supersampled grid
+    # Map (δx_raw, δy_raw) → (δα_arcsec, δδ_arcsec) via M_raw_to_sky.
+    sky     = M_raw_to_sky @ np.stack([DX_ss.ravel(), DY_ss.ravel()])  # (2, N²)
+    dra_ss  = sky[0].reshape(N_ss, N_ss)   # RA offset in arcsec
+    ddec_ss = sky[1].reshape(N_ss, N_ss)   # Dec offset in arcsec
+
+    # Sérsic profile in (row=y, col=x) supersampled frame
     S_ss = _sersic_2d(dra_ss, ddec_ss, Re_arcsec, n, q, PA_rad).astype(np.float64)
 
-    # Get STDPSF at source position (interpolated, supersampled)
-    psf_raw = interpolate_psf(psf_cube, xs_psf, ys_psf, x_src, y_src)  # (psf_size,psf_size)
-    psf_raw = np.asarray(psf_raw, dtype=np.float64)
-    psf_norm = psf_raw / psf_raw.sum()   # normalise PSF to unit flux
+    # STDPSF at source detector position (101×101 at psf_scale supersamples/raw-px)
+    psf_raw  = np.asarray(interpolate_psf(psf_cube, xs_psf, ys_psf, x_src, y_src),
+                          dtype=np.float64)
+    psf_norm = psf_raw / psf_raw.sum()
 
-    # FFT-convolve Sérsic model with PSF (both at 1/psf_scale raw pixel spacing)
+    # FFT-convolve Sérsic model with PSF in the supersampled frame
     conv = fftconvolve(S_ss, psf_norm, mode='same')
 
-    # Extract central (raw_pixels*psf_scale) × (raw_pixels*psf_scale) region
+    # Extract central ss_core × ss_core region and downsample to raw pixels.
+    # The Sérsic+PSF peak is at (half_N + cy_sub*psf_scale, half_N + cx_sub*psf_scale)
+    # in the N_ss grid; after extraction and downsampling it lands at (hw+cy_sub, hw+cx_sub)
+    # in model_raw, matching the source position in obs_cut.
     c0 = half_N - ss_core // 2
     c1 = c0 + ss_core
-    model_ss = conv[c0:c1, c0:c1]   # (ss_core, ss_core) = (raw_pixels*psf_scale)²
+    model_ss = conv[c0:c1, c0:c1]   # (ss_core, ss_core) in (row, col) convention
 
-    # Downsample: average psf_scale × psf_scale blocks → raw pixel model
+    # Downsample: average psf_scale blocks along each axis → (raw_pixels, raw_pixels)
     model_raw = (model_ss
                  .reshape(raw_pixels, psf_scale, raw_pixels, psf_scale)
-                 .mean(axis=(1, 3)))   # (raw_pixels, raw_pixels)
+                 .mean(axis=(1, 3)))
 
     total = model_raw.sum()
     if total <= 0:
@@ -1215,7 +1227,6 @@ def _linear_params_and_chi2(
 def _fit_one_source(
     sersic_init: np.ndarray,
     image_data: list[dict],
-    M_raw_to_sky: np.ndarray,
     hw: int,
 ) -> dict:
     """Fit Sérsic(Re, n, q, PA) jointly over all images for one source.
@@ -1223,9 +1234,10 @@ def _fit_one_source(
     sersic_init : (Re_arcsec, n, q, PA_deg) initial guess
     image_data  : list of dicts, one per detection:
         {'psf_cube', 'xs_psf', 'ys_psf', 'psf_scale',
-         'x_src', 'y_src', 'sci_shape', 'obs_cut', 'inv_var_cut'}
-    M_raw_to_sky: (2,2) matrix (same for all images in one epoch group
-                   to a good approximation — recomputed per source below)
+         'x_src', 'y_src', 'sci_shape', 'obs_cut', 'inv_var_cut',
+         'M_raw_to_sky', 'cx_sub', 'cy_sub'}
+        M_raw_to_sky: per-image (2,2) raw-pixel → sky (arcsec)
+        cx_sub, cy_sub: sub-pixel offset of source within integer pixel
     hw          : cutout half-width
 
     Returns dict with fit results.
@@ -1236,30 +1248,17 @@ def _fit_one_source(
     bounds = [(0.02, 3.0), (0.3, 8.0), (0.1, 1.0), (0.0, 180.0)]
 
     def objective(theta):
-        Re, n, q, PA = theta
-        model_template = _render_sersic_psf(
-            theta, M_raw_to_sky,
-            image_data[0]['psf_cube'], image_data[0]['xs_psf'],
-            image_data[0]['ys_psf'],  image_data[0]['psf_scale'],
-            image_data[0]['x_src'],   image_data[0]['y_src'],
-            image_data[0]['sci_shape'], hw=hw,
-        )
-        if model_template is None:
-            return 1e30
-
         total_chi2 = 0.0
         for imd in image_data:
-            # Re-render with per-image PSF if PSF data differs
-            if imd is not image_data[0]:
-                M_i = _render_sersic_psf(
-                    theta, M_raw_to_sky,
-                    imd['psf_cube'], imd['xs_psf'], imd['ys_psf'], imd['psf_scale'],
-                    imd['x_src'], imd['y_src'], imd['sci_shape'], hw=hw,
-                )
-                if M_i is None:
-                    continue
-            else:
-                M_i = model_template
+            M_i = _render_sersic_psf(
+                theta, imd['M_raw_to_sky'],
+                imd['psf_cube'], imd['xs_psf'], imd['ys_psf'], imd['psf_scale'],
+                imd['x_src'], imd['y_src'], imd['sci_shape'], hw=hw,
+                cx_sub=imd.get('cx_sub', 0.0), cy_sub=imd.get('cy_sub', 0.0),
+            )
+            if M_i is None:
+                total_chi2 += 1e15
+                continue
             _, _, chi2_i = _linear_params_and_chi2(M_i, imd['obs_cut'], imd['inv_var_cut'])
             if np.isfinite(chi2_i):
                 total_chi2 += chi2_i
@@ -1283,9 +1282,10 @@ def _fit_one_source(
     n_images_used = 0
     for imd in image_data:
         M_i = _render_sersic_psf(
-            theta_best, M_raw_to_sky,
+            theta_best, imd['M_raw_to_sky'],
             imd['psf_cube'], imd['xs_psf'], imd['ys_psf'], imd['psf_scale'],
             imd['x_src'],    imd['y_src'],  imd['sci_shape'], hw=hw,
+            cx_sub=imd.get('cx_sub', 0.0), cy_sub=imd.get('cy_sub', 0.0),
         )
         if M_i is None:
             fluxes.append(np.nan); skies.append(np.nan)
@@ -1580,6 +1580,8 @@ def fit_egsf_sources(
                 inv_var_cut = np.where(var_cut > 0,
                                        1.0 / np.maximum(var_cut, 1e-6), 0.0)
 
+                cx_sub = x_raw - round(x_raw)
+                cy_sub = y_raw - round(y_raw)
                 image_data_list.append(dict(
                     psf_cube=psf_cube, xs_psf=xs_psf, ys_psf=ys_psf,
                     psf_scale=psf_scale,
@@ -1587,6 +1589,7 @@ def fit_egsf_sources(
                     obs_cut=obs_cut.astype(np.float32),
                     inv_var_cut=inv_var_cut.astype(np.float32),
                     M_raw_to_sky=M_r2s,
+                    cx_sub=float(cx_sub), cy_sub=float(cy_sub),
                 ))
 
             if len(image_data_list) < min_detections:
@@ -1606,10 +1609,7 @@ def fit_egsf_sources(
             PA_init = 0.0
             sersic_init = np.array([Re_init, 1.0, q_init, PA_init])
 
-            # Use M_raw_to_sky from first valid detection
-            M_r2s_fit = image_data_list[0]['M_raw_to_sky']
-
-            fit = _fit_one_source(sersic_init, image_data_list, M_r2s_fit, cutout_half)
+            fit = _fit_one_source(sersic_init, image_data_list, cutout_half)
             fit['source_id']  = source_id
             fit['epoch_key']  = epoch_key
             fit['ra_med']     = ra_src
@@ -1752,7 +1752,7 @@ def plot_egsf_diagnostics(
     hst_dir = output_dir / 'HST' / 'mastDownload' / 'HST'
 
     # ── Build panels ──────────────────────────────────────────────────────────
-    n_cols   = 4   # obs / model / residual / PSF
+    n_cols   = 5   # obs / model / residual / PSF / residual/σ
     n_rows   = len(sample)
     fig_w    = n_cols * 2.0 + 1.0
     fig_h    = n_rows * 2.2 + 0.5
@@ -1773,12 +1773,12 @@ def plot_egsf_diagnostics(
                 figsize=(fig_w, n_r * 2.2 + 0.5),
                 squeeze=False,
             )
-            col_titles = ['Observed', 'Sérsic model', 'Residual', 'PSF']
+            col_titles = ['Observed', 'Sérsic model', 'Residual', 'PSF', 'Resid/σ (±5)']
             for ci, ct in enumerate(col_titles):
                 axes[0, ci].set_title(ct, fontsize=9, pad=3)
 
             for row_i, (_, src_row) in enumerate(page_rows.iterrows()):
-                ax_obs, ax_mod, ax_res, ax_psf = axes[row_i]
+                ax_obs, ax_mod, ax_res, ax_psf, ax_sig = axes[row_i]
 
                 source_id = src_row['source_id']
                 tier_lbl  = src_row.get('_tier', '')
@@ -1786,7 +1786,7 @@ def plot_egsf_diagnostics(
                 # Find best detection (highest moment_snr) for this source
                 src_dets = morph[morph['source_id'] == source_id].copy()
                 if len(src_dets) == 0:
-                    for ax in (ax_obs, ax_mod, ax_res, ax_psf):
+                    for ax in (ax_obs, ax_mod, ax_res, ax_psf, ax_sig):
                         ax.set_visible(False)
                     continue
                 src_dets = src_dets.sort_values('moment_snr', ascending=False)
@@ -1847,7 +1847,8 @@ def plot_egsf_diagnostics(
                           or flux_cat is None)
 
                 # ── Reconstruct obs_cut ───────────────────────────────────────
-                obs_cut = model_cut = res_cut_img = psf_img = None
+                obs_cut = model_cut = res_cut_img = psf_img = sigma_cut = None
+                res_over_sigma = None
                 if not failed:
                     sci, var = chip_data
                     psf_cube, xs_psf, ys_psf, psf_scale = psf_data
@@ -1861,6 +1862,7 @@ def plot_egsf_diagnostics(
                         res_cut  = sci[y_lo:y_hi, x_lo:x_hi].astype(float)
                         var_cut  = var[y_lo:y_hi, x_lo:x_hi].astype(float)
                         obs_cut  = res_cut + flux_cat * P
+                        sigma_cut = np.sqrt(np.maximum(var_cut, 1e-6))
                         inv_var  = np.where(var_cut > 0,
                                             1.0 / np.maximum(var_cut, 1e-6), 0.0)
 
@@ -1880,6 +1882,8 @@ def plot_egsf_diagnostics(
                             except np.linalg.LinAlgError:
                                 M_r2s = None
                             if M_r2s is not None:
+                                cx_sub = x_raw - round(x_raw)
+                                cy_sub = y_raw - round(y_raw)
                                 theta = np.array([
                                     src_row['Re_arcsec'], src_row['sersic_n'],
                                     src_row['axis_ratio'], src_row['PA_deg'],
@@ -1891,13 +1895,15 @@ def plot_egsf_diagnostics(
                                         psf_cube, xs_psf, ys_psf, psf_scale,
                                         x_raw, y_raw, sci.shape,
                                         hw=cutout_half,
+                                        cx_sub=cx_sub, cy_sub=cy_sub,
                                     )
                                 if M_norm is not None:
                                     flux_fit, sky_fit, _ = _linear_params_and_chi2(
                                         M_norm, obs_cut.astype(np.float32), inv_var.astype(np.float32)
                                     )
-                                    model_cut   = flux_fit * M_norm + sky_fit
-                                    res_cut_img = obs_cut - model_cut
+                                    model_cut      = flux_fit * M_norm + sky_fit
+                                    res_cut_img    = obs_cut - model_cut
+                                    res_over_sigma = res_cut_img / sigma_cut
 
                         # PSF postage stamp (same size as cutout)
                         psf_img = P.copy()
@@ -1929,6 +1935,9 @@ def plot_egsf_diagnostics(
                         norm=None if res_cut_img is None else
                              Normalize(vmin=-3*vstd, vmax=3*vstd))
                 _imshow(ax_psf, psf_img,     cmap='afmhot')
+                _imshow(ax_sig, res_over_sigma, cmap='RdBu_r',
+                        norm=None if res_over_sigma is None else
+                             Normalize(vmin=-5.0, vmax=5.0))
 
                 # Row label on left
                 Re   = float(src_row['Re_arcsec'])
