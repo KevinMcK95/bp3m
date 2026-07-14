@@ -705,23 +705,22 @@ class BP3MSolver:
     #   3. Use_for_fit masking already handles which sources are active;
     #      transits of masked sources are skipped.
 
-    def _add_gaia_epoch_obs(self, epoch_data: dict) -> None:
-        """Register Gaia DR4 epoch AL observations for inclusion in the solve.
-
-        NOT YET IMPLEMENTED — see design comments above.
+    def _add_gaia_epoch_obs(self, epoch_obs_preprocessed: dict) -> None:
+        """Register precomputed Gaia DR4 AL normal-equation contributions.
 
         Parameters
         ----------
-        epoch_data
-            Dict mapping source_id (int64) → epoch DataFrame, as returned by
-            bp3m.pipeline.download_gaia_epoch.download_epoch_astrometry().
+        epoch_obs_preprocessed
+            Dict source_id (int64) → {'H_contrib': (5,5), 'h_contrib': (5,),
+            'n_transits': int, 'n_flagged': int}, as returned by
+            bp3m.pipeline.download_gaia_epoch.prepare_epoch_obs_for_solver().
         """
-        raise NotImplementedError(
-            "_add_gaia_epoch_obs: direct Gaia AL integration is not yet "
-            "implemented.  Use run_gaia_dr4_epoch() + "
-            "merge_epoch_solutions_into_catalog() to apply improved priors "
-            "from gaiasupdate re-solves instead."
-        )
+        self._gaia_epoch_contrib = epoch_obs_preprocessed
+        n_src = len(epoch_obs_preprocessed)
+        n_matched = sum(1 for sid in epoch_obs_preprocessed
+                        if sid in self.star_id_to_idx)
+        print(f"[Solver] Gaia DR4 epoch obs registered: "
+              f"{n_src} sources ({n_matched} matched in catalog)")
 
     # ── Core solver ────────────────────────────────────────────────────────────
 
@@ -876,6 +875,16 @@ class BP3MSolver:
             XCs_xresid[img] = np.einsum('nki,nkl,nl->ni', X[use_align], Cs_inv[use_align], x_resid[use_align])
 
             H_rr[cs:cs+nr, cs:cs+nr] += self._img_data[img]["C_r_prior_inv"]
+
+        # ── Gaia DR4 epoch AL contributions ───────────────────────────────────
+        if getattr(self, '_gaia_epoch_contrib', None):
+            for source_id, contrib in self._gaia_epoch_contrib.items():
+                if source_id not in self.star_id_to_idx:
+                    continue
+                i = self.star_id_to_idx[source_id]
+                H_vv[i] += contrib['H_contrib']
+                h_all[i] += contrib['h_contrib']
+                h_align[i] += contrib['h_contrib']
 
         # ── Invert H_vv → C_vT ────────────────────────────────────────────────
         C_vT    = np.linalg.inv(H_vv)

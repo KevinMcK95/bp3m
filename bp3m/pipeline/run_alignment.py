@@ -52,6 +52,7 @@ def run_alignment(  # noqa: C901
     pos_err_floor: float = 5e-3,
     plot_residuals: bool = False,
     plot_influence: bool = False,
+    gaia_epoch_obs: dict | None = None,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -200,6 +201,9 @@ def run_alignment(  # noqa: C901
                           poly_order=poly_order)
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
+
+    if gaia_epoch_obs:
+        solver._add_gaia_epoch_obs(gaia_epoch_obs)
 
     # ── Fit ───────────────────────────────────────────────────────────────────
     clip = clip_sigma if clip_sigma > 0 else None

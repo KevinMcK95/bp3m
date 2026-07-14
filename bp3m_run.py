@@ -722,12 +722,17 @@ def main():
         )
 
     # ── Step 4b: Gaia DR4 epoch astrometry (optional) ────────────────────────
+    _gaia_epoch_obs_for_solver: dict | None = None
+
     if getattr(args, 'use_gaia_dr4_epoch', False):
         from bp3m.pipeline.download_gaia_epoch import (
             collect_matched_source_ids,
-            run_gaia_dr4_epoch,
+            download_epoch_astrometry,
+            prepare_epoch_obs_for_solver,
             merge_epoch_solutions_into_catalog,
         )
+        import glob as _glob
+        import pandas as _pd
         print("\n" + "=" * 55)
         print("Step 4b: Gaia DR4 epoch astrometry")
         print("=" * 55)
@@ -735,41 +740,39 @@ def main():
         matched_sids = collect_matched_source_ids(output_dir)
         print(f"  Cross-matched sources: {len(matched_sids)}")
 
-        epoch_solutions = run_gaia_dr4_epoch(
-            field_name=field,
-            output_dir=output_dir,
-            matched_source_ids=matched_sids,
+        # epoch cache is stored at output_dir/Gaia/epoch (without field),
+        # matching the path used by run_gaia_dr4_epoch
+        epoch_dir = output_dir / "Gaia" / "epoch"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+
+        epoch_data = download_epoch_astrometry(
+            matched_sids,
+            epoch_cache_dir=epoch_dir,
             access=args.dr4_access,
             prerelease_votable=args.dr4_prerelease_votable,
             data_release=args.dr4_data_release,
             credentials_file=args.dr4_credentials,
-            model=args.dr4_model,
-            n_download_workers=min(args.n_processes, 8) if args.n_processes > 0 else 4,
+            n_workers=min(args.n_processes, 8) if args.n_processes > 0 else 4,
             force=args.force_rerun_dr4_epoch,
         )
+        print(f"  Epoch data available: {len(epoch_data)} sources")
 
-        if len(epoch_solutions) > 0:
-            # Patch the Gaia CSV on disk so the data loader picks up the
-            # epoch-derived parameters automatically on subsequent runs.
-            from bp3m.pipeline.download_gaia import _cache_stem
-            import glob as _glob
+        if epoch_data:
+            # Load the Gaia summary catalog to extract AGIS PM+parallax values
             _gaia_csvs = sorted(_glob.glob(
-                str(output_dir / "Gaia" / f"*_gaia.csv")
+                str(output_dir / field / "Gaia" / "*_gaia.csv")
             ))
             if _gaia_csvs:
-                _gaia_csv = _gaia_csvs[-1]
-                import pandas as _pd
-                _gdf = _pd.read_csv(_gaia_csv)
+                _gdf = _pd.read_csv(_gaia_csvs[-1])
                 _gdf["source_id"] = _gdf["source_id"].astype("int64")
-                _gdf_ep = merge_epoch_solutions_into_catalog(
-                    _gdf, epoch_solutions,
-                    replace_pms=not args.dr4_no_replace_pms,
-                    replace_parallax=not args.dr4_no_replace_pms,
+                _gaia_epoch_obs_for_solver = prepare_epoch_obs_for_solver(
+                    epoch_data, _gdf,
                 )
-                # Save alongside the original; suffix _ep marks epoch-patched.
-                _ep_csv = _gaia_csv.replace("_gaia.csv", "_gaia_ep.csv")
-                _gdf_ep.to_csv(_ep_csv, index=False)
-                print(f"  Epoch-patched catalog saved → {_ep_csv}")
+                n_ep = len(_gaia_epoch_obs_for_solver)
+                print(f"  Precomputed AL obs for {n_ep} sources "
+                      f"(will be injected into BP3M solve)")
+            else:
+                print("  WARNING: no *_gaia.csv found — cannot prepare AL obs")
 
     # ── Step 5a: Synthetic data generation (optional) ─────────────────────────
 
@@ -906,6 +909,7 @@ def main():
                 pos_err_floor=args.bp3m_pos_err_floor,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
+                gaia_epoch_obs=_gaia_epoch_obs_for_solver,
             )
 
     # Save the command only on successful completion so interrupted runs

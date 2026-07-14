@@ -713,3 +713,156 @@ def collect_matched_source_ids(
             continue
 
     return sorted(source_ids)
+
+
+# ── Solver preprocessing ──────────────────────────────────────────────────────
+
+def prepare_epoch_obs_for_solver(
+    epoch_data: dict[int, pd.DataFrame],
+    gaia_df: pd.DataFrame,
+    ref_epoch_jyear: float = DR4_REF_EPOCH_JYEAR,
+    use_agis_flag: bool = True,
+    min_transits: int = 5,
+    excess_noise_floor_mas: float = 0.0,
+) -> dict[int, dict]:
+    """Precompute per-source AL observation quantities for the BP3M normal equations.
+
+    For each source with epoch data, evaluates the linearized AL observation
+    equation from the user's model:
+
+        ΔAL = (Δα* + μα*·Δt)·sin(θ) + (Δδ + μδ·Δt)·cos(θ) + ϖ·P_AL
+
+    which equals  a_k · v_hat  where the design vector is:
+
+        a_k = [sin(θ_k), cos(θ_k), Δt_k·sin(θ_k), Δt_k·cos(θ_k), P_AL_k]
+
+    and v_hat = (Δα*, Δδ, μα*, μδ, ϖ) is BP3M's 5-parameter astrometric vector
+    (position offsets in mas, PMs in mas/yr, parallax in mas).
+
+    The "observed" AL for each transit is computed relative to the AGIS
+    reference solution so that it is consistent with BP3M's v_hat convention
+    (where Δα*=Δδ=0 corresponds to the Gaia reference position):
+
+        y_k = centroid_pos_al_k
+              − [μα*_AGIS·Δt_k·sin(θ_k) + μδ_AGIS·Δt_k·cos(θ_k) + ϖ_AGIS·P_AL_k]
+
+    i.e.  y_k = centroid_pos_al_k − a_k[2:]·v_AGIS[2:]   (only PM+parallax terms,
+    since v_AGIS[0]=v_AGIS[1]=0 in BP3M's convention).
+
+    Per-transit weight: w_k = 1 / (σ_al_k² + (σ_excess + σ_floor)²).
+    Transits with used_by_agis_al=False are optionally down-weighted by a
+    factor of 0.1 to match the AGIS soft-rejection scheme.
+
+    Parameters
+    ----------
+    epoch_data
+        Dict source_id → epoch DataFrame from download_epoch_astrometry().
+    gaia_df
+        Gaia summary catalog (same as passed to the BP3M solver).  Must have
+        columns: source_id (int64), pmra, pmdec, parallax.
+    ref_epoch_jyear
+        Reference epoch for Δt computation (default 2017.5 for DR4).
+    use_agis_flag
+        Down-weight (×0.1) transits where used_by_agis_al=False (default True).
+    min_transits
+        Minimum transits after flagging to include a source (default 5).
+    excess_noise_floor_mas
+        Additional noise floor added in quadrature to all transits (mas).
+
+    Returns
+    -------
+    Dict mapping source_id (int64) → dict with keys:
+        'H_contrib' : (5, 5) ndarray  —  A^T W A
+        'h_contrib' : (5,)   ndarray  —  A^T W y
+        'n_transits': int              —  number of transits used (weight > 0)
+        'n_flagged' : int              —  transits down-weighted by AGIS flag
+    Sources with insufficient transits or missing data are absent.
+    """
+    # Build source_id → (pmra_AGIS, pmdec_AGIS, plx_AGIS) lookup from gaia_df
+    gaia_df = gaia_df.copy()
+    gaia_df["source_id"] = gaia_df["source_id"].astype(np.int64)
+    agis_lookup: dict[int, tuple] = {}
+    for _, row in gaia_df.iterrows():
+        sid = int(row["source_id"])
+        agis_lookup[sid] = (
+            float(row.get("pmra",    0.0) or 0.0),
+            float(row.get("pmdec",   0.0) or 0.0),
+            float(row.get("parallax", 0.0) or 0.0),
+        )
+
+    result: dict[int, dict] = {}
+
+    for source_id, ep_df in epoch_data.items():
+        sid = int(source_id)
+
+        # ── Required columns ──────────────────────────────────────────────────
+        missing = [c for c in _REQUIRED_EPOCH_COLS if c not in ep_df.columns]
+        if missing:
+            continue
+
+        # ── Timing: obs_time_tcb (nanoseconds) → Julian year ─────────────────
+        obs_tcb_ns = ep_df["obs_time_tcb"].to_numpy(dtype=np.float64)
+        t_jyear    = _obs_time_to_jyear(obs_tcb_ns)
+        dt         = t_jyear - ref_epoch_jyear          # Δt in years
+
+        # ── Scan geometry ─────────────────────────────────────────────────────
+        theta_rad = np.radians(ep_df["scan_pos_angle"].to_numpy(dtype=np.float64))
+        sin_th    = np.sin(theta_rad)
+        cos_th    = np.cos(theta_rad)
+        p_al      = ep_df["parallax_factor_al"].to_numpy(dtype=np.float64)
+
+        # ── Design matrix A: (n_transits, 5) ─────────────────────────────────
+        # Columns: [sin(θ), cos(θ), Δt·sin(θ), Δt·cos(θ), P_AL]
+        A = np.column_stack([sin_th, cos_th, dt * sin_th, dt * cos_th, p_al])
+
+        # ── Observed AL: centroid_pos_al (assumed in mas) ─────────────────────
+        centroid_al = ep_df["centroid_pos_al"].to_numpy(dtype=np.float64)
+
+        # Subtract AGIS PM+parallax contribution so that y_k is consistent
+        # with BP3M's convention (Δα*=0, Δδ=0 at the Gaia reference position):
+        #   y_k = centroid_pos_al - (μα*_AGIS·Δt·sin(θ) + μδ_AGIS·Δt·cos(θ) + ϖ_AGIS·P_AL)
+        pmra_agis, pmdec_agis, plx_agis = agis_lookup.get(sid, (0.0, 0.0, 0.0))
+        agis_pm_plx_pred = (pmra_agis  * dt * sin_th
+                            + pmdec_agis * dt * cos_th
+                            + plx_agis   * p_al)
+        y = centroid_al - agis_pm_plx_pred
+
+        # ── Per-transit weights ───────────────────────────────────────────────
+        sigma_al = ep_df["centroid_pos_error_al"].to_numpy(dtype=np.float64)
+        # Per-source excess noise from AGIS (same for all transits of this source)
+        excess_noise = float(ep_df["agis_source_excess_noise"].iloc[0]) \
+                       if "agis_source_excess_noise" in ep_df.columns else 0.0
+        sigma_eff_sq = (sigma_al**2
+                        + (excess_noise + excess_noise_floor_mas)**2)
+        sigma_eff_sq = np.maximum(sigma_eff_sq, 1e-6)   # numerical floor
+        w = 1.0 / sigma_eff_sq
+
+        # Optionally down-weight AGIS-rejected transits by factor 100 in precision
+        n_flagged = 0
+        if use_agis_flag and "used_by_agis_al" in ep_df.columns:
+            agis_used = ep_df["used_by_agis_al"].to_numpy(dtype=bool)
+            n_flagged = int((~agis_used).sum())
+            w[~agis_used] *= 0.1
+
+        # Check we have enough usable transits
+        n_usable = int((w > 0).sum())
+        if n_usable < min_transits:
+            continue
+
+        # ── Precompute normal-equation contributions ──────────────────────────
+        # H_contrib = A^T diag(w) A    shape (5, 5)
+        # h_contrib = A^T diag(w) y    shape (5,)
+        AW       = A * w[:, None]          # (n, 5) scaled rows
+        H_contrib = AW.T @ A               # (5, 5)
+        h_contrib = AW.T @ y               # (5,)
+
+        result[sid] = {
+            "H_contrib":  H_contrib,
+            "h_contrib":  h_contrib,
+            "n_transits": n_usable,
+            "n_flagged":  n_flagged,
+        }
+
+    return result
+
+    return sorted(source_ids)
