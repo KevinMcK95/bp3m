@@ -111,20 +111,92 @@ def _obs_time_to_jyear(obs_time_tcb: np.ndarray) -> np.ndarray:
     return 2010.0 + np.asarray(obs_time_tcb, dtype=np.float64) / _NS_PER_JYEAR
 
 
+def _explode_epoch_transits(df: pd.DataFrame) -> pd.DataFrame:
+    """Explode per-transit epoch DataFrame into per-CCD rows.
+
+    The DR4 VOTable delivers one row per FoV transit with array-valued columns
+    (e.g. obs_time_tcb[10], scan_pos_angle[10], centroid_pos_al[10]) holding
+    one entry per AF/SM CCD in the focal-plane strip.  Scalar columns such as
+    parallax_factor_al and agis_source_excess_noise are the same for all CCDs
+    in a given transit.
+
+    Returns a flat DataFrame with one row per (transit × CCD) combination.
+    Masked/NaN CCD entries are dropped.  The extra column ``ccd_index`` (0–9)
+    records which CCD the row came from.
+    """
+    # Identify which columns hold arrays vs scalars in the first non-null row
+    first_vals = {col: next(
+        (v for v in df[col] if v is not None), None
+    ) for col in df.columns}
+    array_cols = [
+        col for col, v in first_vals.items()
+        if v is not None and hasattr(v, "__len__") and not isinstance(v, str)
+    ]
+    scalar_cols = [col for col in df.columns if col not in array_cols]
+
+    # Columns that must be valid for a CCD observation to be included
+    _CORE_ARRAY_COLS = {
+        "obs_time_tcb", "scan_pos_angle",
+        "centroid_pos_al", "centroid_pos_error_al",
+    }
+
+    rows = []
+    for _, transit in df.iterrows():
+        # Determine CCD count from first array column
+        n_ccd = None
+        for col in array_cols:
+            v = transit[col]
+            if v is not None and hasattr(v, "__len__"):
+                n_ccd = len(v)
+                break
+        if n_ccd is None:
+            continue
+
+        scalar_vals = {col: transit[col] for col in scalar_cols}
+        for ccd_idx in range(n_ccd):
+            row = dict(scalar_vals)
+            row["ccd_index"] = ccd_idx
+            skip = False
+            for col in array_cols:
+                v = transit[col]
+                if v is None or not hasattr(v, "__len__") or len(v) <= ccd_idx:
+                    row[col] = np.nan
+                    continue
+                cell = v[ccd_idx]
+                is_masked = hasattr(cell, "mask") and np.any(cell.mask)
+                if is_masked:
+                    if col in _CORE_ARRAY_COLS:
+                        skip = True
+                        break
+                    row[col] = np.nan
+                else:
+                    row[col] = float(cell) if np.isscalar(cell) else cell
+            if not skip:
+                rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=list(df.columns) + ["ccd_index"])
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
 def _load_prerelease_votable(votable_path: str | Path) -> pd.DataFrame:
     """Load ESA's pre-release epoch astrometry VOTable into a DataFrame.
 
     The pre-release ZIP from
       https://anonftp.cosmos.esa.int/pub/GAIA_PUBLIC_DATA/Gaia_DR4/dr4-prerelease/
       gaia-dr4-prerelease-epoch-astrometry_2026-06-26.zip
-    contains a single VOTable XML file with 12 illustrative sources.
+    contains a single VOTable XML file with 12 illustrative sources (one row per
+    FoV transit with per-CCD array columns).
 
-    Returns a DataFrame with source_id as int64.
+    Returns a flat per-CCD DataFrame with source_id as int64.
     """
     from astropy.table import Table
     tbl = Table.read(str(votable_path), format="votable")
     df = tbl.to_pandas()
     # Ensure source_id is int64 (never float — see gaia_ids memory note)
+    df["source_id"] = df["source_id"].astype(np.int64)
+    # Explode transit-level array columns into per-CCD rows
+    df = _explode_epoch_transits(df)
     df["source_id"] = df["source_id"].astype(np.int64)
     return df
 
@@ -739,24 +811,29 @@ def prepare_epoch_obs_for_solver(
     and v_hat = (Δα*, Δδ, μα*, μδ, ϖ) is BP3M's 5-parameter astrometric vector
     (position offsets in mas, PMs in mas/yr, parallax in mas).
 
-    The "observed" AL for each transit is computed relative to the AGIS
+    The "observed" AL for each CCD transit is computed relative to the AGIS
     reference solution so that it is consistent with BP3M's v_hat convention
     (where Δα*=Δδ=0 corresponds to the Gaia reference position):
 
         y_k = centroid_pos_al_k
-              − [μα*_AGIS·Δt_k·sin(θ_k) + μδ_AGIS·Δt_k·cos(θ_k) + ϖ_AGIS·P_AL_k]
+              + [μα*_AGIS·Δt_k·sin(θ_k) + μδ_AGIS·Δt_k·cos(θ_k) + ϖ_AGIS·P_AL_k]
 
-    i.e.  y_k = centroid_pos_al_k − a_k[2:]·v_AGIS[2:]   (only PM+parallax terms,
-    since v_AGIS[0]=v_AGIS[1]=0 in BP3M's convention).
+    i.e.  y_k = centroid_pos_al_k + a_k[2:]·v_AGIS[2:]   (only PM+parallax terms,
+    since v_AGIS[0]=v_AGIS[1]=0 in BP3M's convention and centroid_pos_al is
+    the AGIS residual: a_k·(v_true − v_AGIS)).
 
-    Per-transit weight: w_k = 1 / (σ_al_k² + (σ_excess + σ_floor)²).
-    Transits with used_by_agis_al=False are optionally down-weighted by a
+    Each epoch DataFrame must be in per-CCD-row format (one row per CCD
+    observation, ~10 rows per FoV transit).  _load_prerelease_votable()
+    already returns this format via _explode_epoch_transits().
+
+    Per-CCD weight: w_k = 1 / (σ_al_k² + (σ_excess + σ_floor)²).
+    CCDs with used_by_agis_al=False are optionally down-weighted by a
     factor of 0.1 to match the AGIS soft-rejection scheme.
 
     Parameters
     ----------
     epoch_data
-        Dict source_id → epoch DataFrame from download_epoch_astrometry().
+        Dict source_id → per-CCD epoch DataFrame from download_epoch_astrometry().
     gaia_df
         Gaia summary catalog (same as passed to the BP3M solver).  Must have
         columns: source_id (int64), pmra, pmdec, parallax.
@@ -867,5 +944,3 @@ def prepare_epoch_obs_for_solver(
         }
 
     return result
-
-    return sorted(source_ids)
