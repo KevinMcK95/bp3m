@@ -70,6 +70,28 @@ _QUALITY_COLS = (
 # Columns added in the 2025-07 update; used to detect stale no-sidecar caches.
 _DSC_COLS = ('classprob_dsc_combmod_quasar', 'in_qso_candidates')
 
+# Columns to SELECT from gaiadr3.galaxy_candidates.
+# Sérsic profile parameters are the key morphology indicators:
+#   radius_sersic  — effective half-light radius (arcsec); use for PSF
+#                    inflation: large radius → position less reliable
+#   sersic_index   — n; n≈1=disk, n≈4=de Vaucouleurs (elliptical)
+#   chi2_sersic    — Sérsic fit quality; outliers → unreliable morphology
+#   flags_sersic   — bit flags for fit quality/convergence
+# Excludes array-type columns that cannot be serialised to CSV.
+_GALAXY_CANDIDATES_COLS = (
+    "source_id, "
+    "classprob_dsc_combmod_galaxy, classprob_dsc_combmod_quasar, "
+    "classlabel_dsc, classlabel_dsc_joint, classlabel_oa, "
+    "n_transits, astrometric_selection_flag, source_selection_flags, "
+    "mag_g_sersic, mag_g_sersic_error, "
+    "radius_sersic, radius_sersic_error, "
+    "sersic_index, sersic_index_error, "
+    "ellipticity_sersic, ellipticity_sersic_error, "
+    "angle_sersic, angle_sersic_error, "
+    "chi2_sersic, flags_sersic, "
+    "l2_norm"
+)
+
 # Columns to SELECT from gaiadr3.qso_candidates (excludes array-type
 # morph_params_corr_vec which cannot be serialised to CSV).
 _QSO_CANDIDATES_COLS = (
@@ -392,6 +414,9 @@ def download_gaia(
     download_gaia_qso_candidates(ra, dec, search_width, search_height,
                                   output_dir, field_name,
                                   force_redownload=force_redownload)
+    download_gaia_galaxy_candidates(ra, dec, search_width, search_height,
+                                     output_dir, field_name,
+                                     force_redownload=force_redownload)
     return df
 
 
@@ -475,6 +500,79 @@ def _add_secular_aberration(df: pd.DataFrame) -> pd.DataFrame:
     df['pmra_aberr_uas']  = pmra
     df['pmdec_aberr_uas'] = pmdec
     return df
+
+
+def download_gaia_galaxy_candidates(
+    ra: float,
+    dec: float,
+    search_width: float,
+    search_height: float,
+    output_dir: Path,
+    field_name: str,
+    force_redownload: bool = False,
+) -> "pd.DataFrame | None":
+    """Download Gaia DR3 galaxy_candidates for the same sky region.
+
+    Saves to:
+        {output_dir}/{field_name}/Gaia/{field_name}_ra{ra}_dec{dec}_w{w}_h{h}_galaxy_candidates.csv
+
+    Returns the DataFrame, or None if the query fails.  The result is always
+    cached — pass ``force_redownload=True`` to re-query the archive.
+
+    Key morphology columns for astrometric use:
+      radius_sersic    — effective half-light radius (arcsec); primary indicator
+                         of how extended the source is in Gaia imaging.
+                         Use to set position uncertainty inflation in the solver:
+                         compact (< ~0.3″) sources are nearly stellar; larger
+                         sources degrade PSF-fit centroid reliability.
+      sersic_index     — profile shape (n≈1 disk, n≈4 elliptical)
+      chi2_sersic      — Sérsic fit quality; poor fits → unreliable morphology
+      flags_sersic     — bit flags for convergence / fit quality
+      classprob_dsc_combmod_galaxy — DSC galaxy probability (cut at e.g. > 0.5)
+    """
+    gaia_dir = Path(output_dir) / field_name / "Gaia"
+    gaia_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = (gaia_dir /
+                f"{field_name}_ra{ra:.4f}_dec{dec:+.4f}"
+                f"_w{search_width:.4f}_h{search_height:.4f}_galaxy_candidates.csv")
+
+    _ABERR_COLS = ('pmra_aberr_uas', 'pmdec_aberr_uas')
+
+    if not force_redownload and out_path.exists():
+        result = pd.read_csv(out_path)
+        if not all(c in result.columns for c in _ABERR_COLS):
+            print(f"[Gaia] Adding secular aberration columns to cached galaxy_candidates...")
+            result = _add_secular_aberration(result)
+            result.to_csv(out_path, index=False)
+        else:
+            print(f"[Gaia] Loading cached galaxy_candidates: {out_path}")
+        return result
+
+    box = (f"CONTAINS(POINT('ICRS',g.ra,g.dec),"
+           f"BOX('ICRS',{ra:.8f},{dec:.8f},{search_width:.8f},{search_height:.8f}))=1")
+    # Include g.ra/dec so the output CSV is self-contained for spatial cross-matching.
+    query = (f"SELECT g2.{_GALAXY_CANDIDATES_COLS.replace(', ', ', g2.')}, g.ra, g.dec "
+             f"FROM gaiadr3.galaxy_candidates AS g2 "
+             f"JOIN gaiadr3.gaia_source AS g ON g2.source_id = g.source_id "
+             f"WHERE {box}")
+
+    print(f"\n[Gaia] Downloading galaxy_candidates for {field_name}...")
+    try:
+        from astroquery.gaia import Gaia
+        job = Gaia.launch_job_async(query)
+        result = job.get_results().to_pandas()
+        try:
+            Gaia.remove_jobs([job.jobid])
+        except Exception:
+            pass
+        result = _add_secular_aberration(result)
+        result.to_csv(out_path, index=False)
+        print(f"  galaxy_candidates: {len(result)} sources → {out_path}")
+        return result
+    except Exception as e:
+        print(f"  WARNING: galaxy_candidates download failed — {e}")
+        return None
 
 
 def find_qso_catalogs(lib_dir: Path | None) -> dict[str, Path | None]:
