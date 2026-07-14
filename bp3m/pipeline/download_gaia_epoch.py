@@ -818,14 +818,17 @@ def prepare_epoch_obs_for_solver(
         # ── Observed AL: centroid_pos_al (assumed in mas) ─────────────────────
         centroid_al = ep_df["centroid_pos_al"].to_numpy(dtype=np.float64)
 
-        # Subtract AGIS PM+parallax contribution so that y_k is consistent
-        # with BP3M's convention (Δα*=0, Δδ=0 at the Gaia reference position):
-        #   y_k = centroid_pos_al - (μα*_AGIS·Δt·sin(θ) + μδ_AGIS·Δt·cos(θ) + ϖ_AGIS·P_AL)
+        # centroid_pos_al is the AGIS residual measured relative to the
+        # per-transit propagated reference position (ra0_k, dec0_k), i.e.:
+        #   centroid_pos_al_k = a_k · (v_true − v_AGIS)
+        # To get y_k = a_k · v_true (what the normal equations need):
+        #   y_k = centroid_pos_al_k + a_k · v_AGIS
+        # where v_AGIS = (0, 0, μα*_AGIS, μδ_AGIS, ϖ_AGIS) in BP3M coordinates.
         pmra_agis, pmdec_agis, plx_agis = agis_lookup.get(sid, (0.0, 0.0, 0.0))
         agis_pm_plx_pred = (pmra_agis  * dt * sin_th
                             + pmdec_agis * dt * cos_th
                             + plx_agis   * p_al)
-        y = centroid_al - agis_pm_plx_pred
+        y = centroid_al + agis_pm_plx_pred
 
         # ── Per-transit weights ───────────────────────────────────────────────
         sigma_al = ep_df["centroid_pos_error_al"].to_numpy(dtype=np.float64)

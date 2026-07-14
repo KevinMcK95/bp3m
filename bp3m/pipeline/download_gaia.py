@@ -62,7 +62,9 @@ _QUALITY_COLS = (
     "(phot_bp_n_obs+phot_rp_n_obs) AS beta, "
     "ipd_gof_harmonic_amplitude, "
     "phot_bp_n_contaminated_transits, phot_rp_n_contaminated_transits, "
-    "ref_epoch"
+    "ref_epoch, "
+    "classprob_dsc_combmod_quasar, classprob_dsc_combmod_galaxy, "
+    "classprob_dsc_combmod_star, in_qso_candidates, in_galaxy_candidates"
 )
 
 
