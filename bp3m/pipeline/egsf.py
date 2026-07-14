@@ -1652,6 +1652,7 @@ def plot_egsf_diagnostics(
     chi2_bins: tuple[float, float, float] = (5.0, 30.0),
     cutout_half: int = _CUTOUT_HALF,
     out_pdf: str | None = None,
+    also_png: bool = True,
 ) -> Path:
     """Save a PDF of diagnostic cutout panels for a sample of fitted eGSF sources.
 
@@ -1945,8 +1946,13 @@ def plot_egsf_diagnostics(
                          fontsize=10, y=1.01)
             fig.tight_layout(rect=[0.18, 0, 1, 1])
             pdf.savefig(fig, bbox_inches='tight')
+            if also_png:
+                png_path = str(out_pdf).replace('.pdf', f'_p{page_idx+1}.png')
+                fig.savefig(png_path, dpi=150, bbox_inches='tight')
+                print(f"  Page {page_idx+1}/{n_pages} → {png_path}")
+            else:
+                print(f"  Page {page_idx+1}/{n_pages} written")
             plt.close(fig)
-            print(f"  Page {page_idx+1}/{n_pages} written")
 
     print(f"Saved → {out_pdf}")
     return Path(out_pdf)
