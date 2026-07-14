@@ -1641,6 +1641,317 @@ def fit_egsf_sources(
     return result
 
 
+# ── Diagnostic cutout plots ────────────────────────────────────────────────────
+
+def plot_egsf_diagnostics(
+    field_name: str,
+    output_dir: str | Path,
+    lib_dir: str | Path | None = None,
+    bp3m_results_subdir: str = 'BP3M_results',
+    n_sources: int = 24,
+    chi2_bins: tuple[float, float, float] = (5.0, 30.0),
+    cutout_half: int = _CUTOUT_HALF,
+    out_pdf: str | None = None,
+) -> Path:
+    """Save a PDF of diagnostic cutout panels for a sample of fitted eGSF sources.
+
+    For each source shows (per best detection): observed galaxy, Sérsic model,
+    residual (obs − model), and the STDPSF, with fit parameters annotated.
+
+    Sources are stratified into three chi2 tiers:
+        good  : chi2_red < chi2_bins[0]
+        medium: chi2_bins[0] ≤ chi2_red < chi2_bins[1]
+        bad   : chi2_red ≥ chi2_bins[1]
+
+    n_sources are drawn evenly across the three tiers (rounded up).
+
+    Requires fit_egsf_sources() to have been run first.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.colors import Normalize
+    import warnings
+
+    output_dir = Path(output_dir)
+    egsf_dir   = output_dir / 'egsf'
+    cat_path   = egsf_dir / f'{field_name}_egsf_catalog.csv'
+    morph_path = egsf_dir / f'{field_name}_galaxy_morphology.csv'
+
+    if not cat_path.exists():
+        raise FileNotFoundError(f"Run fit_egsf_sources first: {cat_path}")
+    if not morph_path.exists():
+        raise FileNotFoundError(f"Run measure_galaxy_morphology first: {morph_path}")
+
+    cat   = pd.read_csv(cat_path)
+    morph = pd.read_csv(morph_path)
+
+    # ── Resolve lib_dir ───────────────────────────────────────────────────────
+    if lib_dir is None:
+        try:
+            from bp3m.setup import CONFIG_FILE, DEFAULT_LIB_DIR
+            if CONFIG_FILE.exists():
+                import tomllib
+                with open(CONFIG_FILE, 'rb') as _f:
+                    _cfg = tomllib.load(_f)
+                lib_dir = Path(_cfg.get('lib_dir', str(DEFAULT_LIB_DIR)))
+            else:
+                lib_dir = DEFAULT_LIB_DIR
+        except Exception:
+            import bp3m as _bp3m_pkg
+            lib_dir = Path(_bp3m_pkg.__file__).parent / 'lib'
+    lib_dir = Path(lib_dir)
+
+    # ── Stratified sample ─────────────────────────────────────────────────────
+    lo, hi = chi2_bins
+    tiers = {
+        f'good (χ²<{lo})':   cat[cat['chi2_red'] < lo],
+        f'med ({lo}≤χ²<{hi})': cat[(cat['chi2_red'] >= lo) & (cat['chi2_red'] < hi)],
+        f'bad (χ²≥{hi})':    cat[cat['chi2_red'] >= hi],
+    }
+    n_per_tier = max(1, (n_sources + 2) // 3)
+    sample_rows = []
+    for tier_label, tier_df in tiers.items():
+        if len(tier_df) == 0:
+            continue
+        chosen = tier_df.sample(min(n_per_tier, len(tier_df)),
+                                random_state=42).copy()
+        chosen['_tier'] = tier_label
+        sample_rows.append(chosen)
+    sample = pd.concat(sample_rows, ignore_index=True)
+    print(f"Diagnostic plots: {len(sample)} sources across {len(tiers)} tiers")
+
+    # ── Load plate solutions ──────────────────────────────────────────────────
+    plates_df = pd.read_csv(output_dir / bp3m_results_subdir / 'image_transformations.csv')
+    plate_map: dict[str, dict] = {}
+    for _, row in plates_df.iterrows():
+        img_name = str(row['image_name'])
+        if '_hi' in img_name or '_lo' in img_name:
+            obs_id = img_name.rsplit('_', 1)[0]
+            suffix = img_name.rsplit('_', 1)[1]
+            plate_map.setdefault(obs_id, {})[suffix] = row.to_dict()
+
+    # ── GDC cache ─────────────────────────────────────────────────────────────
+    from pypass.io import find_gdc, _DETECTOR_PREFIX
+    gdc_cache: dict[str, dict] = {}
+
+    def _get_gdc_cached(instrume, detector, hdr):
+        det_prefix = _DETECTOR_PREFIX.get((instrume, detector))
+        if det_prefix is None:
+            return None
+        if det_prefix not in gdc_cache:
+            gdc_dir  = lib_dir / 'STDGDCs' / det_prefix
+            gdc_path = find_gdc(str(gdc_dir), hdr)
+            if gdc_path is None:
+                return None
+            gdc_cache[det_prefix] = _load_stdgdc_full(gdc_path)
+        return gdc_cache[det_prefix]
+
+    hst_dir = output_dir / 'HST' / 'mastDownload' / 'HST'
+
+    # ── Build panels ──────────────────────────────────────────────────────────
+    n_cols   = 4   # obs / model / residual / PSF
+    n_rows   = len(sample)
+    fig_w    = n_cols * 2.0 + 1.0
+    fig_h    = n_rows * 2.2 + 0.5
+
+    if out_pdf is None:
+        out_pdf = str(egsf_dir / f'{field_name}_egsf_diagnostics.pdf')
+
+    with PdfPages(out_pdf) as pdf:
+        # Split into pages of 12 rows each
+        page_size = 12
+        n_pages   = max(1, (len(sample) + page_size - 1) // page_size)
+
+        for page_idx in range(n_pages):
+            page_rows = sample.iloc[page_idx * page_size : (page_idx + 1) * page_size]
+            n_r = len(page_rows)
+            fig, axes = plt.subplots(
+                n_r, n_cols,
+                figsize=(fig_w, n_r * 2.2 + 0.5),
+                squeeze=False,
+            )
+            col_titles = ['Observed', 'Sérsic model', 'Residual', 'PSF']
+            for ci, ct in enumerate(col_titles):
+                axes[0, ci].set_title(ct, fontsize=9, pad=3)
+
+            for row_i, (_, src_row) in enumerate(page_rows.iterrows()):
+                ax_obs, ax_mod, ax_res, ax_psf = axes[row_i]
+
+                source_id = src_row['source_id']
+                tier_lbl  = src_row.get('_tier', '')
+
+                # Find best detection (highest moment_snr) for this source
+                src_dets = morph[morph['source_id'] == source_id].copy()
+                if len(src_dets) == 0:
+                    for ax in (ax_obs, ax_mod, ax_res, ax_psf):
+                        ax.set_visible(False)
+                    continue
+                src_dets = src_dets.sort_values('moment_snr', ascending=False)
+                det = src_dets.iloc[0]
+
+                obs_id   = str(det['obs_id'])
+                chip_ext = int(det['chip_ext'])
+                x_det    = float(det['x'])
+                y_det    = float(det['y'])
+
+                obs_dir  = hst_dir / obs_id
+                flc_path = str(obs_dir / f'{obs_id}_flc.fits')
+                suffix   = 'hi' if chip_ext == 4 else 'lo'
+                plate    = plate_map.get(obs_id, {}).get(suffix)
+
+                # Load PSF
+                psf_data = _load_image_psf(obs_dir, flc_path, lib_dir)
+
+                # Load GDC
+                gdc = None
+                try:
+                    with fits.open(flc_path) as hdul:
+                        h0 = hdul[0].header
+                    instrume = h0.get('INSTRUME', '').strip().upper()
+                    detector = h0.get('DETECTOR', '').strip().upper()
+                    gdc = _get_gdc_cached(instrume, detector, h0)
+                except Exception:
+                    pass
+
+                # Load residual
+                res_path  = str(obs_dir / f'{obs_id}_flc_residual.fits')
+                chip_data = _load_residual_chip(res_path, chip_ext)
+
+                # Load catalog for flux and raw position
+                cat_path2 = str(obs_dir / f'{obs_id}_flc_catalog.fits')
+                flux_cat = None; x_raw = x_det; y_raw = y_det
+                try:
+                    tbl = Table.read(cat_path2)
+                    c_x    = np.asarray(tbl['x']).astype(float)
+                    c_y    = np.asarray(tbl['y']).astype(float)
+                    c_chip = np.asarray(tbl['chip_ext']).astype(int)
+                    c_flux = np.asarray(tbl['flux']).astype(float)
+                    c_xgdc = np.asarray(tbl['x_gdc']).astype(float)
+                    c_ygdc = np.asarray(tbl['y_gdc']).astype(float)
+                    mask   = c_chip == chip_ext
+                    if mask.sum() > 0:
+                        d2 = (c_x[mask] - x_det)**2 + (c_y[mask] - y_det)**2
+                        nn = int(np.argmin(d2))
+                        if d2[nn] < 4.0:
+                            x_raw    = float(c_x[mask][nn])
+                            y_raw    = float(c_y[mask][nn])
+                            flux_cat = float(c_flux[mask][nn])
+                except Exception:
+                    pass
+
+                failed = (psf_data is None or gdc is None
+                          or chip_data is None or plate is None
+                          or flux_cat is None)
+
+                # ── Reconstruct obs_cut ───────────────────────────────────────
+                obs_cut = model_cut = res_cut_img = psf_img = None
+                if not failed:
+                    sci, var = chip_data
+                    psf_cube, xs_psf, ys_psf, psf_scale = psf_data
+
+                    psf_result = _eval_psf_on_window(
+                        psf_cube, xs_psf, ys_psf, psf_scale,
+                        x_raw, y_raw, sci.shape, hw=cutout_half,
+                    )
+                    if psf_result is not None:
+                        P, y_lo, y_hi, x_lo, x_hi = psf_result
+                        res_cut  = sci[y_lo:y_hi, x_lo:x_hi].astype(float)
+                        var_cut  = var[y_lo:y_hi, x_lo:x_hi].astype(float)
+                        obs_cut  = res_cut + flux_cat * P
+                        inv_var  = np.where(var_cut > 0,
+                                            1.0 / np.maximum(var_cut, 1e-6), 0.0)
+
+                        # ── Sérsic model ──────────────────────────────────────
+                        ra_src  = float(src_row['ra_med'])
+                        dec_src = float(src_row['dec_med'])
+                        M_s2r   = _sky_to_raw_matrix(
+                            ra_src, dec_src, x_raw, y_raw,
+                            plate['a'], plate['b'], plate['c'], plate['d'],
+                            plate['ra0_final'], plate['dec0_final'],
+                            plate['pixel_scale_mas'],
+                            plate['Xo_pivot'], plate['Yo_pivot'], gdc,
+                        )
+                        if M_s2r is not None:
+                            try:
+                                M_r2s = np.linalg.inv(M_s2r)
+                            except np.linalg.LinAlgError:
+                                M_r2s = None
+                            if M_r2s is not None:
+                                theta = np.array([
+                                    src_row['Re_arcsec'], src_row['sersic_n'],
+                                    src_row['axis_ratio'], src_row['PA_deg'],
+                                ])
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter('ignore')
+                                    M_norm = _render_sersic_psf(
+                                        theta, M_r2s,
+                                        psf_cube, xs_psf, ys_psf, psf_scale,
+                                        x_raw, y_raw, sci.shape,
+                                        hw=cutout_half,
+                                    )
+                                if M_norm is not None:
+                                    flux_fit, sky_fit, _ = _linear_params_and_chi2(
+                                        M_norm, obs_cut.astype(np.float32), inv_var.astype(np.float32)
+                                    )
+                                    model_cut   = flux_fit * M_norm + sky_fit
+                                    res_cut_img = obs_cut - model_cut
+
+                        # PSF postage stamp (same size as cutout)
+                        psf_img = P.copy()
+
+                # ── Plot ──────────────────────────────────────────────────────
+                def _imshow(ax, img, cmap='gray', norm=None, label=''):
+                    if img is None:
+                        ax.text(0.5, 0.5, 'N/A', ha='center', va='center',
+                                transform=ax.transAxes, fontsize=8)
+                        ax.set_xticks([]); ax.set_yticks([])
+                        return
+                    ax.imshow(img.T, origin='lower', cmap=cmap, norm=norm,
+                              interpolation='nearest', aspect='equal')
+                    ax.set_xticks([]); ax.set_yticks([])
+
+                # Use symmetric stretch around obs median for all panels
+                if obs_cut is not None:
+                    vmed = float(np.nanmedian(obs_cut))
+                    vstd = float(np.nanstd(obs_cut))
+                    vlo  = vmed - 2 * vstd
+                    vhi  = vmed + 5 * vstd
+                    norm_obs = Normalize(vmin=vlo, vmax=vhi)
+                else:
+                    norm_obs = None
+
+                _imshow(ax_obs, obs_cut,     cmap='afmhot', norm=norm_obs)
+                _imshow(ax_mod, model_cut,   cmap='afmhot', norm=norm_obs)
+                _imshow(ax_res, res_cut_img, cmap='RdBu_r',
+                        norm=None if res_cut_img is None else
+                             Normalize(vmin=-3*vstd, vmax=3*vstd))
+                _imshow(ax_psf, psf_img,     cmap='afmhot')
+
+                # Row label on left
+                Re   = float(src_row['Re_arcsec'])
+                n    = float(src_row['sersic_n'])
+                q    = float(src_row['axis_ratio'])
+                chi2 = float(src_row['chi2_red'])
+                nim  = int(src_row['n_images'])
+                lbl  = (f"{source_id}\n"
+                        f"Re={Re:.3f}\" n={n:.1f} q={q:.2f}\n"
+                        f"χ²={chi2:.1f}  nim={nim}  {tier_lbl}")
+                ax_obs.set_ylabel(lbl, fontsize=6, rotation=0, ha='right',
+                                  va='center', labelpad=60)
+
+            fig.suptitle(f"{field_name} — eGSF diagnostics (page {page_idx+1}/{n_pages})",
+                         fontsize=10, y=1.01)
+            fig.tight_layout(rect=[0.18, 0, 1, 1])
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+            print(f"  Page {page_idx+1}/{n_pages} written")
+
+    print(f"Saved → {out_pdf}")
+    return Path(out_pdf)
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 def run_egsf(
@@ -1847,6 +2158,14 @@ def _cli():
     parser.add_argument('--cutout_half', type=int, default=_CUTOUT_HALF,
                         help=f'Cutout half-width in pixels (default: {_CUTOUT_HALF}, '
                              f'giving {2*_CUTOUT_HALF+1}×{2*_CUTOUT_HALF+1} px)')
+    parser.add_argument('--fit', action='store_true',
+                        help='Also run fit_egsf_sources (Sérsic fitting) after morphology')
+    parser.add_argument('--fit_min_det', type=int, default=3,
+                        help='Min detections for Sérsic fit (default: 3)')
+    parser.add_argument('--diagnostics', action='store_true',
+                        help='Save diagnostic cutout PDF after fitting')
+    parser.add_argument('--diag_n', type=int, default=24,
+                        help='Number of sources in diagnostic PDF (default: 24)')
     args = parser.parse_args()
 
     run_egsf(
@@ -1870,6 +2189,28 @@ def _cli():
             pa_tol=args.pa_tol,
             cutout_half=args.cutout_half,
             force_rerun=args.force,
+        )
+
+    if args.fit or args.diagnostics:
+        fit_egsf_sources(
+            field_name=args.field_name,
+            output_dir=args.output_dir,
+            lib_dir=args.lib_dir,
+            bp3m_results_subdir=args.bp3m_results,
+            pa_tol=args.pa_tol,
+            cutout_half=args.cutout_half,
+            min_detections=args.fit_min_det,
+            force_rerun=args.force,
+        )
+
+    if args.diagnostics:
+        plot_egsf_diagnostics(
+            field_name=args.field_name,
+            output_dir=args.output_dir,
+            lib_dir=args.lib_dir,
+            bp3m_results_subdir=args.bp3m_results,
+            n_sources=args.diag_n,
+            cutout_half=args.cutout_half,
         )
 
 
