@@ -18,7 +18,7 @@ from .miracle_match import miracle_match, rd2x, rd2y
 from .catalog_matcher import fit_affine_weighted, fit_4p_weighted, apply_affine, compute_mahalanobis, compute_logprob_cost, find_offset, find_scale_and_offset
 
 def load_gaia_data(target, data_dir):
-    gaia_path = os.path.join(data_dir, target, "Gaia", "*.csv")
+    gaia_path = os.path.join(data_dir, target, "Gaia", "*_gaia.csv")
     gaia_files = glob.glob(gaia_path)
     if not gaia_files:
         print(f"No Gaia CSV files found in {gaia_path}"); return None
