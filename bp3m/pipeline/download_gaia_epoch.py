@@ -855,17 +855,22 @@ def prepare_epoch_obs_for_solver(
         'n_flagged' : int              —  transits down-weighted by AGIS flag
     Sources with insufficient transits or missing data are absent.
     """
-    # Build source_id → (pmra_AGIS, pmdec_AGIS, plx_AGIS) lookup from gaia_df
+    # Build source_id → (pmra_AGIS, pmdec_AGIS, plx_AGIS) lookup from gaia_df.
+    # Use vectorized access — iterrows() on a purely-numeric DataFrame upcasts int64
+    # source_ids to float64, silently corrupting IDs > 2^53.
     gaia_df = gaia_df.copy()
     gaia_df["source_id"] = gaia_df["source_id"].astype(np.int64)
-    agis_lookup: dict[int, tuple] = {}
-    for _, row in gaia_df.iterrows():
-        sid = int(row["source_id"])
-        agis_lookup[sid] = (
-            float(row.get("pmra",    0.0) or 0.0),
-            float(row.get("pmdec",   0.0) or 0.0),
-            float(row.get("parallax", 0.0) or 0.0),
-        )
+    _agis_sids  = gaia_df["source_id"].values                     # int64 array
+    _agis_pmra  = np.where(gaia_df["pmra"].notna(),   gaia_df["pmra"].values,   0.0) \
+                  if "pmra"     in gaia_df.columns else np.zeros(len(gaia_df))
+    _agis_pmdec = np.where(gaia_df["pmdec"].notna(),  gaia_df["pmdec"].values,  0.0) \
+                  if "pmdec"    in gaia_df.columns else np.zeros(len(gaia_df))
+    _agis_plx   = np.where(gaia_df["parallax"].notna(), gaia_df["parallax"].values, 0.0) \
+                  if "parallax" in gaia_df.columns else np.zeros(len(gaia_df))
+    agis_lookup: dict[int, tuple] = {
+        int(sid): (float(pmra), float(pmdec), float(plx))
+        for sid, pmra, pmdec, plx in zip(_agis_sids, _agis_pmra, _agis_pmdec, _agis_plx)
+    }
 
     result: dict[int, dict] = {}
 
@@ -1030,14 +1035,16 @@ def generate_synthetic_epoch_data(
     if "phot_g_mean_mag" not in source_df.columns:
         source_df["phot_g_mean_mag"] = 18.0
 
-    for _, src in source_df.iterrows():
-        sid = int(src["source_id"])
-        ra  = float(src["ra"])
-        dec = float(src["dec"])
-        pmra   = float(src.get("pmra",    0.0) or 0.0)
-        pmdec  = float(src.get("pmdec",   0.0) or 0.0)
-        plx    = float(src.get("parallax", 0.0) or 0.0)
-        gmag   = float(src.get("phot_g_mean_mag", 18.0))
+    # iterrows() on a purely-numeric DataFrame upcasts int64 source_ids to float64,
+    # silently corrupting IDs > 2^53.  Use itertuples() which preserves column dtypes.
+    for src in source_df.itertuples(index=False):
+        sid  = int(src.source_id)           # np.int64 → Python int, no float roundtrip
+        ra   = float(src.ra)
+        dec  = float(src.dec)
+        pmra  = float(src.pmra   if pd.notna(src.pmra)   else 0.0)
+        pmdec = float(src.pmdec  if pd.notna(src.pmdec)  else 0.0)
+        plx   = float(src.parallax if pd.notna(src.parallax) else 0.0)
+        gmag  = float(src.phot_g_mean_mag)
 
         sigma_single_ccd = _sigma_al_from_gmag(gmag)
 
