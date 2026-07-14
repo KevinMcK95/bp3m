@@ -659,6 +659,70 @@ class BP3MSolver:
             d["JU"]   = JU
             d["X_mat"] = X_mat
 
+    # ── Gaia DR4 epoch AL observations (future) ───────────────────────────────
+    #
+    # When use_gaia_al_obs=True, each Gaia CCD transit contributes a 1-D
+    # observation equation to the normal equations alongside the HST detections.
+    #
+    # For transit k of source i the AL measurement predicts:
+    #
+    #   ψ_ik = sθ·Δα*_i·cos(δ_i) + cθ·Δδ_i
+    #          + sθ·dt_k·μα*_i + cθ·dt_k·μδ_i
+    #          + f_al_k·ϖ_i
+    #
+    # where sθ = sin(scan_pos_angle_k), cθ = cos(scan_pos_angle_k),
+    #       f_al_k = parallax_factor_al_k,
+    #       dt_k = obs_time_jyear_k − ref_epoch_dr4   (years)
+    #
+    # The design vector a_ik in the 5-D parameter space (Δα*, Δδ, μα*, μδ, ϖ):
+    #   a_ik = [sθ·cos(δ), cθ, sθ·dt_k, cθ·dt_k, f_al_k]
+    #
+    # Measurement residual (relative to AGIS solution):
+    #   r_ik = centroid_pos_al_k − ψ_ik(v_agis_i)
+    #        = zeta_k   [pre-stored in the epoch table as 'zeta' if available]
+    #
+    # Effective per-transit variance:
+    #   σ²_ik = centroid_pos_error_al_k² + agis_source_excess_noise_i²
+    #
+    # Unlike HST images, Gaia has no per-epoch "image transformation" to solve
+    # for — scan_pos_angle and parallax_factor_al already encode the full
+    # geometry.  The Gaia epoch observations therefore contribute only to H_vv
+    # and h_all (not to H_rr or K_img), making them pure stellar-parameter
+    # constraints.
+    #
+    # AGIS down-weighting:  transits with used_by_agis_al=False were rejected
+    # by the official AGIS solution (likely due to image parameter quality).
+    # These should be down-weighted in the first BP3M iteration, then
+    # re-admitted after iterative convergence (analogous to gaiasupdate's
+    # huber_downweight / agis_weights scheme).
+    #
+    # Integration plan:
+    #   1. Load epoch DataFrames into the solver via _load_gaia_epoch_obs()
+    #   2. In _solve_one_iter(), after the HST loop, add the Gaia AL
+    #      contributions with:
+    #        H_vv[i] += (a_ik ⊗ a_ik) / σ²_ik   (outer product)
+    #        h_all[i] += a_ik * r_ik / σ²_ik
+    #   3. Use_for_fit masking already handles which sources are active;
+    #      transits of masked sources are skipped.
+
+    def _add_gaia_epoch_obs(self, epoch_data: dict) -> None:
+        """Register Gaia DR4 epoch AL observations for inclusion in the solve.
+
+        NOT YET IMPLEMENTED — see design comments above.
+
+        Parameters
+        ----------
+        epoch_data
+            Dict mapping source_id (int64) → epoch DataFrame, as returned by
+            bp3m.pipeline.download_gaia_epoch.download_epoch_astrometry().
+        """
+        raise NotImplementedError(
+            "_add_gaia_epoch_obs: direct Gaia AL integration is not yet "
+            "implemented.  Use run_gaia_dr4_epoch() + "
+            "merge_epoch_solutions_into_catalog() to apply improved priors "
+            "from gaiasupdate re-solves instead."
+        )
+
     # ── Core solver ────────────────────────────────────────────────────────────
 
     def _compute_Cs(self, img, r_j=None):

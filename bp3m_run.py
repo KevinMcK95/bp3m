@@ -163,6 +163,38 @@ def _parse_args():
     psf.add_argument('--sat_threshold', type=float, default=None,
                      help='Saturation DN threshold (default 60000)')
 
+    # ── Gaia DR4 epoch astrometry (Step 4b) ──────────────────────────────────
+    dr4 = p.add_argument_group('Gaia DR4 epoch astrometry (Step 4b, optional)')
+    dr4.add_argument('--use_gaia_dr4_epoch', action='store_true',
+                     help='Download Gaia DR4 epoch astrometry for cross-matched sources '
+                          'and re-solve 5D parameters with gaiasupdate. Requires the '
+                          'gaiasupdate package (pip install gaiasupdate) and a working '
+                          'ESA DataLink connection (or --dr4_prerelease_votable for '
+                          'offline testing with the ESA pre-release sample).')
+    dr4.add_argument('--dr4_access', type=str, default='datalink',
+                     choices=['datalink', 'prerelease'],
+                     help='Epoch data access method: datalink (default, requires ESA '
+                          'credentials for non-public releases) or prerelease (local '
+                          'VOTable, set --dr4_prerelease_votable).')
+    dr4.add_argument('--dr4_prerelease_votable', type=str, default=None,
+                     help='Path to the ESA pre-release epoch astrometry VOTable '
+                          '(required when --dr4_access=prerelease).')
+    dr4.add_argument('--dr4_data_release', type=str, default='Gaia DR4',
+                     help='DataLink data-release string (default "Gaia DR4"; use '
+                          '"Gaia DR4_INT4" for the internal pre-release).')
+    dr4.add_argument('--dr4_credentials', type=str, default=None,
+                     help='Path to ESA archive credentials file (for DataLink access).')
+    dr4.add_argument('--dr4_model', type=str, default='5p_single_source',
+                     choices=['5p_single_source', '3p_single_source_without_offsets',
+                              '6p_constrained_colour', '6p_perspective_acceleration'],
+                     help='gaiasupdate astrometric model for epoch re-solve '
+                          '(default 5p_single_source).')
+    dr4.add_argument('--dr4_no_replace_pms', action='store_true',
+                     help='Store epoch solutions as extra columns but do NOT replace '
+                          'pmra/pmdec/parallax priors in the solver.')
+    dr4.add_argument('--force_rerun_dr4_epoch', action='store_true',
+                     help='Re-download and re-solve even if epoch cache exists.')
+
     # ── Cross-matching ────────────────────────────────────────────────────────
     xm = p.add_argument_group('Cross-matching (fast_cross_match)')
     xm.add_argument('--cross_match_pix_floor', type=float, default=0.05,
@@ -688,6 +720,56 @@ def main():
             force_rematch=args.force_rematch,
             restrict_to_obsids=_restrict,
         )
+
+    # ── Step 4b: Gaia DR4 epoch astrometry (optional) ────────────────────────
+    if getattr(args, 'use_gaia_dr4_epoch', False):
+        from bp3m.pipeline.download_gaia_epoch import (
+            collect_matched_source_ids,
+            run_gaia_dr4_epoch,
+            merge_epoch_solutions_into_catalog,
+        )
+        print("\n" + "=" * 55)
+        print("Step 4b: Gaia DR4 epoch astrometry")
+        print("=" * 55)
+
+        matched_sids = collect_matched_source_ids(output_dir)
+        print(f"  Cross-matched sources: {len(matched_sids)}")
+
+        epoch_solutions = run_gaia_dr4_epoch(
+            field_name=field,
+            output_dir=output_dir,
+            matched_source_ids=matched_sids,
+            access=args.dr4_access,
+            prerelease_votable=args.dr4_prerelease_votable,
+            data_release=args.dr4_data_release,
+            credentials_file=args.dr4_credentials,
+            model=args.dr4_model,
+            n_download_workers=min(args.n_processes, 8) if args.n_processes > 0 else 4,
+            force=args.force_rerun_dr4_epoch,
+        )
+
+        if len(epoch_solutions) > 0:
+            # Patch the Gaia CSV on disk so the data loader picks up the
+            # epoch-derived parameters automatically on subsequent runs.
+            from bp3m.pipeline.download_gaia import _cache_stem
+            import glob as _glob
+            _gaia_csvs = sorted(_glob.glob(
+                str(output_dir / "Gaia" / f"*_gaia.csv")
+            ))
+            if _gaia_csvs:
+                _gaia_csv = _gaia_csvs[-1]
+                import pandas as _pd
+                _gdf = _pd.read_csv(_gaia_csv)
+                _gdf["source_id"] = _gdf["source_id"].astype("int64")
+                _gdf_ep = merge_epoch_solutions_into_catalog(
+                    _gdf, epoch_solutions,
+                    replace_pms=not args.dr4_no_replace_pms,
+                    replace_parallax=not args.dr4_no_replace_pms,
+                )
+                # Save alongside the original; suffix _ep marks epoch-patched.
+                _ep_csv = _gaia_csv.replace("_gaia.csv", "_gaia_ep.csv")
+                _gdf_ep.to_csv(_ep_csv, index=False)
+                print(f"  Epoch-patched catalog saved → {_ep_csv}")
 
     # ── Step 5a: Synthetic data generation (optional) ─────────────────────────
 
