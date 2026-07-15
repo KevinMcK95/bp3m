@@ -880,8 +880,7 @@ class BP3MSolver:
                     use_astrom = use_align
 
             # When exclude_2p_from_alignment is set, 2p stars do not contribute
-            # to the image transformation equations (H_rr, h_r).  They still
-            # appear in H_vv/h_all so their own astrometry is still solved.
+            # to the image transformation equations (H_rr, h_r).
             if self.exclude_2p_from_alignment:
                 sidx_all = d["sidx"]
                 not_2p = ~self.gaia_2p[sidx_all]
@@ -906,22 +905,17 @@ class BP3MSolver:
 
             JUT_Cs = np.einsum('nki,nkl->nil', JU, Cs_inv)
 
-            # H_vv: all stars used for either alignment or astrometry
-            np.add.at(H_vv, sidx_any, np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
-
-            # h_all: residual information from all used detections
-            np.subtract.at(h_all, sidx_any, np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
-
-            # Images dropped due to insufficient non-2p alignment stars:
-            # still contribute to stellar astrometry (H_vv/h_all above) and
-            # keep their prior in H_rr (so H_rr stays full-rank), but do NOT
-            # contribute to the alignment normal equations (XCsX, h_align).
-            # K_img = None → zero Schur correction from this image (valid since
-            # H_rr = prior-only → K ≈ 0 for the weak prior used here).
+            # Images dropped due to insufficient non-2p alignment stars are
+            # excluded entirely: no H_vv, no H_rr data, no Schur correction.
+            # Still add the prior so the H_rr block is not zero.
             if dropped:
                 H_rr[cs:cs+nr, cs:cs+nr] += d["C_r_prior_inv"]
                 K_img[img] = None
                 continue
+
+            # H_vv/h_all: stellar astrometry from all used detections
+            np.add.at(H_vv, sidx_any, np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
+            np.subtract.at(h_all, sidx_any, np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
 
             # h_align: residual information from alignment detections only
             # (used in Schur complement rhs to avoid cross-image coupling)
