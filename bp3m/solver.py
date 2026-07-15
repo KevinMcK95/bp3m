@@ -858,7 +858,7 @@ class BP3MSolver:
 
         for j_idx, img in enumerate(self.image_names):
             d = self._img_data[img]
-            if d is None:
+            if d is None or d.get("_dropped_by_2p_check", False):
                 K_img[img] = None
                 continue
 
@@ -1174,6 +1174,31 @@ class BP3MSolver:
         # Store as instance variable so _solve_one_pass and _update_use_for_fit
         # can access it without signature changes.
         self._use_two_tier = use_two_tier
+
+        # When 2p stars are excluded from the alignment, drop any image that
+        # would have fewer non-2p alignment stars than half the transformation
+        # DOF (i.e., fewer independent 2D constraints than free parameters).
+        if self.exclude_2p_from_alignment:
+            min_align = max(4, self.N_R // 2)
+            dropped_imgs = []
+            for img in self.image_names:
+                d = self._img_data.get(img)
+                if d is None:
+                    continue
+                sidx = d["sidx"]
+                use_fit = d["use_for_fit"]
+                n_non2p = int((use_fit & ~self.gaia_2p[sidx]).sum())
+                if n_non2p < min_align:
+                    dropped_imgs.append((img, n_non2p))
+                    # Mark dropped — _img_data[img] stays alive so r_init is
+                    # accessible for r_hat assembly; _solve_one_pass skips it.
+                    self._img_data[img]["_dropped_by_2p_check"] = True
+            if dropped_imgs:
+                print(f"\n  [exclude_2p_from_alignment] Dropping {len(dropped_imgs)} "
+                      f"image(s) with fewer than {min_align} non-2p alignment stars:")
+                for img, n in dropped_imgs:
+                    print(f"    WARNING: {img} dropped — only {n} non-2p alignment "
+                          f"stars (need ≥{min_align})")
 
         r_hat = np.concatenate([self._img_data[img]["r_init"]
                                  for img in self.image_names])

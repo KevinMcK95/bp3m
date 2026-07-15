@@ -237,6 +237,7 @@ run_alignment(
     exclude_2p_from_alignment=True,
 )
 
+
 # ── Step 4b: HST-only alignment with epoch-derived catalog ────────────────────
 # No epoch obs — Gaia prior comes entirely from the epoch-derived catalog.
 # For 5p stars the catalog IS a sufficient statistic for the epoch obs, so pulls
@@ -253,6 +254,7 @@ run_alignment(
     split_ccd=False,
     exclude_2p_from_alignment=True,
 )
+
 
 # ── Step 5: Compare pulls ─────────────────────────────────────────────────────
 # Build source-id sets for 5p and 2p stars (based on original catalog).
