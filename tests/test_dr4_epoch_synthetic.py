@@ -309,16 +309,24 @@ def _compute_pulls(res_dir: "Path", label: str,
     _orig_dec_map = dict(zip(orig_cat["source_id"], orig_cat["dec"]))
     _ep_ra_map    = dict(zip(_ep["source_id"], _ep["ra"]))
     _ep_dec_map   = dict(zip(_ep["source_id"], _ep["dec"]))
-    ep_ra_corr  = np.array([
-        (_ep_ra_map.get(g, _orig_ra_map.get(g, 0.0)) - _orig_ra_map.get(g, 0.0))
-        * np.cos(np.radians(_orig_dec_map.get(g, 0.0))) * 3.6e6
-        for g in gids
-    ])
-    ep_dec_corr = np.array([
-        (_ep_dec_map.get(g, _orig_dec_map.get(g, 0.0)) - _orig_dec_map.get(g, 0.0))
-        * 3.6e6
-        for g in gids
-    ])
+    # ep_ra_corr: shift of epoch-derived catalog relative to original catalog (mas).
+    # Only apply when the run uses the epoch-derived catalog as its Gaia reference
+    # (HSTCAT).  For the EPOCH run the reference IS the original catalog, so the
+    # truth is simply true_delta_racosdec with no correction.
+    if use_epoch_cat_ref:
+        ep_ra_corr  = np.array([
+            (_ep_ra_map.get(g, _orig_ra_map.get(g, 0.0)) - _orig_ra_map.get(g, 0.0))
+            * np.cos(np.radians(_orig_dec_map.get(g, 0.0))) * 3.6e6
+            for g in gids
+        ])
+        ep_dec_corr = np.array([
+            (_ep_dec_map.get(g, _orig_dec_map.get(g, 0.0)) - _orig_dec_map.get(g, 0.0))
+            * 3.6e6
+            for g in gids
+        ])
+    else:
+        ep_ra_corr  = np.zeros(len(gids))
+        ep_dec_corr = np.zeros(len(gids))
     df["resid_delta_racosdec"] = (df["delta_racosdec_bp3m"]
                                   - (df["true_delta_racosdec"] - ep_ra_corr))
     df["resid_delta_dec"]      = (df["delta_dec_bp3m"]
@@ -339,12 +347,12 @@ def _compute_pulls(res_dir: "Path", label: str,
 print("\n" + "=" * 60)
 print(f"HST + DR4 epoch pulls ({SYN_EPOCH})")
 print("=" * 60)
-cmp_ep  = _compute_pulls(EPOCH_DIR,  "epoch",  gaia_df)
+cmp_ep  = _compute_pulls(EPOCH_DIR,  "epoch",  gaia_df, use_epoch_cat_ref=False)
 
 print("\n" + "=" * 60)
 print(f"HST-only + epoch-derived catalog pulls ({SYN_HSTCAT})")
 print("=" * 60)
-cmp_hc  = _compute_pulls(HSTCAT_DIR, "hstcat", gaia_df)
+cmp_hc  = _compute_pulls(HSTCAT_DIR, "hstcat", gaia_df, use_epoch_cat_ref=True)
 
 # ── Side-by-side summary: EPOCH vs HSTCAT ────────────────────────────────────
 # Primary comparison: 5p stars only (sufficient-statistic check; 2p star
