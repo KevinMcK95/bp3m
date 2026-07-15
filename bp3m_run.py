@@ -268,6 +268,10 @@ def _parse_args():
     bp.add_argument('--bp3m_min_stars', type=int, default=0,
                     help='Exclude images with fewer than this many Gaia cross-matched '
                          'stars from BP3M (default: 0 = keep all images)')
+    bp.add_argument('--exclude_2p_from_alignment', action='store_true',
+                    help='Exclude Gaia 2-parameter (position-only) stars from the '
+                         'image-transformation alignment; images with too few non-2p '
+                         'stars are dropped entirely')
 
     # ── Synthetic tests ───────────────────────────────────────────────────────
     syn = p.add_argument_group('Synthetic tests (requires completed cross-match, Step 4)')
@@ -859,6 +863,7 @@ def main():
                 pos_err_floor=args.bp3m_pos_err_floor,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
+                exclude_2p_from_alignment=args.exclude_2p_from_alignment,
             )
             # ── Step 5b: Compare synthetic results to truth ────────────────────
             print("\n" + "=" * 55)
@@ -910,6 +915,7 @@ def main():
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 gaia_epoch_obs=_gaia_epoch_obs_for_solver,
+                exclude_2p_from_alignment=args.exclude_2p_from_alignment,
             )
 
     # Save the command only on successful completion so interrupted runs
