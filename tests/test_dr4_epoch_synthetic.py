@@ -30,13 +30,17 @@ from bp3m.pipeline.download_gaia_epoch import (
 
 DATA_ROOT  = Path("/home/jupyter-kmckinnon/data_bootes/bp3m/GaiaHub_results")
 FIELD      = "Leo_I"
-SYN_BASE   = "synthetic_nosplit"        # existing HST-only synthetic
-SYN_EPOCH  = "synthetic_nosplit_dr4"    # new HST + epoch run
-SYN_HSTCAT = "synthetic_nosplit_dr4_hstcat"  # HST-only with epoch-derived catalog
-FIELD_DIR  = DATA_ROOT / FIELD
-BASE_DIR   = FIELD_DIR / SYN_BASE
-EPOCH_DIR  = FIELD_DIR / SYN_EPOCH
-HSTCAT_DIR = FIELD_DIR / SYN_HSTCAT
+SYN_BASE        = "synthetic_nosplit"            # existing HST-only synthetic
+SYN_EPOCH       = "synthetic_nosplit_dr4"        # HST + epoch, 2p excluded from align
+SYN_HSTCAT      = "synthetic_nosplit_dr4_hstcat" # HST-only + epoch cat, 2p excluded
+SYN_EPOCH_INC   = "synthetic_nosplit_dr4_inc"       # HST + epoch, 2p included in align
+SYN_HSTCAT_INC  = "synthetic_nosplit_dr4_hstcat_inc"# HST-only + epoch cat, 2p included
+FIELD_DIR       = DATA_ROOT / FIELD
+BASE_DIR        = FIELD_DIR / SYN_BASE
+EPOCH_DIR       = FIELD_DIR / SYN_EPOCH
+HSTCAT_DIR      = FIELD_DIR / SYN_HSTCAT
+EPOCH_INC_DIR   = FIELD_DIR / SYN_EPOCH_INC
+HSTCAT_INC_DIR  = FIELD_DIR / SYN_HSTCAT_INC
 
 # ── Step 1: Read existing truth + Gaia catalog ────────────────────────────────
 print("=" * 60)
@@ -163,97 +167,72 @@ print(f"  Preprocessed {len(epoch_obs)} sources with ≥5 CCD observations")
 total_ccd = sum(d["n_transits"] for d in epoch_obs.values())
 print(f"  Total CCD observations: {total_ccd}")
 
-# ── Step 3: Create synthetic_nosplit_dr4 directory ────────────────────────────
+# ── Step 3: directories are set up inside Step 4 below ───────────────────────
+
+# ── Step 4: Run all four alignment scenarios ──────────────────────────────────
+# Scenarios A/B use --exclude_2p_from_alignment (only 5p stars drive the image
+# transformation).  Scenarios C/D include 2p stars in the alignment.
+# Comparing A vs C and B vs D isolates the effect of the flag.
+
+def _setup_symlinks(target_dir, base_dir, epoch_cat_df=None):
+    """Create/refresh HST, Gaia (or write epoch cat), and truth symlinks."""
+    target_dir.mkdir(exist_ok=True)
+    # Gaia: write epoch catalog if provided, else symlink from base
+    gaia_link = target_dir / "Gaia"
+    if gaia_link.exists() or gaia_link.is_symlink():
+        if gaia_link.is_symlink():
+            gaia_link.unlink()
+        elif gaia_link.is_dir():
+            import shutil; shutil.rmtree(gaia_link)
+    if epoch_cat_df is not None:
+        gaia_link.mkdir(exist_ok=True)
+        epoch_cat_df.to_csv(gaia_link / "Leo_I_synthetic_gaia.csv", index=False)
+    else:
+        gaia_link.symlink_to(base_dir / "Gaia")
+    # HST and truth: always symlink
+    for subdir in ("HST", "truth"):
+        lnk = target_dir / subdir
+        if lnk.exists() or lnk.is_symlink():
+            lnk.unlink()
+        lnk.symlink_to(base_dir / subdir)
+
+# Scenario A: HST + epoch, 2p excluded from alignment
 print("\n" + "=" * 60)
-print(f"Setting up {SYN_EPOCH} directory")
+print(f"Setting up {SYN_EPOCH} (epoch, 2p excluded)")
 print("=" * 60)
+_setup_symlinks(EPOCH_DIR, BASE_DIR)
+print(f"Running alignment: {SYN_EPOCH}")
+run_alignment(output_dir=FIELD_DIR, field_name=SYN_EPOCH,
+              gaia_epoch_obs=epoch_obs, split_ccd=False,
+              exclude_2p_from_alignment=True)
 
-EPOCH_DIR.mkdir(exist_ok=True)
-
-# Symlink HST and Gaia from the base synthetic
-for subdir in ("HST", "Gaia"):
-    link = EPOCH_DIR / subdir
-    target = BASE_DIR / subdir
-    if link.exists() or link.is_symlink():
-        link.unlink()
-    link.symlink_to(target)
-    print(f"  Linked {link} -> {target}")
-
-# Symlink truth so compare_synthetic_results can find it
-truth_link = EPOCH_DIR / "truth"
-truth_target = BASE_DIR / "truth"
-if truth_link.exists() or truth_link.is_symlink():
-    truth_link.unlink()
-truth_link.symlink_to(truth_target)
-print(f"  Linked {truth_link} -> {truth_target}")
-
-# ── Step 3b: Set up HST-only + epoch-derived catalog directory ────────────────
-# Writes the epoch-derived gaia_df to disk.  gaia_df now has ra/dec updated to
-# the epoch-derived position (≈ physical truth) and pmra/pmdec/parallax/errors/
-# correlations replaced by the epoch normal-equation solution.
-# This lets us run an HST-only alignment using the epoch catalog as a prior,
-# which should give pulls identical to the HST + epoch run if the catalog
-# statistics are truly sufficient statistics for the epoch observations.
+# Scenario B: HST-only + epoch-derived catalog, 2p excluded from alignment
 print("\n" + "=" * 60)
-print(f"Setting up {SYN_HSTCAT} directory (HST-only + epoch-derived catalog)")
+print(f"Setting up {SYN_HSTCAT} (epoch cat, 2p excluded)")
 print("=" * 60)
+_setup_symlinks(HSTCAT_DIR, BASE_DIR, epoch_cat_df=gaia_df)
+print(f"Running alignment: {SYN_HSTCAT}")
+run_alignment(output_dir=FIELD_DIR, field_name=SYN_HSTCAT,
+              split_ccd=False, exclude_2p_from_alignment=True)
 
-HSTCAT_DIR.mkdir(exist_ok=True)
-
-# Epoch-derived Gaia catalog (not a symlink — written from the in-memory gaia_df)
-hstcat_gaia_dir = HSTCAT_DIR / "Gaia"
-hstcat_gaia_dir.mkdir(exist_ok=True)
-gaia_catalog_name = "Leo_I_synthetic_gaia.csv"
-gaia_df.to_csv(hstcat_gaia_dir / gaia_catalog_name, index=False)
-print(f"  Wrote epoch-derived catalog → {hstcat_gaia_dir / gaia_catalog_name}")
-
-# HST: symlink from BASE_DIR
-hst_link = HSTCAT_DIR / "HST"
-if hst_link.exists() or hst_link.is_symlink():
-    hst_link.unlink()
-hst_link.symlink_to(BASE_DIR / "HST")
-print(f"  Linked {hst_link} -> {BASE_DIR / 'HST'}")
-
-# truth: symlink from BASE_DIR
-hstcat_truth_link = HSTCAT_DIR / "truth"
-if hstcat_truth_link.exists() or hstcat_truth_link.is_symlink():
-    hstcat_truth_link.unlink()
-hstcat_truth_link.symlink_to(BASE_DIR / "truth")
-print(f"  Linked {hstcat_truth_link} -> {BASE_DIR / 'truth'}")
-
-# ── Step 4: Run alignment with epoch data ─────────────────────────────────────
-# Both runs use --exclude_2p_from_alignment so the alignment is determined solely
-# by 5p stars, isolating the apples-to-apples comparison to the sufficient-statistic
-# check for 5p stars.  2p stars still get their own astrometric posteriors.
+# Scenario C: HST + epoch, 2p included in alignment
 print("\n" + "=" * 60)
-print(f"Running alignment: HST + DR4 epoch ({SYN_EPOCH})")
+print(f"Setting up {SYN_EPOCH_INC} (epoch, 2p included)")
 print("=" * 60)
+_setup_symlinks(EPOCH_INC_DIR, BASE_DIR)
+print(f"Running alignment: {SYN_EPOCH_INC}")
+run_alignment(output_dir=FIELD_DIR, field_name=SYN_EPOCH_INC,
+              gaia_epoch_obs=epoch_obs, split_ccd=False,
+              exclude_2p_from_alignment=False)
 
-run_alignment(
-    output_dir=FIELD_DIR,
-    field_name=SYN_EPOCH,
-    gaia_epoch_obs=epoch_obs,
-    split_ccd=False,
-    exclude_2p_from_alignment=True,
-)
-
-
-# ── Step 4b: HST-only alignment with epoch-derived catalog ────────────────────
-# No epoch obs — Gaia prior comes entirely from the epoch-derived catalog.
-# For 5p stars the catalog IS a sufficient statistic for the epoch obs, so pulls
-# here should match the HST + epoch pulls above (for 5p stars).
-# For 2p stars the catalog encodes only the position from the epoch solve (NaN PM);
-# results will differ slightly from the epoch path due to weak PM signal in epochs.
+# Scenario D: HST-only + epoch-derived catalog, 2p included in alignment
 print("\n" + "=" * 60)
-print(f"Running alignment: HST-only + epoch-derived catalog ({SYN_HSTCAT})")
+print(f"Setting up {SYN_HSTCAT_INC} (epoch cat, 2p included)")
 print("=" * 60)
-
-run_alignment(
-    output_dir=FIELD_DIR,
-    field_name=SYN_HSTCAT,
-    split_ccd=False,
-    exclude_2p_from_alignment=True,
-)
+_setup_symlinks(HSTCAT_INC_DIR, BASE_DIR, epoch_cat_df=gaia_df)
+print(f"Running alignment: {SYN_HSTCAT_INC}")
+run_alignment(output_dir=FIELD_DIR, field_name=SYN_HSTCAT_INC,
+              split_ccd=False, exclude_2p_from_alignment=False)
 
 
 # ── Step 5: Compare pulls ─────────────────────────────────────────────────────
@@ -344,19 +323,19 @@ def _compute_pulls(res_dir: "Path", label: str,
     return df
 
 
-print("\n" + "=" * 60)
-print(f"HST + DR4 epoch pulls ({SYN_EPOCH})")
-print("=" * 60)
-cmp_ep  = _compute_pulls(EPOCH_DIR,  "epoch",  gaia_df, use_epoch_cat_ref=False)
+# ── Step 5: Compute pulls for all four scenarios ──────────────────────────────
+scenarios = [
+    (EPOCH_DIR,      "ep_excl",   False),  # A: epoch,  2p excluded
+    (HSTCAT_DIR,     "hc_excl",   True),   # B: hstcat, 2p excluded
+    (EPOCH_INC_DIR,  "ep_incl",   False),  # C: epoch,  2p included
+    (HSTCAT_INC_DIR, "hc_incl",   True),   # D: hstcat, 2p included
+]
+cmps = {}
+for res_dir, tag, use_ep_ref in scenarios:
+    cmps[tag] = _compute_pulls(res_dir, tag, gaia_df,
+                               use_epoch_cat_ref=use_ep_ref)
 
-print("\n" + "=" * 60)
-print(f"HST-only + epoch-derived catalog pulls ({SYN_HSTCAT})")
-print("=" * 60)
-cmp_hc  = _compute_pulls(HSTCAT_DIR, "hstcat", gaia_df, use_epoch_cat_ref=True)
-
-# ── Side-by-side summary: EPOCH vs HSTCAT ────────────────────────────────────
-# Primary comparison: 5p stars only (sufficient-statistic check; 2p star
-# handling differs between the two runs so their pulls are inherently not equal).
+# ── Side-by-side summary ──────────────────────────────────────────────────────
 params = [
     ("delta_racosdec", "Δα*"),
     ("delta_dec",      "Δδ"),
@@ -365,16 +344,26 @@ params = [
     ("parallax",       "Δϖ"),
 ]
 
+tags    = ["ep_excl", "hc_excl", "ep_incl", "hc_incl"]
+headers = ["EPOCH_excl", "HSTCAT_excl", "EPOCH_incl", "HSTCAT_incl"]
+
 for subset_label, mask_fn in [("5p stars", lambda df: df["is_5p"]),
                                ("2p stars", lambda df: ~df["is_5p"])]:
-    print("\n" + "=" * 60)
-    print(f"Summary ({subset_label}) — EPOCH vs HSTCAT")
-    print("=" * 60)
-    print(f"  {'Param':<8} {'pull_μ_ep':>11} {'pull_σ_ep':>11} "
-          f"{'pull_μ_hstcat':>14} {'pull_σ_hstcat':>14}")
+    print("\n" + "=" * 76)
+    print(f"Summary ({subset_label})  "
+          f"  excl=2p excluded from alignment  incl=2p included")
+    print("=" * 76)
+    hdr = f"  {'Param':<6}"
+    for h in headers:
+        hdr += f"  {'μ_'+h[:7]:>9} {'σ_'+h[:7]:>9}"
+    print(hdr)
     for key, label in params:
         col = f"pull_{key}"
-        pe  = cmp_ep.loc[mask_fn(cmp_ep),  col].dropna()
-        phc = cmp_hc.loc[mask_fn(cmp_hc), col].dropna()
-        print(f"  {label:<8} {pe.mean():>11.3f} {pe.std():>11.3f} "
-              f"{phc.mean():>14.3f} {phc.std():>14.3f}")
+        row = f"  {label:<6}"
+        for tag in tags:
+            df_ = cmps[tag]
+            vals = df_.loc[mask_fn(df_), col].dropna()
+            mu   = vals.mean() if len(vals) else float("nan")
+            sig  = vals.std()  if len(vals) else float("nan")
+            row += f"  {mu:>9.3f} {sig:>9.3f}"
+        print(row)
