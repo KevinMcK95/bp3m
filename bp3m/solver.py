@@ -858,27 +858,20 @@ class BP3MSolver:
 
         for j_idx, img in enumerate(self.image_names):
             d = self._img_data[img]
-            if d is None or d.get("_dropped_by_2p_check", False):
+            cs = j_idx * nr
+
+            if d is None:
                 K_img[img] = None
                 continue
 
+            dropped = d.get("_dropped_by_2p_check", False)
+
             if z_weights is not None:
-                # Soft-weight two-tier mode: Gaia-matched (align_init) drive the
-                # transformation; all Phase-0-surviving detections (including
-                # HST-only) constrain stellar astrometry.  This mirrors the hard-EM
-                # two-tier split that keeps HST-only out of the transformation
-                # estimate, preventing the instability from Bug 9.
-                z          = z_weights[img]   # (n,) float, 0 for excluded detections
-                # Mirror the hard-EM two-tier exactly: same Gaia population for
-                # the transformation (post-Phase-0 use_for_fit), same astrometry
-                # population (use_for_fit | use_for_astrom, i.e. Gaia + callback-
-                # enabled HST-only).  Using use_for_align_init instead of
-                # use_for_fit would include Phase-0-rejected Gaia detections which
-                # shift the transformation away from the hard-EM fixed point.
-                use_align  = d["use_for_fit"]      # post-Phase-0 Gaia → H_rr
+                z          = z_weights[img]
+                use_align  = d["use_for_fit"]
                 use_astrom = (d["use_for_fit"]
                               | d.get("use_for_astrom",
-                                      d["use_for_fit"]))  # Gaia + HST-only → H_vv
+                                      d["use_for_fit"]))
             else:
                 use_align  = d["use_for_fit"]
                 if getattr(self, '_use_two_tier', False):
@@ -900,15 +893,12 @@ class BP3MSolver:
             X    = d["X_mat"]    # (n, 2, N_R)
             xys  = d["xys"]      # (n, 2)
 
-            # Extract r_j first so we can pass it to _compute_Cs (poly Jacobian)
-            cs  = j_idx * nr
             r_j = r_current[cs:cs + nr]
 
             Cs     = self._compute_Cs(img, r_j)   # (n, 2, 2)
             Cs_inv = np.linalg.inv(Cs)
 
             if z_weights is not None:
-                # Scale precision by soft weight: (n,2,2) * (n,1,1)
                 Cs_inv = Cs_inv * z[:, None, None]
 
             x_pred  = np.einsum('nkl,l->nk', X, r_j)
@@ -922,6 +912,17 @@ class BP3MSolver:
             # h_all: residual information from all used detections
             np.subtract.at(h_all, sidx_any, np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
 
+            # Images dropped due to insufficient non-2p alignment stars:
+            # still contribute to stellar astrometry (H_vv/h_all above) and
+            # keep their prior in H_rr (so H_rr stays full-rank), but do NOT
+            # contribute to the alignment normal equations (XCsX, h_align).
+            # K_img = None → zero Schur correction from this image (valid since
+            # H_rr = prior-only → K ≈ 0 for the weak prior used here).
+            if dropped:
+                H_rr[cs:cs+nr, cs:cs+nr] += d["C_r_prior_inv"]
+                K_img[img] = None
+                continue
+
             # h_align: residual information from alignment detections only
             # (used in Schur complement rhs to avoid cross-image coupling)
             np.subtract.at(h_align, sidx_align, np.einsum('nik,nk->ni', JUT_Cs[use_align], x_resid[use_align]))
@@ -934,7 +935,7 @@ class BP3MSolver:
             H_rr[cs:cs+nr, cs:cs+nr] += XCsX
             XCs_xresid[img] = np.einsum('nki,nkl,nl->ni', X[use_align], Cs_inv[use_align], x_resid[use_align])
 
-            H_rr[cs:cs+nr, cs:cs+nr] += self._img_data[img]["C_r_prior_inv"]
+            H_rr[cs:cs+nr, cs:cs+nr] += d["C_r_prior_inv"]
 
         # ── Gaia DR4 epoch AL contributions ───────────────────────────────────
         if getattr(self, '_gaia_epoch_contrib', None):
