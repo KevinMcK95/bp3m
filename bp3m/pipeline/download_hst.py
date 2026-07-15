@@ -953,6 +953,7 @@ def _parse_polygons(s_region: str) -> list[np.ndarray]:
         if len(nums) < 6:
             continue
         verts = np.array(nums).reshape(-1, 2)
+        verts[:, 0] = verts[:, 0] % 360   # normalise RA from (−180,180] → [0,360)
         polys.append(verts)
     return polys
 
@@ -987,7 +988,7 @@ def _footprint_bbox(s_region: str) -> tuple[float, float, float, float] | None:
                 pass
         if len(coords) < 4:
             return None
-        ras  = coords[0::2]
+        ras  = [r % 360 for r in coords[0::2]]   # normalise RA from (−180,180] → [0,360)
         decs = coords[1::2]
         return min(ras), max(ras), min(decs), max(decs)
     except Exception:
