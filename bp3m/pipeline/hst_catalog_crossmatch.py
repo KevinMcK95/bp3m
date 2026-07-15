@@ -1148,10 +1148,10 @@ def _phase2_gaia_catalog_anchor(
     ``anchor_gaia_ids`` is the set of Gaia source IDs already handled by
     Phase 1.  Only Gaia stars NOT in this set are searched here.
 
-    This ensures that new Gaia stars (not in the original BP3M v1 run, e.g.
-    faint stars recovered by the improved crossmatch or 2p stars whose PM was
-    not measured in v1) also get their detections labelled before Phase 3
-    (within-filter crossmatch), so they survive the min_detections cut.
+    Vectorized implementation: iterates over sub-images (outer) and predicts
+    positions for all target stars simultaneously (inner), building each
+    KDTree once.  Conflict resolution (multiple stars → same detection) uses
+    a closest-wins dict instead of sequential tree rebuilds.
     """
     if gaia_csv is None or not Path(gaia_csv).exists():
         return det_df
@@ -1182,94 +1182,126 @@ def _phase2_gaia_catalog_anchor(
     search_deg = search_radius_px * PLATE_SCALE_DEG
     cos_dec_global = np.cos(np.radians(det_df['dec'].median()))
 
-    # Build ZP offsets and KD-trees (same as Phase 1)
-    gaia_g_lookup = gaia_df.set_index(id_col)['gmag'].to_dict() if 'gmag' in gaia_df.columns else {}
+    # ── Pre-extract target arrays (vectorized over stars) ─────────────────────
+    tgt_ids  = targets[id_col].to_numpy(dtype=np.int64)
+    tgt_ra   = targets['ra'].to_numpy(dtype=float)
+    tgt_dec  = targets['dec'].to_numpy(dtype=float)
+    _pmra    = targets['pmra'].to_numpy(dtype=float)  if 'pmra'  in targets.columns else np.zeros(len(targets))
+    _pmdec   = targets['pmdec'].to_numpy(dtype=float) if 'pmdec' in targets.columns else np.zeros(len(targets))
+    tgt_pmra  = np.where(np.isfinite(_pmra),  _pmra,  0.0)
+    tgt_pmdec = np.where(np.isfinite(_pmdec), _pmdec, 0.0)
+    tgt_gmag  = targets['gmag'].to_numpy(dtype=float) if 'gmag' in targets.columns else np.full(len(targets), np.nan)
+    tgt_cos   = np.cos(np.radians(tgt_dec))
+    valid_pos = np.isfinite(tgt_ra) & np.isfinite(tgt_dec)
+
+    # ── ZP offsets per sub-image ──────────────────────────────────────────────
     zp_per_sub: dict[str, tuple[float, float]] = {}
     matched_det = det_df[det_df['has_gaia_match']].copy()
-    if len(matched_det) > 0:
-        matched_det['_gid'] = matched_det['gaia_source_id'].astype(np.int64)
-        gaia_g_ser = gaia_df.set_index(id_col)['gmag'] if 'gmag' in gaia_df.columns else pd.Series(dtype=float)
+    if len(matched_det) > 0 and 'gmag' in gaia_df.columns:
+        gaia_g_ser = gaia_df.set_index(id_col)['gmag']
+        matched_det['_gid']  = matched_det['gaia_source_id'].astype(np.int64)
         matched_det['_gmag'] = matched_det['_gid'].map(gaia_g_ser)
-        valid = matched_det.dropna(subset=['_gmag', 'mag_zp'])
-        for sub, grp in valid.groupby('sub_name'):
+        valid_zp = matched_det.dropna(subset=['_gmag', 'mag_zp'])
+        for sub, grp in valid_zp.groupby('sub_name'):
             diffs = grp['_gmag'].values - grp['mag_zp'].values
             if len(diffs) >= 5:
-                med = float(np.median(diffs))
+                med   = float(np.median(diffs))
                 sigma = float(np.median(np.abs(diffs - med)) / 0.6745)
                 zp_per_sub[sub] = (med, max(sigma, 0.1))
 
-    det_df = det_df.copy()
-    sub_trees: dict[str, tuple] = {}
-    for sub, grp in det_df[~det_df['has_gaia_match']].groupby('sub_name'):
-        if len(grp) == 0:
-            continue
-        ra_s = grp['ra'].values; dec_s = grp['dec'].values
-        tree = cKDTree(np.column_stack([ra_s * cos_dec_global, dec_s]))
-        sub_trees[sub] = (tree, ra_s, dec_s, grp['mag_zp'].values, grp.index.values)
-
     epoch_lookup = (2000.0 + det_df.groupby('sub_name')['epoch_mjd'].first() / MJD_YR - _MJD0_YR).to_dict()
-    already_labelled: set[tuple[int, str]] = set()
-    for row in det_df[det_df['has_gaia_match']].itertuples():
-        already_labelled.add((int(row.gaia_source_id), row.sub_name))
 
-    # Pre-extract source_id as int64 to prevent float64 precision loss via iterrows.
-    _target_ids = targets[id_col].to_numpy(dtype=np.int64)
-    n_anchored = 0; n_stars_improved = 0
-    for _tgt_i, (_, star) in enumerate(targets.iterrows()):
-        gid = int(_target_ids[_tgt_i])
-        ra0_g = float(star.get('ra', np.nan))
-        dec0_g = float(star.get('dec', np.nan))
-        if not (np.isfinite(ra0_g) and np.isfinite(dec0_g)):
+    det_df = det_df.copy()
+    col_match = det_df.columns.get_loc('has_gaia_match')
+    col_gid   = det_df.columns.get_loc('gaia_source_id')
+
+    n_anchored = 0
+    matched_gids: set[int] = set()
+
+    # ── Outer loop: one iteration per sub-image ───────────────────────────────
+    for sub_name, epoch_yr in epoch_lookup.items():
+        sub_mask = (det_df['sub_name'] == sub_name) & (~det_df['has_gaia_match'])
+        sub_grp  = det_df[sub_mask]
+        if len(sub_grp) == 0:
             continue
-        pmra  = float(star.get('pmra',  0) or 0) if np.isfinite(star.get('pmra',  np.nan)) else 0.0
-        pmdec = float(star.get('pmdec', 0) or 0) if np.isfinite(star.get('pmdec', np.nan)) else 0.0
-        g_mag = gaia_g_lookup.get(gid, np.nan)
 
-        star_added = 0
-        for sub_name, epoch_yr in epoch_lookup.items():
-            if (gid, sub_name) in already_labelled or sub_name not in sub_trees:
-                continue
-            dt = epoch_yr - GAIA_EPOCH_YR
-            ra_pred  = ra0_g + pmra  * dt / (np.cos(np.radians(dec0_g)) * 3.6e6)
-            dec_pred = dec0_g + pmdec * dt / 3.6e6
-            tree, ra_s, dec_s, mag_s, idx_s = sub_trees[sub_name]
-            k = min(n_candidates, len(ra_s))
-            dists, ii = tree.query([[ra_pred * cos_dec_global, dec_pred]], k=k)
-            dists = dists[0]; ii = ii[0]
-            ok = dists < search_deg
-            if not ok.any():
-                continue
-            zp_info = zp_per_sub.get(sub_name)
-            best_row = None; best_sep = np.inf
-            for ki, dist_i in zip(ii[ok], dists[ok]):
-                row_idx = idx_s[ki]
-                if np.isfinite(g_mag) and zp_info is not None:
-                    zp_med, zp_sig = zp_info
-                    hst_mag = float(mag_s[ki]) if np.isfinite(mag_s[ki]) else np.nan
-                    if np.isfinite(hst_mag):
-                        resid = abs(hst_mag - (g_mag - zp_med))
-                        if resid > mag_n_sigma * np.sqrt(zp_sig**2 + mag_floor**2):
-                            continue
-                if dist_i < best_sep:
-                    best_sep = dist_i; best_row = row_idx
-            if best_row is None:
-                continue
-            det_df.iat[best_row, det_df.columns.get_loc('has_gaia_match')] = True
-            det_df.iat[best_row, det_df.columns.get_loc('gaia_source_id')] = np.int64(gid)
-            already_labelled.add((gid, sub_name))
-            keep = idx_s != best_row
-            if keep.any():
-                sub_trees[sub_name] = (
-                    cKDTree(np.column_stack([ra_s[keep]*cos_dec_global, dec_s[keep]])),
-                    ra_s[keep], dec_s[keep], mag_s[keep], idx_s[keep])
+        ra_s  = sub_grp['ra'].values
+        dec_s = sub_grp['dec'].values
+        mag_s = sub_grp['mag_zp'].values
+        idx_s = sub_grp.index.values   # global det_df row indices
+
+        # Build KDTree for this sub-image once
+        tree = cKDTree(np.column_stack([ra_s * cos_dec_global, dec_s]))
+
+        # Predict positions for all valid targets simultaneously
+        dt = epoch_yr - GAIA_EPOCH_YR
+        ra_pred  = tgt_ra  + tgt_pmra  * dt / (tgt_cos * 3.6e6)
+        dec_pred = tgt_dec + tgt_pmdec * dt / 3.6e6
+
+        k = min(n_candidates, len(ra_s))
+        query_pts = np.column_stack([ra_pred * cos_dec_global, dec_pred])
+        # Mask invalid targets with a dummy point outside the field so they
+        # get large distances and are naturally filtered below.
+        query_pts[~valid_pos] = 1e9
+
+        dists_all, ii_all = tree.query(query_pts, k=k)   # (N_tgt, k)
+        if k == 1:
+            dists_all = dists_all[:, np.newaxis]
+            ii_all    = ii_all[:, np.newaxis]
+
+        # For each target, find its best valid candidate (closest passing
+        # distance + magnitude filters).  Loop is over k≤5, not over stars.
+        best_dist = np.full(len(tgt_ids), np.inf)
+        best_det  = np.full(len(tgt_ids), -1, dtype=int)  # local index into idx_s
+
+        zp_info    = zp_per_sub.get(sub_name)
+        mag_thresh = mag_n_sigma * np.sqrt(zp_info[1]**2 + mag_floor**2) if zp_info else np.inf
+
+        for ki in range(k):
+            dists = dists_all[:, ki]
+            ii    = ii_all[:,   ki]
+
+            # Only consider targets that haven't found a valid match yet
+            need = (best_det == -1) & valid_pos & (dists < search_deg)
+            if not need.any():
+                break
+
+            # Magnitude filter (vectorized)
+            if zp_info is not None:
+                zp_med = zp_info[0]
+                hst_mags = mag_s[ii]
+                both_finite = need & np.isfinite(tgt_gmag) & np.isfinite(hst_mags)
+                resid = np.where(both_finite,
+                                 np.abs(hst_mags - (tgt_gmag - zp_med)), 0.0)
+                mag_ok = np.where(both_finite, resid <= mag_thresh, True)
+                valid  = need & mag_ok
             else:
-                del sub_trees[sub_name]
-            star_added += 1; n_anchored += 1
-        if star_added > 0:
-            n_stars_improved += 1
+                valid = need
+
+            best_dist = np.where(valid, dists,        best_dist)
+            best_det  = np.where(valid, ii.astype(int), best_det)
+
+        # Resolve conflicts: multiple targets matched to same detection →
+        # keep the closest target for each detection.
+        # assign maps local_det_idx → (dist, target_idx)
+        assign: dict[int, tuple[float, int]] = {}
+        for ti in np.where(best_det >= 0)[0]:
+            det_local = int(best_det[ti])
+            dist      = float(best_dist[ti])
+            if det_local not in assign or dist < assign[det_local][0]:
+                assign[det_local] = (dist, int(ti))
+
+        # Apply assignments
+        for det_local, (_, ti) in assign.items():
+            glob_idx = idx_s[det_local]
+            gid      = int(tgt_ids[ti])
+            det_df.iat[glob_idx, col_match] = True
+            det_df.iat[glob_idx, col_gid]   = np.int64(gid)
+            n_anchored += 1
+            matched_gids.add(gid)
 
     print(f"  Phase 2: added {n_anchored} detections across "
-          f"{n_stars_improved} non-V1 Gaia stars ({len(targets)} candidates)")
+          f"{len(matched_gids)} non-V1 Gaia stars ({len(targets)} candidates)")
     return det_df
 
 
