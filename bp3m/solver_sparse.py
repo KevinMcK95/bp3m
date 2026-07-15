@@ -249,9 +249,9 @@ class BP3MSolverSparse(BP3MSolver):
         self._update_R(r_hat)
 
         nr      = self.N_R
-        _pnames = ['a', 'b', 'c', 'd', 'w', 'z', 'Δα0', 'Δδ0']
-        if nr > 8:
-            _pnames += [f'poly{i}' for i in range(nr - 8)]
+        _pnames = ['a', 'b', 'c', 'd', 'Δα0', 'Δδ0']
+        if nr > 6:
+            _pnames += [f'poly{i}' for i in range(nr - 6)]
         _n_imgs = len(self.image_names)
 
         def _delta_summary(diff):
@@ -262,8 +262,6 @@ class BP3MSolverSparse(BP3MSolver):
                          f"  [{self.image_names[img_idx]} / {_pnames[param_idx]}]")
             parts = []
             for p in range(nr):
-                if p in (6, 7):
-                    continue
                 vals = diff[p::nr]
                 med  = float(np.median(vals))
                 if _n_imgs > 1:
@@ -281,8 +279,6 @@ class BP3MSolverSparse(BP3MSolver):
                 r_hat, _return_C_r=is_last)
 
             diff = np.abs(r_hat_new - r_hat)
-            diff[6::nr] = 0
-            diff[7::nr] = 0
             delta = np.max(diff)
             r_hat = r_hat_new
             self._update_R(r_hat)

@@ -514,11 +514,30 @@ def download_hst_images(
     print(f"\n  Found {len(obs_df)} observation(s):")
     _print_obs_table(obs_df)
 
-    # Save footprint plot
+    # Save footprint plot — load qso_candidates + vetted qso_anchors if available
     footprint_png = hst_dir / f"{field_name}_footprints.png"
+    _qso_df     = None
+    _anchor_df  = None
+    _gaia_dir   = Path(output_dir) / field_name / "Gaia"
+    _qso_csvs   = sorted(_gaia_dir.glob("*_qso_candidates.csv"))
+    if _qso_csvs:
+        try:
+            _qso_df = pd.read_csv(_qso_csvs[0])
+        except Exception:
+            pass
+    _anchor_csv = _gaia_dir / f"{field_name}_qso_anchors.csv"
+    if _anchor_csv.exists():
+        try:
+            _adf = pd.read_csv(_anchor_csv, dtype={'source_id': 'int64'})
+            _anchor_df = _adf[_adf['is_qso_anchor'].fillna(False)].copy()
+            if len(_anchor_df) == 0:
+                _anchor_df = None
+        except Exception:
+            pass
     try:
         plot_footprints(obs_df, footprint_png,
-                        gaia_df=gaia_df, field_name=field_name,
+                        gaia_df=gaia_df, qso_df=_qso_df, anchor_df=_anchor_df,
+                        field_name=field_name,
                         ra=ra, dec=dec,
                         search_width=search_width,
                         search_height=search_height)
@@ -706,6 +725,8 @@ def plot_footprints(
     obs_df: pd.DataFrame,
     save_path: str | Path,
     gaia_df: 'pd.DataFrame | None' = None,
+    qso_df: 'pd.DataFrame | None' = None,
+    anchor_df: 'pd.DataFrame | None' = None,
     field_name: str = '',
     ra: float | None = None,
     dec: float | None = None,
@@ -725,6 +746,12 @@ def plot_footprints(
                     proposal_id, instrument_name, obs_time.
     save_path     : output PNG path.
     gaia_df       : optional Gaia catalogue; plotted as background scatter.
+    qso_df        : optional Gaia qso_candidates catalogue (all Gaia-flagged
+                    possible QSOs, before external catalog vetting); plotted as
+                    small orange circles.
+    anchor_df     : optional vetted QSO anchors (survived Quaia/MILLIQUAS
+                    cross-match + astrometric cut); plotted as larger gold stars
+                    on top of the raw candidates.
     field_name    : used in the figure title.
     ra, dec       : field centre (degrees).  When provided together with
                     search_width / search_height, the axes are fixed to the
@@ -745,6 +772,25 @@ def plot_footprints(
         ax.scatter(gaia_df['ra'].values, gaia_df['dec'].values,
                    c=gmag, cmap='Greys', vmin=16, vmax=22,
                    s=2, alpha=0.5, rasterized=True, zorder=1)
+
+    # ── QSO candidates (all Gaia-flagged, before external vetting) ───────────
+    if qso_df is not None and len(qso_df) > 0 and 'ra' in qso_df.columns:
+        # If we also have anchors, show raw candidates as lighter background markers
+        _qso_alpha = 0.45 if anchor_df is not None else 0.8
+        ax.scatter(qso_df['ra'].values, qso_df['dec'].values,
+                   marker='o', s=18, color='#f4a261', alpha=_qso_alpha,
+                   linewidths=0.2, zorder=3,
+                   label=f'Gaia QSO candidates ({len(qso_df)})')
+
+    # ── Vetted QSO anchors (Quaia/MILLIQUAS + astrometric cut) ───────────────
+    if anchor_df is not None and len(anchor_df) > 0:
+        _acol = 'ra' if 'ra' in anchor_df.columns else None
+        _dcol = 'dec' if 'dec' in anchor_df.columns else None
+        if _acol and _dcol:
+            ax.scatter(anchor_df[_acol].values, anchor_df[_dcol].values,
+                       marker='*', s=90, color='gold', edgecolors='darkorange',
+                       linewidths=0.6, alpha=0.95, zorder=5,
+                       label=f'Vetted QSO anchors ({len(anchor_df)})')
 
     # ── Footprint polygons ────────────────────────────────────────────────────
     filter_patches: dict[str, mpatches.Patch] = {}   # for legend
@@ -794,9 +840,9 @@ def plot_footprints(
     pad_factor = 0.08
 
     if ra is not None and dec is not None and search_width and search_height:
-        cos_d = np.cos(np.deg2rad(dec))
-        cut_ra_lo  = ra  - search_width  / 2 / cos_d
-        cut_ra_hi  = ra  + search_width  / 2 / cos_d
+        # search_width is already in RA degrees (expanded by 1/cos(dec) by the caller)
+        cut_ra_lo  = ra  - search_width  / 2
+        cut_ra_hi  = ra  + search_width  / 2
         cut_dec_lo = dec - search_height / 2
         cut_dec_hi = dec + search_height / 2
 
@@ -857,9 +903,22 @@ def plot_footprints(
     ax.set_aspect(1.0 / np.cos(np.deg2rad(center_dec)), adjustable='box')
 
     # ── Legend, labels, title ─────────────────────────────────────────────────
-    if filter_patches:
-        ax.legend(handles=list(filter_patches.values()),
-                  title='Filter', fontsize=8, title_fontsize=8,
+    import matplotlib.lines as mlines
+    legend_handles = list(filter_patches.values())
+    if qso_df is not None and len(qso_df) > 0 and 'ra' in qso_df.columns:
+        legend_handles.append(
+            mlines.Line2D([], [], marker='o', color='#f4a261',
+                          markersize=6, linestyle='None', alpha=0.7,
+                          label=f'Gaia QSO candidates ({len(qso_df)})'))
+    if anchor_df is not None and len(anchor_df) > 0:
+        legend_handles.append(
+            mlines.Line2D([], [], marker='*', color='gold',
+                          markeredgecolor='darkorange', markeredgewidth=0.6,
+                          markersize=10, linestyle='None',
+                          label=f'Vetted QSO anchors ({len(anchor_df)})'))
+    if legend_handles:
+        ax.legend(handles=legend_handles,
+                  title='Filter / sources', fontsize=8, title_fontsize=8,
                   loc='best', framealpha=0.8)
 
     ax.set_xlabel('R.A. (deg)')
@@ -876,23 +935,25 @@ def plot_footprints(
 def _parse_polygons(s_region: str) -> list[np.ndarray]:
     """
     Parse a MAST s_region string into a list of (N,2) vertex arrays.
-    Handles strings with one or more POLYGON blocks.
+    Handles strings with one or more POLYGON blocks and ignores non-numeric
+    tokens such as the ICRS frame identifier (e.g. "POLYGON ICRS ra dec ...").
     """
     polys = []
-    # Split on 'POLYGON' keyword (case-insensitive)
     parts = s_region.upper().split('POLYGON')
     for part in parts:
         part = part.strip()
         if not part:
             continue
-        try:
-            nums = [float(x) for x in part.split()]
-            if len(nums) < 6:
+        nums = []
+        for tok in part.split():
+            try:
+                nums.append(float(tok))
+            except (ValueError, TypeError):
                 continue
-            verts = np.array(nums).reshape(-1, 2)
-            polys.append(verts)
-        except (ValueError, TypeError):
+        if len(nums) < 6:
             continue
+        verts = np.array(nums).reshape(-1, 2)
+        polys.append(verts)
     return polys
 
 
@@ -914,10 +975,16 @@ def _footprint_bbox(s_region: str) -> tuple[float, float, float, float] | None:
     """
     Parse a MAST s_region string (one or more POLYGON vertices) and return
     (ra_min, ra_max, dec_min, dec_max).  Returns None if unparseable.
+    Ignores non-numeric tokens such as ICRS (e.g. "POLYGON ICRS ra dec ...").
     """
     try:
         tokens = s_region.upper().replace('POLYGON', ' ').split()
-        coords = [float(t) for t in tokens]
+        coords = []
+        for t in tokens:
+            try:
+                coords.append(float(t))
+            except (ValueError, TypeError):
+                pass
         if len(coords) < 4:
             return None
         ras  = coords[0::2]

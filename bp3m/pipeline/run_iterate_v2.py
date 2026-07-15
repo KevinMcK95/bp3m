@@ -88,6 +88,9 @@ def main():
                         help='Use Student-t IRLS soft weights instead of hard tests 1-4')
     parser.add_argument('--student_t_nu', type=float, default=50.0,
                         help='Student-t degrees of freedom for soft-weight IRLS')
+    parser.add_argument('--exclude_2p_from_alignment', action='store_true',
+                        help='Exclude 2-parameter Gaia stars from the alignment solve '
+                             '(they still contribute to their own astrometric posteriors)')
 
     # ── Crossmatch parameters ──────────────────────────────────────────────────
     parser.add_argument('--match_n_sigma', type=float, default=5.0,
@@ -108,6 +111,8 @@ def main():
                         help='Per-detection chi2 sigma threshold for Phase 4 outlier rejection')
     parser.add_argument('--zp_max_corr', type=float, default=None,
                         help='Max ZP correction to apply (mag). Default: 0.0 when pre-measured ZP exists, 3.0 otherwise')
+    parser.add_argument('--stop_after_gaia_residuals', action='store_true',
+                        help='Print Phase 1+2 Gaia match residuals then exit (for debugging pointing offsets)')
 
     args = parser.parse_args()
 
@@ -150,8 +155,9 @@ def main():
         cross_filter_radius_mas  = args.cross_filter_radius_mas,
         save_detections          = not args.no_save_detections,
         phase4_outlier_sigma     = args.phase4_outlier_sigma,
-        anchor_bp3m_dir          = bp3m_v1_dir if bp3m_v1_dir.exists() else None,
-        zp_max_corr              = args.zp_max_corr,
+        anchor_bp3m_dir              = bp3m_v1_dir if bp3m_v1_dir.exists() else None,
+        zp_max_corr                  = args.zp_max_corr,
+        stop_after_gaia_residuals    = args.stop_after_gaia_residuals,
     )
 
     bp3m_kwargs = dict(
@@ -171,8 +177,9 @@ def main():
         use_influence_clip   = not args.no_influence_clip,
         influence_d_thresh   = args.influence_d_thresh,
         influence_sigma_min  = args.influence_sigma_min,
-        use_soft_weights     = args.soft_weights,
-        student_t_nu         = args.student_t_nu,
+        use_soft_weights              = args.soft_weights,
+        student_t_nu                  = args.student_t_nu,
+        exclude_2p_from_alignment     = args.exclude_2p_from_alignment,
     )
 
     # ── Step 1: initial crossmatch ─────────────────────────────────────────────

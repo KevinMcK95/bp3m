@@ -62,7 +62,63 @@ _QUALITY_COLS = (
     "(phot_bp_n_obs+phot_rp_n_obs) AS beta, "
     "ipd_gof_harmonic_amplitude, "
     "phot_bp_n_contaminated_transits, phot_rp_n_contaminated_transits, "
-    "ref_epoch"
+    "ref_epoch, "
+    "classprob_dsc_combmod_quasar, classprob_dsc_combmod_galaxy, "
+    "classprob_dsc_combmod_star, in_qso_candidates, in_galaxy_candidates"
+)
+
+# Columns added in the 2025-07 update; used to detect stale no-sidecar caches.
+_DSC_COLS = ('classprob_dsc_combmod_quasar', 'in_qso_candidates')
+
+# Columns to SELECT from gaiadr3.galaxy_candidates.
+# Key morphology columns (UNITS: radius_sersic / radius_de_vaucouleurs are in MAS):
+#   radius_sersic — effective half-light radius in MAS; primary extent indicator.
+#                   Divide by 1000 to get arcsec.  Only populated when the Sérsic
+#                   fit converged; NULL for many sources (fit did not converge).
+#   n_sersic      — Sérsic index (n≈1=disk, n≈4=de Vaucouleurs elliptical)
+#   l2_sersic     — L2 norm of Sérsic fit residuals (quality; lower = better)
+#   flags_sersic  — bit flags for fit convergence/quality (non-zero = caveats)
+# Both Sérsic and de Vaucouleurs fits are included.
+# Excludes morph_params_corr_vec_sersic and morph_params_corr_vec_de_vaucouleurs
+# (array types, cannot be serialised to CSV).
+_GALAXY_CANDIDATES_COLS = (
+    "source_id, "
+    "vari_best_class_name, vari_best_class_score, "
+    "classprob_dsc_combmod_galaxy, classprob_dsc_combmod_quasar, "
+    "classlabel_dsc, classlabel_dsc_joint, classlabel_oa, "
+    "redshift_ugc, redshift_ugc_lower, redshift_ugc_upper, "
+    "n_transits, source_selection_flags, "
+    "radius_sersic, radius_sersic_error, "
+    "n_sersic, n_sersic_error, "
+    "ellipticity_sersic, ellipticity_sersic_error, "
+    "posangle_sersic, posangle_sersic_error, "
+    "intensity_sersic, intensity_sersic_error, "
+    "l2_sersic, flags_sersic, "
+    "radius_de_vaucouleurs, radius_de_vaucouleurs_error, "
+    "ellipticity_de_vaucouleurs, ellipticity_de_vaucouleurs_error, "
+    "l2_de_vaucouleurs, flags_de_vaucouleurs"
+)
+
+# Columns to SELECT from gaiadr3.qso_candidates (excludes array-type
+# morph_params_corr_vec which cannot be serialised to CSV).
+_QSO_CANDIDATES_COLS = (
+    "source_id, gaia_crf_source, astrometric_selection_flag, "
+    "vari_best_class_name, vari_best_class_score, "
+    "classprob_dsc_combmod_quasar, classprob_dsc_combmod_galaxy, "
+    "classlabel_dsc, classlabel_dsc_joint, classlabel_oa, "
+    "fractional_variability_g, structure_function_index, "
+    "structure_function_index_scatter, qso_variability, non_qso_variability, "
+    "vari_agn_membership_score, "
+    "redshift_qsoc, redshift_qsoc_lower, redshift_qsoc_upper, "
+    "ccfratio_qsoc, zscore_qsoc, flags_qsoc, "
+    "n_transits, intensity_quasar, intensity_quasar_error, "
+    "intensity_hostgalaxy, intensity_hostgalaxy_error, "
+    "radius_hostgalaxy, radius_hostgalaxy_error, "
+    "sersic_index, sersic_index_error, "
+    "ellipticity_hostgalaxy, ellipticity_hostgalaxy_error, "
+    "posangle_hostgalaxy, posangle_hostgalaxy_error, "
+    "host_galaxy_detected, host_galaxy_flag, "
+    "l2_norm, source_selection_flags"
 )
 
 
@@ -121,9 +177,27 @@ def _mag_bins(min_mag, max_mag, area):
         log10(1.0), log10(1.0 + max_mag - min_mag), num=int(n))
 
 
+_QUERY_TIMEOUT = 300   # seconds per attempt
+_QUERY_RETRIES = 3
+
+
+def _submit_gaia_async(full_q: str) -> pd.DataFrame:
+    """Submit one Gaia TAP async job and return the result as a DataFrame."""
+    from astroquery.gaia import Gaia
+    job = Gaia.launch_job_async(full_q)
+    result = job.get_results().to_pandas()
+    try:
+        Gaia.remove_jobs([job.jobid])
+    except Exception:
+        pass
+    return result
+
+
 def _query_mag_bin(args):
     """Worker: launch one Gaia TAP query for a magnitude slice."""
-    from astroquery.gaia import Gaia
+    import concurrent.futures
+    import time
+
     query, min_g, max_g, ind_dir, field, n, n_total = args
     full_q = (query +
               f" AND (phot_g_mean_mag > {min_g:.4f})"
@@ -135,17 +209,38 @@ def _query_mag_bin(args):
         if cache_path.exists():
             return pd.read_csv(cache_path)
 
-    job = Gaia.launch_job_async(full_q)
-    result = job.get_results().to_pandas()
-    try:
-        Gaia.remove_jobs([job.jobid])
-    except Exception:
-        pass
-
-    if cache_path is not None:
-        result.to_csv(cache_path, index=False)
-    print(f"  Bin {n}/{n_total}: {len(result)} stars  (G {min_g:.2f}–{max_g:.2f})")
-    return result
+    print(f"  Bin {n}/{n_total}: querying G {min_g:.2f}–{max_g:.2f} ...", flush=True)
+    print(f"  ADQL: {full_q}", flush=True)
+    last_exc = None
+    for attempt in range(_QUERY_RETRIES):
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+                future = exe.submit(_submit_gaia_async, full_q)
+                result = future.result(timeout=_QUERY_TIMEOUT)
+            if cache_path is not None:
+                result.to_csv(cache_path, index=False)
+            print(f"  Bin {n}/{n_total}: {len(result)} stars  (G {min_g:.2f}–{max_g:.2f})")
+            return result
+        except concurrent.futures.TimeoutError:
+            last_exc = TimeoutError(
+                f"Gaia TAP query timed out after {_QUERY_TIMEOUT}s"
+            )
+            wait = 30 * (attempt + 1)
+            if attempt < _QUERY_RETRIES - 1:
+                print(f"    Timeout (attempt {attempt+1}/{_QUERY_RETRIES}), "
+                      f"retrying in {wait}s ...", flush=True)
+                time.sleep(wait)
+        except Exception as e:
+            last_exc = e
+            wait = 15 * (attempt + 1)
+            if attempt < _QUERY_RETRIES - 1:
+                print(f"    Error: {e} (attempt {attempt+1}/{_QUERY_RETRIES}), "
+                      f"retrying in {wait}s ...", flush=True)
+                time.sleep(wait)
+    raise RuntimeError(
+        f"Gaia query for bin {n}/{n_total} (G {min_g:.2f}–{max_g:.2f}) "
+        f"failed after {_QUERY_RETRIES} attempts: {last_exc}"
+    ) from last_exc
 
 
 # ── Cache helpers ────────────────────────────────────────────────────────────
@@ -289,9 +384,14 @@ def download_gaia(
             return pd.read_csv(out_path)
         elif out_path.exists():
             if diffs == ["no sidecar — cannot verify query match"]:
-                print(f"[Gaia] WARNING: cached CSV found but no query sidecar — "
-                      f"loading anyway: {out_path}")
-                return pd.read_csv(out_path)
+                _header = pd.read_csv(out_path, nrows=0)
+                if all(c in _header.columns for c in _DSC_COLS):
+                    print(f"[Gaia] WARNING: cached CSV found but no query sidecar — "
+                          f"loading anyway: {out_path}")
+                    return pd.read_csv(out_path)
+                else:
+                    print(f"[Gaia] Cached CSV is missing DSC classification columns "
+                          f"— re-downloading to add them.")
             else:
                 print(f"[Gaia] Cached query differs from current request "
                       f"— re-downloading:")
@@ -356,4 +456,187 @@ def download_gaia(
     print(f"  Stars after quality filter: {n_clean} / {len(df)}")
     print(f"  Saved: {out_path}")
     print(f"  Query metadata: {meta_path}")
+
+    download_gaia_qso_candidates(ra, dec, search_width, search_height,
+                                  output_dir, field_name,
+                                  force_redownload=force_redownload)
+    download_gaia_galaxy_candidates(ra, dec, search_width, search_height,
+                                     output_dir, field_name,
+                                     force_redownload=force_redownload)
     return df
+
+
+def download_gaia_qso_candidates(
+    ra: float,
+    dec: float,
+    search_width: float,
+    search_height: float,
+    output_dir: Path,
+    field_name: str,
+    force_redownload: bool = False,
+) -> pd.DataFrame | None:
+    """Download Gaia DR3 qso_candidates for the same sky region.
+
+    Saves to:
+        {output_dir}/{field_name}/Gaia/{field_name}_ra{ra}_dec{dec}_w{w}_h{h}_qso_candidates.csv
+
+    Returns the DataFrame, or None if the query fails.  The result is always
+    cached — pass ``force_redownload=True`` to re-query the archive.
+
+    Key columns unique to this table (not in gaiadr3.gaia_source):
+      gaia_crf_source          — Gaia CRF3 membership (highest-quality anchors)
+      redshift_qsoc            — photometric redshift
+      fractional_variability_g — G-band flux variability amplitude
+      structure_function_index — AGN variability structure function exponent
+      vari_agn_membership_score — combined AGN membership score
+      classlabel_dsc_joint     — string classification label
+      host_galaxy_detected     — resolved host galaxy flag (unresolved preferred)
+      qso_variability          — variability-based QSO probability score
+    """
+    gaia_dir = Path(output_dir) / field_name / "Gaia"
+    gaia_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = (gaia_dir /
+                f"{field_name}_ra{ra:.4f}_dec{dec:+.4f}"
+                f"_w{search_width:.4f}_h{search_height:.4f}_qso_candidates.csv")
+
+    _ABERR_COLS = ('pmra_aberr_uas', 'pmdec_aberr_uas')
+
+    if not force_redownload and out_path.exists():
+        result = pd.read_csv(out_path)
+        if not all(c in result.columns for c in _ABERR_COLS):
+            print(f"[Gaia] Adding secular aberration columns to cached qso_candidates...")
+            result = _add_secular_aberration(result)
+            result.to_csv(out_path, index=False)
+        else:
+            print(f"[Gaia] Loading cached qso_candidates: {out_path}")
+        return result
+
+    box = (f"CONTAINS(POINT('ICRS',g.ra,g.dec),"
+           f"BOX('ICRS',{ra:.8f},{dec:.8f},{search_width:.8f},{search_height:.8f}))=1")
+    # Include g.ra/dec so the output CSV is self-contained for spatial cross-matching.
+    query = (f"SELECT q.{_QSO_CANDIDATES_COLS.replace(', ', ', q.')}, g.ra, g.dec "
+             f"FROM gaiadr3.qso_candidates AS q "
+             f"JOIN gaiadr3.gaia_source AS g ON q.source_id = g.source_id "
+             f"WHERE {box}")
+
+    print(f"\n[Gaia] Downloading qso_candidates for {field_name}...")
+    try:
+        from astroquery.gaia import Gaia
+        job = Gaia.launch_job_async(query)
+        result = job.get_results().to_pandas()
+        try:
+            Gaia.remove_jobs([job.jobid])
+        except Exception:
+            pass
+        result = _add_secular_aberration(result)
+        result.to_csv(out_path, index=False)
+        print(f"  qso_candidates: {len(result)} sources → {out_path}")
+        return result
+    except Exception as e:
+        print(f"  WARNING: qso_candidates download failed — {e}")
+        return None
+
+
+def _add_secular_aberration(df: pd.DataFrame) -> pd.DataFrame:
+    """Add pmra_aberr_uas / pmdec_aberr_uas columns (µas/yr) in place."""
+    from .secular_aberration import secular_aberration_pm
+    pmra, pmdec = secular_aberration_pm(df['ra'].values, df['dec'].values)
+    df = df.copy()
+    df['pmra_aberr_uas']  = pmra
+    df['pmdec_aberr_uas'] = pmdec
+    return df
+
+
+def download_gaia_galaxy_candidates(
+    ra: float,
+    dec: float,
+    search_width: float,
+    search_height: float,
+    output_dir: Path,
+    field_name: str,
+    force_redownload: bool = False,
+) -> "pd.DataFrame | None":
+    """Download Gaia DR3 galaxy_candidates for the same sky region.
+
+    Saves to:
+        {output_dir}/{field_name}/Gaia/{field_name}_ra{ra}_dec{dec}_w{w}_h{h}_galaxy_candidates.csv
+
+    Returns the DataFrame, or None if the query fails.  The result is always
+    cached — pass ``force_redownload=True`` to re-query the archive.
+
+    Key morphology columns for astrometric use:
+      radius_sersic    — effective half-light radius in MAS (divide by 1000 for
+                         arcsec); primary indicator of how extended the source is.
+                         NULL when the Sérsic fit did not converge (~most sources).
+                         Use to set position uncertainty inflation in the solver.
+      n_sersic         — Sérsic index (n≈1 disk, n≈4 de Vaucouleurs elliptical)
+      l2_sersic        — L2 norm of Sérsic fit residuals; outliers → poor fit
+      flags_sersic     — bit flags for convergence / fit quality
+      classprob_dsc_combmod_galaxy — DSC galaxy probability (cut at e.g. > 0.5)
+      redshift_ugc     — photometric redshift from the UGC module
+    """
+    gaia_dir = Path(output_dir) / field_name / "Gaia"
+    gaia_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = (gaia_dir /
+                f"{field_name}_ra{ra:.4f}_dec{dec:+.4f}"
+                f"_w{search_width:.4f}_h{search_height:.4f}_galaxy_candidates.csv")
+
+    _ABERR_COLS = ('pmra_aberr_uas', 'pmdec_aberr_uas')
+
+    if not force_redownload and out_path.exists():
+        result = pd.read_csv(out_path)
+        if not all(c in result.columns for c in _ABERR_COLS):
+            print(f"[Gaia] Adding secular aberration columns to cached galaxy_candidates...")
+            result = _add_secular_aberration(result)
+            result.to_csv(out_path, index=False)
+        else:
+            print(f"[Gaia] Loading cached galaxy_candidates: {out_path}")
+        return result
+
+    box = (f"CONTAINS(POINT('ICRS',g.ra,g.dec),"
+           f"BOX('ICRS',{ra:.8f},{dec:.8f},{search_width:.8f},{search_height:.8f}))=1")
+    # Include g.ra/dec so the output CSV is self-contained for spatial cross-matching.
+    query = (f"SELECT g2.{_GALAXY_CANDIDATES_COLS.replace(', ', ', g2.')}, g.ra, g.dec "
+             f"FROM gaiadr3.galaxy_candidates AS g2 "
+             f"JOIN gaiadr3.gaia_source AS g ON g2.source_id = g.source_id "
+             f"WHERE {box}")
+
+    print(f"\n[Gaia] Downloading galaxy_candidates for {field_name}...")
+    try:
+        from astroquery.gaia import Gaia
+        job = Gaia.launch_job_async(query)
+        result = job.get_results().to_pandas()
+        try:
+            Gaia.remove_jobs([job.jobid])
+        except Exception:
+            pass
+        result = _add_secular_aberration(result)
+        result.to_csv(out_path, index=False)
+        print(f"  galaxy_candidates: {len(result)} sources → {out_path}")
+        return result
+    except Exception as e:
+        print(f"  WARNING: galaxy_candidates download failed — {e}")
+        return None
+
+
+def find_qso_catalogs(lib_dir: Path | None) -> dict[str, Path | None]:
+    """Return paths to the MILLIQUAS and Quaia FITS files in lib_dir.
+
+    Returns a dict with keys 'quaia' and 'milliquas', each either a Path to
+    the FITS file or None if not found.  Call from the field cross-match step
+    to locate the reference catalogs for QSO vetting.
+    """
+    result: dict[str, Path | None] = {'quaia': None, 'milliquas': None}
+    if lib_dir is None:
+        return result
+    qso_dir = Path(lib_dir) / "qso_catalogs"
+    if not qso_dir.exists():
+        return result
+    for name, filename in (('quaia', 'quaia_G20.5.fits'),
+                            ('milliquas', 'milliquas.fits')):
+        p = qso_dir / filename
+        if p.exists():
+            result[name] = p
+    return result

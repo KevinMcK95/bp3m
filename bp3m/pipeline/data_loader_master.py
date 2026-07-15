@@ -198,7 +198,8 @@ def _load_fits_catalog(cat_path: Path) -> dict | None:
             "cov_xx": tbl["cov_xx_gdc"].astype(float),
             "cov_yy": tbl["cov_yy_gdc"].astype(float),
             "cov_xy": tbl["cov_xy_gdc"].astype(float),
-            "mag":    tbl["mag"].astype(float),
+            "mag":     tbl["mag"].astype(float),
+            "mag_gdc": tbl["mag_gdc"].astype(float),
             "qfit":   tbl["qfit"].astype(float),
             "n_sat":  tbl["n_sat"].astype(int),
         }
@@ -260,13 +261,10 @@ def load_master_v2(
         raise FileNotFoundError(f"master_combined_v2.csv not found: {master_path}")
 
     print(f"  Loading master catalog: {master_path}")
-    master = pd.read_csv(master_path, low_memory=False)
-    # Ensure gaia_source_id is int64 without float64 precision loss.
-    # New files (written after the int64 fix) store 0 for missing and have no NaN
-    # in this column, so direct int64 conversion is safe.  Old files stored NaN
-    # for HST-only rows, which forces float64.  In either case we convert via
-    # the float→int64 lookup built from the Gaia catalog (built below), so we
-    # defer this conversion until gaia_float_to_int64 is available.
+    # Read gaia_source_id directly as int64.  The column stores exact integer
+    # strings (0 for HST-only, no NaN), so no float64 round-trip occurs.
+    master = pd.read_csv(master_path, low_memory=False,
+                         dtype={'gaia_source_id': np.int64})
     hst_idx_cols = [c for c in master.columns if c.startswith("hst_indices_")]
 
     # ── Real Gaia catalog ─────────────────────────────────────────────────────
@@ -293,27 +291,7 @@ def load_master_v2(
     )
     gaia_real.rename(columns={"source_id": "Gaia_id", "ref_epoch": "Gaia_time"}, inplace=True)
 
-    # float64 → int64 lookup (Gaia IDs may have been stored as float in CSV)
-    gaia_float_to_int64: dict[float, np.int64] = {
-        float(gid): np.int64(gid) for gid in gaia_real["Gaia_id"].values
-    }
     gaia_id_set: set = set(gaia_real["Gaia_id"].values)
-
-    # Now that gaia_float_to_int64 is built, fix gaia_source_id column precision.
-    # Old master files have float64 (NaN for HST-only); new files have int64 (0).
-    # We use the float→int64 lookup to recover exact IDs for Gaia-matched rows.
-    if "gaia_source_id" in master.columns:
-        _raw_gids = pd.to_numeric(master["gaia_source_id"], errors="coerce").fillna(0.0)
-        _corrected = np.zeros(len(master), dtype=np.int64)
-        for _k, _fval in enumerate(_raw_gids.values):
-            if _fval == 0.0:
-                _corrected[_k] = 0
-            elif int(_fval) in gaia_id_set:
-                _corrected[_k] = int(_fval)
-            else:
-                # Try float→int64 lookup to recover precision
-                _corrected[_k] = int(gaia_float_to_int64.get(float(_fval), int(_fval)))
-        master["gaia_source_id"] = _corrected
 
     # ── Compute color offsets G − filter_mag from Gaia-matched rows ───────────
     # Used to convert HST magnitudes to an estimated G magnitude for HST-only
@@ -344,6 +322,14 @@ def load_master_v2(
     # ── Parse detections and classify sources ─────────────────────────────────
     print(f"  Parsing {len(master)} source rows...")
 
+    # Pre-extract gaia_source_id as int64 BEFORE the iterrows loop.
+    # iterrows() recasts int64 columns to float64 in mixed-dtype DataFrames
+    # (confirmed pandas 3.0.2), which causes catastrophic precision loss for
+    # 19-digit Gaia IDs.  Extracting the array first preserves exact int64 values.
+    _gaia_src_ids = (master["gaia_source_id"].to_numpy(dtype=np.int64)
+                     if "gaia_source_id" in master.columns
+                     else np.zeros(len(master), dtype=np.int64))
+
     source_records: list[dict] = []
 
     for row_i, row in master.iterrows():
@@ -355,13 +341,21 @@ def load_master_v2(
             pairs = []
             for col in hst_idx_cols:
                 pairs.extend(_parse_detections_column(row.get(col, "")))
-            # deduplicate while preserving order
-            seen: set = set()
+            # Deduplicate: first by exact (sub_name, cat_idx), then by sub_name.
+            # A source should have at most one detection per image; if the same
+            # sub_name appears with two different cat_idx values (matched to two
+            # catalog entries in the same image), keep the first occurrence.
+            seen_pair: set = set()
+            seen_sub: set = set()
             deduped = []
             for p in pairs:
-                if p not in seen:
-                    seen.add(p)
-                    deduped.append(p)
+                if p in seen_pair:
+                    continue
+                seen_pair.add(p)
+                if p[0] in seen_sub:
+                    continue
+                seen_sub.add(p[0])
+                deduped.append(p)
             pairs = deduped
 
         # Phase 4 outliers: keep them in a SEPARATE list so they enter the
@@ -390,11 +384,10 @@ def load_master_v2(
         has_gaia = bool(row.get("has_gaia_match", False))
         gaia_id: np.int64 | None = None
         if has_gaia:
-            raw_id = row.get("gaia_source_id", 0)
+            # Use pre-extracted int64 array — iterrows() loses precision on 19-digit IDs.
+            raw_id = int(_gaia_src_ids[row_i])
             try:
-                # gaia_source_id column was corrected to int64 above, so raw_id
-                # is already an exact int64 value (0 for missing).
-                gaia_id = np.int64(int(raw_id))
+                gaia_id = np.int64(raw_id)
                 if gaia_id == 0:
                     has_gaia = False
                 elif gaia_id not in gaia_id_set:
@@ -548,7 +541,17 @@ def load_master_v2(
         if meta is None:
             skipped_meta.append(sub_name)
         else:
-            images[sub_name] = meta   # same dict for _lo and _hi (identical metadata)
+            for sfx in ("_lo", "_hi"):
+                if sub_name.endswith(sfx):
+                    cp = meta.get(f"chip_pointing{sfx}")
+                    if cp is not None:
+                        meta = dict(meta)
+                        meta["ra0"]  = cp["ra0"]
+                        meta["dec0"] = cp["dec0"]
+                        meta["Xo"]   = cp["Xo"]
+                        meta["Yo"]   = cp["Yo"]
+                    break
+            images[sub_name] = meta
 
     if skipped_meta:
         print(f"  Warning: metadata missing for {len(skipped_meta)} sub-images "
@@ -575,6 +578,8 @@ def load_master_v2(
         return fits_cache[base], psf_hw_cache[base]
 
     # ── Group detections by sub_name ──────────────────────────────────────────
+    # Track (sub_name, Gaia_id) → cat_idx to detect duplicate assignments.
+    _img_gaia_seen: dict[tuple[str, np.int64], int] = {}
     img_records: dict[str, list[dict]] = {}
     for rec in valid_recs:
         _chi2_by_img = rec.get("det_chi2_by_img", {})
@@ -582,6 +587,15 @@ def load_master_v2(
         for sub_name, cat_idx in rec["detections"]:
             if sub_name not in valid_sub_names:
                 continue
+            _key = (sub_name, rec["Gaia_id"])
+            if _key in _img_gaia_seen:
+                _prev_ci = _img_gaia_seen[_key]
+                _tag = f"gaia_id={rec['Gaia_id']}" if rec["has_gaia"] else f"hst_id={rec['Gaia_id']}"
+                print(f"  WARNING: duplicate ({_tag}) in {sub_name}: "
+                      f"cat_idx={_prev_ci} (primary) and cat_idx={cat_idx} (primary) "
+                      f"— keeping first, dropping second")
+                continue
+            _img_gaia_seen[_key] = cat_idx
             img_records.setdefault(sub_name, []).append({
                 "Gaia_id":      rec["Gaia_id"],
                 "cat_idx":      cat_idx,
@@ -593,6 +607,15 @@ def load_master_v2(
         for sub_name, cat_idx in rec.get("outlier_detections", []):
             if sub_name not in valid_sub_names:
                 continue
+            _key = (sub_name, rec["Gaia_id"])
+            if _key in _img_gaia_seen:
+                _prev_ci = _img_gaia_seen[_key]
+                _tag = f"gaia_id={rec['Gaia_id']}" if rec["has_gaia"] else f"hst_id={rec['Gaia_id']}"
+                print(f"  WARNING: duplicate ({_tag}) in {sub_name}: "
+                      f"cat_idx={_prev_ci} (primary) and cat_idx={cat_idx} (outlier) "
+                      f"— keeping first, dropping outlier")
+                continue
+            _img_gaia_seen[_key] = cat_idx
             img_records.setdefault(sub_name, []).append({
                 "Gaia_id":      rec["Gaia_id"],
                 "cat_idx":      cat_idx,

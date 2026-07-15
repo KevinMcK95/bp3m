@@ -33,6 +33,7 @@ from scipy import linalg
 import astropy.units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
+from typing import Optional
 
 from .astro_utils import (
     plane_project, plane_project_jacobian, plane_project_tangent_derivs,
@@ -64,10 +65,9 @@ _SIGMA_PM  = 100.0  # mas/yr  (2p / HST-only only)
 _SIGMA_ROT_DEG  = 0.1    # degrees
 _SIGMA_SCALE    = 1.5e-2  # fractional pixel scale ratio
 _SIGMA_SKEW     = 5e-3   # on- and off-axis skew terms
-_SIGMA_POINTING = 1e-6  # RA0,Dec0 (ARCSEC) — effectively fixed at 0; tangent-point
-                        # update is disabled in _update_geometry (w/z degeneracy), so
-                        # these must be pinned or the [w,Δα0] block is 3e8-ill-conditioned
-_SIGMA_CENTER = 2048   # WZ (global pixels)
+_SIGMA_POINTING = 5000.0  # RA0,Dec0 (MAS) = 5 arcsec; ~100 ACS WFC pixels; loose enough
+                          # to absorb real HST pointing error, tight enough to regularise
+                          # the tangent-point update in _update_geometry
 
 # Initial residual filter applied in _precompute_geometry.
 # Stars whose corrected 2D residual (after removing bulk w,z offset)
@@ -82,11 +82,10 @@ def _make_image_prior(meta, poly_order=1):
     """
     Return (r_prior_j, C_r_prior_inv_j) for image j.
 
-    r_j = (a, b, c, d, w, z, Δα0, Δδ0 [, poly terms...])
+    r_j = (a, b, c, d, Δα0, Δδ0 [, poly terms...])
     Prior:
       (a,b,c,d) — from header rotation/scale (strong prior)
-      (w, z)    — uninformative (flat); mean initialised to median residual later
-      (Δα0,Δδ0) — sigma = _SIGMA_POINTING arcsec
+      (Δα0,Δδ0) — sigma = _SIGMA_POINTING mas (loose; ~100 ACS WFC pixels)
       poly terms — zero mean, flat prior (determined entirely by data)
     """
     n_r = n_r_from_poly_order(poly_order)
@@ -100,7 +99,7 @@ def _make_image_prior(meta, poly_order=1):
 
     r_prior = np.zeros(n_r)
     r_prior[:4] = [a, b, c, d]
-    # r_prior[4:] = 0  (w, z, Δα0, Δδ0 and all poly terms start at zero)
+    # r_prior[4:] = 0  (Δα0, Δδ0 and all poly terms start at zero)
 
     # Jacobian ∂(a,b,c,d)/∂(rot_rad, scale_ratio, on_skew, off_skew)
     cr, sr = np.cos(rot_rad), np.sin(rot_rad)
@@ -120,12 +119,9 @@ def _make_image_prior(meta, poly_order=1):
     except np.linalg.LinAlgError:
         C_r_prior_inv[:4, :4] = np.diag(1.0 / np.diag(C_abcd + 1e-30 * np.eye(4)))
 
-    C_r_prior_inv[4, 4] = _SIGMA_CENTER ** -2
-    C_r_prior_inv[5, 5] = _SIGMA_CENTER ** -2
-    C_r_prior_inv[6, 6] = _SIGMA_POINTING ** -2
-    C_r_prior_inv[7, 7] = _SIGMA_POINTING ** -2
-
-    # Indices 4, 5 (w, z) and 8+ (poly terms) remain zero — flat prior.
+    C_r_prior_inv[4, 4] = _SIGMA_POINTING ** -2  # Δα0
+    C_r_prior_inv[5, 5] = _SIGMA_POINTING ** -2  # Δδ0
+    # Indices 6+ (poly terms) remain zero — flat prior.
 
     return r_prior, C_r_prior_inv
 
@@ -146,7 +142,7 @@ class BP3MSolver:
 
     def __init__(self, images, stars_per_image, gaia_catalog,
                  star_id_to_idx, image_names, star_in_image,
-                 poly_order=1):
+                 poly_order=1, exclude_2p_from_alignment=False):
         """
         Parameters
         ----------
@@ -161,6 +157,7 @@ class BP3MSolver:
             raise ValueError(f"poly_order must be ≥ 1, got {poly_order}")
         self.poly_order = poly_order
         self.N_R = n_r_from_poly_order(poly_order)
+        self.exclude_2p_from_alignment = exclude_2p_from_alignment
 
         self.images = images
         self.stars_per_image = stars_per_image
@@ -335,10 +332,13 @@ class BP3MSolver:
             sidx = np.array([self.star_id_to_idx[gid] for gid in df["Gaia_id"]])
 
             ra0, dec0 = meta["ra0"], meta["dec0"]
+            # Initialize rolling tangent-point accumulator (reset each fit call)
+            meta["ra0_current"]  = ra0
+            meta["dec0_current"] = dec0
             # pscale    = meta["pixel_scale"]   # mas/pixel
             pscale    = meta["orig_pixel_scale"]   # mas/pixel
-            # Xo, Yo    = meta["Xo"], meta["Yo"]
-            Xo, Yo    = 2048.0, 2048.0
+            Xo = meta.get("Xo", 2048.0)
+            Yo = meta.get("Yo", 2048.0)
             meta['Xo'] = Xo
             meta['Yo'] = Yo
             hst_time  = Time(meta["hst_time_mjd"],format='mjd')
@@ -357,13 +357,9 @@ class BP3MSolver:
             # Jacobian J_i,j: (n, 2, 2) in pix/mas
             J = plane_project_jacobian(ra_g, dec_g, ra0, dec0, pscale)
 
-            # Tangent-point derivatives for Δα0, Δδ0 columns of X_mat
-            #change to Δα0, Δδ0 to be in ARCSEC (not mas) for numerical stability
-            #by using pscale/1000
+            # Tangent-point derivatives for Δα0, Δδ0 columns of X_mat (units: px/mas)
             dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = plane_project_tangent_derivs(
-                ra_g, dec_g, ra0, dec0, pscale/1000)
-            # dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = plane_project_tangent_derivs(
-            #     ra_g, dec_g, ra0, dec0, pscale)
+                ra_g, dec_g, ra0, dec0, pscale)
 
             # Parallax factors: difference between HST epoch and Gaia epoch
             #Gaia has already removed the parallax, so no need to subtract plx at J2016
@@ -421,20 +417,20 @@ class BP3MSolver:
             r_prior, C_r_prior_inv = _make_image_prior(meta, poly_order=self.poly_order)
 
             # ── Build r_init (initial iterate) ───────────────────────────────
-            # When transformation.csv provides (a,b,c,d,w,z) from fast_cross_match,
+            # When transformation.csv provides (a,b,c,d) from fast_cross_match,
             # use those as the starting point.  The prior (r_prior, C_r_prior_inv)
             # is computed solely from the WCS header and is never modified here.
             # r_init is a copy: changing it never changes the prior.
-            fcm_abcdwz = meta.get("fcm_abcdwz")
+            fcm_abcd = meta.get("fcm_abcd")
+            _n_fcm   = len(fcm_abcd) if fcm_abcd is not None else 0
             r_init = r_prior.copy()
-            if fcm_abcdwz is not None:
-                r_init[:6] = fcm_abcdwz   # a, b, c, d, w, z from cross-match
+            if _n_fcm:
+                r_init[:_n_fcm] = fcm_abcd[:_n_fcm]
 
             # ── Initial residual screening ────────────────────────────────────
             # Used to permanently block implausible cross-matches (> 100 px after
-            # accounting for the bulk offset).  r_init provides a better prediction
-            # than r_prior because a,b,c,d,w,z are already well-constrained, so
-            # the per-star residuals are much smaller and the screening is cleaner.
+            # subtracting the median bulk offset).  Without w/z, there is always a
+            # bulk offset in r_init predictions, so we always subtract the median.
             # Use only PM and parallax (cols 2-4): position offset Δα,Δδ = 0 at
             # reference epoch. v_survey[:, 0:2] stores absolute ra/dec in degrees,
             # which would produce spuriously large offsets for non-Gaia stars.
@@ -445,16 +441,10 @@ class BP3MSolver:
             x_pred_init = np.einsum('nkl,l->nk', X_mat, r_init) - ave_motion_offset
             x_resid_init = xys - x_pred_init
 
-            if fcm_abcdwz is not None:
-                # w,z already encoded in r_init — residuals are centred near zero.
-                # No bulk-offset subtraction needed for the ok_init screen.
-                resid_mag = np.hypot(x_resid_init[:, 0], x_resid_init[:, 1])
-            else:
-                # r_init = r_prior (w=z=0): subtract median bulk offset as before.
-                med_wz_screen = (np.nanmedian(x_resid_init[good_for_fitting], axis=0)
-                                 if good_for_fitting.any() else np.zeros(2))
-                x_resid_corr = x_resid_init - med_wz_screen
-                resid_mag = np.hypot(x_resid_corr[:, 0], x_resid_corr[:, 1])
+            med_screen = (np.nanmedian(x_resid_init[good_for_fitting], axis=0)
+                          if good_for_fitting.any() else np.zeros(2))
+            x_resid_corr = x_resid_init - med_screen
+            resid_mag = np.hypot(x_resid_corr[:, 0], x_resid_corr[:, 1])
 
             ok_init = resid_mag <= _INIT_RESID_CLIP_PX  # (n,) hard ceiling mask
 
@@ -467,17 +457,11 @@ class BP3MSolver:
                           f"initial residual > {_INIT_RESID_CLIP_PX:.0f} px")
 
             # ── Set prior mean from cross-match solution ──────────────────────
-            # When transformation.csv provides (a,b,c,d,w,z), override the
-            # WCS-only prior mean for all 6 parameters.  This ensures that when
-            # no data stars contribute (good_for_fitting all-False), the solve
-            # returns r_hat = r_prior = cross-match solution rather than the
-            # WCS-only estimate, so Phase-0 residuals are computed at the correct
-            # transformation and stars can be re-admitted.  Falls back to residual
-            # median for w,z (or zero) only when no cross-match solution exists.
-            if fcm_abcdwz is not None:
-                r_prior[:6] = fcm_abcdwz[:6]
-            elif good_for_fitting.any():
-                r_prior[[4, 5]] = np.nanmedian(x_resid_init[good_for_fitting], axis=0)
+            # When transformation.csv provides (a,b,c,d), override the WCS-only
+            # prior mean so that Phase-0 residuals are computed at the correct
+            # transformation and stars can be re-admitted when no data contribute.
+            if _n_fcm:
+                r_prior[:_n_fcm] = fcm_abcd[:_n_fcm]
 
             self.gaia_n_hst_used[sidx[good_for_fitting]] += 1
 
@@ -593,21 +577,23 @@ class BP3MSolver:
 
             self.gaia_n_hst_used[sidx[use_align | use_astrom]] += 1
 
-            # ── Updated tangent point (ra0 + Δα0, dec0 + Δδ0) ──────────────
-            # Δα0, Δδ0 are in ARCSEC (pscale/1000 scaling used in X_mat).
-            # r_j[6] = Δα0 arcsec, r_j[7] = Δδ0 arcsec.
-            # ra0_up  = meta["ra0"]  + r_j[6] / 3600.0   # degrees
-            # dec0_up = meta["dec0"] + r_j[7] / 3600.0   # degrees
-
-            #it is currently unstable to update RA0,Dec0 (because of correlation with WZ)
-            #so don't update for now. Maybe future versions will have better priors on WZ
-            #and RA0,Dec0 (including correlations between images, e.g., where we have a 
-            #good estimate of their offsets from each other)
-            ra0_up  = meta["ra0"]   # degrees
-            dec0_up = meta["dec0"]  # degrees
-
             pscale   = meta["orig_pixel_scale"]
             hst_time = Time(meta["hst_time_mjd"], format="mjd")
+
+            # ── Accumulate tangent-point correction into ra0_current ──────────
+            # r_j[4] = Δα0 in mas where Δα0 = (ra0_current - ra0_true)*3.6e6,
+            # so ra0_true = ra0_current - Δα0/3.6e6.  Subtract (not add) to
+            # move toward ra0_true.
+            meta["ra0_current"]  -= r_j[4] / 3_600_000.0   # mas → degrees
+            meta["dec0_current"] -= r_j[5] / 3_600_000.0
+            meta["ra0_final"]   = meta["ra0_current"]
+            meta["dec0_final"]  = meta["dec0_current"]
+            # Reset residual in r_hat so next solve starts from Δα0=0 at the new point
+            r_hat[j_idx * nr + 4] = 0.0
+            r_hat[j_idx * nr + 5] = 0.0
+
+            ra0_tp  = meta["ra0_current"]
+            dec0_tp = meta["dec0_current"]
 
             # ── Updated stellar RA/Dec from v_hat[:,0:2] ─────────────────────
             # v_hat[:,0] = Δα* [mas], v_hat[:,1] = Δδ [mas]
@@ -622,16 +608,20 @@ class BP3MSolver:
             t_g   = self.gaia_time[sidx]
             dt_yr = (hst_time - t_g).to(u.year).value
 
-            # ── Recompute projected Gaia positions ────────────────────────────
-            #DO NOT USE THE UPDATED GAIA COORDINATES HERE! Just the RA0,Dec0 updates
-            xs, ys = plane_project(ra_g_orig, dec_g_orig, ra0_up, dec0_up, pscale)
+            # ── Recompute projected Gaia positions at current tangent point ───
+            # xys, J, and tangent-point derivatives are all evaluated at ra0_current
+            # (the accumulated best-fit tangent point).  r_j[4:6] are now 0, so
+            # X_mat @ r_j contributes nothing from the pointing columns, and the
+            # residuals xys - X_mat @ r_j correctly represent the remaining error.
+            # Recomputing J at ra0_current keeps the linearisation accurate when
+            # the total offset is large.
+            xs, ys = plane_project(ra_g_orig, dec_g_orig, ra0_tp, dec0_tp, pscale)
             xys    = np.stack([xs, ys], axis=1)
 
             # ── Recompute Jacobian J and tangent-point derivatives ────────────
-            J = plane_project_jacobian(ra_g_orig, dec_g_orig, ra0_up, dec0_up, pscale)
+            J = plane_project_jacobian(ra_g_orig, dec_g_orig, ra0_tp, dec0_tp, pscale)
             dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = \
-                plane_project_tangent_derivs(ra_g_orig, dec_g_orig, ra0_up, dec0_up,
-                                             pscale / 1000)
+                plane_project_tangent_derivs(ra_g_orig, dec_g_orig, ra0_tp, dec0_tp, pscale)
 
             # ── Recompute parallax factors ────────────────────────────────────
             #DO use the new best fit RA,Dec positions here
@@ -658,6 +648,119 @@ class BP3MSolver:
             d["xys"]  = xys
             d["JU"]   = JU
             d["X_mat"] = X_mat
+
+    # ── Gaia DR4 epoch AL observations (future) ───────────────────────────────
+    #
+    # When use_gaia_al_obs=True, each Gaia CCD transit contributes a 1-D
+    # observation equation to the normal equations alongside the HST detections.
+    #
+    # For transit k of source i the AL measurement predicts:
+    #
+    #   ψ_ik = sθ·Δα*_i·cos(δ_i) + cθ·Δδ_i
+    #          + sθ·dt_k·μα*_i + cθ·dt_k·μδ_i
+    #          + f_al_k·ϖ_i
+    #
+    # where sθ = sin(scan_pos_angle_k), cθ = cos(scan_pos_angle_k),
+    #       f_al_k = parallax_factor_al_k,
+    #       dt_k = obs_time_jyear_k − ref_epoch_dr4   (years)
+    #
+    # The design vector a_ik in the 5-D parameter space (Δα*, Δδ, μα*, μδ, ϖ):
+    #   a_ik = [sθ·cos(δ), cθ, sθ·dt_k, cθ·dt_k, f_al_k]
+    #
+    # Measurement residual (relative to AGIS solution):
+    #   r_ik = centroid_pos_al_k − ψ_ik(v_agis_i)
+    #        = zeta_k   [pre-stored in the epoch table as 'zeta' if available]
+    #
+    # Effective per-transit variance:
+    #   σ²_ik = centroid_pos_error_al_k² + agis_source_excess_noise_i²
+    #
+    # Unlike HST images, Gaia has no per-epoch "image transformation" to solve
+    # for — scan_pos_angle and parallax_factor_al already encode the full
+    # geometry.  The Gaia epoch observations therefore contribute only to H_vv
+    # and h_all (not to H_rr or K_img), making them pure stellar-parameter
+    # constraints.
+    #
+    # AGIS down-weighting:  transits with used_by_agis_al=False were rejected
+    # by the official AGIS solution (likely due to image parameter quality).
+    # These should be down-weighted in the first BP3M iteration, then
+    # re-admitted after iterative convergence (analogous to gaiasupdate's
+    # huber_downweight / agis_weights scheme).
+    #
+    # Integration plan:
+    #   1. Load epoch DataFrames into the solver via _load_gaia_epoch_obs()
+    #   2. In _solve_one_iter(), after the HST loop, add the Gaia AL
+    #      contributions with:
+    #        H_vv[i] += (a_ik ⊗ a_ik) / σ²_ik   (outer product)
+    #        h_all[i] += a_ik * r_ik / σ²_ik
+    #   3. Use_for_fit masking already handles which sources are active;
+    #      transits of masked sources are skipped.
+
+    def _add_gaia_epoch_obs(self, epoch_obs_preprocessed: dict) -> None:
+        """Register precomputed Gaia DR4 AL normal-equation contributions.
+
+        For each star with epoch data:
+          - Removes the Gaia 5p summary-solution prior from C_survey_inv /
+            C_survey_inv_dot_v (to avoid double-counting the epoch information)
+          - Replaces it with the same diffuse prior used for 2p/HST-only stars
+            (flat position, 100 mas/yr PM, Michalik parallax prior)
+
+        Parameters
+        ----------
+        epoch_obs_preprocessed
+            Dict source_id (int64) → {'H_contrib': (5,5), 'h_contrib': (5,),
+            'n_transits': int, 'n_flagged': int}, as returned by
+            bp3m.pipeline.download_gaia_epoch.prepare_epoch_obs_for_solver().
+        """
+        self._gaia_epoch_contrib = epoch_obs_preprocessed
+
+        epoch_indices = [self.star_id_to_idx[sid] for sid in epoch_obs_preprocessed
+                         if sid in self.star_id_to_idx]
+        if not epoch_indices:
+            print("[Solver] Gaia DR4 epoch obs: no matched sources in catalog")
+            return
+
+        idx_ep = np.array(epoch_indices, dtype=int)
+
+        # ── Zero out the Gaia 5p prior for all epoch stars ────────────────────
+        # The 5p summary solution is derived from the same epoch transits we are
+        # incorporating directly, so using it as a prior would double-count.
+        self.C_survey_inv[idx_ep]       = 0.0
+        self.C_survey_inv_dot_v[idx_ep] = 0.0
+
+        # Compute Michalik parallax prior for epoch stars and install diffuse
+        # prior into _C_VG_inv_per_star (same treatment as 2p/HST-only stars)
+        sigma_plx_ep = michalik_sigma_plx_prior(
+            self.gaia_ra[idx_ep], self.gaia_dec[idx_ep], self.gaia_g[idx_ep]
+        )
+        self._C_VG_inv_per_star[idx_ep, 0] = _SIGMA_POS**-2
+        self._C_VG_inv_per_star[idx_ep, 1] = _SIGMA_POS**-2
+        self._C_VG_inv_per_star[idx_ep, 2] = _SIGMA_PM**-2
+        self._C_VG_inv_per_star[idx_ep, 3] = _SIGMA_PM**-2
+        fin_ep = np.isfinite(sigma_plx_ep)
+        self._C_VG_inv_per_star[idx_ep[fin_ep], 4] = sigma_plx_ep[fin_ep]**-2
+        self._sigma_diff_per_star[idx_ep, 0] = 1e4
+        self._sigma_diff_per_star[idx_ep, 1] = 1e4
+        self._sigma_diff_per_star[idx_ep, 2] = _SIGMA_PM
+        self._sigma_diff_per_star[idx_ep, 3] = _SIGMA_PM
+        self._sigma_diff_per_star[idx_ep[fin_ep], 4] = sigma_plx_ep[fin_ep]
+
+        # ── Zero out the Gaia 2p position prior for all 2p stars ──────────────
+        # The 2p position estimate and its uncertainty are also derived from epoch
+        # AL observations; using them as priors when epoch data is incorporated
+        # directly would double-count the same underlying measurements.
+        idx_2p = np.where(self.gaia_2p)[0]
+        if len(idx_2p):
+            self.C_survey_inv[idx_2p]       = 0.0
+            self.C_survey_inv_dot_v[idx_2p] = 0.0
+            # _C_VG_inv_per_star already has the diffuse prior for 2p stars
+            # (set in _load_star_data), so no further changes needed there.
+
+        n_src     = len(epoch_obs_preprocessed)
+        n_matched = len(epoch_indices)
+        n_2p      = len(idx_2p)
+        print(f"[Solver] Gaia DR4 epoch obs: {n_src} sources, "
+              f"{n_matched} matched; Gaia prior zeroed for {n_matched} epoch "
+              f"stars + {n_2p} 2p stars → diffuse prior only")
 
     # ── Core solver ────────────────────────────────────────────────────────────
 
@@ -743,33 +846,33 @@ class BP3MSolver:
 
         for j_idx, img in enumerate(self.image_names):
             d = self._img_data[img]
+            cs = j_idx * nr
+
             if d is None:
                 K_img[img] = None
                 continue
 
+            dropped = d.get("_dropped_by_2p_check", False)
+
             if z_weights is not None:
-                # Soft-weight two-tier mode: Gaia-matched (align_init) drive the
-                # transformation; all Phase-0-surviving detections (including
-                # HST-only) constrain stellar astrometry.  This mirrors the hard-EM
-                # two-tier split that keeps HST-only out of the transformation
-                # estimate, preventing the instability from Bug 9.
-                z          = z_weights[img]   # (n,) float, 0 for excluded detections
-                # Mirror the hard-EM two-tier exactly: same Gaia population for
-                # the transformation (post-Phase-0 use_for_fit), same astrometry
-                # population (use_for_fit | use_for_astrom, i.e. Gaia + callback-
-                # enabled HST-only).  Using use_for_align_init instead of
-                # use_for_fit would include Phase-0-rejected Gaia detections which
-                # shift the transformation away from the hard-EM fixed point.
-                use_align  = d["use_for_fit"]      # post-Phase-0 Gaia → H_rr
+                z          = z_weights[img]
+                use_align  = d["use_for_fit"]
                 use_astrom = (d["use_for_fit"]
                               | d.get("use_for_astrom",
-                                      d["use_for_fit"]))  # Gaia + HST-only → H_vv
+                                      d["use_for_fit"]))
             else:
                 use_align  = d["use_for_fit"]
                 if getattr(self, '_use_two_tier', False):
                     use_astrom = d.get("use_for_astrom", use_align)
                 else:
                     use_astrom = use_align
+
+            # When exclude_2p_from_alignment is set, 2p stars do not contribute
+            # to the image transformation equations (H_rr, h_r).
+            if self.exclude_2p_from_alignment:
+                sidx_all = d["sidx"]
+                not_2p = ~self.gaia_2p[sidx_all]
+                use_align = use_align & not_2p
             use_any    = use_align | use_astrom   # for H_vv/h_all (stellar precision)
             sidx_any   = d["sidx"][use_any]
             sidx_align = d["sidx"][use_align]
@@ -777,15 +880,12 @@ class BP3MSolver:
             X    = d["X_mat"]    # (n, 2, N_R)
             xys  = d["xys"]      # (n, 2)
 
-            # Extract r_j first so we can pass it to _compute_Cs (poly Jacobian)
-            cs  = j_idx * nr
             r_j = r_current[cs:cs + nr]
 
             Cs     = self._compute_Cs(img, r_j)   # (n, 2, 2)
             Cs_inv = np.linalg.inv(Cs)
 
             if z_weights is not None:
-                # Scale precision by soft weight: (n,2,2) * (n,1,1)
                 Cs_inv = Cs_inv * z[:, None, None]
 
             x_pred  = np.einsum('nkl,l->nk', X, r_j)
@@ -793,10 +893,16 @@ class BP3MSolver:
 
             JUT_Cs = np.einsum('nki,nkl->nil', JU, Cs_inv)
 
-            # H_vv: all stars used for either alignment or astrometry
-            np.add.at(H_vv, sidx_any, np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
+            # Images dropped due to insufficient non-2p alignment stars are
+            # excluded entirely: no H_vv, no H_rr data, no Schur correction.
+            # Still add the prior so the H_rr block is not zero.
+            if dropped:
+                H_rr[cs:cs+nr, cs:cs+nr] += d["C_r_prior_inv"]
+                K_img[img] = None
+                continue
 
-            # h_all: residual information from all used detections
+            # H_vv/h_all: stellar astrometry from all used detections
+            np.add.at(H_vv, sidx_any, np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
             np.subtract.at(h_all, sidx_any, np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
 
             # h_align: residual information from alignment detections only
@@ -811,7 +917,19 @@ class BP3MSolver:
             H_rr[cs:cs+nr, cs:cs+nr] += XCsX
             XCs_xresid[img] = np.einsum('nki,nkl,nl->ni', X[use_align], Cs_inv[use_align], x_resid[use_align])
 
-            H_rr[cs:cs+nr, cs:cs+nr] += self._img_data[img]["C_r_prior_inv"]
+            H_rr[cs:cs+nr, cs:cs+nr] += d["C_r_prior_inv"]
+
+        # ── Gaia DR4 epoch AL contributions ───────────────────────────────────
+        if getattr(self, '_gaia_epoch_contrib', None):
+            for source_id, contrib in self._gaia_epoch_contrib.items():
+                if source_id not in self.star_id_to_idx:
+                    continue
+                i = self.star_id_to_idx[source_id]
+                H_vv[i] += contrib['H_contrib']
+                h_all[i] += contrib['h_contrib']
+                # 2p epoch contributions excluded from alignment when flag is set.
+                if not (self.exclude_2p_from_alignment and self.gaia_2p[i]):
+                    h_align[i] += contrib['h_contrib']
 
         # ── Invert H_vv → C_vT ────────────────────────────────────────────────
         C_vT    = np.linalg.inv(H_vv)
@@ -832,6 +950,11 @@ class BP3MSolver:
             if d is None or K_img[img] is None:
                 continue
             use  = d["use_for_fit"]
+            # The Schur correction K^T C_v K must use the same star set as
+            # H_rr (XCsX).  When 2p stars are excluded from alignment, K must
+            # also exclude them so the Schur complement remains consistent.
+            if self.exclude_2p_from_alignment:
+                use = use & ~self.gaia_2p[d["sidx"]]
             sidx = d["sidx"][use]
             K    = K_img[img][use]
 
@@ -850,6 +973,8 @@ class BP3MSolver:
                 if d2 is None or K_img[img2] is None:
                     continue
                 use2 = d2["use_for_fit"]
+                if self.exclude_2p_from_alignment:
+                    use2 = use2 & ~self.gaia_2p[d2["sidx"]]
                 sidx2 = d2["sidx"][use2]
                 K2    = K_img[img2][use2]
 
@@ -925,7 +1050,8 @@ class BP3MSolver:
             use_soft_weights: bool = False,
             student_t_nu: float = 50.0,
             z_tol: float = 1.0,
-            z_init: dict | None = None):
+            z_init: dict | None = None,
+            no_align_prior: bool = False):
         """
         Iterative BP3M fit with outlier rejection.
 
@@ -1040,16 +1166,41 @@ class BP3MSolver:
         # can access it without signature changes.
         self._use_two_tier = use_two_tier
 
+        # When 2p stars are excluded from the alignment, drop any image that
+        # would have fewer non-2p alignment stars than half the transformation
+        # DOF (i.e., fewer independent 2D constraints than free parameters).
+        if self.exclude_2p_from_alignment:
+            min_align = max(4, self.N_R // 2)
+            dropped_imgs = []
+            for img in self.image_names:
+                d = self._img_data.get(img)
+                if d is None:
+                    continue
+                sidx = d["sidx"]
+                use_fit = d["use_for_fit"]
+                n_non2p = int((use_fit & ~self.gaia_2p[sidx]).sum())
+                if n_non2p < min_align:
+                    dropped_imgs.append((img, n_non2p))
+                    # Mark dropped — _img_data[img] stays alive so r_init is
+                    # accessible for r_hat assembly; _solve_one_pass skips it.
+                    self._img_data[img]["_dropped_by_2p_check"] = True
+            if dropped_imgs:
+                print(f"\n  [exclude_2p_from_alignment] Dropping {len(dropped_imgs)} "
+                      f"image(s) with fewer than {min_align} non-2p alignment stars:")
+                for img, n in dropped_imgs:
+                    print(f"    WARNING: {img} dropped — only {n} non-2p alignment "
+                          f"stars (need ≥{min_align})")
+
         r_hat = np.concatenate([self._img_data[img]["r_init"]
                                  for img in self.image_names])
         self._update_R(r_hat)
         nr  = self.N_R
         C_r = None
 
-        # Parameter names for diagnostic output (indices 6,7 are always zeroed)
-        _pnames = ['a', 'b', 'c', 'd', 'w', 'z', 'Δα0', 'Δδ0']
-        if nr > 8:
-            _pnames += [f'poly{i}' for i in range(nr - 8)]
+        # Parameter names for diagnostic output
+        _pnames = ['a', 'b', 'c', 'd', 'Δα0', 'Δδ0']
+        if nr > 6:
+            _pnames += [f'poly{i}' for i in range(nr - 6)]
         _n_imgs = len(self.image_names)
 
         def _delta_summary(diff):
@@ -1060,11 +1211,8 @@ class BP3MSolver:
             max_str   = (f"{diff[imax]:.3e}"
                          f"  [{self.image_names[img_idx]} / {_pnames[param_idx]}]")
 
-            # Per-parameter median and 68% width across images (skip pinned params 6,7)
             parts = []
             for p in range(nr):
-                if p in (6, 7):
-                    continue
                 vals = diff[p::nr]
                 med  = float(np.median(vals))
                 if _n_imgs > 1:
@@ -1079,8 +1227,6 @@ class BP3MSolver:
             for it_i in range(500):
                 r_new, C_r_i, a_i, K_i, CvT_i = self._solve_one_pass(r_hat, z_weights=z_weights)
                 diff = np.abs(r_new - r_hat)
-                diff[6::nr] = 0
-                diff[7::nr] = 0
                 delta = np.max(diff)
                 r_hat = r_new
                 self._update_R(r_hat)
@@ -1099,6 +1245,13 @@ class BP3MSolver:
             print(f"  {label}: WARNING — did not converge (max|Δr| = {max_str})")
             print(f"    params: {stats_str}")
             return r_hat, C_r_i, a_i, K_i, CvT_i
+
+        # ── Disable alignment prior if requested ─────────────────────────────
+        if no_align_prior:
+            n_r = self.N_R
+            for img in self.image_names:
+                self._img_data[img]["C_r_prior_inv"] = np.zeros((n_r, n_r))
+            print(" no_align_prior=True: alignment priors zeroed out")
 
         # ── Phase 0: pre-filter using one solve + same outlier rejection as Phase 2
         if prefilter and clip_sigma is not None:
@@ -2074,8 +2227,7 @@ class BP3MSolver:
         import pandas as pd
 
         nr = self.N_R
-        param_names = ['a', 'b', 'c', 'd', 'w', 'z',
-                       'da0', 'dd0'][:nr]
+        param_names = ['a', 'b', 'c', 'd', 'Δα0', 'Δδ0'][:nr]
 
         rows = []
         for j_idx, img in enumerate(self.image_names):

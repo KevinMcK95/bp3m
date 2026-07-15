@@ -159,6 +159,37 @@ def _match_one(args):
         return name, 0, str(exc)
 
 
+def _validate_catalog_if_needed(field_name: str, output_dir) -> None:
+    """Run validate_target if cross_match_catalog.csv is missing or stale.
+
+    Stale means the catalog is present but missing the Gaia BP/RP photometry
+    columns added in the 2025-07 validator update.  Called both when all
+    cross-matches were already cached and after a fresh matching run, so the
+    catalog is always up to date before data_loader_flc.py reads it.
+    """
+    cat_path = Path(output_dir) / field_name / "cross_match_catalog.csv"
+    _new_phot_cols = ('gaia_gmag_error', 'gaia_bpmag', 'gaia_bpmag_error',
+                      'gaia_rpmag', 'gaia_rpmag_error')
+
+    needs_validate = False
+    if not cat_path.exists():
+        print("  cross_match_catalog.csv not found — running validator...")
+        needs_validate = True
+    else:
+        header = pd.read_csv(cat_path, nrows=0)
+        if not all(c in header.columns for c in _new_phot_cols):
+            print("  cross_match_catalog.csv is missing photometry columns — "
+                  "re-running validator to update it...")
+            needs_validate = True
+
+    if needs_validate:
+        try:
+            from gaia_cross_match.validator import validate_target
+            validate_target(field_name, str(Path(output_dir)))
+        except Exception as _e:
+            print(f"  WARNING: cross-image validation failed — {_e}")
+
+
 def run_cross_match(
     output_dir: Path,
     field_name: str,
@@ -175,6 +206,8 @@ def run_cross_match(
     force_rematch: bool = False,
     image_id: str | None = None,
     restrict_to_obsids: list[str] | None = None,
+    lib_dir: "Path | None" = None,
+    run_qso_vetting: bool = True,
 ) -> list[Path]:
     """
     Cross-match all PSF-fit HST catalogs in a field against Gaia.
@@ -286,6 +319,7 @@ def run_cross_match(
               f"{', '.join(skipped_nophot)}")
     if not work:
         print("  All cross-matches up to date.")
+        _validate_catalog_if_needed(field_name, output_dir)
         existing = [Path(f['root']) / "matched_gaia.csv" for f in folders]
         return [p for p in existing if p.exists()]
 
@@ -327,13 +361,9 @@ def run_cross_match(
                     if Path(f['root']).name == name
                 )) / "matched_gaia.csv")
 
-    # Run cross-image validation
-    try:
-        from gaia_cross_match.validator import validate_target
-        print("\n  Running cross-image validation...")
-        validate_target(field_name, str(Path(output_dir)))
-    except Exception as _e:
-        print(f"  WARNING: cross-image validation failed — {_e}")
+    # Run cross-image validation (always, after fresh matching)
+    print("\n  Running cross-image validation...")
+    _validate_catalog_if_needed(field_name, output_dir)
 
     # Include previously-cached successful results in the return list.
     # Exclude images flagged as skipped (no photometric calibration) or failed.
@@ -354,4 +384,22 @@ def run_cross_match(
             results.append(p)
 
     print(f"  Cross-match complete: {len(results)}/{len(folders)} available.")
+
+    # ── QSO anchor vetting (Quaia + MILLIQUAS + astrometric cut) ─────────────
+    if run_qso_vetting:
+        try:
+            from .qso_vetting import vet_qso_candidates
+            print("\n" + "─" * 50)
+            print("Step 4b: QSO anchor vetting")
+            print("─" * 50)
+            vet_qso_candidates(
+                field_name=field_name,
+                output_dir=output_dir,
+                lib_dir=lib_dir,
+            )
+        except Exception as _qexc:
+            print(f"  WARNING: QSO vetting failed — {_qexc}")
+    else:
+        print("  QSO vetting skipped (--no_qso_anchors)")
+
     return results

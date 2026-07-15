@@ -73,10 +73,9 @@ def _pixel_scale_from_cd(cd11, cd12, cd21, cd22) -> float:
     return np.sqrt(abs(cd11 * cd22 - cd12 * cd21)) * 3600.0 * 1000.0
 
 
-def _fcm_to_abcdwz(A, B, C, D, xs_o, ys_o, xt_o, yt_o, x_cen, y_cen,
-                   orig_rot_deg: float) -> np.ndarray:
+def _fcm_to_abcd(A, B, C, D, orig_rot_deg: float) -> np.ndarray:
     """
-    Convert fast_cross_match transformation parameters to BP3M (a,b,c,d,w,z).
+    Convert fast_cross_match transformation parameters to BP3M (a,b,c,d).
 
     The fast_cross_match affine maps HST pixels → Gaia pixels after applying
     orig_rot (= -orientat).  BP3M's (a,b,c,d) maps HST-centered pixels to the
@@ -84,22 +83,17 @@ def _fcm_to_abcdwz(A, B, C, D, xs_o, ys_o, xt_o, yt_o, x_cen, y_cen,
 
         [[a,b],[c,d]] = R_cw(orig_rot_deg) @ [[A,B],[C,D]]
 
-        [w,z] = R_cw(orig_rot_deg) @ ( [[A,B],[C,D]] @ [2048-xs_o, 2048-ys_o]
-                                        + [xt_o - x_cen, yt_o - y_cen] )
-
     where R_cw(θ) = [[cosθ, sinθ], [-sinθ, cosθ]] and Xo=Yo=2048 (BP3M pivot).
-    Validated on Leo_I (56 images) and Fornax_dSph (12 images): residuals
-    ≤6.5e-5 in a,b,c,d and ≤0.09 px in w,z relative to converged BP3M posteriors.
+    The bulk image offset is now captured by Δα0/Δδ0 (free parameters) rather
+    than by pixel translations w/z (removed).
     """
     deg2rad = np.pi / 180.0
     rot_rad = orig_rot_deg * deg2rad
     cos_r, sin_r = np.cos(rot_rad), np.sin(rot_rad)
     R_cw = np.array([[cos_r, sin_r], [-sin_r, cos_r]])
     M    = np.array([[A, B], [C, D]])
-    abcd = (R_cw @ M).ravel()                         # [a, b, c, d]
-    wz   = R_cw @ (M @ np.array([2048.0 - xs_o, 2048.0 - ys_o])
-                   + np.array([xt_o - x_cen, yt_o - y_cen]))
-    return np.array([abcd[0], abcd[1], abcd[2], abcd[3], wz[0], wz[1]])
+    abcd = (R_cw @ M).ravel()
+    return np.array([abcd[0], abcd[1], abcd[2], abcd[3]])
 
 
 def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
@@ -149,7 +143,7 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
 
     orig_pixel_scale_mas = pscale_arcsec * 1000.0   # mas/pix
 
-    return {
+    meta = {
         # Pointing / tangent point
         "ra0":  ra_cen,
         "dec0": dec_cen,
@@ -182,13 +176,50 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
         # Source pivot (needed to reconstruct the full initial transform)
         "xs_o": xs_o, "ys_o": ys_o,
         "xt_o": xt_o, "yt_o": yt_o,
-        # Pre-converted BP3M (a,b,c,d,w,z) from the cross-match solution.
+        # Pre-converted BP3M (a,b,c,d) from the cross-match solution.
         # Used to initialise r_hat before the first EM iteration; the prior
         # (r_prior, C_r_prior_inv) is still derived from the WCS header and
         # is unaffected by this value.
-        "fcm_abcdwz": _fcm_to_abcdwz(A, B, C, D, xs_o, ys_o, xt_o, yt_o,
-                                      x_cen, y_cen, -orientat),
+        "fcm_abcd": _fcm_to_abcd(A, B, C, D, -orientat),
+        # Per-chip tangent-point info (lo = lower chip, hi = upper chip).
+        # Populated from the catalog FITS header (CHIP{n}_CRPIX{1,2}_GDC /
+        # CHIP{n}_CRVAL{1,2}) when the catalog file is present.  None otherwise.
+        "chip_pointing_lo": None,
+        "chip_pointing_hi": None,
     }
+
+    # ── Per-chip pointing from catalog FITS (optional) ────────────────────────
+    cat_path = img_dir / f"{img_name}_flc_catalog.fits"
+    if cat_path.exists():
+        try:
+            with fits.open(cat_path, memmap=False) as cat_hdu:
+                cat_hdr = cat_hdu[1].header
+            # Collect all CHIP prefixes that have both _CRPIX1_GDC and CRVAL1
+            prefixes = sorted({
+                k.split("_CRPIX1_GDC")[0]
+                for k in cat_hdr.keys()
+                if k.endswith("_CRPIX1_GDC") and k.startswith("CHIP")
+            })
+            chip_pts = []
+            for pfx in prefixes:
+                xo  = cat_hdr.get(f"{pfx}_CRPIX1_GDC")
+                yo  = cat_hdr.get(f"{pfx}_CRPIX2_GDC")
+                ra0 = cat_hdr.get(f"{pfx}_CRVAL1")
+                dc0 = cat_hdr.get(f"{pfx}_CRVAL2")
+                if all(v is not None for v in [xo, yo, ra0, dc0]):
+                    chip_pts.append({
+                        "Xo": float(xo), "Yo": float(yo),
+                        "ra0": float(ra0), "dec0": float(dc0),
+                    })
+            if len(chip_pts) == 2:
+                # Sort by Yo: smaller Yo → lower chip (_lo), larger → upper (_hi)
+                chip_pts.sort(key=lambda p: p["Yo"])
+                meta["chip_pointing_lo"] = chip_pts[0]
+                meta["chip_pointing_hi"] = chip_pts[1]
+        except Exception:
+            pass  # catalog absent or malformed — fall back to shared pointing
+
+    return meta
 
 
 def _build_stars_df(img_dir: Path, img_name: str,
@@ -309,6 +340,125 @@ def _build_stars_df(img_dir: Path, img_name: str,
         "use_for_fit":       ok_sat,
     })
     return df
+
+
+# ── CCD/amplifier split utilities ────────────────────────────────────────────
+# Moved here from data_loader.py so that all active pipeline code imports from
+# data_loader_flc and data_loader.py (GaiaHub-based loader) is unused.
+
+_AMP_SPLITS = {
+    "ACSWFC":   {"x_split": 2048.0, "y_split": 2048.0},
+    "WFC3UVIS": {"x_split": 2048.0, "y_split": 2051.0},
+}
+_AMP_SPLITS_DEFAULT = {"x_split": 2048.0, "y_split": 2048.0}
+
+
+def _get_amp_splits(meta: dict) -> dict:
+    """Return the x_split / y_split dict for the instrument+detector in *meta*."""
+    key = (meta.get("instrument", "") + meta.get("detector", "")).upper()
+    return _AMP_SPLITS.get(key, _AMP_SPLITS_DEFAULT)
+
+
+def split_images_by_ccd(images, stars_per_image, min_stars_per_ccd: int = 20):
+    """
+    Split each image into two independent CCD halves along the Y boundary.
+
+    For ACS/WFC the chips meet at Y_orig = 2048; for WFC3/UVIS at Y_orig = 2051.
+    The boundary is looked up per-image from ``_AMP_SPLITS`` using the
+    ``instrument`` and ``detector`` fields stored in *images*.
+
+    Each half inherits identical pointing/scale metadata from its parent and
+    is initialised from the same r_prior.  Fitting them independently gives
+    each physical CCD its own r_j vector, which is correct because they have
+    independent distortion patterns.
+
+    Naming convention
+    -----------------
+    ``{img}_lo``  — stars with Y_orig ≤ y_split  (lower chip)
+    ``{img}_hi``  — stars with Y_orig >  y_split  (upper chip)
+
+    If all stars in an image fall on one side, only that entry is created.
+    If either half has fewer than *min_stars_per_ccd* stars, the image is kept
+    whole (not split) so the transformation can still be constrained.
+
+    Parameters
+    ----------
+    images : dict[str -> dict]
+        Image metadata (as returned by load_image_data_flc).
+        Must contain ``instrument`` and ``detector`` keys.
+    stars_per_image : dict[str -> pd.DataFrame]
+        Per-image source tables.  Must contain ``Y_orig`` (falls back to ``Y``).
+    min_stars_per_ccd : int
+        Minimum stars required on each CCD half to allow splitting.  Images
+        where either half falls below this threshold are kept unsplit.
+        Default: 20.
+
+    Returns
+    -------
+    new_images, new_stars_per_image : dicts with ``_lo`` / ``_hi`` suffixes
+        for split images, or unchanged keys for images kept whole.
+    """
+    new_images = {}
+    new_spi = {}
+
+    for img in sorted(images.keys()):
+        meta   = images[img]
+        df     = stars_per_image[img]
+        y_col  = 'Y_orig' if 'Y_orig' in df.columns else 'Y'
+        y_vals = df[y_col].to_numpy(float)
+        y_split = _get_amp_splits(meta)["y_split"]
+
+        lo_mask = y_vals <= y_split
+        hi_mask = y_vals >  y_split
+        n_lo, n_hi = lo_mask.sum(), hi_mask.sum()
+
+        if n_lo < min_stars_per_ccd or n_hi < min_stars_per_ccd:
+            print(f"    {img}: lo={n_lo}, hi={n_hi} stars — below "
+                  f"min_stars_per_ccd={min_stars_per_ccd}, keeping unsplit")
+            new_images[img] = dict(meta)
+            new_spi[img]    = df
+            continue
+
+        for suffix, mask in [('_lo', lo_mask), ('_hi', hi_mask)]:
+            sub_df = df[mask].reset_index(drop=True)
+            if len(sub_df) == 0:
+                continue
+            sub_meta = dict(meta)
+            cp = meta.get(f"chip_pointing{suffix}")  # chip_pointing_lo / _hi
+            if cp is not None:
+                sub_meta["ra0"]  = cp["ra0"]
+                sub_meta["dec0"] = cp["dec0"]
+                sub_meta["Xo"]   = cp["Xo"]
+                sub_meta["Yo"]   = cp["Yo"]
+            new_images[img + suffix] = sub_meta
+            new_spi[img + suffix]    = sub_df
+
+    return new_images, new_spi
+
+
+def build_index_maps(stars_per_image, gaia_catalog):
+    """
+    Build integer index maps for vectorized access.
+
+    Returns
+    -------
+    star_id_to_idx : dict[Gaia_id -> int]
+    image_names : list[str]   (sorted)
+    star_in_image : dict[image_name -> np.ndarray of star indices]
+        Maps per-image rows to global star indices.
+    """
+    star_id_to_idx = {gid: i for i, gid in enumerate(gaia_catalog["Gaia_id"])}
+    image_names = sorted(stars_per_image.keys())
+
+    star_in_image = {}
+    for img in image_names:
+        df = stars_per_image[img]
+        idxs = np.array([star_id_to_idx[gid] for gid in df["Gaia_id"]
+                         if gid in star_id_to_idx], dtype=int)
+        mask = df["Gaia_id"].isin(star_id_to_idx)
+        star_in_image[img] = idxs
+
+    return star_id_to_idx, image_names, star_in_image
 
 
 # ── Public entry point ────────────────────────────────────────────────────────

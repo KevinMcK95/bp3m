@@ -63,52 +63,18 @@ def _read_transform(img_dir: Path) -> dict | None:
     if not p.exists():
         return None
     tdf = pd.read_csv(p).set_index("parameter")["value"]
-    keys = ["A", "B", "C", "D", "xs_o", "ys_o", "xt_o", "yt_o",
-            "ra_cen", "dec_cen", "x_cen", "y_cen", "pixel_scale", "orientat"]
+    keys_req = ["A", "B", "C", "D", "xs_o", "ys_o", "xt_o", "yt_o",
+                "ra_cen", "dec_cen", "x_cen", "y_cen", "pixel_scale", "orientat"]
+    keys_opt = {"ratio": 1.0, "on_skew": 0.0, "off_skew": 0.0}
     try:
-        return {k: float(tdf[k]) for k in keys}
+        d = {k: float(tdf[k]) for k in keys_req}
     except KeyError as e:
         print(f"    transformation.csv missing key {e}")
         return None
+    for k, default in keys_opt.items():
+        d[k] = float(tdf[k]) if k in tdf.index else default
+    return d
 
-
-def _sky_to_pixel(ra: np.ndarray, dec: np.ndarray,
-                  t: dict) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Map sky positions (degrees, at HST epoch) → GDC pixel coordinates.
-
-    Mirrors the exact pipeline used by cross_match_cli.py:
-      1. Gnomonic projection to nominal pixel frame centred at (x_cen, y_cen)
-      2. Initial inverse rotation by ORIENTAT to align with HST detector axes
-      3. Invert A,B,C,D affine transform to obtain GDC pixel (x, y)
-
-    The A,B,C,D values in transformation.csv capture ONLY the residual
-    distortion after the initial ORIENTAT rotation has been applied.
-    """
-    _ensure_fcm()
-    from miracle_match import rd2x, rd2y
-
-    scale_deg = t["pixel_scale"] / 3600.0          # arcsec/pix → deg/pix
-
-    # 1. Gnomonic project sky → nominal pixel
-    x_g = t["x_cen"] - rd2x(ra, dec, t["ra_cen"], t["dec_cen"]) / scale_deg
-    y_g = t["y_cen"] + rd2y(ra, dec, t["ra_cen"], t["dec_cen"]) / scale_deg
-
-    # 2. Initial inverse rotation (same as cross_match_cli init_inv_rot_mat)
-    theta     = np.radians(-t["orientat"])
-    Rinit     = np.array([[ np.cos(theta),  np.sin(theta)],
-                           [-np.sin(theta),  np.cos(theta)]])
-    Rinit_inv = np.linalg.inv(Rinit)
-    dxy       = np.column_stack([x_g - t["x_cen"], y_g - t["y_cen"]])
-    xy_rot    = (Rinit_inv @ dxy.T).T + np.array([t["x_cen"], t["y_cen"]])
-
-    # 3. Invert A,B,C,D
-    M    = np.array([[t["A"], t["B"]], [t["C"], t["D"]]])
-    Minv = np.linalg.inv(M)
-    dW   = xy_rot[:, 0] - t["xt_o"]
-    dZ   = xy_rot[:, 1] - t["yt_o"]
-    dxy_hst = (Minv @ np.vstack([dW, dZ])).T
-    return t["xs_o"] + dxy_hst[:, 0], t["ys_o"] + dxy_hst[:, 1]
 
 
 def _mjd_from_flc(flc_path: Path) -> float:
@@ -118,35 +84,79 @@ def _mjd_from_flc(flc_path: Path) -> float:
         return 0.5 * (float(h["EXPSTART"]) + float(h["EXPEND"]))
 
 
-def _fit_abcdwz(x_pred: np.ndarray, y_pred: np.ndarray,
-                xs_bp3m: np.ndarray, ys_bp3m: np.ndarray,
-                Xo: float = 2048.0, Yo: float = 2048.0) -> dict:
+def _abcd_from_physical(rot_deg: float, ratio: float,
+                        on_skew: float, off_skew: float) -> dict:
     """
-    Fit BP3M's 6-parameter linear transform from noiseless predictions.
+    Construct BP3M (a,b,c,d) analytically from physical alignment parameters.
 
-    Solves  xs = a*(X-Xo) + b*(Y-Yo) + w
-            ys = c*(X-Xo) + d*(Y-Yo) + z
-    by least squares, which is exact for noiseless data.
+    The model (from solver.py _make_image_prior Jacobian):
+        a =  ratio * cos(θ) + on_skew
+        b =  ratio * sin(θ) + off_skew
+        c = -ratio * sin(θ) + off_skew
+        d =  ratio * cos(θ) - on_skew
 
-    Note: BP3M also has Δα0/Δδ0 columns in its design matrix, but
-    _SIGMA_POINTING = 1e-6 arcsec pins them to ≈0, so the effective
-    model is exactly 6-parameter.
-
-    Parameters
-    ----------
-    x_pred, y_pred : noiseless HST pixel positions (GDC frame)
-    xs_bp3m, ys_bp3m : Gaia pseudo-image pixel positions from plane_project
-    Xo, Yo : BP3M centering pivot (2048.0 as used in solver.py)
+    where θ = orig_rot_deg (negative of HST ORIENTAT), ratio is the
+    fractional pixel-scale factor (≈ 1.0), and on_skew / off_skew are
+    small distortion terms (≈ 0).
     """
-    dX = x_pred - Xo
-    dY = y_pred - Yo
-    A_des = np.column_stack([dX, dY, np.ones(len(dX))])  # (N, 3)
-    params_x, _, _, _ = np.linalg.lstsq(A_des, xs_bp3m, rcond=None)
-    params_y, _, _, _ = np.linalg.lstsq(A_des, ys_bp3m, rcond=None)
+    theta = np.deg2rad(rot_deg)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
     return dict(
-        true_a=float(params_x[0]), true_b=float(params_x[1]), true_w=float(params_x[2]),
-        true_c=float(params_y[0]), true_d=float(params_y[1]), true_z=float(params_y[2]),
+        true_a=float(ratio * cos_t + on_skew),
+        true_b=float(ratio * sin_t + off_skew),
+        true_c=float(-ratio * sin_t + off_skew),
+        true_d=float(ratio * cos_t - on_skew),
     )
+
+
+def _read_chip_info(flc_path: Path, cat_path: Path) -> dict:
+    """
+    Read per-chip geometry for the split-CCD forward model.
+
+    Returns a dict with:
+        y_split          : Y_orig threshold separating lo/hi chips
+        chip_pointing_lo : {Xo, Yo, ra0, dec0} for the lower chip (or None)
+        chip_pointing_hi : {Xo, Yo, ra0, dec0} for the upper chip (or None)
+    """
+    _AMP_SPLITS = {
+        ("ACS",  "WFC"):  2048.0,
+        ("WFC3", "UVIS"): 2051.0,
+    }
+    with afits.open(flc_path, memmap=False) as hdu:
+        h0 = hdu[0].header
+        instrument = str(h0.get("INSTRUME", "")).strip().upper()
+        detector   = str(h0.get("DETECTOR", "")).strip().upper()
+    y_split = _AMP_SPLITS.get((instrument, detector), 2048.0)
+
+    chip_pointing_lo = None
+    chip_pointing_hi = None
+    try:
+        with afits.open(cat_path, memmap=False) as hdu:
+            cat_hdr = hdu[1].header
+        prefixes = sorted({
+            k.split("_CRPIX1_GDC")[0]
+            for k in cat_hdr.keys()
+            if k.endswith("_CRPIX1_GDC") and k.startswith("CHIP")
+        })
+        chip_pts = []
+        for pfx in prefixes:
+            xo  = cat_hdr.get(f"{pfx}_CRPIX1_GDC")
+            yo  = cat_hdr.get(f"{pfx}_CRPIX2_GDC")
+            ra0 = cat_hdr.get(f"{pfx}_CRVAL1")
+            dc0 = cat_hdr.get(f"{pfx}_CRVAL2")
+            if all(v is not None for v in [xo, yo, ra0, dc0]):
+                chip_pts.append({"Xo": float(xo), "Yo": float(yo),
+                                  "ra0": float(ra0), "dec0": float(dc0)})
+        if len(chip_pts) == 2:
+            chip_pts.sort(key=lambda p: p["Yo"])
+            chip_pointing_lo = chip_pts[0]
+            chip_pointing_hi = chip_pts[1]
+    except Exception:
+        pass
+
+    return {"y_split": y_split,
+            "chip_pointing_lo": chip_pointing_lo,
+            "chip_pointing_hi": chip_pointing_hi}
 
 
 def _propagate(df: pd.DataFrame, mjd: float) -> tuple[np.ndarray, np.ndarray]:
@@ -202,26 +212,55 @@ def _propagate(df: pd.DataFrame, mjd: float) -> tuple[np.ndarray, np.ndarray]:
 
 def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,
                               hst_idx: np.ndarray,
-                              x_syn: np.ndarray, y_syn: np.ndarray) -> None:
+                              x_syn: np.ndarray, y_syn: np.ndarray,
+                              x_raw_new: np.ndarray | None = None,
+                              y_raw_new: np.ndarray | None = None,
+                              scale_hst_errors: float = 1.0) -> None:
     """
-    Copy src_catalog to dst_catalog, replacing x_gdc/y_gdc (and x/y raw) at
-    the given hst_idx rows with the synthetic pixel coordinates.
-    Also clears n_sat for those rows so use_for_alignment is not blocked.
+    Write dst_catalog containing ONLY the hst_idx rows from src_catalog, with
+    x_gdc/y_gdc replaced by the synthetic pixel coordinates, x/y raw columns
+    updated from the inverse GDC approximation, and n_sat cleared.
+
+    Trimming to matched rows only keeps catalog size proportional to detections
+    (~500 rows) instead of the full detector catalog (~40k rows).  The row
+    indices in the output are 0..N-1, and the hst_index column in matched_gaia.csv
+    is rewritten (by the caller) to use these compact indices.
+
+    scale_hst_errors: multiply all cov_xx/yy/xy_gdc entries by scale_hst_errors².
+    x_raw_new / y_raw_new: updated raw detector coords from inverse GDC; if None,
+    the original raw coords are preserved (backward-compatible default).
     """
+    cov_scale2 = scale_hst_errors ** 2
     with afits.open(src_catalog, memmap=False) as src:
         bintable = src[1]
         new_cols = []
         for col in bintable.columns:
-            arr = bintable.data[col.name].copy()
-            if col.name in ("x_gdc", "x"):
-                arr[hst_idx] = x_syn
-            elif col.name in ("y_gdc", "y"):
-                arr[hst_idx] = y_syn
+            arr = bintable.data[col.name][hst_idx].copy()
+            if col.name == "x_gdc":
+                arr[:] = x_syn
+            elif col.name == "y_gdc":
+                arr[:] = y_syn
+            elif col.name == "x" and x_raw_new is not None:
+                arr[:] = x_raw_new
+            elif col.name == "y" and y_raw_new is not None:
+                arr[:] = y_raw_new
             elif col.name == "n_sat":
-                arr[hst_idx] = 0
+                arr[:] = 0
+            elif col.name in ("cov_xx_gdc", "cov_yy_gdc", "cov_xy_gdc") and cov_scale2 != 1.0:
+                arr[:] = arr * cov_scale2
             new_cols.append(afits.Column(name=col.name, format=col.format,
                                           array=arr, unit=col.unit))
         new_bin  = afits.BinTableHDU.from_columns(new_cols)
+        # Copy the catalog header (chip pointing keys etc.) to new extension
+        for key, val in src[1].header.items():
+            if key not in ("XTENSION", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2",
+                           "PCOUNT", "GCOUNT", "TFIELDS", "END") and not key.startswith("TTYPE") \
+                    and not key.startswith("TFORM") and not key.startswith("TUNIT") \
+                    and not key.startswith("TDISP"):
+                try:
+                    new_bin.header[key] = val
+                except Exception:
+                    pass
         new_hdul = afits.HDUList([src[0].copy(), new_bin]
                                  + [ext.copy() for ext in src[2:]])
         new_hdul.writeto(str(dst_catalog), overwrite=True)
@@ -243,11 +282,17 @@ def generate_synthetic_data(
     force_regenerate: bool = False,
     only_5p: bool = False,
     all_5p_gaia: bool = False,
+    rot_sigma: float = 0.01,
+    ratio_sigma: float = 1e-4,
+    skew_sigma: float = 1e-5,
+    pointing_sigma: float = 500.0,
     true_pm_center: tuple[float, float] | None = None,
     true_pm_width: float = 0.1,
     true_parallax_center: float | None = None,
     true_parallax_width: float = 0.1,
     syn_name: str = "synthetic",
+    split_ccd: bool = True,
+    scale_hst_errors: float = 1.0,
 ) -> Path:
     """
     Generate synthetic HST observations and write a synthetic data tree.
@@ -268,6 +313,10 @@ def generate_synthetic_data(
                        Default 0 = use transformation.csv values unchanged.
     images           : optional explicit list of image names to include
     force_regenerate : regenerate even if synthetic directory already exists
+    rot_sigma        : 1σ uncertainty for true rotation draw (degrees, default 0.01)
+    ratio_sigma      : 1σ uncertainty for true pixel-scale ratio draw (default 1e-4)
+    skew_sigma       : 1σ for true on/off-axis skew draws (default 1e-5)
+    pointing_sigma   : 1σ for true pointing offset draw in RA*cos(dec) and Dec (mas, default 500)
     only_5p          : if True, exclude 2-param Gaia stars (no measured PM/parallax)
                        from the synthetic test — useful for isolating whether 2-param
                        stars affect image parameter estimation
@@ -292,6 +341,12 @@ def generate_synthetic_data(
     syn_name         : subdirectory name for the synthetic output tree (default 'synthetic').
                        Use a distinct name (e.g. 'synthetic_only5p') to avoid overwriting
                        results from a different configuration.
+    split_ccd        : if True (default), generate positions using per-chip tangent points
+                       from the catalog header (CHIP{n}_CRVAL/CRPIX), matching BP3M's
+                       split-CCD mode.  If False, use the full-frame tangent point
+                       (ra_cen/dec_cen from transformation.csv) for ALL stars, matching
+                       BP3M's no-split mode.  Must match the split_ccd flag passed to
+                       run_alignment / bp3m-synthetic --no_split_ccd.
 
     Returns
     -------
@@ -307,6 +362,14 @@ def generate_synthetic_data(
     hst_root   = field_path / tel_upper / "mastDownload" / tel_upper
     gaia_dir   = field_path / "Gaia"
     syn_dir    = field_path / syn_name
+
+    # ── Early exit if synthetic data already exists ───────────────────────────
+    if syn_dir.exists() and not force_regenerate:
+        print(f"\n{'─'*50}")
+        print(f"Synthetic data already exists at {syn_dir}")
+        print(f"  (pass force_regenerate=True / --force_regenerate to regenerate)")
+        print(f"{'─'*50}")
+        return syn_dir
 
     print(f"\n{'─'*50}")
     print("Synthetic: generating synthetic observations")
@@ -375,6 +438,12 @@ def generate_synthetic_data(
             cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
             cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
             cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
+            cat_x_gdc  = tbl["x_gdc"].astype(float)
+            cat_y_gdc  = tbl["y_gdc"].astype(float)
+            cat_x_raw  = tbl["x"].astype(float)    # raw detector X for inverse GDC
+            cat_y_raw  = tbl["y"].astype(float)    # raw detector Y for chip assignment
+
+        chip_info = _read_chip_info(flc_path, cat_path)
 
         all_gaia_ids.update(match["gaia_source_id"].values)
         per_image[img_name] = dict(
@@ -382,6 +451,9 @@ def generate_synthetic_data(
             transform=t, mjd=_mjd_from_flc(flc_path),
             match=match,
             cat_cov_xx=cat_cov_xx, cat_cov_yy=cat_cov_yy, cat_cov_xy=cat_cov_xy,
+            cat_x_gdc=cat_x_gdc, cat_y_gdc=cat_y_gdc,
+            cat_x_raw=cat_x_raw, cat_y_raw=cat_y_raw,
+            **chip_info,  # y_split, chip_pointing_lo, chip_pointing_hi
         )
 
     if not per_image:
@@ -419,24 +491,68 @@ def generate_synthetic_data(
         # Useful only to verify BP3M is unbiased when handed perfect data.
         print(f"  true_gaia mode: truth = Gaia catalog values, no prior draw")
     else:
+        from scipy.stats import truncnorm as _truncnorm
+
         # Default: draw the full 5D offset from the Gaia covariance.
         # For 5/6-param stars: full 5D draw from inflated Gaia covariance.
+        # Enforce: true parallax (= gaia_plx + v_true[4]) must be positive.
+        plx_gaia_5p = gaia_obs["parallax"].values.astype(float)
+        n_plx_truncated = 0
         for i in np.where(has_pm)[0]:
             v_true[i] = rng.multivariate_normal(np.zeros(5), C_gaia[i])
+            # Truncate parallax component if needed so true_plx > 0
+            plx_sigma = float(np.sqrt(max(C_gaia[i, 4, 4], 1e-20)))
+            if plx_gaia_5p[i] + v_true[i, 4] <= 0.0:
+                a_lo = -plx_gaia_5p[i] / plx_sigma   # lower truncation in σ units
+                v_true[i, 4] = float(
+                    _truncnorm.rvs(a_lo, np.inf, loc=0.0, scale=plx_sigma,
+                                   random_state=rng))
+                n_plx_truncated += 1
+        if n_plx_truncated:
+            print(f"  {n_plx_truncated} 5p star(s) had plx component resampled "
+                  f"to enforce true_plx > 0")
 
-        # For 2-param stars: only position is measured by Gaia.
-        # Position draw: 2×2 block of Gaia covariance.
-        # PM/parallax draw: independent priors (not measured by Gaia).
+        # For 2-param stars: position from 2×2 Gaia covariance; PMs and parallax
+        # drawn to match the empirical distribution of the 5p/6p stars' true values.
         no_pm_idx = np.where(~has_pm)[0]
         n_no_pm   = len(no_pm_idx)
         if n_no_pm > 0:
             for i in no_pm_idx:
                 v_true[i, :2] = rng.multivariate_normal(np.zeros(2), C_gaia[i, :2, :2])
-            v_true[no_pm_idx, 2] = rng.normal(0.0, 10.0, n_no_pm)   # pmra  [mas/yr]
-            v_true[no_pm_idx, 3] = rng.normal(0.0, 10.0, n_no_pm)   # pmdec [mas/yr]
-            v_true[no_pm_idx, 4] = rng.normal(0.0,  1.0, n_no_pm)   # plx   [mas] — allow negative
-            print(f"  {n_no_pm} 2-param stars: position from Gaia 2×2 cov, "
-                  f"PM from N(0,10²), parallax from N(0,1)")
+
+            # Compute 5p true PM/parallax values (after positivity truncation above)
+            pm_idx = np.where(has_pm)[0]
+            true_pmra_5p  = gaia_obs["pmra"].values[pm_idx]  + v_true[pm_idx, 2]
+            true_pmdec_5p = gaia_obs["pmdec"].values[pm_idx] + v_true[pm_idx, 3]
+            true_plx_5p   = plx_gaia_5p[pm_idx]              + v_true[pm_idx, 4]
+
+            # Half 68% width = (84th − 16th pctile) / 2  ≈  σ for a Gaussian
+            def _half68(arr):
+                return max((np.percentile(arr, 84) - np.percentile(arr, 16)) / 2.0,
+                           1e-6)
+
+            pmra_med   = float(np.median(true_pmra_5p))
+            pmra_sig   = _half68(true_pmra_5p)
+            pmdec_med  = float(np.median(true_pmdec_5p))
+            pmdec_sig  = _half68(true_pmdec_5p)
+            plx_med    = float(np.median(true_plx_5p))
+            plx_sig    = _half68(true_plx_5p)
+
+            # PM draws: unconstrained Gaussian matching 5p distribution
+            v_true[no_pm_idx, 2] = rng.normal(pmra_med,  pmra_sig,  n_no_pm)
+            v_true[no_pm_idx, 3] = rng.normal(pmdec_med, pmdec_sig, n_no_pm)
+
+            # Parallax: truncated normal with lower bound at 0 (true plx must be > 0)
+            # For 2p stars v_true[i, 4] IS the true parallax (no Gaia measurement).
+            a_lo_plx = -plx_med / plx_sig
+            v_true[no_pm_idx, 4] = _truncnorm.rvs(
+                a_lo_plx, np.inf, loc=plx_med, scale=plx_sig,
+                size=n_no_pm, random_state=rng)
+
+            print(f"  {n_no_pm} 2-param stars: position from Gaia 2×2 cov; "
+                  f"PM from 5p empirical N({pmra_med:.2f},{pmdec_med:.2f}) "
+                  f"±({pmra_sig:.2f},{pmdec_sig:.2f}) mas/yr; "
+                  f"plx from TN({plx_med:.3f}, {plx_sig:.3f}, >0) mas")
 
         pos_rms = float(np.sqrt(np.mean(v_true[:, 0]**2 + v_true[:, 1]**2) / 2))
         print(f"  True astrometry offset drawn from Gaia covariance "
@@ -461,6 +577,12 @@ def generate_synthetic_data(
     if zero_parallax and true_parallax_center is None:
         gaia_true["parallax"] = 0.0
         v_true[:, 4] = 0.0
+
+    if not true_gaia:
+        n_neg_plx = int((gaia_true["parallax"].values < 0).sum())
+        if n_neg_plx:
+            print(f"  WARNING: {n_neg_plx} star(s) still have negative true parallax "
+                  f"after truncation (likely from zero_parallax or override path)")
 
     # source_id → row index in gaia_obs/gaia_true
     id_to_row = {int(sid): i for i, sid in enumerate(gaia_obs["source_id"].values)}
@@ -586,12 +708,65 @@ def generate_synthetic_data(
               f"(σ_pmra={med_pmra_err:.3f}, σ_pmdec={med_pmdec_err:.3f}, "
               f"σ_plx={med_plx_err:.3f} mas)")
 
+    # ── Draw fresh Gaia observations from N(gaia_true, C_gaia) ──────────────────
+    # The synthetic Gaia catalog (gaia_syn) must be a proper noisy measurement
+    # of the physical truth (gaia_true).  After truncnorm enforcement on parallax,
+    # gaia_obs (used as gaia_syn so far) is no longer consistent with gaia_true:
+    # the "noise" = gaia_obs − gaia_true = −v_true is biased.  Fix: draw fresh
+    # noise from N(0, C_gaia), add to gaia_true, and update v_true = −noise.
+    # Result: v_true is zero-mean by construction.
+    # Skip: (a) true_gaia — no Gaia noise at all; (b) _pm_parallax_override —
+    # already uses the correct generative model for PM/parallax parameters.
+    if not true_gaia and not _pm_parallax_override:
+        fresh_noise = np.zeros((N, 5))
+        for _i in range(N):
+            fresh_noise[_i] = rng.multivariate_normal(np.zeros(5), C_gaia[_i])
+
+        gt_ra  = gaia_true["ra"].values
+        gt_dec = gaia_true["dec"].values
+
+        # Position update for ALL stars (5p and 2p)
+        gaia_syn["ra"]  = gt_ra  + fresh_noise[:, 0] / (cos_dec * 3.6e6)
+        gaia_syn["dec"] = gt_dec + fresh_noise[:, 1] / 3.6e6
+        v_true[:, 0] = -fresh_noise[:, 0]
+        v_true[:, 1] = -fresh_noise[:, 1]
+
+        # 5p/6p stars: also refresh PM and parallax
+        if has_pm.any():
+            pm_idx = np.where(has_pm)[0]
+            gt_pmra  = gaia_true["pmra"].values[pm_idx]
+            gt_pmdec = gaia_true["pmdec"].values[pm_idx]
+            gt_plx   = gaia_true["parallax"].values[pm_idx]
+            gaia_syn.loc[has_pm, "pmra"]     = gt_pmra  + fresh_noise[pm_idx, 2]
+            gaia_syn.loc[has_pm, "pmdec"]    = gt_pmdec + fresh_noise[pm_idx, 3]
+            gaia_syn.loc[has_pm, "parallax"] = gt_plx   + fresh_noise[pm_idx, 4]
+            v_true[pm_idx, 2] = -fresh_noise[pm_idx, 2]
+            v_true[pm_idx, 3] = -fresh_noise[pm_idx, 3]
+            v_true[pm_idx, 4] = -fresh_noise[pm_idx, 4]
+            # 2p star v_true[2:5] (population PM/parallax draw) is unchanged
+
+        n_5p_fresh = int(has_pm.sum())
+        n_2p_fresh = N - n_5p_fresh
+        print(f"  Fresh Gaia draw from N(truth, C_gaia): "
+              f"{n_5p_fresh} 5p (all 5 params) + {n_2p_fresh} 2p (position only)")
+
     # ── Create output directories ─────────────────────────────────────────────
     syn_gaia  = syn_dir / "Gaia"
     syn_hst   = syn_dir / tel_upper / "mastDownload" / tel_upper
     syn_truth = syn_dir / "truth"
     for d in (syn_gaia, syn_hst, syn_truth):
         d.mkdir(parents=True, exist_ok=True)
+
+    # When regenerating with an image filter, remove any stale image dirs from
+    # previous runs that are NOT in the current filter set.  Otherwise BP3M
+    # would discover them and include them in the fit.
+    if images is not None and syn_hst.exists():
+        keep_names = set(per_image.keys())
+        for old_dir in list(syn_hst.iterdir()):
+            if old_dir.is_dir() and old_dir.name not in keep_names:
+                import shutil as _shutil
+                _shutil.rmtree(old_dir)
+                print(f"  Removed stale synthetic image dir: {old_dir.name}")
 
     # Write synthetic Gaia catalog
     syn_gaia_path = syn_gaia / f"{field_name}_synthetic_gaia.csv"
@@ -616,42 +791,145 @@ def generate_synthetic_data(
             gaia_ids  = gaia_ids[valid]
             rows_true = rows_true[valid]
 
-        # Optionally perturb the true transformation parameters
-        t_fwd = t.copy()
         if jitter_sigma > 0.0:
-            for key in ("A", "B", "C", "D", "xs_o", "ys_o", "xt_o", "yt_o"):
-                t_fwd[key] += float(rng.normal(0.0, jitter_sigma))
+            import warnings
+            warnings.warn(
+                "jitter_sigma is deprecated; physical alignment parameters are now always "
+                "drawn from their prior distributions.  jitter_sigma is ignored.",
+                DeprecationWarning, stacklevel=2)
 
-        # Propagate true positions to HST epoch
-        df_prop  = gaia_true.iloc[rows_true].copy().reset_index(drop=True)
-        ra_p, dec_p = _propagate(df_prop, mjd)
+        # ── Draw true alignment parameters for this image ─────────────────────
+        # orig_rot_deg = -orientat  (PA of HST y-axis is negative of BP3M angle)
+        orig_rot_deg = -t["orientat"]
+        true_rot_deg    = orig_rot_deg + rng.normal(0.0, rot_sigma)
+        true_ratio      = 1.0 + rng.normal(0.0, ratio_sigma)
+        true_on_skew    = rng.normal(0.0, skew_sigma)
+        true_off_skew   = rng.normal(0.0, skew_sigma)
+        # Pointing offset in RA*cos(dec) and Dec mas; applied equally to all chips.
+        true_delta_racosdec_mas = rng.normal(0.0, pointing_sigma)
+        true_delta_dec0_mas     = rng.normal(0.0, pointing_sigma)
 
-        # Forward model sky → pixel
-        x_pred, y_pred = _sky_to_pixel(ra_p, dec_p, t_fwd)
+        abcd = _abcd_from_physical(true_rot_deg, true_ratio, true_on_skew, true_off_skew)
+        M    = np.array([[abcd["true_a"], abcd["true_b"]],
+                         [abcd["true_c"], abcd["true_d"]]])
+        Minv = np.linalg.inv(M)
 
-        # Compute Gaia pseudo-image coords (what BP3M uses as the 'observed' xys)
-        # using the same plane_project call as solver.py.
-        #
-        # Note: plane_project(ra_p, dec_p) ≈ plane_project(ra_g, dec_g) + JU @ v_true
-        # to first order (gnomonic linearization), which is exactly the right-hand side
-        # of the BP3M model equation at truth:
-        #   x_survey = X @ r_true - JU @ v_T_true
-        #   => X @ r_true = plane_project(ra_g) + JU @ v_true = plane_project(ra_p)
-        # So using ra_p here is correct — it bakes in the v_true offset as required.
+        # ── Pointing offset in degrees (shared by both forward model branches) ─
+        cos_dec_cen = np.cos(np.deg2rad(t["dec_cen"]))
+        ra_off_deg  = true_delta_racosdec_mas / (cos_dec_cen * 3.6e6)
+        dec_off_deg = true_delta_dec0_mas / 3.6e6
+
+        # ── True (A,B,C,D) for warm-start transformation.csv ─────────────────
+        # Invert _fcm_to_abcd: [[A,B],[C,D]] = R_cw(rot)^T @ [[a,b],[c,d]]
+        _rr = np.deg2rad(true_rot_deg)
+        _cr, _sr = np.cos(_rr), np.sin(_rr)
+        _R_ccw = np.array([[_cr, -_sr], [_sr, _cr]])
+        _M_abcd = np.array([[abcd["true_a"], abcd["true_b"]],
+                             [abcd["true_c"], abcd["true_d"]]])
+        _M_ABCD = _R_ccw @ _M_abcd
+        ws_A = float(_M_ABCD[0, 0]); ws_B = float(_M_ABCD[0, 1])
+        ws_C = float(_M_ABCD[1, 0]); ws_D = float(_M_ABCD[1, 1])
+
+        # Propagate true stellar positions to HST epoch
         _ensure_bp3m()
         from bp3m.astro_utils import plane_project as _plane_project
-        pscale_mas = t_fwd["pixel_scale"] * 1000.0   # arcsec/pix → mas/pix
-        xs_bp3m, ys_bp3m = _plane_project(
-            ra_p, dec_p, t_fwd["ra_cen"], t_fwd["dec_cen"], pscale_mas)
+        pscale_mas = t["pixel_scale"] * 1000.0   # arcsec/pix → mas/pix
+        df_prop = gaia_true.iloc[rows_true].copy().reset_index(drop=True)
+        ra_p, dec_p = _propagate(df_prop, mjd)
 
-        # Fit true BP3M a,b,c,d,w,z from the noiseless data (exact linear fit)
-        abcdwz = _fit_abcdwz(x_pred, y_pred, xs_bp3m, ys_bp3m)
-        per_image[img_name]["true_abcdwz"] = abcdwz
+        chip_lo = info.get("chip_pointing_lo")
+        chip_hi = info.get("chip_pointing_hi")
 
-        # Draw noise from real per-star covariance
+        # Use per-chip tangent points only when split_ccd=True.  When split_ccd=False
+        # BP3M uses the full-frame ra_cen/dec_cen from transformation.csv, so the
+        # forward model must also use that tangent point to remain consistent.
+        if split_ccd and chip_lo is not None and chip_hi is not None:
+            # ── Split-CCD forward model ───────────────────────────────────────
+            # Both chips share the same drawn alignment params (rotation, scale,
+            # skew, pointing offset).  Each chip has its own nominal tangent point
+            # (chip_pointing_{lo,hi}["ra0/dec0"]) and pixel pivot (Xo, Yo).
+            # The same angular pointing offset is applied to both nominal points.
+            ra0_lo  = chip_lo["ra0"]  + ra_off_deg
+            dec0_lo = chip_lo["dec0"] + dec_off_deg
+            ra0_hi  = chip_hi["ra0"]  + ra_off_deg
+            dec0_hi = chip_hi["dec0"] + dec_off_deg
+
+            Xo_lo, Yo_lo = chip_lo["Xo"], chip_lo["Yo"]
+            Xo_hi, Yo_hi = chip_hi["Xo"], chip_hi["Yo"]
+
+            y_raw     = info["cat_y_raw"][hst_idx]
+            y_split   = info.get("y_split", 2048.0)
+            is_lo_mask = y_raw <= y_split
+            is_hi_mask = ~is_lo_mask
+
+            x_pred = np.empty(len(hst_idx))
+            y_pred = np.empty(len(hst_idx))
+
+            if is_lo_mask.any():
+                xs_lo, ys_lo = _plane_project(
+                    ra_p[is_lo_mask], dec_p[is_lo_mask], ra0_lo, dec0_lo, pscale_mas)
+                dxy_lo = (Minv @ np.vstack([xs_lo, ys_lo])).T
+                x_pred[is_lo_mask] = Xo_lo + dxy_lo[:, 0]
+                y_pred[is_lo_mask] = Yo_lo + dxy_lo[:, 1]
+            if is_hi_mask.any():
+                xs_hi, ys_hi = _plane_project(
+                    ra_p[is_hi_mask], dec_p[is_hi_mask], ra0_hi, dec0_hi, pscale_mas)
+                dxy_hi = (Minv @ np.vstack([xs_hi, ys_hi])).T
+                x_pred[is_hi_mask] = Xo_hi + dxy_hi[:, 0]
+                y_pred[is_hi_mask] = Yo_hi + dxy_hi[:, 1]
+
+            # Per-chip truth rows: BP3M reports delta_ra0_mas = (ra0_final - ra0_init) * 3.6e6
+            # where ra0_init is the chip's nominal ra0 from data_loader_flc.
+            truth_rows_this = []
+            for suffix, ra0_nom, dec0_nom, ra0_t, dec0_t in [
+                ("_lo", chip_lo["ra0"], chip_lo["dec0"], ra0_lo, dec0_lo),
+                ("_hi", chip_hi["ra0"], chip_hi["dec0"], ra0_hi, dec0_hi),
+            ]:
+                truth_rows_this.append(dict(
+                    image_name=img_name + suffix,
+                    true_rot_deg=true_rot_deg,
+                    true_ratio=true_ratio,
+                    true_on_skew=true_on_skew,
+                    true_off_skew=true_off_skew,
+                    true_delta_ra0_mas=(ra0_t - ra0_nom) * 3.6e6,    # raw RA mas
+                    true_delta_dec0_mas=(dec0_t - dec0_nom) * 3.6e6, # Dec mas
+                    warmstart_delta_ra0_mas=ra_off_deg * 3.6e6,       # baked into CHIP CRVAL
+                    warmstart_delta_dec0_mas=dec_off_deg * 3.6e6,
+                    **abcd,
+                ))
+
+        else:
+            # ── Full-frame forward model ──────────────────────────────────────
+            ra_cen  = t["ra_cen"]
+            dec_cen = t["dec_cen"]
+            Xo = t["x_cen"]
+            Yo = t["y_cen"]
+            ra0_true  = ra_cen  + ra_off_deg
+            dec0_true = dec_cen + dec_off_deg
+
+            xs_bp3m, ys_bp3m = _plane_project(ra_p, dec_p, ra0_true, dec0_true, pscale_mas)
+            dxy    = (Minv @ np.vstack([xs_bp3m, ys_bp3m])).T
+            x_pred = Xo + dxy[:, 0]
+            y_pred = Yo + dxy[:, 1]
+
+            truth_rows_this = [dict(
+                image_name=img_name,
+                true_rot_deg=true_rot_deg,
+                true_ratio=true_ratio,
+                true_on_skew=true_on_skew,
+                true_off_skew=true_off_skew,
+                true_delta_ra0_mas=(ra0_true - ra_cen) * 3.6e6,
+                true_delta_dec0_mas=(dec0_true - dec_cen) * 3.6e6,
+                warmstart_delta_ra0_mas=ra_off_deg * 3.6e6,   # baked into transformation.csv ra_cen
+                warmstart_delta_dec0_mas=dec_off_deg * 3.6e6,
+                **abcd,
+            )]
+
+        # Draw noise from real per-star covariance (optionally scaled)
         cov_xx = info["cat_cov_xx"][hst_idx]
         cov_yy = info["cat_cov_yy"][hst_idx]
         cov_xy = info["cat_cov_xy"][hst_idx]
+        _hst_cov_scale2 = scale_hst_errors ** 2
         noise_xy = np.zeros((len(hst_idx), 2))
         for k in range(len(hst_idx)):
             C_k = np.array([[max(cov_xx[k], 1e-8), cov_xy[k]],
@@ -659,34 +937,118 @@ def generate_synthetic_data(
             eigv = np.linalg.eigvalsh(C_k)
             if eigv[0] < 0:
                 C_k += (-eigv[0] + 1e-10) * np.eye(2)
-            noise_xy[k] = rng.multivariate_normal([0., 0.], C_k)
+            noise_xy[k] = rng.multivariate_normal([0., 0.], C_k * _hst_cov_scale2)
 
         x_syn = x_pred + noise_xy[:, 0]
         y_syn = y_pred + noise_xy[:, 1]
+
+        # ── Compute raw (x, y) from synthetic GDC positions ───────────────────
+        # Inverse GDC approximation: the per-star GDC correction (gdc − raw) is
+        # treated as locally constant.  This correctly propagates PM/parallax
+        # motion into the raw pixel coordinate used for hi/lo chip assignment.
+        x_gdc_orig = info["cat_x_gdc"][hst_idx]
+        y_gdc_orig = info["cat_y_gdc"][hst_idx]
+        x_raw_orig = info["cat_x_raw"][hst_idx]
+        y_raw_orig = info["cat_y_raw"][hst_idx]
+        delta_x_gdc = x_gdc_orig - x_raw_orig   # GDC correction in x
+        delta_y_gdc = y_gdc_orig - y_raw_orig   # GDC correction in y
+        x_raw_new = x_syn - delta_x_gdc
+        y_raw_new = y_syn - delta_y_gdc
+
+        # In split-CCD mode, check whether any star's new raw y crosses the
+        # chip boundary and recompute those stars with the correct tangent point.
+        if split_ccd and chip_lo is not None and chip_hi is not None:
+            y_split_val = info.get("y_split", 2048.0)
+            is_lo_new = y_raw_new <= y_split_val
+            crossed = is_lo_mask != is_lo_new
+            if crossed.any():
+                n_crossed = int(crossed.sum())
+                print(f"    {img_name}: {n_crossed} star(s) crossed chip boundary "
+                      f"after PM/parallax propagation — recomputing with correct chip")
+                # Stars that were lo but are now hi
+                to_hi = crossed & ~is_lo_new
+                if to_hi.any():
+                    xs_h, ys_h = _plane_project(
+                        ra_p[to_hi], dec_p[to_hi], ra0_hi, dec0_hi, pscale_mas)
+                    dxy_h = (Minv @ np.vstack([xs_h, ys_h])).T
+                    x_pred[to_hi] = Xo_hi + dxy_h[:, 0]
+                    y_pred[to_hi] = Yo_hi + dxy_h[:, 1]
+                # Stars that were hi but are now lo
+                to_lo = crossed & is_lo_new
+                if to_lo.any():
+                    xs_l, ys_l = _plane_project(
+                        ra_p[to_lo], dec_p[to_lo], ra0_lo, dec0_lo, pscale_mas)
+                    dxy_l = (Minv @ np.vstack([xs_l, ys_l])).T
+                    x_pred[to_lo] = Xo_lo + dxy_l[:, 0]
+                    y_pred[to_lo] = Yo_lo + dxy_l[:, 1]
+                # Recompute x/y_syn for crossed stars (keep same noise draw)
+                x_syn[crossed] = x_pred[crossed] + noise_xy[crossed, 0]
+                y_syn[crossed] = y_pred[crossed] + noise_xy[crossed, 1]
+                # Recompute raw coords for crossed stars
+                x_raw_new[crossed] = x_syn[crossed] - delta_x_gdc[crossed]
+                y_raw_new[crossed] = y_syn[crossed] - delta_y_gdc[crossed]
 
         # Write synthetic image directory
         syn_img = syn_hst / img_name
         syn_img.mkdir(parents=True, exist_ok=True)
 
-        for src, dst_name in [(info["flc_path"],        info["flc_path"].name),
-                               (info["img_dir"] / "transformation.csv",
-                                "transformation.csv")]:
-            dst = syn_img / dst_name
-            if not dst.exists():
-                os.symlink(src.resolve(), dst)
+        # Symlink FLC FITS (header only needed; no position data changes)
+        dst_flc = syn_img / info["flc_path"].name
+        if not dst_flc.exists():
+            os.symlink(info["flc_path"].resolve(), dst_flc)
 
+        # Write warm-start transformation.csv with true alignment parameters
+        # (instead of symlinking to the original GaiaHub fit) so that the
+        # solver starts near the truth and Phase 0 sees only noise-level residuals.
+        _orig_tran = pd.read_csv(info["img_dir"] / "transformation.csv",
+                                 index_col="parameter")["value"]
+        _ws_updates = {
+            "A": ws_A, "B": ws_B, "C": ws_C, "D": ws_D,
+            "ra_cen":  t["ra_cen"]  + ra_off_deg,
+            "dec_cen": t["dec_cen"] + dec_off_deg,
+            "orientat": -true_rot_deg,
+            "ratio":    true_ratio,
+            "on_skew":  true_on_skew,
+            "off_skew": true_off_skew,
+        }
+        if "rot_deg" in _orig_tran.index:
+            _ws_updates["rot_deg"] = true_rot_deg
+        _new_tran = _orig_tran.copy()
+        for _k, _v in _ws_updates.items():
+            _new_tran[_k] = _v
+        pd.DataFrame({"parameter": _new_tran.index, "value": _new_tran.values}).to_csv(
+            syn_img / "transformation.csv", index=False)
+
+        dst_cat = syn_img / info["cat_path"].name
         _write_synthetic_catalog(
             src_catalog=info["cat_path"],
-            dst_catalog=syn_img / info["cat_path"].name,
+            dst_catalog=dst_cat,
             hst_idx=hst_idx,
             x_syn=x_syn,
             y_syn=y_syn,
+            x_raw_new=x_raw_new,
+            y_raw_new=y_raw_new,
+            scale_hst_errors=scale_hst_errors,
         )
 
+        # Update CHIP{n}_CRVAL1/2 in catalog header with drawn pointing offset
+        # so split-CCD chips get the correct warm-start tangent point.
+        with afits.open(str(dst_cat), mode='update') as _hdu:
+            _hdr = _hdu[1].header
+            for _key in list(_hdr.keys()):
+                if _key.endswith('_CRVAL1'):
+                    _hdr[_key] = float(_hdr[_key]) + ra_off_deg
+                elif _key.endswith('_CRVAL2'):
+                    _hdr[_key] = float(_hdr[_key]) + dec_off_deg
+            _hdu.flush()
+
+        # hst_index must be 0..N-1 after catalog trimming (catalog now only has
+        # the matched rows in the same order as hst_idx).
         match_out = match.copy()
         match_out["gaia_source_id"] = gaia_ids
+        match_out["hst_index"] = np.arange(len(hst_idx), dtype=int)
         match_out.to_csv(syn_img / "matched_gaia.csv", index=False)
-        per_image[img_name]["t_fwd"] = t_fwd
+        per_image[img_name]["truth_rows"] = truth_rows_this
         n_written += 1
 
     # ── Update v_true for all_5p_gaia promoted stars ─────────────────────────
@@ -712,21 +1074,19 @@ def generate_synthetic_data(
                  else np.full(len(gaia_obs), np.nan)),
     }).to_csv(syn_truth / "stellar_truth.csv", index=False)
 
+    # image_truth.csv has one row per CCD half (img_lo / img_hi when split,
+    # or one row per base image when unsplit).  Columns:
+    #   image_name            — chip-specific name (matches BP3M image_transformations.csv)
+    #   true_rot_deg          — drawn rotation (orig_rot + N(0,0.01²))
+    #   true_ratio            — drawn pixel-scale ratio (1 + N(0,1e-4²))
+    #   true_on_skew          — drawn on-axis skew (N(0,1e-5²))
+    #   true_off_skew         — drawn off-axis skew (N(0,1e-5²))
+    #   true_a, true_b, true_c, true_d  — BP3M abcd from physical params
+    #   true_delta_ra0_mas    — BP3M-equivalent Δα0 = (ra0_true - chip_ra0) × 3.6e6
+    #   true_delta_dec0_mas   — BP3M-equivalent Δδ0 = (dec0_true - chip_dec0) × 3.6e6
     img_truth_rows = []
     for img_name, info in per_image.items():
-        t_f = info.get("t_fwd", info["transform"])
-        row = dict(
-            image_name=img_name,
-            # transformation.csv parameters (for reference)
-            true_A=t_f["A"], true_B=t_f["B"],
-            true_C=t_f["C"], true_D=t_f["D"],
-            true_xs_o=t_f["xs_o"], true_ys_o=t_f["ys_o"],
-            true_xt_o=t_f["xt_o"], true_yt_o=t_f["yt_o"],
-        )
-        # BP3M-parameterized truth (a,b,c,d,w,z fitted from noiseless data)
-        if "true_abcdwz" in info:
-            row.update(info["true_abcdwz"])
-        img_truth_rows.append(row)
+        img_truth_rows.extend(info.get("truth_rows", []))
     pd.DataFrame(img_truth_rows).to_csv(syn_truth / "image_truth.csv", index=False)
 
     print(f"  Wrote truth tables to {syn_truth}")
@@ -836,23 +1196,87 @@ def compare_synthetic_results(
 
         if img_truth_path.exists():
             img_truth = pd.read_csv(img_truth_path)
-            img_cmp = img_results.merge(
-                img_truth, left_on="image_name_base", right_on="image_name",
-                how="inner", suffixes=("", "_truth"))
-            # Compare BP3M output a,b,c,d,w,z to the fitted truth
-            bp3m_params = [("a", "true_a"), ("b", "true_b"),
-                           ("c", "true_c"), ("d", "true_d"),
-                           ("w", "true_w"), ("z", "true_z")]
-            for bp3m_col, true_col in bp3m_params:
+            # Pass 1: direct name match (new per-chip truth tables where names
+            # match exactly: img_lo ↔ img_lo, img_hi ↔ img_hi).
+            direct = img_results.merge(
+                img_truth, on="image_name", how="left", suffixes=("", "_truth"))
+            matched_direct = direct[direct["true_a"].notna()]
+            unmatched = direct[direct["true_a"].isna()].drop(
+                columns=[c for c in direct.columns if c.endswith("_truth") or c in img_truth.columns[1:]],
+                errors="ignore")
+
+            # Pass 2: for BP3M images not matched in pass 1, try:
+            #   (a) strip _hi/_lo from the BP3M name and look up the base in truth
+            #       (backward compat: truth has single base-name rows)
+            #   (b) look up img_lo / img_hi rows in truth when BP3M kept the image
+            #       unsplit (BP3M name has no suffix, but truth has lo/hi rows)
+            extra_rows = []
+            truth_name_set = set(img_truth["image_name"])
+            for _, row in unmatched.iterrows():
+                bname = row["image_name_base"]
+                # case (a): base name directly in truth
+                t_rows = img_truth[img_truth["image_name"] == bname]
+                if len(t_rows) == 0:
+                    # case (b): any lo/hi variant of bname in truth
+                    t_rows = img_truth[img_truth["image_name"].str.startswith(bname + "_")]
+                if len(t_rows) > 0:
+                    merged = {**row.to_dict(),
+                              **t_rows.iloc[0].to_dict(),
+                              "image_name": row["image_name"]}
+                    extra_rows.append(merged)
+
+            parts = [matched_direct]
+            if extra_rows:
+                parts.append(pd.DataFrame(extra_rows))
+            img_cmp = pd.concat(parts, ignore_index=True) if len(parts) > 1 else matched_direct
+            # Compare BP3M output a,b,c,d,delta_ra0_mas,delta_dec0_mas to fitted truth.
+            # Columns: (result_col, truth_col, sigma_col_in_results)
+            #
+            # For warm-started runs, delta_ra0_mas and delta_dec0_mas in BP3M are
+            # residuals from the warm-started reference point, not from the original
+            # ra_cen.  image_truth.csv stores warmstart_delta_ra0_mas so we can
+            # compute the correct truth in BP3M's frame:
+            #   bp3m_truth = true_delta_ra0 - warmstart_delta_ra0  (≈ 0 for perfect WS)
+            if ("warmstart_delta_ra0_mas"  in img_cmp.columns and
+                    "warmstart_delta_dec0_mas" in img_cmp.columns):
+                img_cmp["bp3m_true_delta_ra0_mas"]  = (img_cmp["true_delta_ra0_mas"]
+                                                        - img_cmp["warmstart_delta_ra0_mas"])
+                img_cmp["bp3m_true_delta_dec0_mas"] = (img_cmp["true_delta_dec0_mas"]
+                                                        - img_cmp["warmstart_delta_dec0_mas"])
+                dra_truth_col  = "bp3m_true_delta_ra0_mas"
+                ddec_truth_col = "bp3m_true_delta_dec0_mas"
+            else:
+                dra_truth_col  = "true_delta_ra0_mas"
+                ddec_truth_col = "true_delta_dec0_mas"
+
+            bp3m_params = [
+                ("a",             "true_a",         "sigma_a"),
+                ("b",             "true_b",         "sigma_b"),
+                ("c",             "true_c",         "sigma_c"),
+                ("d",             "true_d",         "sigma_d"),
+                ("delta_ra0_mas",  dra_truth_col,   "sigma_dra0_mas"),
+                ("delta_dec0_mas", ddec_truth_col,  "sigma_ddec0_mas"),
+            ]
+            for bp3m_col, true_col, _ in bp3m_params:
                 if bp3m_col in img_cmp and true_col in img_cmp:
                     img_cmp[f"resid_{bp3m_col}"] = img_cmp[bp3m_col] - img_cmp[true_col]
-            img_cmp.to_csv(bp3m_dir / "synthetic_image_comparison.csv", index=False)
+
+            # Pulls (resid / sigma) and diagonal chi2_6d
+            for bp3m_col, _, sig_col in bp3m_params:
+                rcol = f"resid_{bp3m_col}"
+                pcol = f"pull_{bp3m_col}"
+                if rcol in img_cmp.columns and sig_col in img_cmp.columns:
+                    img_cmp[pcol] = img_cmp[rcol] / img_cmp[sig_col].replace(0, np.nan)
+            pull_cols = [f"pull_{col}" for col, _, _ in bp3m_params
+                         if f"pull_{col}" in img_cmp.columns]
+            if pull_cols:
+                img_cmp["chi2_6d"] = img_cmp[pull_cols].pow(2).sum(axis=1, min_count=1)
+
             print(f"\n  Image transformation residuals "
                   f"({len(img_cmp)} CCD halves, {len(img_truth)} images):")
-            print(f"  {'param':<8} {'bias':>10} {'RMS':>10}  {'pull μ':>8} {'pull σ':>8}")
-            for bp3m_col, _ in bp3m_params:
+            print(f"  {'param':<16} {'bias':>10} {'RMS':>10}  {'pull μ':>8} {'pull σ':>8}")
+            for bp3m_col, _, sig_col in bp3m_params:
                 col = f"resid_{bp3m_col}"
-                sig_col = f"sigma_{bp3m_col}"
                 if col in img_cmp:
                     r = img_cmp[col].dropna()
                     if sig_col in img_cmp:
@@ -860,12 +1284,15 @@ def compare_synthetic_results(
                         pull_str = f"{pull.mean():>8.3f} {pull.std():>8.3f}"
                     else:
                         pull_str = "     n/a      n/a"
-                    print(f"  {bp3m_col:<8} {r.mean():>10.5f} {r.std():>10.5f}  {pull_str}")
+                    print(f"  {bp3m_col:<16} {r.mean():>10.5f} {r.std():>10.5f}  {pull_str}")
 
             # Per-image chi2 using full 6×6 covariance block from C_r.npy
+            # (adds chi2_Cr column to img_cmp in-place)
             C_r_path = bp3m_dir / "C_r.npy"
             if C_r_path.exists():
                 _print_image_chi2(img_cmp, C_r_path, bp3m_params, bp3m_dir)
+
+            img_cmp.to_csv(bp3m_dir / "synthetic_image_comparison.csv", index=False)
 
         else:
             img_results.to_csv(bp3m_dir / "synthetic_image_comparison.csv", index=False)
@@ -901,7 +1328,7 @@ def run_conditional_solve(
     """
     # bp3m is installed as a package; no sys.path manipulation needed
     from bp3m.data_loader_flc import load_image_data_flc
-    from bp3m.data_loader import build_index_maps, split_images_by_ccd
+    from bp3m.data_loader_flc import build_index_maps, split_images_by_ccd
     from bp3m.solver import BP3MSolver
 
     field_path = Path(output_dir) / field_name
@@ -937,11 +1364,12 @@ def run_conditional_solve(
                         star_id_to_idx, image_names, star_in_image,
                         poly_order=poly_order)
 
-    # Run one EM pass with BP3M's default r_init so geometry is set up,
-    # then immediately override with r_true below.
-    r_init, _, _, _, _, _, _ = solver.fit(n_iter=1, clip_sigma=None,
-                                          inflate_hst_errors=inflate_hst_errors,
-                                          prefilter=False)
+    # Run one converged pass so rolling re-linearization accumulates Δα0/Δδ0
+    # into ra0_current; after convergence r_hat[4:6]=0 per image (true Δα0=0
+    # for synthetic data generated at transformation.csv tangent point).
+    r_hat_converged, _, _, _, _, _, _ = solver.fit(n_iter=1, clip_sigma=None,
+                                                    inflate_hst_errors=inflate_hst_errors,
+                                                    prefilter=False)
 
     # ── Build r_true vector in BP3M ordering ──────────────────────────────────
     img_truth = pd.read_csv(truth_dir / "image_truth.csv")
@@ -949,22 +1377,32 @@ def run_conditional_solve(
                      for _, row in img_truth.iterrows()}
 
     nr  = solver.N_R
-    r_true_vec = r_init.copy()   # start from r_init so Δα0/Δδ0 are in place
+    # After one convergence pass, _update_geometry has absorbed all Δα0/Δδ0
+    # corrections into ra0_current and reset r_hat[4:6] = 0 for each image.
+    # The conditional solve evaluates the stellar posterior at the TRUE image
+    # params.  For abcd (indices 0-3), we override with the drawn truth.
+    # For Δα0/Δδ0 (indices 4,5), the converged r_hat already has them ≈ 0
+    # (geometry absorbed), so we also set them to 0 relative to the current
+    # tangent point — which after convergence lies close to the true tangent
+    # point.  This is correct as long as n_iter=1 convergence moved ra0_current
+    # close enough to ra0_true that the residual Δα0/Δδ0 is negligible.
+    r_true_vec = r_hat_converged.copy()
     for j_idx, img in enumerate(solver.image_names):
-        # strip _hi/_lo suffix for split_ccd
-        base = img.replace("_hi", "").replace("_lo", "")
-        if base not in img_truth_map:
-            print(f"  WARNING: no truth for image {img} (base={base}) — using r_init")
-            continue
-        row = img_truth_map[base]
+        # Try chip-specific name first (new per-chip truth tables), then strip suffix
+        if img in img_truth_map:
+            row = img_truth_map[img]
+        else:
+            base = img.replace("_hi", "").replace("_lo", "")
+            if base not in img_truth_map:
+                print(f"  WARNING: no truth for image {img} (base={base}) — using r_init")
+                continue
+            row = img_truth_map[base]
         cs = j_idx * nr
         r_true_vec[cs + 0] = row["true_a"]
         r_true_vec[cs + 1] = row["true_b"]
         r_true_vec[cs + 2] = row["true_c"]
         r_true_vec[cs + 3] = row["true_d"]
-        r_true_vec[cs + 4] = row["true_w"]
-        r_true_vec[cs + 5] = row["true_z"]
-        # Δα0=Δδ0=0 (pinned by _SIGMA_POINTING — keep whatever r_init has)
+        # Δα0/Δδ0 = 0 after convergence (geometry accumulated into ra0_current)
 
     # ── Conditional stellar solve at r_true ───────────────────────────────────
     _, _, a_arr, _, C_vT = solver._solve_one_pass(r_true_vec)
@@ -1081,6 +1519,28 @@ def _plot_cond_pulls(pull_cond: np.ndarray, param_labels: list, out_dir: Path) -
     plt.close(fig)
 
 
+# ── covariance inversion helper ──────────────────────────────────────────────
+
+def _scaled_cov_chi2(C: np.ndarray, resid: np.ndarray) -> float:
+    """
+    Compute resid^T C^{-1} resid with diagonal pre-scaling for numerical stability.
+
+    Equivalent to working in the correlation matrix space:
+        sigma = sqrt(diag(C))
+        C_corr = C / outer(sigma, sigma)   (condition number ~O(10) vs ~O(10^14))
+        resid_s = resid / sigma
+        chi2 = resid_s @ solve(C_corr, resid_s)
+
+    Raises np.linalg.LinAlgError if C_corr is singular.
+    """
+    sigma = np.sqrt(np.diag(C))
+    if np.any(sigma == 0):
+        raise np.linalg.LinAlgError("zero diagonal in covariance block")
+    C_corr = C / np.outer(sigma, sigma)
+    resid_s = resid / sigma
+    return float(resid_s @ np.linalg.solve(C_corr, resid_s))
+
+
 # ── stellar 5D chi2 ──────────────────────────────────────────────────────────
 
 def _compute_stellar_chi2(cmp: pd.DataFrame, v_cov_marg_path: Path,
@@ -1131,7 +1591,7 @@ def _compute_stellar_chi2(cmp: pd.DataFrame, v_cov_marg_path: Path,
             continue
         C_i = C_full[bp3m_row]
         try:
-            chi2_vals[k] = float(dv @ np.linalg.inv(C_i) @ dv)
+            chi2_vals[k] = _scaled_cov_chi2(C_i, dv)
         except np.linalg.LinAlgError:
             pass
 
@@ -1158,16 +1618,17 @@ def _compute_stellar_chi2(cmp: pd.DataFrame, v_cov_marg_path: Path,
         print(f"  Saved: {out_dir / 'plots_syn_stellar_chi2.png'}")
 
 
-# ── image chi2 and covariance ─────────────────────────────────────────────────
+# ── image chi2 ────────────────────────────────────────────────────────────────
+
 
 def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
                       bp3m_params: list, out_dir: Path) -> None:
     """
-    For each CCD half (row in img_cmp), compute chi2 for the 6-parameter
-    residual vector (a,b,c,d,w,z) using the per-image diagonal block of C_r.
+    For each CCD half (row in img_cmp), compute chi2 for the image-parameter
+    residual vector using the per-image diagonal block of C_r.
 
-    Also prints the full correlation matrix of all image parameters and saves
-    a histogram of chi2 values.
+    bp3m_params : list of (result_col, truth_col, sigma_col) triples — only
+                  entries with a non-NaN resid_ column in img_cmp are included.
     """
     try:
         import matplotlib
@@ -1177,19 +1638,37 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
         plt = None
 
     C_r = np.load(C_r_path)
-    n_r_per_img = 8          # a,b,c,d,w,z,dra0,ddec0 (8 params per CCD half)
-    n_img = len(img_cmp)
     n_tot = C_r.shape[0]
-    param_names = ["a", "b", "c", "d", "w", "z"]
 
-    print(f"\n  Per-image chi² (6 parameters: a,b,c,d,w,z):")
+    # Determine n_r_per_img from C_r size and image count; fall back to 6.
+    n_img_rows = len(img_cmp)
+    if n_img_rows > 0 and n_tot % n_img_rows == 0:
+        n_r_per_img = n_tot // n_img_rows
+    else:
+        n_r_per_img = 6   # poly_order=1 default
+
+    # Build the ordered list of result columns that have residuals
+    resid_cols = [col for col, _, _ in bp3m_params
+                  if f"resid_{col}" in img_cmp.columns]
+    n_params = len(resid_cols)
+    if n_params == 0:
+        print("  Per-image chi²: no residual columns found, skipping")
+        return
+
+    # Map result_col → index in the r_j vector (a=0,b=1,c=2,d=3,Δα0=4,Δδ0=5)
+    _col_to_ridx = {"a": 0, "b": 1, "c": 2, "d": 3,
+                    "delta_ra0_mas": 4, "delta_dec0_mas": 5}
+
+    param_label = ",".join(resid_cols)
+    print(f"\n  Per-image chi² ({n_params} parameters: {param_label}):")
     print(f"  {'image':<22} {'chi2':>8}  {'dof':>4}  {'p-val':>7}")
 
+    img_sorted = img_cmp["image_name"].tolist()
     chi2_vals = []
+    row_indices_used = []
+
     for row_idx, row in img_cmp.iterrows():
         img_name = row["image_name"]
-        # Find position in the concatenated r vector
-        img_sorted = img_cmp["image_name"].tolist()
         j = img_sorted.index(img_name)
         cs = j * n_r_per_img
 
@@ -1197,23 +1676,28 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
             print(f"  {img_name:<22}  C_r too small for this image, skipping")
             continue
 
-        # 6×6 block for a,b,c,d,w,z (first 6 of 8 params)
-        C_j = C_r[cs:cs+6, cs:cs+6]
-        resid = np.array([row.get(f"resid_{p}", np.nan) for p in param_names])
+        resid = np.array([row.get(f"resid_{col}", np.nan) for col in resid_cols])
         if np.any(np.isnan(resid)):
             print(f"  {img_name:<22}  missing residuals, skipping")
             continue
+
+        # Extract the sub-block of C_r for these parameters
+        ridxs = [_col_to_ridx.get(col, k) for k, col in enumerate(resid_cols)]
+        block_idxs = [cs + ri for ri in ridxs]
+        C_j = C_r[np.ix_(block_idxs, block_idxs)]
+
         try:
-            C_j_inv = np.linalg.inv(C_j)
-            chi2 = float(resid @ C_j_inv @ resid)
+            chi2 = _scaled_cov_chi2(C_j, resid)
         except np.linalg.LinAlgError:
             print(f"  {img_name:<22}  singular C_r block, skipping")
             continue
 
         from scipy.stats import chi2 as chi2_dist
-        pval = 1.0 - chi2_dist.cdf(chi2, df=6)
-        print(f"  {img_name:<22} {chi2:>8.3f}  {6:>4}  {pval:>7.4f}")
+        pval = 1.0 - chi2_dist.cdf(chi2, df=n_params)
+        print(f"  {img_name:<22} {chi2:>8.3f}  {n_params:>4}  {pval:>7.4f}")
         chi2_vals.append(chi2)
+        row_indices_used.append(j)
+        img_cmp.loc[row_idx, "chi2_Cr"] = chi2
 
     if chi2_vals and plt is not None:
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -1221,9 +1705,9 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
                 label=f"N={len(chi2_vals)}")
         x = np.linspace(0, max(chi2_vals) * 1.2, 200)
         from scipy.stats import chi2 as chi2_dist
-        ax.plot(x, chi2_dist.pdf(x, df=6) * len(chi2_vals) * (x[1]-x[0]),
-                "k--", lw=1.5, label="χ²(6) expected")
-        ax.set_xlabel("χ² per image (6 dof: a,b,c,d,w,z)")
+        ax.plot(x, chi2_dist.pdf(x, df=n_params) * len(chi2_vals) * (x[1]-x[0]),
+                "k--", lw=1.5, label=f"χ²({n_params}) expected")
+        ax.set_xlabel(f"χ² per image ({n_params} dof: {param_label})")
         ax.set_ylabel("count")
         ax.legend()
         ax.set_title("Per-image transformation χ²")
@@ -1232,33 +1716,24 @@ def _print_image_chi2(img_cmp: pd.DataFrame, C_r_path: Path,
         plt.close(fig)
         print(f"  Saved: {out_dir / 'plots_syn_image_chi2.png'}")
 
-    # Global chi2 using full n_images*6 × n_images*6 joint covariance
-    img_sorted = img_cmp["image_name"].tolist()
+    # Global chi2 using full joint covariance block
     resid_all = []
-    row_indices = []
-    for img_name in img_sorted:
-        j = img_sorted.index(img_name)
+    idx_all = []
+    for j in row_indices_used:
         cs = j * n_r_per_img
-        if cs + n_r_per_img > n_tot:
-            continue
-        row = img_cmp[img_cmp["image_name"] == img_name].iloc[0]
-        rv = np.array([row.get(f"resid_{p}", np.nan) for p in param_names])
+        row = img_cmp[img_cmp["image_name"] == img_sorted[j]].iloc[0]
+        rv = np.array([row.get(f"resid_{col}", np.nan) for col in resid_cols])
         if np.any(np.isnan(rv)):
             continue
+        ridxs = [_col_to_ridx.get(col, k) for k, col in enumerate(resid_cols)]
         resid_all.append(rv)
-        row_indices.append(j)
+        idx_all.extend([cs + ri for ri in ridxs])
 
     if len(resid_all) >= 2:
         resid_vec = np.concatenate(resid_all)
-        # Build index list for the full covariance block
-        idx = []
-        for j in row_indices:
-            cs = j * n_r_per_img
-            idx.extend(range(cs, cs + 6))
-        C_full_block = C_r[np.ix_(idx, idx)]
+        C_full_block = C_r[np.ix_(idx_all, idx_all)]
         try:
-            C_inv = np.linalg.inv(C_full_block)
-            chi2_global = float(resid_vec @ C_inv @ resid_vec)
+            chi2_global = _scaled_cov_chi2(C_full_block, resid_vec)
             dof_global = len(resid_vec)
             from scipy.stats import chi2 as chi2_dist
             pval_global = 1.0 - chi2_dist.cdf(chi2_global, df=dof_global)

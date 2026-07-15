@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -49,9 +50,13 @@ def run_alignment(  # noqa: C901
     influence_d_thresh: float = 1.0,
     influence_sigma_min: float = 2.0,
     use_two_tier: bool = False,
+    no_align_prior: bool = False,
     pos_err_floor: float = 5e-3,
     plot_residuals: bool = False,
     plot_influence: bool = False,
+    use_qso_anchors: bool = True,
+    gaia_epoch_obs: Optional[dict] = None,
+    exclude_2p_from_alignment: bool = False,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -79,6 +84,7 @@ def run_alignment(  # noqa: C901
     use_influence_clip  : enable test-4 Cook's D influence clipping
     influence_d_thresh  : Cook's D threshold (default 1.0)
     influence_sigma_min : minimum sigma_resid for influence flagging (default 2.0)
+    no_align_prior      : zero out the alignment (a,b,c,d,delta_ra0,delta_dec0) prior
 
     Returns
     -------
@@ -87,7 +93,7 @@ def run_alignment(  # noqa: C901
     _ensure_bp3m(bp3m_dir)
 
     from bp3m.data_loader_flc import load_image_data_flc
-    from bp3m.data_loader import build_index_maps
+    from bp3m.data_loader_flc import build_index_maps
     from bp3m.solver import BP3MSolver
     from bp3m.solver_sparse import BP3MSolverSparse
     from bp3m.checkpointing import save_results
@@ -96,7 +102,7 @@ def run_alignment(  # noqa: C901
     import pandas as pd
 
     data_root   = Path(output_dir)
-    output_bp3m = data_root / field_name / "BP3M_results"
+    output_bp3m = Path(bp3m_dir) if bp3m_dir is not None else data_root / field_name / "BP3M_results"
     output_bp3m.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "─"*50)
@@ -186,7 +192,7 @@ def run_alignment(  # noqa: C901
 
     # ── Split CCD if requested ────────────────────────────────────────────────
     if split_ccd:
-        from bp3m.data_loader import split_images_by_ccd
+        from bp3m.data_loader_flc import split_images_by_ccd
         imgs, filtered_spi = split_images_by_ccd(
             imgs, filtered_spi, min_stars_per_ccd=min_stars_split_ccd)
         image_names = sorted(filtered_spi.keys())
@@ -197,9 +203,80 @@ def run_alignment(  # noqa: C901
     SolverClass = BP3MSolverSparse if use_sparse else BP3MSolver
     solver = SolverClass(imgs, filtered_spi, gaia_catalog,
                           star_id_to_idx, image_names, star_in_image,
-                          poly_order=poly_order)
+                          poly_order=poly_order,
+                          exclude_2p_from_alignment=exclude_2p_from_alignment)
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
+
+    # ── QSO anchor prior injection ────────────────────────────────────────────
+    # Replaces the diffuse global prior on PM+parallax with a tight secular-
+    # aberration prior for vetted QSO anchors.  Adds σ_κ^{-2} to the PM rows
+    # of C_survey_inv and the matching secular-aberration RHS to
+    # C_survey_inv_dot_v — the Gaia measurement contribution stays unchanged.
+    print("\n  QSO anchor priors:")
+    if use_qso_anchors:
+        _qso_anchor_path = (Path(output_dir) / field_name / 'Gaia'
+                            / f'{field_name}_qso_anchors.csv')
+        if _qso_anchor_path.exists():
+            import pandas as _qpd
+
+            _qdf     = _qpd.read_csv(_qso_anchor_path, dtype={'source_id': 'int64'})
+            _n_gaia_candidates = len(_qdf)
+            _qdf_ok  = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+            _n_anchors = len(_qdf_ok)
+
+            # Breakdown: quaia / milliquas / crf
+            _n_quaia  = int(_qdf_ok.get('quaia_match',   _qpd.Series(False)).sum())
+            _n_mq     = int(_qdf_ok.get('milliquas_match', _qpd.Series(False)).sum())
+            _n_crf    = int(_qdf_ok.get('gaia_crf_source', _qpd.Series(False)).sum())
+            _n_5p     = int(_qdf['has_5p_solution'].sum())
+            _n_astrom = int(_qdf['astrometric_pass'].sum())
+
+            print(f"    Gaia qso_candidates in field:  {_n_gaia_candidates}")
+            print(f"    With 5p/6p Gaia solution:      {_n_5p}")
+            print(f"    Astrometric cut survivors:     {_n_astrom}  "
+                  f"(|Δv|_Mahal < 3σ vs secular aberration + zero parallax)")
+            print(f"    Quaia (source_id match):       "
+                  f"{int(_qdf['quaia_match'].sum())} candidates  →  {_n_quaia} anchors")
+            print(f"    MILLIQUAS (RA/Dec match):      "
+                  f"{int(_qdf['milliquas_match'].sum())} candidates  →  {_n_mq} anchors")
+            if _n_crf:
+                print(f"    Gaia CRF3 (highest purity):    {_n_crf} anchors")
+            print(f"    Vetted QSO anchors total:      {_n_anchors}  "
+                  f"(catalog match AND astrometric pass)")
+
+            _sigma_qso_pm_inv_sq  = (3.5e-4) ** -2
+            _sigma_qso_plx_inv_sq = (1.0e-3) ** -2
+            _n_injected = 0
+
+            for _, _qrow in _qdf_ok.iterrows():
+                _sidx = star_id_to_idx.get(int(_qrow['source_id']))
+                if _sidx is None:
+                    continue
+                _pmra_ab  = float(_qrow['pmra_aberr_uas'])  * 1e-3
+                _pmdec_ab = float(_qrow['pmdec_aberr_uas']) * 1e-3
+
+                solver.C_survey_inv[_sidx, 2, 2] += _sigma_qso_pm_inv_sq
+                solver.C_survey_inv[_sidx, 3, 3] += _sigma_qso_pm_inv_sq
+                solver.C_survey_inv[_sidx, 4, 4] += _sigma_qso_plx_inv_sq
+                solver.C_survey_inv_dot_v[_sidx, 2] += _sigma_qso_pm_inv_sq * _pmra_ab
+                solver.C_survey_inv_dot_v[_sidx, 3] += _sigma_qso_pm_inv_sq * _pmdec_ab
+                _n_injected += 1
+
+            if _n_injected > 0:
+                print(f"    Injected into alignment:       {_n_injected}  "
+                      f"(σ_κ = 0.35 µas/yr, σ_plx = 1 µas)")
+            else:
+                print(f"    Injected into alignment:       0  "
+                      f"(none of the {_n_anchors} vetted anchors are in the HST field)")
+        else:
+            print(f"    QSO anchor file not found at {_qso_anchor_path.name}")
+            print(f"    Run cross-match step first to generate it (or pass --no_qso_anchors)")
+    else:
+        print("    Disabled (--no_qso_anchors)")
+
+    if gaia_epoch_obs:
+        solver._add_gaia_epoch_obs(gaia_epoch_obs)
 
     # ── Fit ───────────────────────────────────────────────────────────────────
     clip = clip_sigma if clip_sigma > 0 else None
@@ -213,6 +290,7 @@ def run_alignment(  # noqa: C901
         influence_d_thresh=influence_d_thresh,
         influence_sigma_min=influence_sigma_min,
         use_two_tier=use_two_tier,
+        no_align_prior=no_align_prior,
     )
     print(f"  Fit completed in {time.time()-t0:.1f}s")
 
@@ -343,25 +421,28 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
         n_astrom = int(np.sum(use_ast & ~d_img['use_for_fit']))
         a, b, c, d = r_j[:4]
         alpha_applied = float(d_img.get('alpha_applied', 1.0))
+        meta = images[img]
         rows.append(dict(
             image_name=img,
             n_stars_alignment=n_align,
             n_stars_astrometry_only=n_astrom,
             a=a, b=b, c=c, d=d,
-            w=r_j[4], z=r_j[5],
-            delta_ra0_mas=r_j[6]*1000,
-            delta_dec0_mas=r_j[7]*1000,
+            delta_ra0_mas=(meta.get('ra0_final', meta['ra0']) - meta['ra0']) * 3_600_000.0,
+            delta_dec0_mas=(meta.get('dec0_final', meta['dec0']) - meta['dec0']) * 3_600_000.0,
+            ra0_final=meta.get('ra0_final', meta['ra0']),
+            dec0_final=meta.get('dec0_final', meta['dec0']),
             pixel_scale_mas=np.sqrt(a*d - b*c) * images[img].get('orig_pixel_scale', 50.0),
             rotation_deg=np.degrees(np.arctan2(b - c, a + d)),
             on_skew=(a - d) / 2,
             off_skew=(b + c) / 2,
             sigma_a=np.sqrt(C_j[0,0]), sigma_b=np.sqrt(C_j[1,1]),
             sigma_c=np.sqrt(C_j[2,2]), sigma_d=np.sqrt(C_j[3,3]),
-            sigma_w=np.sqrt(C_j[4,4]), sigma_z=np.sqrt(C_j[5,5]),
-            sigma_dra0_mas=np.sqrt(C_j[6,6])*1000,
-            sigma_ddec0_mas=np.sqrt(C_j[7,7])*1000,
+            sigma_dra0_mas=np.sqrt(C_j[4,4]),
+            sigma_ddec0_mas=np.sqrt(C_j[5,5]),
+            Xo_pivot=meta.get('Xo', 2048.0),
+            Yo_pivot=meta.get('Yo', 2048.0),
             alpha=alpha_applied,
-            **{f'r_{k}': float(r_j[k]) for k in range(8, solver.N_R)},
+            **{f'r_{k}': float(r_j[k]) for k in range(6, solver.N_R)},
         ))
     pd.DataFrame(rows).to_csv(output_dir / "image_transformations.csv", index=False)
 

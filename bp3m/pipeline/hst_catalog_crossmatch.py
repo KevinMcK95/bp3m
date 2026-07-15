@@ -63,6 +63,7 @@ try:
         get_parallax_factors,
         plane_project,
         plane_project_jacobian,
+        plane_project_tangent_derivs,
         compute_poly_jacobian,
         hst_position_cov,
         n_r_from_poly_order,
@@ -108,6 +109,41 @@ def _get_y_split(instrument: str, detector: str) -> int:
     return _AMP_Y_SPLITS.get((instrument.upper(), detector.upper()), 2048)
 
 
+def _read_chip_xoyo(cat_path: Path) -> tuple:
+    """
+    Read per-chip (Xo, Yo, ra0, dec0) from CHIP{n}_CRPIX{1,2}_GDC and
+    CHIP{n}_CRVAL{1,2} keywords in the catalog FITS header.
+
+    Returns (chip_lo, chip_hi) sorted by Yo (lo = smaller Yo = lower chip).
+    Each element is a dict with keys 'Xo','Yo','ra0','dec0', or None.
+    """
+    try:
+        with fits.open(cat_path, memmap=False) as hdu:
+            cat_hdr = hdu[1].header
+        prefixes = sorted({
+            k.split("_CRPIX1_GDC")[0]
+            for k in cat_hdr.keys()
+            if k.endswith("_CRPIX1_GDC") and k.startswith("CHIP")
+        })
+        chip_pts = []
+        for pfx in prefixes:
+            xo  = cat_hdr.get(f"{pfx}_CRPIX1_GDC")
+            yo  = cat_hdr.get(f"{pfx}_CRPIX2_GDC")
+            ra0 = cat_hdr.get(f"{pfx}_CRVAL1")
+            dc0 = cat_hdr.get(f"{pfx}_CRVAL2")
+            if all(v is not None for v in [xo, yo, ra0, dc0]):
+                chip_pts.append({
+                    "Xo": float(xo), "Yo": float(yo),
+                    "ra0": float(ra0), "dec0": float(dc0),
+                })
+        if len(chip_pts) == 2:
+            chip_pts.sort(key=lambda p: p["Yo"])
+            return chip_pts[0], chip_pts[1]   # lo, hi
+    except Exception:
+        pass
+    return None, None
+
+
 # ── Helpers: coordinate transform ────────────────────────────────────────────
 
 def _project_to_radec(
@@ -122,12 +158,14 @@ def _project_to_radec(
     dec0: float,
     pscale: float,
     poly_order: int = 1,
+    Xo: float = 2048.0,
+    Yo: float = 2048.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert GDC-corrected HST pixel positions to (RA, Dec) with full
     uncertainty propagation (r-vector uncertainty + PSF measurement noise).
 
-    Uses the same centering (Xo=Yo=2048) and math as BP3M's hst_to_radec().
+    Uses the same centering pivot (Xo, Yo) and math as BP3M's hst_to_radec().
 
     Returns
     -------
@@ -137,16 +175,27 @@ def _project_to_radec(
     """
     n = len(x_gdc)
     n_r = len(r_j)
-    X_c = x_gdc - _SOLVER_XO
-    Y_c = y_gdc - _SOLVER_YO
+    X_c = x_gdc - Xo
+    Y_c = y_gdc - Yo
 
-    # Build design matrices (n, 2, n_r) — vectorised; tangent-point derivs are 0 here
+    # Build design matrices (n, 2, n_r).
+    # Tangent-point derivatives (indices 4,5) require approximate star positions;
+    # get those from a first pass with only a,b,c,d (indices 0-3).
+    X_approx = np.zeros((n, 2, n_r))
+    X_approx[:, 0, 0] = X_c;  X_approx[:, 0, 1] = Y_c
+    X_approx[:, 1, 2] = X_c;  X_approx[:, 1, 3] = Y_c
+    x_approx = np.einsum('nkl,l->nk', X_approx, r_j)
+    ra_approx, dec_approx = plane_project_inverse(
+        x_approx[:, 0], x_approx[:, 1], ra0, dec0, pscale)
+    dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0 = plane_project_tangent_derivs(
+        ra_approx, dec_approx, ra0, dec0, pscale)
     X_mats = np.zeros((n, 2, n_r))
-    X_mats[:, 0, 0] = X_c;  X_mats[:, 0, 1] = Y_c;  X_mats[:, 0, 4] = 1.0
-    X_mats[:, 1, 2] = X_c;  X_mats[:, 1, 3] = Y_c;  X_mats[:, 1, 5] = 1.0
-    # columns 6,7 (tangent-point derivatives) stay 0
+    X_mats[:, 0, 0] = X_c;        X_mats[:, 0, 1] = Y_c
+    X_mats[:, 0, 4] = dxs_dra0;   X_mats[:, 0, 5] = dxs_ddec0
+    X_mats[:, 1, 2] = X_c;        X_mats[:, 1, 3] = Y_c
+    X_mats[:, 1, 4] = dys_dra0;   X_mats[:, 1, 5] = dys_ddec0
     _S = 2048.0
-    _col = 8
+    _col = 6
     for _deg in range(2, poly_order + 1):
         _sc = _S ** (_deg - 1)
         for _j in range(_deg + 1):
@@ -290,16 +339,45 @@ def _load_all_detections(field_dir: Path,
             alpha_lookup[row['image_name']] = float(row['alpha'])
         print(f"  Loaded alpha inflation factors for {len(alpha_lookup)} sub-images")
 
+    # Per-sub-image tangent-point ra0/dec0 for _project_to_radec.
+    #
+    # With rolling re-linearization (current solver): the solver accumulates
+    # the Δα0 correction into ra0_current (→ ra0_final) and resets r_j[4:6] to
+    # 0 after each geometry update.  At convergence, a,b,c,d are calibrated
+    # relative to ra0_final, and r_j[4:6] = 0.  So we must use ra0_final as
+    # the tangent point and zero out r_j[4:6] in r_vecs.
+    #
+    # Backward compatibility (pre-rolling-re-linearization CSVs): if ra0_final
+    # is absent or NaN, fall back to recovering ra0_initial from
+    # ra0_final - delta_ra0_mas/3.6e6 and keeping r_j[4:6] = delta_ra0_mas
+    # (old single-step convention).
+    ra0_initial_lookup: dict[str, tuple[float, float]] = {}
+    _uses_ra0_final: set[str] = set()   # sub-images that should have r_j[4:6]=0
+    for _row in transform_df.itertuples():
+        _ra0f  = float(getattr(_row, 'ra0_final',      np.nan))
+        _dec0f = float(getattr(_row, 'dec0_final',     np.nan))
+        _dra   = float(getattr(_row, 'delta_ra0_mas',  0.0))
+        _ddec  = float(getattr(_row, 'delta_dec0_mas', 0.0))
+        if np.isfinite(_ra0f) and np.isfinite(_dec0f):
+            # New-style: use ra0_final directly; r_j[4:6] will be zeroed below.
+            ra0_initial_lookup[_row.image_name] = (_ra0f, _dec0f)
+            _uses_ra0_final.add(_row.image_name)
+        # If ra0_final is NaN the old per-chip _read_chip_xoyo / ra_cen path
+        # is used (no entry in ra0_initial_lookup → existing fallback applies).
+
     # r-vectors per sub-image
     r_vecs = {}
     for j, row in enumerate(transform_df.itertuples()):
         cs       = j * n_r
         sub_name = row.image_name
-        r_base   = np.array([row.a, row.b, row.c, row.d, row.w, row.z,
-                              row.delta_ra0_mas / 1000.0,
-                              row.delta_dec0_mas / 1000.0])
-        if n_r > 8:
-            extra = np.array([getattr(row, f'r_{k}', 0.0) for k in range(8, n_r)])
+        # When the solver used rolling re-linearization, r_j[4:6] was reset to 0
+        # at convergence and the full offset is encoded in ra0_final.  Zero them
+        # here so _project_to_radec does not double-apply the pointing correction.
+        _dra_rj  = 0.0 if sub_name in _uses_ra0_final else float(getattr(row, 'delta_ra0_mas',  0.0))
+        _ddec_rj = 0.0 if sub_name in _uses_ra0_final else float(getattr(row, 'delta_dec0_mas', 0.0))
+        r_base   = np.array([row.a, row.b, row.c, row.d, _dra_rj, _ddec_rj])
+        if n_r > 6:
+            extra = np.array([getattr(row, f'r_{k}', 0.0) for k in range(6, n_r)])
             r_j   = np.concatenate([r_base, extra])
         else:
             r_j   = r_base
@@ -336,9 +414,32 @@ def _load_all_detections(field_dir: Path,
             ra0    = float(tdf['ra_cen'])
             dec0   = float(tdf['dec_cen'])
             pscale = float(tdf['pixel_scale']) * 1000.0   # mas/pix
+            # x_cen/y_cen: image-centre pivot used by the solver for Xo/Yo
+            Xo_sub = float(tdf['x_cen']) if 'x_cen' in tdf.index else 2048.0
+            Yo_sub = float(tdf['y_cen']) if 'y_cen' in tdf.index else 2048.0
         except Exception as exc:
             print(f"  Warning: skipping {base} (transformation.csv error): {exc}")
             return None
+
+        # For chip-split sub-images, override Xo/Yo and ra0/dec0 with the
+        # per-chip GDC reference pixel from the FITS catalog header.
+        if suffix in ('_lo', '_hi'):
+            _cp_lo, _cp_hi = _read_chip_xoyo(cat_path)
+            _cp = _cp_lo if suffix == '_lo' else _cp_hi
+            if _cp is not None:
+                Xo_sub  = _cp['Xo']
+                Yo_sub  = _cp['Yo']
+                # Also update ra0/dec0 to the per-chip pointing unless already
+                # overridden by ra0_initial_lookup (which takes highest priority).
+                if sub_name not in ra0_initial_lookup:
+                    ra0  = _cp['ra0']
+                    dec0 = _cp['dec0']
+
+        # Override ra0/dec0 with the tangent point the v1 solver converged to.
+        # With rolling re-linearization ra0_initial_lookup stores ra0_final
+        # (r_j[4:6] zeroed in r_vecs).  Without it, falls back to per-chip CRVAL.
+        if sub_name in ra0_initial_lookup:
+            ra0, dec0 = ra0_initial_lookup[sub_name]
 
         # Instrument/detector/epoch from FITS header
         flt = instrument = detector = 'UNKNOWN'
@@ -400,8 +501,19 @@ def _load_all_detections(field_dir: Path,
                    if 'is_star_candidate' in tbl.dtype.names else \
                    np.ones(len(tbl), bool)
 
-        # Select sources for this sub-image (hi/lo chip split)
-        if suffix == '_hi':
+        # Select sources for this sub-image using chip_ext (preferred) or y_raw threshold
+        if suffix in ('_hi', '_lo') and 'chip_ext' in tbl.dtype.names:
+            _cat_chip_ext = np.asarray(tbl['chip_ext'], int)
+            _unique_exts  = np.unique(_cat_chip_ext[_cat_chip_ext > 0])
+            if len(_unique_exts) >= 2:
+                # Lower sci_ext index = lower y position = lo chip; higher = hi chip
+                _lo_ext = int(_unique_exts.min())
+                _hi_ext = int(_unique_exts.max())
+                mask = (_cat_chip_ext == _hi_ext) if suffix == '_hi' else (_cat_chip_ext == _lo_ext)
+            else:
+                # Single chip or missing values — fall back to y_raw threshold
+                mask = (cat_y_raw > y_split) if suffix == '_hi' else (cat_y_raw <= y_split)
+        elif suffix == '_hi':
             mask = cat_y_raw > y_split
         elif suffix == '_lo':
             mask = cat_y_raw <= y_split
@@ -432,6 +544,7 @@ def _load_all_detections(field_dir: Path,
                 cat_cov_xx[idx] * alpha2, cat_cov_yy[idx] * alpha2,
                 cat_cov_xy[idx] * alpha2,
                 r_j, C_r_j, ra0, dec0, pscale, poly_order=poly_order,
+                Xo=Xo_sub, Yo=Yo_sub,
             )
         except Exception as exc:
             print(f"  Warning: projection failed for {sub_name}: {exc}")
@@ -721,6 +834,129 @@ def _fit_astrometry(ra: np.ndarray, dec: np.ndarray,
     }
 
 
+def _print_all_gaia_residuals(
+    det_df: pd.DataFrame,
+    gaia_csv: Optional[Path],
+    v1_bp3m_dir: Optional[Path] = None,
+) -> None:
+    """
+    Print per-image angular separations between all Gaia-matched HST detections
+    and their propagated Gaia positions.  Uses v1 BP3M PMs when available,
+    falls back to Gaia catalog PMs.  Called after Phase 1+2 to diagnose
+    whether the cross-match initialization is on-target.
+    """
+    GAIA_EPOCH_YR  = 2016.0
+    PLATE_SCALE_DEG = 50.0 / 3.6e6   # 50 mas/px → deg/px
+
+    matched = det_df[det_df['has_gaia_match']].copy()
+    if len(matched) == 0:
+        return
+    matched['gaia_source_id'] = matched['gaia_source_id'].astype(np.int64)
+
+    # ── Build Gaia position/PM table: v1 BP3M estimates preferred ─────────────
+    gaia_info: dict[int, tuple[float, float, float, float]] = {}  # gid → (ra, dec, pmra, pmdec)
+
+    if gaia_csv is not None and Path(gaia_csv).exists():
+        try:
+            gcol = {'source_id': np.int64, 'SOURCE_ID': np.int64}
+            gdf = pd.read_csv(gaia_csv, dtype=gcol)
+            gdf.columns = [c.lower() for c in gdf.columns]
+            id_col = 'source_id' if 'source_id' in gdf.columns else None
+            if id_col:
+                for row in gdf.itertuples(index=False):
+                    gid = int(getattr(row, id_col))
+                    ra  = float(getattr(row, 'ra',  np.nan))
+                    dec = float(getattr(row, 'dec', np.nan))
+                    pmra  = float(getattr(row, 'pmra',  0) or 0) if np.isfinite(getattr(row, 'pmra',  np.nan)) else 0.0
+                    pmdec = float(getattr(row, 'pmdec', 0) or 0) if np.isfinite(getattr(row, 'pmdec', np.nan)) else 0.0
+                    if np.isfinite(ra) and np.isfinite(dec):
+                        gaia_info[gid] = (ra, dec, pmra, pmdec)
+        except Exception:
+            pass
+
+    if v1_bp3m_dir is not None:
+        astrom_path = Path(v1_bp3m_dir) / 'stellar_astrometry.csv'
+        if astrom_path.exists():
+            try:
+                adf = pd.read_csv(astrom_path, dtype={'Gaia_id': np.int64})
+                for row in adf.itertuples(index=False):
+                    gid = int(row.Gaia_id)
+                    if gid <= 0:
+                        continue
+                    ra  = float(getattr(row, 'ra',  np.nan))
+                    dec = float(getattr(row, 'dec', np.nan))
+                    pmra  = float(getattr(row, 'pmra_bp3m_cond',  getattr(row, 'pmra',  0) or 0) or 0)
+                    pmdec = float(getattr(row, 'pmdec_bp3m_cond', getattr(row, 'pmdec', 0) or 0) or 0)
+                    if np.isfinite(ra) and np.isfinite(dec):
+                        gaia_info[gid] = (ra, dec, pmra, pmdec)
+            except Exception:
+                pass
+
+    if not gaia_info:
+        n_tot  = int(matched['gaia_source_id'].nunique())
+        counts = matched.groupby('sub_name').size()
+        print(f"\n  Gaia stars anchored after Phase 1+2: {n_tot} unique stars, "
+              f"{len(matched)} detections across {len(counts)} sub-images")
+        for sub in sorted(counts.index):
+            print(f"    {sub:35s}  {int(counts[sub]):4d}")
+        return
+
+    # ── Compute per-detection separation ──────────────────────────────────────
+    epoch_lookup = (2000.0 + matched.groupby('sub_name')['epoch_mjd'].first()
+                    / MJD_YR - _MJD0_YR).to_dict()
+    cos_dec_global = np.cos(np.radians(matched['dec'].median()))
+
+    seps_per_sub: dict[str, list[float]] = {}
+    for row in matched.itertuples(index=False):
+        gid = int(row.gaia_source_id)
+        if gid not in gaia_info:
+            continue
+        ra0_g, dec0_g, pmra, pmdec = gaia_info[gid]
+        sub = row.sub_name
+        epoch_yr = epoch_lookup.get(sub, GAIA_EPOCH_YR)
+        dt = epoch_yr - GAIA_EPOCH_YR
+        ra_pred  = ra0_g + pmra  * dt / (np.cos(np.radians(dec0_g)) * 3.6e6)
+        dec_pred = dec0_g + pmdec * dt / 3.6e6
+        sep_deg = np.hypot((row.ra - ra_pred) * cos_dec_global, row.dec - dec_pred)
+        seps_per_sub.setdefault(sub, []).append(sep_deg / PLATE_SCALE_DEG)
+
+    all_seps = [s for ss in seps_per_sub.values() for s in ss]
+    n_tot = int(matched['gaia_source_id'].nunique())
+    print(f"\n  Gaia match residuals after Phase 1+2: {n_tot} unique stars, "
+          f"{len(all_seps)} detections across {len(seps_per_sub)} sub-images")
+    if all_seps:
+        _a = np.array(all_seps)
+        _p16, _p84, _p95 = np.percentile(_a, [16, 84, 95])
+        print(f"  All images: mean={np.mean(_a):.2f} px  "
+              f"rms={np.std(_a):.2f} px  "
+              f"median={np.median(_a):.2f} px  "
+              f"σ_68={0.5*(_p84-_p16):.2f} px  "
+              f"p95={_p95:.2f} px")
+    print(f"  Per-image (N = matched detections, sep = predicted-vs-detected):")
+    for sub in sorted(seps_per_sub):
+        ss = np.array(seps_per_sub[sub])
+        _p16s, _p84s = np.percentile(ss, [16, 84])
+        print(f"    {sub:35s}  N={len(ss):4d}  "
+              f"mean={np.mean(ss):5.2f} px  rms={np.std(ss):5.2f} px  "
+              f"median={np.median(ss):5.2f} px  σ_68={0.5*(_p84s-_p16s):5.2f} px")
+
+
+def _print_phase_residuals(seps_per_sub: dict, phase_label: str) -> None:
+    """Print per-image Gaia match separations for Phase 1 / Phase 2 diagnostics."""
+    if not seps_per_sub:
+        return
+    all_seps = [s for ss in seps_per_sub.values() for s in ss]
+    n_tot = len(all_seps)
+    mean_all = float(np.mean(all_seps))
+    rms_all  = float(np.std(all_seps))
+    print(f"  {phase_label} per-image match separations "
+          f"(N={n_tot}  all: mean={mean_all:.2f} px  rms={rms_all:.2f} px):")
+    for sub in sorted(seps_per_sub):
+        ss = np.array(seps_per_sub[sub])
+        print(f"    {sub:35s}  N={len(ss):4d}  "
+              f"mean={np.mean(ss):5.2f} px  rms={np.std(ss):5.2f} px")
+
+
 # ── Phase 0b: V1 BP3M-anchored Gaia detection ────────────────────────────────
 
 def _phase0b_anchor_gaia_stars(
@@ -804,8 +1040,8 @@ def _phase0b_anchor_gaia_stars(
         sub_trees[sub] = (tree, ra_s, dec_s, grp['mag_zp'].values,
                           grp.index.values)
 
-    epoch_lookup = (det_df.groupby('sub_name')['epoch_mjd'].first() / MJD_YR
-                    + _MJD0_YR).to_dict()
+    epoch_lookup = (2000.0 + det_df.groupby('sub_name')['epoch_mjd'].first() / MJD_YR
+                    - _MJD0_YR).to_dict()
 
     # ── Build set of (gid, sub_name) pairs already in det_df ─────────────────
     # Skip sub-images where this star is already correctly labelled.
@@ -971,7 +1207,7 @@ def _phase2_gaia_catalog_anchor(
         tree = cKDTree(np.column_stack([ra_s * cos_dec_global, dec_s]))
         sub_trees[sub] = (tree, ra_s, dec_s, grp['mag_zp'].values, grp.index.values)
 
-    epoch_lookup = (det_df.groupby('sub_name')['epoch_mjd'].first() / MJD_YR + _MJD0_YR).to_dict()
+    epoch_lookup = (2000.0 + det_df.groupby('sub_name')['epoch_mjd'].first() / MJD_YR - _MJD0_YR).to_dict()
     already_labelled: set[tuple[int, str]] = set()
     for row in det_df[det_df['has_gaia_match']].itertuples():
         already_labelled.add((int(row.gaia_source_id), row.sub_name))
@@ -2485,6 +2721,7 @@ def _measure_astrometry_proper(
     dec0_field: float,
     pscale: float,
     sub_img_meta: Optional[dict] = None,
+    sub_img_xoyo: Optional[dict] = None,
     gaia_df: Optional[pd.DataFrame] = None,
     outlier_sigma: float = 5.0,
     min_hst_epochs: int = 2,
@@ -2670,10 +2907,26 @@ def _measure_astrometry_proper(
             has_full_gaia_astrometry = False
             gaia_g_mag = 20.0  # cap — HST-only sources are always faint
 
+        # ── Per-image tangent-plane metadata ─────────────────────────────────
+        # Needed both in the detection loop (for tangent-point derivatives) and
+        # later for _build_system / reference sky position computation.
+        _meta = sub_img_meta or {}
+        _xoyo = sub_img_xoyo or {}
+
+        def _img_meta(sname: str) -> tuple[float, float, float]:
+            return _meta.get(sname, (ra0_field, dec0_field, pscale))
+
+        def _img_xoyo(sname: str) -> tuple[float, float]:
+            return _xoyo.get(sname, (_SOLVER_XO, _SOLVER_YO))
+
         # ── Collect per-detection data ────────────────────────────────────────
         # For poly_order=1 (the common case) we skip build_X_matrix entirely:
         # X_mat is reconstructed vectorised inside _build_system, and y_obs is
         # computed inline.  For higher orders we fall back to the full call.
+        # In either case the Δα0/Δδ0 tangent-point derivatives (indices 4-5)
+        # are computed at the star's sky position — for Gaia stars that is
+        # ra_g/dec_g; for HST-only stars we invert a,b,c,d to get an
+        # approximate sky position for the derivative computation.
         det_data: list[dict] = []
         _poly1 = (poly_order == 1)
         for (sname, cidx) in valid_pairs:
@@ -2681,17 +2934,35 @@ def _measure_astrometry_proper(
             if j_idx < 0:
                 continue
             d   = det_lookup[(sname, cidx)]
-            x_c = float(d['x_gdc']) - _SOLVER_XO
-            y_c = float(d['y_gdc']) - _SOLVER_YO
+            _xo_k, _yo_k = _img_xoyo(sname)
+            x_c = float(d['x_gdc']) - _xo_k
+            y_c = float(d['y_gdc']) - _yo_k
             cs  = j_idx * n_r
             r_blk = r_hat_arr[cs:cs + n_r]
+            ra0_k, dec0_k, ps_k = _img_meta(sname)
+            if has_gaia:
+                _tpd_ra, _tpd_dec = ra_g, dec_g
+            else:
+                # Approximate sky position from a,b,c,d only (no Δα0/Δδ0)
+                _tpd_ra, _tpd_dec = plane_project_inverse(
+                    r_blk[0]*x_c + r_blk[1]*y_c,
+                    r_blk[2]*x_c + r_blk[3]*y_c,
+                    ra0_k, dec0_k, ps_k)
+            _dxdra0, _dxddec0, _dydra0, _dyddec0 = plane_project_tangent_derivs(
+                _tpd_ra, _tpd_dec, ra0_k, dec0_k, ps_k)
             if _poly1:
-                # y_obs = X_mat @ r_blk for poly_order=1 without allocating X_mat
-                y_obs = np.array([r_blk[0]*x_c + r_blk[1]*y_c + r_blk[4],
-                                  r_blk[2]*x_c + r_blk[3]*y_c + r_blk[5]])
+                y_obs = np.array([
+                    r_blk[0]*x_c + r_blk[1]*y_c
+                    + float(_dxdra0)*r_blk[4] + float(_dxddec0)*r_blk[5],
+                    r_blk[2]*x_c + r_blk[3]*y_c
+                    + float(_dydra0)*r_blk[4] + float(_dyddec0)*r_blk[5],
+                ])
                 X_mat = None   # reconstructed in _build_system
             else:
-                X_mat = build_X_matrix(x_c, y_c, 0., 0., 0., 0., poly_order=poly_order)
+                X_mat = build_X_matrix(x_c, y_c,
+                                       float(_dxdra0), float(_dxddec0),
+                                       float(_dydra0), float(_dyddec0),
+                                       poly_order=poly_order)
                 y_obs = X_mat @ r_blk
             det_data.append({
                 'sname':      sname,
@@ -2700,6 +2971,10 @@ def _measure_astrometry_proper(
                 'x_c':        x_c,
                 'y_c':        y_c,
                 'X_mat':      X_mat,
+                'dxdra0':     float(_dxdra0),
+                'dxddec0':    float(_dxddec0),
+                'dydra0':     float(_dydra0),
+                'dyddec0':    float(_dyddec0),
                 'y_obs':      y_obs,
                 'epoch_yr':   2000.0 + (float(d['epoch_mjd']) - _MJD_J2000) / MJD_YR,
                 'epoch_mjd':  float(d['epoch_mjd']),
@@ -2724,13 +2999,6 @@ def _measure_astrometry_proper(
             return base_row
 
         # ── Reference sky position ────────────────────────────────────────────
-        # Per-image tangent-plane metadata (ra0, dec0, pscale) matching BP3M.
-        # sub_img_meta maps sub-image name → (ra0_deg, dec0_deg, pscale_mas).
-        _meta = sub_img_meta or {}
-
-        def _img_meta(sname: str) -> tuple[float, float, float]:
-            return _meta.get(sname, (ra0_field, dec0_field, pscale))
-
         if has_gaia:
             ref_ra, ref_dec = ra_g, dec_g
         else:
@@ -2849,8 +3117,14 @@ def _measure_astrometry_proper(
             # X_mat array: for poly_order=1 reconstruct from x_c/y_c (no alloc in loop)
             if poly_order == 1:
                 X_arr = np.zeros((N, 2, n_r))
-                X_arr[:, 0, 0] = x_c_arr;  X_arr[:, 0, 1] = y_c_arr;  X_arr[:, 0, 4] = 1.
-                X_arr[:, 1, 2] = x_c_arr;  X_arr[:, 1, 3] = y_c_arr;  X_arr[:, 1, 5] = 1.
+                X_arr[:, 0, 0] = x_c_arr;  X_arr[:, 0, 1] = y_c_arr
+                X_arr[:, 1, 2] = x_c_arr;  X_arr[:, 1, 3] = y_c_arr
+                if n_r > 4:
+                    # Columns 4,5 are tangent-point derivatives (px/mas), not unit shifts.
+                    X_arr[:, 0, 4] = np.array([da['dxdra0']  for da in ddata])
+                    X_arr[:, 0, 5] = np.array([da['dxddec0'] for da in ddata])
+                    X_arr[:, 1, 4] = np.array([da['dydra0']  for da in ddata])
+                    X_arr[:, 1, 5] = np.array([da['dyddec0'] for da in ddata])
             else:
                 X_arr = np.array([da['X_mat'] for da in ddata])  # (N, 2, n_r)
 
@@ -3566,6 +3840,7 @@ def run_hst_crossmatch(
     phase4_outlier_sigma: float = 3.5,
     cycle_id: int = 0,
     zp_max_corr: Optional[float] = None,
+    stop_after_gaia_residuals: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """
     Run the full HST cross-match pipeline for a field.
@@ -3700,6 +3975,14 @@ def run_hst_crossmatch(
         anchor_gaia_ids=_v1_anchor_ids,
         search_radius_px=50.0, n_candidates=5)
 
+    # ── Post-Phase-2: per-image Gaia match residual summary ──────────────────
+    _print_all_gaia_residuals(det_df, gaia_csv=gaia_csv,
+                              v1_bp3m_dir=_anchor_dir)
+
+    if stop_after_gaia_residuals:
+        print("\n  [--stop_after_gaia_residuals] Stopping after Phase 2 residuals.")
+        return {}
+
     # ── Phase 3: within-filter matching ──────────────────────────────────────
     print("\nPhase 3: Within-filter cross-matching ...")
     filter_masters = _within_filter_match(
@@ -3795,22 +4078,38 @@ def run_hst_crossmatch(
                                          .loc[saved_names]
                                          .reset_index())
 
-            # Build r_hat array from image_transformations.csv
-            # Base 8 params; higher-order coefficients saved as r_8, r_9, … when poly_order > 1
-            _r_base_cols = ['a', 'b', 'c', 'd', 'w', 'z', 'delta_ra0_mas', 'delta_dec0_mas']
-            _r_extra_cols = [f'r_{k}' for k in range(8, n_r4)]
+            # Build r_hat array from image_transformations.csv.
+            # With rolling re-linearization, r_j[4:6] were reset to 0 at convergence
+            # and the offset is encoded in ra0_final.  Zero them here; ra0_init4
+            # will use ra0_final as the tangent point (same fix as Phase 0 above).
+            _r_base_cols = ['a', 'b', 'c', 'd']
+            _r_extra_cols = [f'r_{k}' for k in range(6, n_r4)]
+            _uses_ra0_final4: set[str] = set()
+            ra0_init4: dict[str, tuple[float, float]] = {}
+            for _r4 in transform_df4.itertuples():
+                _ra0f4  = float(getattr(_r4, 'ra0_final',      np.nan))
+                _dec0f4 = float(getattr(_r4, 'dec0_final',     np.nan))
+                if np.isfinite(_ra0f4) and np.isfinite(_dec0f4):
+                    ra0_init4[_r4.image_name] = (_ra0f4, _dec0f4)
+                    _uses_ra0_final4.add(_r4.image_name)
             r_hat4_blocks = []
             for row in transform_df4.itertuples():
                 r_base  = np.array([getattr(row, p) for p in _r_base_cols])
+                _use_fin = row.image_name in _uses_ra0_final4
+                dra0  = 0.0 if _use_fin else float(getattr(row, 'delta_ra0_mas',  0.0))
+                ddec0 = 0.0 if _use_fin else float(getattr(row, 'delta_dec0_mas', 0.0))
                 r_extra = np.array([getattr(row, c, 0.0) for c in _r_extra_cols])
-                r_hat4_blocks.append(np.concatenate([r_base, r_extra]))
+                r_hat4_blocks.append(np.concatenate([r_base, [dra0, ddec0], r_extra]))
             r_hat4 = np.concatenate(r_hat4_blocks)
             image_names4 = transform_df4['image_name'].tolist()
 
             # Build per-sub-image metadata: sub_name → (ra0_deg, dec0_deg, pscale_mas)
             # transformation.csv is per obs_id directory; both _hi and _lo chips share it.
+            # Per-chip ra0/dec0 from ra0_init4 override the combined-image ra_cen for
+            # _hi/_lo sub-images so the design matrix matches the solver convention.
             hst_root4 = field_dir / 'HST' / 'mastDownload' / 'HST'
             sub_img_meta4: dict[str, tuple[float, float, float]] = {}
+            sub_img_xoyo4: dict[str, tuple[float, float]] = {}
             pscale4 = 50.0  # ACS/WFC default; overwritten per image below
             for img_dir4 in sorted(hst_root4.iterdir()):
                 t4 = img_dir4 / 'transformation.csv'
@@ -3822,16 +4121,38 @@ def run_hst_crossmatch(
                         ra4   = float(tdf4['ra_cen'])
                         dec4  = float(tdf4['dec_cen'])
                         ps4   = float(tdf4['pixel_scale']) * 1000.0  # arcsec → mas
+                        xo4   = float(tdf4['x_cen']) if 'x_cen' in tdf4.index else 2048.0
+                        yo4   = float(tdf4['y_cen']) if 'y_cen' in tdf4.index else 2048.0
                     except (KeyError, ValueError):
                         tdf4 = pd.read_csv(t4)
                         ra4   = float(tdf4['ra_cen'].iloc[0])
                         dec4  = float(tdf4['dec_cen'].iloc[0])
                         ps4   = float(tdf4['pixel_scale'].iloc[0]) * 1000.0
+                        xo4   = float(tdf4['x_cen'].iloc[0]) if 'x_cen' in tdf4.columns else 2048.0
+                        yo4   = float(tdf4['y_cen'].iloc[0]) if 'y_cen' in tdf4.columns else 2048.0
                     pscale4 = ps4  # remember last valid pscale as fallback
                     base4 = img_dir4.name
-                    for sfx in ('_hi', '_lo', ''):
-                        sub_img_meta4[base4 + sfx] = (ra4, dec4, ps4)
+
+                    # Per-chip Xo/Yo from FITS catalog header (CHIP{n}_CRPIX_GDC)
+                    cat4 = img_dir4 / f'{base4}_flc_catalog.fits'
+                    _cp_lo4, _cp_hi4 = _read_chip_xoyo(cat4)
+
                     sub_img_meta4[base4] = (ra4, dec4, ps4)
+                    sub_img_xoyo4[base4] = (xo4, yo4)
+                    for sfx in ('_hi', '_lo', ''):
+                        sname4 = base4 + sfx
+                        if sname4 in ra0_init4:
+                            ra4_s, dec4_s = ra0_init4[sname4]
+                        else:
+                            ra4_s, dec4_s = ra4, dec4
+                        sub_img_meta4[sname4] = (ra4_s, dec4_s, ps4)
+                        # Use per-chip Xo/Yo if available; fall back to image centre
+                        if sfx == '_lo' and _cp_lo4 is not None:
+                            sub_img_xoyo4[sname4] = (_cp_lo4['Xo'], _cp_lo4['Yo'])
+                        elif sfx == '_hi' and _cp_hi4 is not None:
+                            sub_img_xoyo4[sname4] = (_cp_hi4['Xo'], _cp_hi4['Yo'])
+                        else:
+                            sub_img_xoyo4[sname4] = (xo4, yo4)
                 except Exception:
                     pass
 
@@ -3888,6 +4209,7 @@ def run_hst_crossmatch(
                 dec0_field       = dec0_field,
                 pscale           = pscale4,
                 sub_img_meta     = sub_img_meta4,
+                sub_img_xoyo     = sub_img_xoyo4,
                 gaia_df          = gaia_df,
                 outlier_sigma    = phase4_outlier_sigma,
                 _det_lookup      = _shared_det_lookup,
@@ -3914,6 +4236,7 @@ def run_hst_crossmatch(
                 n_r             = n_r4,
                 poly_order      = poly_order4,
                 sub_img_meta    = sub_img_meta4,
+                sub_img_xoyo    = sub_img_xoyo4,
                 ra0_field       = ra0_field,
                 dec0_field      = dec0_field,
                 pscale          = pscale4,
@@ -3966,7 +4289,9 @@ def run_hst_crossmatch(
                             image_names=_p4['image_names'], n_r=_p4['n_r'],
                             poly_order=_p4['poly_order'], ra0_field=_p4['ra0_field'],
                             dec0_field=_p4['dec0_field'], pscale=_p4['pscale'],
-                            sub_img_meta=_p4['sub_img_meta'], gaia_df=gaia_df,
+                            sub_img_meta=_p4['sub_img_meta'],
+                            sub_img_xoyo=_p4.get('sub_img_xoyo'),
+                            gaia_df=gaia_df,
                             outlier_sigma=phase4_outlier_sigma,
                             _det_lookup=_p4.get('det_lookup'),
                             _tele_xyz_cache=_p4.get('tele_xyz_cache'),
@@ -4080,6 +4405,7 @@ def run_hst_crossmatch(
                         dec0_field      = _p4['dec0_field'],
                         pscale          = _p4['pscale'],
                         sub_img_meta    = _p4['sub_img_meta'],
+                        sub_img_xoyo    = _p4.get('sub_img_xoyo'),
                         _det_lookup     = _p4.get('det_lookup'),
                         _tele_xyz_cache = _p4.get('tele_xyz_cache'),
                         _src_detections = None,  # different column structure for pass2
@@ -4693,6 +5019,192 @@ def _plot_cmds(combined_df: pd.DataFrame, gaia_df: Optional[pd.DataFrame],
     # Hist2d colorbar
     if last_h2d is not None:
         last_h2_k = max(k for k in range(n_pairs) if axes_h2[k].get_visible())
+        fig.colorbar(last_h2d, ax=axes_h2[last_h2_k],
+                     label='N', fraction=0.046, pad=0.04)
+
+    if title:
+        fig.suptitle(title, y=1.01)
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _plot_color_color(combined_df: pd.DataFrame, gaia_df: Optional[pd.DataFrame],
+                      output_path: Path, title: str = '') -> None:
+    """All pairwise colour-colour panels from available HST filters plus Gaia.
+
+    For the Gaia panel (always first when available): x = BP−G, y = G−RP.
+    For each triplet of bands (i < j < k by effective wavelength), plots
+    (band_i − band_j) on x vs (band_j − band_k) on y.
+
+    ``gaia_df`` must have columns ``source_id``, ``gmag``, ``bpmag``, ``rpmag``
+    (the latter two are used to compute BP−G and G−RP independently).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    _WL: dict[str, float] = {
+        'F225W': 237, 'F275W': 271, 'F300X': 282, 'F336W': 336,
+        'F390W': 392, 'F435W': 432, 'F438W': 438, 'F475W': 476,
+        'F555W': 531, 'F606W': 592, 'F600LP': 747, 'F625W': 626,
+        'F775W': 764, 'F814W': 803, 'F850LP': 918,
+        'G': 673,
+    }
+
+    def _wl(band: str) -> float:
+        if band in _WL:
+            return _WL[band]
+        import re
+        m = re.search(r'(\d{3,4})', band)
+        return float(m.group(1)) if m else 1000.0
+
+    # ── Collect HST magnitude arrays ─────────────────────────────────────────
+    mag_cols    = sorted(c for c in combined_df.columns if c.startswith('mag_wmean_'))
+    band_labels = [c.replace('mag_wmean_', '') for c in mag_cols]
+    mags: dict[str, np.ndarray] = {
+        lbl: combined_df[col].values.astype(float)
+        for lbl, col in zip(band_labels, mag_cols)
+    }
+
+    # Optionally add Gaia G band (same logic as _plot_cmds)
+    g_added = False
+    if gaia_df is not None and 'gaia_source_id' in combined_df.columns:
+        gdf_lower = gaia_df.rename(columns=str.lower)
+        sids = combined_df['gaia_source_id'].values
+        if 'gmag' in gdf_lower.columns and 'source_id' in gdf_lower.columns:
+            g_lookup = gdf_lower.set_index('source_id')['gmag']
+            g_vals = np.where(sids != 0,
+                              pd.Series(sids).map(g_lookup).values.astype(float),
+                              np.nan)
+            if np.isfinite(g_vals).sum() > 10:
+                mags['G'] = g_vals
+                band_labels.append('G')
+                g_added = True
+    if not g_added and 'gaia_gmag' in combined_df.columns:
+        g_vals = combined_df['gaia_gmag'].values.astype(float)
+        if np.isfinite(g_vals).sum() > 10:
+            mags['G'] = g_vals
+            band_labels.append('G')
+            g_added = True
+
+    bands = sorted(band_labels, key=_wl)
+    n = len(bands)
+    if n < 3:
+        return  # need at least 3 bands for any colour-colour panel
+
+    # ── Build Gaia BP-G and G-RP arrays (Gaia-only colour-colour first panel) ─
+    bp_g_vals: Optional[np.ndarray] = None
+    g_rp_vals: Optional[np.ndarray] = None
+    if gaia_df is not None and 'gaia_source_id' in combined_df.columns:
+        gdf_lower = gaia_df.rename(columns=str.lower)
+        sids = combined_df['gaia_source_id'].values
+        has_bp = 'bpmag' in gdf_lower.columns
+        has_rp = 'rpmag' in gdf_lower.columns
+        if g_added and has_bp and has_rp and 'source_id' in gdf_lower.columns:
+            idx = gdf_lower.set_index('source_id')
+            bp_lookup = idx['bpmag']
+            rp_lookup = idx['rpmag']
+            bp_vals = np.where(sids != 0,
+                               pd.Series(sids).map(bp_lookup).values.astype(float),
+                               np.nan)
+            rp_vals = np.where(sids != 0,
+                               pd.Series(sids).map(rp_lookup).values.astype(float),
+                               np.nan)
+            g_arr = mags['G']
+            _bp_g = bp_vals - g_arr   # positive for red stars
+            _g_rp = g_arr  - rp_vals  # positive for red stars
+            if np.isfinite(_bp_g).sum() > 10 and np.isfinite(_g_rp).sum() > 10:
+                bp_g_vals = _bp_g
+                g_rp_vals = _g_rp
+
+    # ── Build panel list ──────────────────────────────────────────────────────
+    # Each entry: (x_label, y_label, x_vals, y_vals, ok_mask)
+    panel_data = []
+
+    if bp_g_vals is not None and g_rp_vals is not None:
+        ok = np.isfinite(bp_g_vals) & np.isfinite(g_rp_vals)
+        if ok.sum() >= 2:
+            panel_data.append(('BP−G', 'G−RP', bp_g_vals, g_rp_vals, ok))
+
+    # All triplets (i, j, k) with i < j < k
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                bi, bj, bk = bands[i], bands[j], bands[k]
+                c_x = mags[bi] - mags[bj]
+                c_y = mags[bj] - mags[bk]
+                ok  = np.isfinite(c_x) & np.isfinite(c_y)
+                if ok.sum() < 2:
+                    continue
+                xlabel = f'{bi}−{bj}'
+                ylabel = f'{bj}−{bk}'
+                panel_data.append((xlabel, ylabel, c_x, c_y, ok))
+
+    n_panels = len(panel_data)
+    if n_panels == 0:
+        return
+
+    ncols       = min(4, n_panels)
+    nrows_sc    = (n_panels + ncols - 1) // ncols
+    nrows_total = 2 * nrows_sc
+
+    fig, axes = plt.subplots(nrows_total, ncols,
+                             figsize=(4 * ncols, 4 * nrows_total),
+                             squeeze=False)
+    axes_sc = axes[:nrows_sc].ravel()
+    axes_h2 = axes[nrows_sc:].ravel()
+    for _ax in axes.ravel():
+        _ax.set_facecolor('#e8e8e8')
+
+    panel_xlim: dict[int, tuple[float, float]] = {}
+    panel_ylim: dict[int, tuple[float, float]] = {}
+
+    for k, (xlabel, ylabel, c_x, c_y, ok) in enumerate(panel_data):
+        ax = axes_sc[k]
+        ax.scatter(c_x[ok], c_y[ok], s=1.5, alpha=0.35,
+                   color='steelblue', rasterized=True)
+        cx_lo, cx_hi = np.percentile(c_x[ok], [0.5, 99.5])
+        cy_lo, cy_hi = np.percentile(c_y[ok], [0.5, 99.5])
+        pad_x = 0.25 * (cx_hi - cx_lo) if cx_hi > cx_lo else 0.5
+        pad_y = 0.25 * (cy_hi - cy_lo) if cy_hi > cy_lo else 0.5
+        xlim = (cx_lo - pad_x, cx_hi + pad_x)
+        ylim = (cy_lo - pad_y, cy_hi + pad_y)
+        ax.set_xlim(*xlim); ax.set_ylim(*ylim)
+        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+        panel_xlim[k] = xlim
+        panel_ylim[k] = ylim
+
+    for k in range(n_panels, len(axes_sc)):
+        axes_sc[k].set_visible(False)
+        axes_h2[k].set_visible(False)
+
+    last_h2d = None
+    for k, (xlabel, ylabel, c_x, c_y, ok) in enumerate(panel_data):
+        ax = axes_h2[k]
+        xlim = panel_xlim[k]
+        ylim = panel_ylim[k]
+        xlo, xhi = min(xlim), max(xlim)
+        ylo, yhi = min(ylim), max(ylim)
+        if xhi <= xlo or yhi <= ylo:
+            ax.set_visible(False)
+            continue
+        _, _, _, img = ax.hist2d(
+            c_x[ok], c_y[ok], bins=80,
+            range=[[xlo, xhi], [ylo, yhi]],
+            norm=LogNorm(vmin=1), cmap='viridis', rasterized=True)
+        ax.set_xlim(*xlim); ax.set_ylim(*ylim)
+        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+        last_h2d = img
+
+    for k in range(n_panels):
+        for ax in (axes_sc[k], axes_h2[k]):
+            if ax.get_visible():
+                ax.grid(True, which='major', lw=0.4, alpha=0.5)
+                ax.grid(True, which='minor', lw=0.2, alpha=0.3, linestyle=':')
+                ax.minorticks_on()
+
+    if last_h2d is not None:
+        last_h2_k = max(k for k in range(n_panels) if axes_h2[k].get_visible())
         fig.colorbar(last_h2d, ax=axes_h2[last_h2_k],
                      label='N', fraction=0.046, pad=0.04)
 

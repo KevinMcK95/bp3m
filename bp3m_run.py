@@ -163,6 +163,38 @@ def _parse_args():
     psf.add_argument('--sat_threshold', type=float, default=None,
                      help='Saturation DN threshold (default 60000)')
 
+    # ── Gaia DR4 epoch astrometry (Step 4b) ──────────────────────────────────
+    dr4 = p.add_argument_group('Gaia DR4 epoch astrometry (Step 4b, optional)')
+    dr4.add_argument('--use_gaia_dr4_epoch', action='store_true',
+                     help='Download Gaia DR4 epoch astrometry for cross-matched sources '
+                          'and re-solve 5D parameters with gaiasupdate. Requires the '
+                          'gaiasupdate package (pip install gaiasupdate) and a working '
+                          'ESA DataLink connection (or --dr4_prerelease_votable for '
+                          'offline testing with the ESA pre-release sample).')
+    dr4.add_argument('--dr4_access', type=str, default='datalink',
+                     choices=['datalink', 'prerelease'],
+                     help='Epoch data access method: datalink (default, requires ESA '
+                          'credentials for non-public releases) or prerelease (local '
+                          'VOTable, set --dr4_prerelease_votable).')
+    dr4.add_argument('--dr4_prerelease_votable', type=str, default=None,
+                     help='Path to the ESA pre-release epoch astrometry VOTable '
+                          '(required when --dr4_access=prerelease).')
+    dr4.add_argument('--dr4_data_release', type=str, default='Gaia DR4',
+                     help='DataLink data-release string (default "Gaia DR4"; use '
+                          '"Gaia DR4_INT4" for the internal pre-release).')
+    dr4.add_argument('--dr4_credentials', type=str, default=None,
+                     help='Path to ESA archive credentials file (for DataLink access).')
+    dr4.add_argument('--dr4_model', type=str, default='5p_single_source',
+                     choices=['5p_single_source', '3p_single_source_without_offsets',
+                              '6p_constrained_colour', '6p_perspective_acceleration'],
+                     help='gaiasupdate astrometric model for epoch re-solve '
+                          '(default 5p_single_source).')
+    dr4.add_argument('--dr4_no_replace_pms', action='store_true',
+                     help='Store epoch solutions as extra columns but do NOT replace '
+                          'pmra/pmdec/parallax priors in the solver.')
+    dr4.add_argument('--force_rerun_dr4_epoch', action='store_true',
+                     help='Re-download and re-solve even if epoch cache exists.')
+
     # ── Cross-matching ────────────────────────────────────────────────────────
     xm = p.add_argument_group('Cross-matching (fast_cross_match)')
     xm.add_argument('--cross_match_pix_floor', type=float, default=0.05,
@@ -177,6 +209,10 @@ def _parse_args():
                     help='Half-width of the offset histogram search during 4P discovery in pixels (default 50)')
     xm.add_argument('--no_resid_floor', action='store_true',
                     help='Disable the per-iteration empirical residual covariance floor during affine refinement')
+    xm.add_argument('--no_qso_anchors', action='store_true',
+                    help='Skip QSO anchor vetting (Quaia + MILLIQUAS cross-match + '
+                         'astrometric cut). By default QSO vetting runs after cross-matching '
+                         'and saves {field}/Gaia/{field}_qso_anchors.csv for pop-fit.')
 
     # ── Alignment (BP3M) ──────────────────────────────────────────────────────
     bp = p.add_argument_group('Bayesian alignment (BP3M)')
@@ -203,6 +239,10 @@ def _parse_args():
                          'Only applies when --no_split_ccd is not set. (default: 20)')
     bp.add_argument('--no_inflate_hst_errors', action='store_true',
                     help='Disable per-image HST error inflation (default: inflation enabled)')
+    bp.add_argument('--no_align_prior', action='store_true',
+                    help='Disable the alignment parameter prior (a,b,c,d,delta_ra0,delta_dec0). '
+                         'Sets the prior precision to zero so posteriors are determined entirely '
+                         'by the data. Useful for diagnosing prior-driven biases.')
     bp.add_argument('--bp3m_pos_err_floor', type=float, default=5e-3,
                     help='Minimum HST position uncertainty floor in pixels before BP3M '
                          '(default 0.001 px; prevents numerically unstable residuals for '
@@ -236,6 +276,13 @@ def _parse_args():
     bp.add_argument('--bp3m_min_stars', type=int, default=0,
                     help='Exclude images with fewer than this many Gaia cross-matched '
                          'stars from BP3M (default: 0 = keep all images)')
+    bp.add_argument('--fit_indv_images_only', action='store_true',
+                    help='Run BP3M separately on each image and save results in '
+                         'BP3M_indv_results/{image_name}/. Skips the joint multi-image fit.')
+    bp.add_argument('--exclude_2p_from_alignment', action='store_true',
+                    help='Exclude Gaia 2-parameter (position-only) stars from the '
+                         'image-transformation alignment; images with too few non-2p '
+                         'stars are dropped entirely')
 
     # ── Synthetic tests ───────────────────────────────────────────────────────
     syn = p.add_argument_group('Synthetic tests (requires completed cross-match, Step 4)')
@@ -687,7 +734,62 @@ def main():
             use_resid_floor=not args.no_resid_floor,
             force_rematch=args.force_rematch,
             restrict_to_obsids=_restrict,
+            lib_dir=Path(args.lib_dir) if args.lib_dir else None,
+            run_qso_vetting=not args.no_qso_anchors,
         )
+
+    # ── Step 4b: Gaia DR4 epoch astrometry (optional) ────────────────────────
+    _gaia_epoch_obs_for_solver: dict | None = None
+
+    if getattr(args, 'use_gaia_dr4_epoch', False):
+        from bp3m.pipeline.download_gaia_epoch import (
+            collect_matched_source_ids,
+            download_epoch_astrometry,
+            prepare_epoch_obs_for_solver,
+            merge_epoch_solutions_into_catalog,
+        )
+        import glob as _glob
+        import pandas as _pd
+        print("\n" + "=" * 55)
+        print("Step 4b: Gaia DR4 epoch astrometry")
+        print("=" * 55)
+
+        matched_sids = collect_matched_source_ids(output_dir)
+        print(f"  Cross-matched sources: {len(matched_sids)}")
+
+        # epoch cache is stored at output_dir/Gaia/epoch (without field),
+        # matching the path used by run_gaia_dr4_epoch
+        epoch_dir = output_dir / "Gaia" / "epoch"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+
+        epoch_data = download_epoch_astrometry(
+            matched_sids,
+            epoch_cache_dir=epoch_dir,
+            access=args.dr4_access,
+            prerelease_votable=args.dr4_prerelease_votable,
+            data_release=args.dr4_data_release,
+            credentials_file=args.dr4_credentials,
+            n_workers=min(args.n_processes, 8) if args.n_processes > 0 else 4,
+            force=args.force_rerun_dr4_epoch,
+        )
+        print(f"  Epoch data available: {len(epoch_data)} sources")
+
+        if epoch_data:
+            # Load the Gaia summary catalog to extract AGIS PM+parallax values
+            _gaia_csvs = sorted(_glob.glob(
+                str(output_dir / field / "Gaia" / "*_gaia.csv")
+            ))
+            if _gaia_csvs:
+                _gdf = _pd.read_csv(_gaia_csvs[-1])
+                _gdf["source_id"] = _gdf["source_id"].astype("int64")
+                _gaia_epoch_obs_for_solver = prepare_epoch_obs_for_solver(
+                    epoch_data, _gdf,
+                )
+                n_ep = len(_gaia_epoch_obs_for_solver)
+                print(f"  Precomputed AL obs for {n_ep} sources "
+                      f"(will be injected into BP3M solve)")
+            else:
+                print("  WARNING: no *_gaia.csv found — cannot prepare AL obs")
 
     # ── Step 5a: Synthetic data generation (optional) ─────────────────────────
 
@@ -741,7 +843,84 @@ def main():
     if not args.skip_alignment:
         from bp3m.pipeline.run_alignment import run_alignment
 
-        if args.test_synthetic:
+        if args.fit_indv_images_only:
+            # Discover the filtered image list (mirrors run_alignment's filtering).
+            from bp3m.data_loader_flc import load_image_data_flc
+            from bp3m.data_loader import build_index_maps
+
+            _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
+                output_dir, field, pos_err_floor=args.bp3m_pos_err_floor)
+            _, _indv_names, _ = build_index_maps(_spi_all, _gaia_all)
+
+            if _bp3m_images is not None:
+                _req = set(_bp3m_images)
+                _indv_names = [n for n in _indv_names if n in _req]
+            if args.bp3m_remove_images:
+                _drop = set(args.bp3m_remove_images)
+                _indv_names = [n for n in _indv_names if n not in _drop]
+            if args.restrict_filters:
+                _kf = {f.upper() for f in args.restrict_filters}
+                _indv_names = [n for n in _indv_names
+                               if _imgs_all[n].get('filter', '').upper() in _kf]
+            if args.restrict_instdet:
+                _kid = {s.upper() for s in args.restrict_instdet}
+                _indv_names = [
+                    n for n in _indv_names
+                    if (_imgs_all[n].get('instrument', '') +
+                        _imgs_all[n].get('detector', '')).upper() in _kid
+                ]
+            if args.bp3m_min_stars > 0:
+                _indv_names = [n for n in _indv_names
+                               if len(_spi_all[n]) >= args.bp3m_min_stars]
+
+            _indv_root = output_dir / field / "BP3M_indv_results"
+            print("\n" + "─"*50)
+            print(f"Individual image fitting: {len(_indv_names)} images")
+            print(f"Output: {_indv_root}")
+            print("─"*50)
+
+            _n_ok, _n_fail = 0, 0
+            for _img in _indv_names:
+                print(f"\n  ── {_img} ──")
+                try:
+                    run_alignment(
+                        output_dir=output_dir, field_name=field,
+                        n_iter=args.n_bp3m_iter,
+                        n_samples=args.n_samples,
+                        mcmc_posteriors=args.mcmc_posteriors,
+                        clip_sigma=args.bp3m_clip_sigma,
+                        poly_order=args.poly_order,
+                        split_ccd=not args.no_split_ccd,
+                        min_stars_split_ccd=args.min_stars_split_ccd,
+                        inflate_hst_errors=not args.no_inflate_hst_errors,
+                        use_sparse=args.sparse,
+                        no_plots=args.no_plots,
+                        images=[_img],
+                        remove_images=None,
+                        restrict_filters=None,
+                        restrict_instdet=None,
+                        bp3m_min_stars=0,
+                        checkpoint_dir=None,
+                        use_influence_clip=not args.no_influence_clip,
+                        influence_d_thresh=args.influence_d_thresh,
+                        influence_sigma_min=args.influence_sigma_min,
+                        use_two_tier=args.two_tier,
+                        no_align_prior=args.no_align_prior,
+                        pos_err_floor=args.bp3m_pos_err_floor,
+                        plot_residuals=args.plot_residuals,
+                        plot_influence=args.plot_influence,
+                        bp3m_dir=_indv_root / _img,
+                    )
+                    _n_ok += 1
+                except Exception as _exc:
+                    import traceback as _tb
+                    print(f"  WARNING: {_img} failed: {_exc}")
+                    _tb.print_exc()
+                    _n_fail += 1
+
+            print(f"\nIndividual fitting complete: {_n_ok} succeeded, {_n_fail} failed")
+
+        elif args.test_synthetic:
             # Run BP3M on the synthetic directory tree.
             # The synthetic data lives at {output_dir}/{field}/{syn_name}/,
             # so we pass output_dir={output_dir}/{field} and field_name=syn_name.
@@ -771,9 +950,12 @@ def main():
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,
                 use_two_tier=args.two_tier,
+                no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
+                use_qso_anchors=not args.no_qso_anchors,
+                exclude_2p_from_alignment=args.exclude_2p_from_alignment,
             )
             # ── Step 5b: Compare synthetic results to truth ────────────────────
             print("\n" + "=" * 55)
@@ -821,9 +1003,13 @@ def main():
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,
                 use_two_tier=args.two_tier,
+                no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
+                use_qso_anchors=not args.no_qso_anchors,
+                gaia_epoch_obs=_gaia_epoch_obs_for_solver,
+                exclude_2p_from_alignment=args.exclude_2p_from_alignment,
             )
 
     # Save the command only on successful completion so interrupted runs

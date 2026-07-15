@@ -217,7 +217,14 @@ def split_images_by_ccd(images, stars_per_image, min_stars_per_ccd: int = 20):
             sub_df = df[mask].reset_index(drop=True)
             if len(sub_df) == 0:
                 continue
-            new_images[img + suffix] = dict(meta)
+            sub_meta = dict(meta)
+            cp = meta.get(f"chip_pointing{suffix}")  # chip_pointing_lo / _hi
+            if cp is not None:
+                sub_meta["ra0"]  = cp["ra0"]
+                sub_meta["dec0"] = cp["dec0"]
+                sub_meta["Xo"]   = cp["Xo"]
+                sub_meta["Yo"]   = cp["Yo"]
+            new_images[img + suffix] = sub_meta
             new_spi[img + suffix]    = sub_df
 
     return new_images, new_spi

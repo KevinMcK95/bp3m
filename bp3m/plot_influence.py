@@ -163,7 +163,7 @@ def _plot_cooks_d(df, image_names, top_n, output_dir):
 
 def _plot_param_influence(df, image_names, n_images, output_dir):
     infl_cols = [c for c in df.columns if c.startswith("infl_") and
-                 c[5:] in ("a", "b", "c", "d", "w", "z")]
+                 c[5:] in ("a", "b", "c", "d", "Δα0", "Δδ0")]
     if not infl_cols:
         return
 
