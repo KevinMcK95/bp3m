@@ -968,6 +968,11 @@ class BP3MSolver:
             if d is None or K_img[img] is None:
                 continue
             use  = d["use_for_fit"]
+            # The Schur correction K^T C_v K must use the same star set as
+            # H_rr (XCsX).  When 2p stars are excluded from alignment, K must
+            # also exclude them so the Schur complement remains consistent.
+            if self.exclude_2p_from_alignment:
+                use = use & ~self.gaia_2p[d["sidx"]]
             sidx = d["sidx"][use]
             K    = K_img[img][use]
 
@@ -986,6 +991,8 @@ class BP3MSolver:
                 if d2 is None or K_img[img2] is None:
                     continue
                 use2 = d2["use_for_fit"]
+                if self.exclude_2p_from_alignment:
+                    use2 = use2 & ~self.gaia_2p[d2["sidx"]]
                 sidx2 = d2["sidx"][use2]
                 K2    = K_img[img2][use2]
 
