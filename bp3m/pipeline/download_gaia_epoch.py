@@ -977,25 +977,24 @@ def generate_synthetic_epoch_data(
     n_ccd_per_transit: int = 9,
     ref_epoch_jyear: float = DR4_REF_EPOCH_JYEAR,
     mission_start_jyear: float = 2014.5,
-    mission_end_jyear: float = 2017.5,
-    agis_source_excess_noise: float = 0.0,
+    mission_end_jyear: float = 2019.5,
     rejection_fraction: float = 0.05,
     seed: int = 42,
 ) -> dict[int, pd.DataFrame]:
     """Generate synthetic Gaia DR4 epoch astrometry for end-to-end pipeline tests.
 
     Creates per-CCD AL observations consistent with the model expected by
-    prepare_epoch_obs_for_solver().  The ``centroid_pos_al`` values are AGIS
-    residuals relative to the input catalog solution (the "true" parameters equal
-    the catalog parameters, so the signal is zero and the data are pure noise).
-    ``centroid_pos_error_al`` is set to the same σ used to draw the noise,
-    ensuring the solver sees realistic self-consistent weights.
+    prepare_epoch_obs_for_solver().  The ``centroid_pos_al`` values start as pure
+    Gaussian noise drawn at the formal CCD precision σ_AL (from G magnitude).
+    No AGIS excess noise is added; ``agis_source_excess_noise`` is set to 0.
 
-    To inject a signal (test recovery of a perturbation), supply a source_df
-    whose ``pmra``/``pmdec``/``parallax`` differ from the truth you want to
-    recover — the caller adds the AL signal externally after calling this function,
-    or uses the returned DataFrames directly and relies on the BP3M prior update
-    (zeroing the Gaia catalog prior) to measure the departure.
+    To build a self-consistent synthetic catalog, call
+    ``compute_epoch_catalog_solutions`` after injecting truth signal.  That
+    function solves the 5-parameter AGIS normal equations from the epoch data and
+    updates both the epoch DataFrames and the Gaia catalog DataFrame so that the
+    catalog values are EXACTLY what the epoch solve recovers.  This guarantees that
+    replacing the Gaia summary prior with raw epoch observations produces identical
+    results.
 
     Parameters
     ----------
@@ -1006,14 +1005,11 @@ def generate_synthetic_epoch_data(
     n_transits_per_source
         Number of FoV transits per source (default 80, ~typical for DR4).
     n_ccd_per_transit
-        Number of AF CCDs per transit (1-9, default 9 = AF1-9).  One row is
-        emitted per CCD, with a slightly different obs_time_tcb (~10 s spacing).
+        Number of AF CCDs per transit (1-9, default 9 = AF1-9).
     ref_epoch_jyear
         Reference epoch for Δt in the observation model (default 2017.5).
     mission_start_jyear, mission_end_jyear
-        Observation window for random transit time draw (default 2014.5-2017.5).
-    agis_source_excess_noise
-        Source excess noise (mas) to inject into all sources (default 0.0).
+        Observation window for random transit time draw (default 2014.5–2019.5).
     rejection_fraction
         Fraction of CCD observations to mark as used_by_agis_al=False (default 5%).
     seed
@@ -1023,6 +1019,8 @@ def generate_synthetic_epoch_data(
     -------
     Dict source_id (int64) → per-CCD epoch DataFrame, compatible with
     ``prepare_epoch_obs_for_solver()`` and ``_save_epoch_cache()``.
+    centroid_pos_al = pure noise at σ_AL; call compute_epoch_catalog_solutions
+    after truth injection to get exact catalog consistency.
     """
     from bp3m.astro_utils import get_tele_position, get_parallax_factors
     from astropy.time import Time
@@ -1041,26 +1039,29 @@ def generate_synthetic_epoch_data(
         sid  = int(src.source_id)           # np.int64 → Python int, no float roundtrip
         ra   = float(src.ra)
         dec  = float(src.dec)
-        pmra  = float(src.pmra   if pd.notna(src.pmra)   else 0.0)
-        pmdec = float(src.pmdec  if pd.notna(src.pmdec)  else 0.0)
-        plx   = float(src.parallax if pd.notna(src.parallax) else 0.0)
-        gmag  = float(src.phot_g_mean_mag)
+        gmag = float(src.phot_g_mean_mag)
 
-        sigma_single_ccd = _sigma_al_from_gmag(gmag)
+        sigma_al = _sigma_al_from_gmag(gmag)
+
+        # 2p stars (no Gaia PM measurement) get 2–5 transits to reflect that Gaia
+        # could not solve the full 5-parameter system from their limited detections.
+        # 5p stars get the full n_transits_per_source.
+        pmra_val = getattr(src, 'pmra', float('nan'))
+        is_2p = not np.isfinite(float(pmra_val)) if pmra_val is not None else True
+        n_transit = int(rng.integers(2, 6)) if is_2p else n_transits_per_source
 
         # ── Generate random transit times over the mission window ─────────────
         t_jyear = rng.uniform(mission_start_jyear, mission_end_jyear,
-                              size=n_transits_per_source)
+                              size=n_transit)
         t_jyear = np.sort(t_jyear)
 
         # ── Scan angles: approximate Gaia scanning law ────────────────────────
-        # Gaia's spin period is ~6 h; over the 3-year mission each star is
-        # observed at a wide variety of scan angles.  Draw from a uniform
-        # distribution on [0°, 360°) as a first approximation.
-        theta_deg = rng.uniform(0.0, 360.0, size=n_transits_per_source)
+        # Gaia's spin period is ~6 h; over the mission each star is observed at
+        # a wide variety of scan angles.  Draw uniform on [0°, 360°).
+        theta_deg = rng.uniform(0.0, 360.0, size=n_transit)
 
         # ── Parallax factors: use Earth's position as Gaia L2 approximation ──
-        p_al_arr = np.empty(n_transits_per_source)
+        p_al_arr = np.empty(n_transit)
         for k, t_yr in enumerate(t_jyear):
             t_astropy = Time(t_yr, format="jyear")
             try:
@@ -1072,39 +1073,30 @@ def generate_synthetic_epoch_data(
                 p_al_arr[k] = float(pf_ra[0] * np.sin(theta_rad_k)
                                     + pf_dec[0] * np.cos(theta_rad_k))
             except Exception:
-                # Fall back to a simple sinusoidal approximation
                 lam_sun = np.radians(360.0 * (t_yr - 2015.0) % 360.0)
-                ra_rad  = np.radians(ra)
-                dec_rad = np.radians(dec)
-                cos_dec = np.cos(dec_rad)
+                cos_dec = np.cos(np.radians(dec))
                 p_al_arr[k] = float(
                     (-np.sin(lam_sun) * np.sin(theta_deg[k] * np.pi / 180) * cos_dec
                      + np.cos(lam_sun) * np.cos(theta_deg[k] * np.pi / 180) * cos_dec)
                 )
 
         # ── Expand each transit to n_ccd_per_transit CCD rows ─────────────────
-        # CCD times are spaced ~10 s apart within a transit (AF strip crossing time)
         ccd_time_offset_jyr = np.arange(n_ccd_per_transit) * (10.0 / (365.25 * 86400))
-        # ccd_scan_angle_offset: slight variation (~0.005°) across the focal plane
         ccd_angle_offset_deg = np.linspace(-0.005, 0.005, n_ccd_per_transit)
 
         rows = []
-        for k in range(n_transits_per_source):
+        for k in range(n_transit):
             for ccd_idx in range(n_ccd_per_transit):
-                t_ccd = t_jyear[k] + ccd_time_offset_jyr[ccd_idx]
+                t_ccd  = t_jyear[k] + ccd_time_offset_jyr[ccd_idx]
                 theta_ccd = theta_deg[k] + ccd_angle_offset_deg[ccd_idx]
-                dt_k = t_ccd - ref_epoch_jyear
-                sin_th = np.sin(np.radians(theta_ccd))
-                cos_th = np.cos(np.radians(theta_ccd))
 
-                # centroid_pos_al = a_k · (v_true − v_AGIS) + noise
-                # For the synthetic base case v_true = v_AGIS → signal = 0
-                noise = rng.normal(0.0, sigma_single_ccd)
-                centroid_al = noise
-
-                # obs_time_tcb: nanoseconds from 2010-01-01 TCB
+                # centroid_pos_al = pure noise at σ_AL.
+                # Signal is injected externally (truth injection step).
+                # After truth injection, call compute_epoch_catalog_solutions to
+                # derive exact catalog values and update centroid_pos_al to the
+                # AGIS residual relative to the epoch-solved reference.
+                noise = rng.normal(0.0, sigma_al)
                 obs_ns = int((t_ccd - 2010.0) * _NS_PER_JYEAR)
-
                 is_rejected = rng.random() < rejection_fraction
                 rows.append({
                     "source_id":                 sid,
@@ -1114,9 +1106,9 @@ def generate_synthetic_epoch_data(
                     "obs_time_tcb":              obs_ns,
                     "scan_pos_angle":            theta_ccd,
                     "parallax_factor_al":        float(p_al_arr[k]),
-                    "centroid_pos_al":           centroid_al,
-                    "centroid_pos_error_al":     sigma_single_ccd,
-                    "agis_source_excess_noise":  agis_source_excess_noise,
+                    "centroid_pos_al":           noise,
+                    "centroid_pos_error_al":     sigma_al,
+                    "agis_source_excess_noise":  0.0,
                     "used_by_agis_al":           not is_rejected,
                     "ccd_index":                 ccd_idx,
                 })
@@ -1126,3 +1118,272 @@ def generate_synthetic_epoch_data(
         result[sid] = df
 
     return result
+
+
+def compute_epoch_catalog_solutions(
+    epoch_data: dict[int, pd.DataFrame],
+    gaia_df: pd.DataFrame,
+    ref_epoch_jyear: float = DR4_REF_EPOCH_JYEAR,
+    use_agis_flag: bool = True,
+    min_transits: int = 5,
+) -> tuple[dict[int, pd.DataFrame], pd.DataFrame]:
+    """Derive exact Gaia catalog values from epoch data and update both.
+
+    Call this AFTER injecting truth signal into the epoch DataFrames.  For each
+    star, the function:
+
+    1. Reconstructs the absolute AL measurements:
+           y_k = centroid_pos_al + a_k[2:] · v_AGIS[2:]
+       where v_AGIS = (pmra, pmdec, parallax) from the original gaia_df.
+    2. Solves the 5-parameter normal equations:
+           H = A^T diag(1/σ_AL²) A
+           v_hat = H^{-1} A^T W y
+           C = H^{-1}
+    3. Updates gaia_df with (v_hat, C) — these ARE the "Gaia DR4 catalog
+       solution" for this star.
+    4. Updates centroid_pos_al in the epoch DataFrame to be the AGIS residual
+       relative to v_hat:
+           centroid_pos_al_new = y_k - a_k[2:] · v_hat[2:]
+       so that prepare_epoch_obs_for_solver (using updated gaia_df) reconstructs
+       y_k exactly, guaranteeing that the epoch H/h and the Gaia prior are
+       IDENTICALLY the same information.
+
+    Parameters
+    ----------
+    epoch_data
+        Dict source_id → per-CCD DataFrame, after truth injection.
+    gaia_df
+        Gaia summary catalog (original, before update).  Must have source_id (int64),
+        pmra, pmdec, parallax columns.
+    ref_epoch_jyear
+        Reference epoch (default 2017.5 for DR4).
+    use_agis_flag
+        Only use transits with used_by_agis_al=True for the solve (default True).
+    min_transits
+        Minimum active transits required to solve (default 5).
+
+    Returns
+    -------
+    (updated_epoch_data, updated_gaia_df)
+        updated_epoch_data : dict with centroid_pos_al rebaselined to v_hat
+        updated_gaia_df    : gaia_df with pmra/pmdec/parallax/errors/correlations
+                             replaced by the epoch-derived values for 5p stars,
+                             and ra_error/dec_error updated for 2p stars.
+    """
+    gaia_df = gaia_df.copy()
+    gaia_df["source_id"] = gaia_df["source_id"].astype(np.int64)
+
+    # Build lookup of original AGIS catalog values (pmra, pmdec, parallax).
+    # Use vectorized access — never iterrows() on numeric DataFrames.
+    _sids = gaia_df["source_id"].values
+    _pmra  = np.where(gaia_df["pmra"].notna(),     gaia_df["pmra"].values,     0.0) \
+             if "pmra"     in gaia_df.columns else np.zeros(len(gaia_df))
+    _pmdec = np.where(gaia_df["pmdec"].notna(),    gaia_df["pmdec"].values,    0.0) \
+             if "pmdec"    in gaia_df.columns else np.zeros(len(gaia_df))
+    _plx   = np.where(gaia_df["parallax"].notna(), gaia_df["parallax"].values, 0.0) \
+             if "parallax" in gaia_df.columns else np.zeros(len(gaia_df))
+    agis_orig: dict[int, tuple[float, float, float]] = {
+        int(s): (float(pm), float(pmd), float(p))
+        for s, pm, pmd, p in zip(_sids, _pmra, _pmdec, _plx)
+    }
+
+    # Also track which stars are 5p (have measured pmra)
+    _has_pmra = gaia_df["pmra"].notna().values if "pmra" in gaia_df.columns \
+                else np.zeros(len(gaia_df), dtype=bool)
+    is_5p_lookup: dict[int, bool] = {
+        int(s): bool(f) for s, f in zip(_sids, _has_pmra)
+    }
+
+    # Index gaia_df by source_id (int64) for fast scalar update
+    gaia_df = gaia_df.set_index("source_id")
+
+    updated_epoch_data: dict[int, pd.DataFrame] = {}
+    n_solved = 0
+
+    for source_id, ep_df in epoch_data.items():
+        sid = int(source_id)
+        ep_df = ep_df.copy()
+
+        if not all(c in ep_df.columns for c in _REQUIRED_EPOCH_COLS):
+            updated_epoch_data[sid] = ep_df
+            continue
+
+        # Select AGIS-accepted observations for the solve
+        if use_agis_flag and "used_by_agis_al" in ep_df.columns:
+            mask_act = ep_df["used_by_agis_al"].values.astype(bool)
+        else:
+            mask_act = np.ones(len(ep_df), dtype=bool)
+
+        if mask_act.sum() < min_transits:
+            updated_epoch_data[sid] = ep_df
+            continue
+
+        ep_act = ep_df[mask_act]
+
+        # Timing and geometry for active observations
+        obs_tcb = ep_act["obs_time_tcb"].to_numpy(dtype=np.float64)
+        t_yr    = _obs_time_to_jyear(obs_tcb)
+        dt      = t_yr - ref_epoch_jyear
+        theta   = np.radians(ep_act["scan_pos_angle"].to_numpy(dtype=np.float64))
+        sin_th  = np.sin(theta)
+        cos_th  = np.cos(theta)
+        p_al    = ep_act["parallax_factor_al"].to_numpy(dtype=np.float64)
+
+        # Design matrix: [sin θ, cos θ, Δt·sin θ, Δt·cos θ, P_AL]
+        A = np.column_stack([sin_th, cos_th, dt * sin_th, dt * cos_th, p_al])
+
+        # Weights: formal CCD noise only (agis_source_excess_noise = 0 for synthetic)
+        sigma_al = ep_act["centroid_pos_error_al"].to_numpy(dtype=np.float64)
+        sigma_exc = float(ep_act["agis_source_excess_noise"].iloc[0]) \
+                    if "agis_source_excess_noise" in ep_act.columns else 0.0
+        w = 1.0 / np.maximum(sigma_al**2 + sigma_exc**2, 1e-12)
+
+        # Reconstruct absolute measurements: y = centroid_pos_al + AGIS PM+plx prediction
+        pmra_agis, pmdec_agis, plx_agis = agis_orig.get(sid, (0.0, 0.0, 0.0))
+        centroid_act = ep_act["centroid_pos_al"].to_numpy(dtype=np.float64)
+        agis_corr = pmra_agis * dt * sin_th + pmdec_agis * dt * cos_th + plx_agis * p_al
+        y = centroid_act + agis_corr
+
+        # Normal equations: H = A^T W A, h = A^T W y
+        AW = A * w[:, None]
+        H  = AW.T @ A   # (5, 5)
+        h  = AW.T @ y   # (5,)
+
+        try:
+            C     = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            updated_epoch_data[sid] = ep_df
+            continue
+
+        v_hat = C @ h   # [Δα*, Δδ, μα*, μδ, ϖ]
+
+        # ── Update gaia_df ────────────────────────────────────────────────────
+        if sid not in gaia_df.index:
+            updated_epoch_data[sid] = ep_df
+            continue
+
+        # Helper for safe sqrt
+        def _safe_sqrt(x: float) -> float:
+            return float(np.sqrt(max(x, 0.0)))
+
+        def _safe_corr(cov_ij: float, var_i: float, var_j: float) -> float:
+            d = float(np.sqrt(max(var_i, 1e-40) * max(var_j, 1e-40)))
+            return float(np.clip(cov_ij / d, -1.0, 1.0))
+
+        is_5p = is_5p_lookup.get(sid, False)
+
+        if is_5p:
+            # ── 5p stars: full 5-parameter epoch solution ──────────────────────
+            # H is well-conditioned with ~80 transits; no prior needed.
+            # The epoch catalog is a sufficient statistic for the epoch obs:
+            #   h_prior = C_inv @ v_survey ≡ h_epoch  when v_survey = v_hat (all 5)
+            #             and C = H_epoch^{-1}
+            #
+            # Centroid rebaseline: remove old AGIS PM+plx prediction and subtract
+            # the epoch-derived prediction so prepare_epoch_obs_for_solver recovers
+            # y_orig = centroid_new + new_agis (using updated catalog pmra/pmdec/plx).
+            obs_tcb_all = ep_df["obs_time_tcb"].to_numpy(dtype=np.float64)
+            t_yr_all    = _obs_time_to_jyear(obs_tcb_all)
+            dt_all      = t_yr_all - ref_epoch_jyear
+            sin_all     = np.sin(np.radians(ep_df["scan_pos_angle"].to_numpy(dtype=np.float64)))
+            cos_all     = np.cos(np.radians(ep_df["scan_pos_angle"].to_numpy(dtype=np.float64)))
+            p_al_all    = ep_df["parallax_factor_al"].to_numpy(dtype=np.float64)
+
+            centroid_all  = ep_df["centroid_pos_al"].to_numpy(dtype=np.float64)
+            agis_corr_all = (pmra_agis * dt_all * sin_all
+                             + pmdec_agis * dt_all * cos_all
+                             + plx_agis * p_al_all)
+            y_all         = centroid_all + agis_corr_all
+            new_agis      = (v_hat[2] * dt_all * sin_all
+                             + v_hat[3] * dt_all * cos_all
+                             + v_hat[4] * p_al_all)
+            ep_df["centroid_pos_al"] = y_all - new_agis
+
+            # Update ra/dec (moves linearization point to epoch-derived position).
+            if "ra" in gaia_df.columns and "dec" in gaia_df.columns:
+                dec_rad = np.radians(float(gaia_df.loc[sid, "dec"]))
+                gaia_df.loc[sid, "ra"]  = float(gaia_df.loc[sid, "ra"])  \
+                                          + float(v_hat[0]) / (np.cos(dec_rad) * 3.6e6)
+                gaia_df.loc[sid, "dec"] = float(gaia_df.loc[sid, "dec"]) \
+                                          + float(v_hat[1]) / 3.6e6
+
+            gaia_df.loc[sid, "pmra"]     = float(v_hat[2])
+            gaia_df.loc[sid, "pmdec"]    = float(v_hat[3])
+            gaia_df.loc[sid, "parallax"] = float(v_hat[4])
+
+            for col, idx in [("pmra_error",     2), ("pmdec_error",     3),
+                              ("parallax_error", 4), ("ra_error",        0),
+                              ("dec_error",      1)]:
+                if col in gaia_df.columns:
+                    gaia_df.loc[sid, col] = _safe_sqrt(C[idx, idx])
+
+            corr_pairs = [
+                ("pmra_pmdec_corr",      2, 3),
+                ("parallax_pmra_corr",   4, 2),
+                ("parallax_pmdec_corr",  4, 3),
+                ("ra_dec_corr",          0, 1),
+                ("ra_parallax_corr",     0, 4),
+                ("ra_pmra_corr",         0, 2),
+                ("ra_pmdec_corr",        0, 3),
+                ("dec_parallax_corr",    1, 4),
+                ("dec_pmra_corr",        1, 2),
+                ("dec_pmdec_corr",       1, 3),
+            ]
+            for col, i, j in corr_pairs:
+                if col in gaia_df.columns:
+                    gaia_df.loc[sid, col] = _safe_corr(C[i, j], C[i, i], C[j, j])
+
+        else:
+            # ── 2p stars: position-only update with diffuse PM/parallax prior ───
+            # 2p stars have 2–5 transits (insufficient for a 5p solve without a
+            # prior).  Apply the same diffuse PM and parallax priors used by the
+            # main BP3M solver to regularize, then update only ra/dec and their
+            # 2×2 position covariance.  PM/parallax stay NaN (driven by prior, not
+            # data).
+            #
+            # Centroid rebaseline is NOT done for 2p stars: since pmra=NaN → AGIS
+            # reference = 0 in prepare_epoch_obs_for_solver, the raw centroid
+            # already encodes y = centroid + 0 = y_orig.  Rebaselining with the
+            # prior-regularized v_hat would corrupt h in the joint solve.
+            from bp3m.astro_utils import michalik_sigma_plx_prior
+            _SIGMA_PM_2P = 100.0  # mas/yr — matches solver._SIGMA_PM
+            ra_2p  = float(gaia_df.loc[sid, "ra"])
+            dec_2p = float(gaia_df.loc[sid, "dec"])
+            gmag_2p = float(gaia_df.loc[sid, "phot_g_mean_mag"]) \
+                      if "phot_g_mean_mag" in gaia_df.columns else 18.0
+            sigma_plx_2p = michalik_sigma_plx_prior(ra_2p, dec_2p, gmag_2p)
+
+            H_prior_2p = np.diag([0.0, 0.0,
+                                  _SIGMA_PM_2P**-2, _SIGMA_PM_2P**-2,
+                                  float(sigma_plx_2p)**-2])
+            try:
+                C_2p = np.linalg.inv(H + H_prior_2p)
+            except np.linalg.LinAlgError:
+                updated_epoch_data[sid] = ep_df
+                continue
+            v_hat_2p = C_2p @ h
+
+            # Update ra/dec only.
+            if "ra" in gaia_df.columns and "dec" in gaia_df.columns:
+                dec_rad = np.radians(dec_2p)
+                gaia_df.loc[sid, "ra"]  = ra_2p \
+                                          + float(v_hat_2p[0]) / (np.cos(dec_rad) * 3.6e6)
+                gaia_df.loc[sid, "dec"] = dec_2p \
+                                          + float(v_hat_2p[1]) / 3.6e6
+
+            # Update position errors and correlation from the 2×2 subblock.
+            if "ra_error" in gaia_df.columns:
+                gaia_df.loc[sid, "ra_error"]  = _safe_sqrt(C_2p[0, 0])
+            if "dec_error" in gaia_df.columns:
+                gaia_df.loc[sid, "dec_error"] = _safe_sqrt(C_2p[1, 1])
+            if "ra_dec_corr" in gaia_df.columns:
+                gaia_df.loc[sid, "ra_dec_corr"] = _safe_corr(C_2p[0, 1], C_2p[0, 0], C_2p[1, 1])
+
+            # pmra/pmdec/parallax remain NaN — not written to gaia_df.
+
+        updated_epoch_data[sid] = ep_df
+        n_solved += 1
+
+    gaia_df = gaia_df.reset_index()
+    print(f"  compute_epoch_catalog_solutions: solved {n_solved}/{len(epoch_data)} stars")
+    return updated_epoch_data, gaia_df

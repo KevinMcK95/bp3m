@@ -33,6 +33,7 @@ from scipy import linalg
 import astropy.units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
+from typing import Optional
 
 from .astro_utils import (
     plane_project, plane_project_jacobian, plane_project_tangent_derivs,
@@ -146,7 +147,7 @@ class BP3MSolver:
 
     def __init__(self, images, stars_per_image, gaia_catalog,
                  star_id_to_idx, image_names, star_in_image,
-                 poly_order=1):
+                 poly_order=1, exclude_2p_from_alignment=False):
         """
         Parameters
         ----------
@@ -161,6 +162,7 @@ class BP3MSolver:
             raise ValueError(f"poly_order must be ≥ 1, got {poly_order}")
         self.poly_order = poly_order
         self.N_R = n_r_from_poly_order(poly_order)
+        self.exclude_2p_from_alignment = exclude_2p_from_alignment
 
         self.images = images
         self.stars_per_image = stars_per_image
@@ -883,6 +885,14 @@ class BP3MSolver:
                     use_astrom = d.get("use_for_astrom", use_align)
                 else:
                     use_astrom = use_align
+
+            # When exclude_2p_from_alignment is set, 2p stars do not contribute
+            # to the image transformation equations (H_rr, h_r).  They still
+            # appear in H_vv/h_all so their own astrometry is still solved.
+            if self.exclude_2p_from_alignment:
+                sidx_all = d["sidx"]
+                not_2p = ~self.gaia_2p[sidx_all]
+                use_align = use_align & not_2p
             use_any    = use_align | use_astrom   # for H_vv/h_all (stellar precision)
             sidx_any   = d["sidx"][use_any]
             sidx_align = d["sidx"][use_align]
@@ -934,7 +944,9 @@ class BP3MSolver:
                 i = self.star_id_to_idx[source_id]
                 H_vv[i] += contrib['H_contrib']
                 h_all[i] += contrib['h_contrib']
-                h_align[i] += contrib['h_contrib']
+                # 2p epoch contributions excluded from alignment when flag is set.
+                if not (self.exclude_2p_from_alignment and self.gaia_2p[i]):
+                    h_align[i] += contrib['h_contrib']
 
         # ── Invert H_vv → C_vT ────────────────────────────────────────────────
         C_vT    = np.linalg.inv(H_vv)
@@ -1048,7 +1060,7 @@ class BP3MSolver:
             use_soft_weights: bool = False,
             student_t_nu: float = 50.0,
             z_tol: float = 1.0,
-            z_init: dict | None = None):
+            z_init: Optional[dict] = None):
         """
         Iterative BP3M fit with outlier rejection.
 
