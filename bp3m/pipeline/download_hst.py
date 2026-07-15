@@ -840,9 +840,9 @@ def plot_footprints(
     pad_factor = 0.08
 
     if ra is not None and dec is not None and search_width and search_height:
-        cos_d = np.cos(np.deg2rad(dec))
-        cut_ra_lo  = ra  - search_width  / 2 / cos_d
-        cut_ra_hi  = ra  + search_width  / 2 / cos_d
+        # search_width is already in RA degrees (expanded by 1/cos(dec) by the caller)
+        cut_ra_lo  = ra  - search_width  / 2
+        cut_ra_hi  = ra  + search_width  / 2
         cut_dec_lo = dec - search_height / 2
         cut_dec_hi = dec + search_height / 2
 
@@ -935,23 +935,25 @@ def plot_footprints(
 def _parse_polygons(s_region: str) -> list[np.ndarray]:
     """
     Parse a MAST s_region string into a list of (N,2) vertex arrays.
-    Handles strings with one or more POLYGON blocks.
+    Handles strings with one or more POLYGON blocks and ignores non-numeric
+    tokens such as the ICRS frame identifier (e.g. "POLYGON ICRS ra dec ...").
     """
     polys = []
-    # Split on 'POLYGON' keyword (case-insensitive)
     parts = s_region.upper().split('POLYGON')
     for part in parts:
         part = part.strip()
         if not part:
             continue
-        try:
-            nums = [float(x) for x in part.split()]
-            if len(nums) < 6:
+        nums = []
+        for tok in part.split():
+            try:
+                nums.append(float(tok))
+            except (ValueError, TypeError):
                 continue
-            verts = np.array(nums).reshape(-1, 2)
-            polys.append(verts)
-        except (ValueError, TypeError):
+        if len(nums) < 6:
             continue
+        verts = np.array(nums).reshape(-1, 2)
+        polys.append(verts)
     return polys
 
 
@@ -973,10 +975,16 @@ def _footprint_bbox(s_region: str) -> tuple[float, float, float, float] | None:
     """
     Parse a MAST s_region string (one or more POLYGON vertices) and return
     (ra_min, ra_max, dec_min, dec_max).  Returns None if unparseable.
+    Ignores non-numeric tokens such as ICRS (e.g. "POLYGON ICRS ra dec ...").
     """
     try:
         tokens = s_region.upper().replace('POLYGON', ' ').split()
-        coords = [float(t) for t in tokens]
+        coords = []
+        for t in tokens:
+            try:
+                coords.append(float(t))
+            except (ValueError, TypeError):
+                pass
         if len(coords) < 4:
             return None
         ras  = coords[0::2]

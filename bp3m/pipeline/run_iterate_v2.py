@@ -88,6 +88,9 @@ def main():
                         help='Use Student-t IRLS soft weights instead of hard tests 1-4')
     parser.add_argument('--student_t_nu', type=float, default=50.0,
                         help='Student-t degrees of freedom for soft-weight IRLS')
+    parser.add_argument('--exclude_2p_from_alignment', action='store_true',
+                        help='Exclude 2-parameter Gaia stars from the alignment solve '
+                             '(they still contribute to their own astrometric posteriors)')
 
     # ── Crossmatch parameters ──────────────────────────────────────────────────
     parser.add_argument('--match_n_sigma', type=float, default=5.0,
@@ -174,8 +177,9 @@ def main():
         use_influence_clip   = not args.no_influence_clip,
         influence_d_thresh   = args.influence_d_thresh,
         influence_sigma_min  = args.influence_sigma_min,
-        use_soft_weights     = args.soft_weights,
-        student_t_nu         = args.student_t_nu,
+        use_soft_weights              = args.soft_weights,
+        student_t_nu                  = args.student_t_nu,
+        exclude_2p_from_alignment     = args.exclude_2p_from_alignment,
     )
 
     # ── Step 1: initial crossmatch ─────────────────────────────────────────────

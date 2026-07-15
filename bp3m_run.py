@@ -163,6 +163,38 @@ def _parse_args():
     psf.add_argument('--sat_threshold', type=float, default=None,
                      help='Saturation DN threshold (default 60000)')
 
+    # ── Gaia DR4 epoch astrometry (Step 4b) ──────────────────────────────────
+    dr4 = p.add_argument_group('Gaia DR4 epoch astrometry (Step 4b, optional)')
+    dr4.add_argument('--use_gaia_dr4_epoch', action='store_true',
+                     help='Download Gaia DR4 epoch astrometry for cross-matched sources '
+                          'and re-solve 5D parameters with gaiasupdate. Requires the '
+                          'gaiasupdate package (pip install gaiasupdate) and a working '
+                          'ESA DataLink connection (or --dr4_prerelease_votable for '
+                          'offline testing with the ESA pre-release sample).')
+    dr4.add_argument('--dr4_access', type=str, default='datalink',
+                     choices=['datalink', 'prerelease'],
+                     help='Epoch data access method: datalink (default, requires ESA '
+                          'credentials for non-public releases) or prerelease (local '
+                          'VOTable, set --dr4_prerelease_votable).')
+    dr4.add_argument('--dr4_prerelease_votable', type=str, default=None,
+                     help='Path to the ESA pre-release epoch astrometry VOTable '
+                          '(required when --dr4_access=prerelease).')
+    dr4.add_argument('--dr4_data_release', type=str, default='Gaia DR4',
+                     help='DataLink data-release string (default "Gaia DR4"; use '
+                          '"Gaia DR4_INT4" for the internal pre-release).')
+    dr4.add_argument('--dr4_credentials', type=str, default=None,
+                     help='Path to ESA archive credentials file (for DataLink access).')
+    dr4.add_argument('--dr4_model', type=str, default='5p_single_source',
+                     choices=['5p_single_source', '3p_single_source_without_offsets',
+                              '6p_constrained_colour', '6p_perspective_acceleration'],
+                     help='gaiasupdate astrometric model for epoch re-solve '
+                          '(default 5p_single_source).')
+    dr4.add_argument('--dr4_no_replace_pms', action='store_true',
+                     help='Store epoch solutions as extra columns but do NOT replace '
+                          'pmra/pmdec/parallax priors in the solver.')
+    dr4.add_argument('--force_rerun_dr4_epoch', action='store_true',
+                     help='Re-download and re-solve even if epoch cache exists.')
+
     # ── Cross-matching ────────────────────────────────────────────────────────
     xm = p.add_argument_group('Cross-matching (fast_cross_match)')
     xm.add_argument('--cross_match_pix_floor', type=float, default=0.05,
@@ -247,6 +279,10 @@ def _parse_args():
     bp.add_argument('--fit_indv_images_only', action='store_true',
                     help='Run BP3M separately on each image and save results in '
                          'BP3M_indv_results/{image_name}/. Skips the joint multi-image fit.')
+    bp.add_argument('--exclude_2p_from_alignment', action='store_true',
+                    help='Exclude Gaia 2-parameter (position-only) stars from the '
+                         'image-transformation alignment; images with too few non-2p '
+                         'stars are dropped entirely')
 
     # ── Synthetic tests ───────────────────────────────────────────────────────
     syn = p.add_argument_group('Synthetic tests (requires completed cross-match, Step 4)')
@@ -702,6 +738,59 @@ def main():
             run_qso_vetting=not args.no_qso_anchors,
         )
 
+    # ── Step 4b: Gaia DR4 epoch astrometry (optional) ────────────────────────
+    _gaia_epoch_obs_for_solver: dict | None = None
+
+    if getattr(args, 'use_gaia_dr4_epoch', False):
+        from bp3m.pipeline.download_gaia_epoch import (
+            collect_matched_source_ids,
+            download_epoch_astrometry,
+            prepare_epoch_obs_for_solver,
+            merge_epoch_solutions_into_catalog,
+        )
+        import glob as _glob
+        import pandas as _pd
+        print("\n" + "=" * 55)
+        print("Step 4b: Gaia DR4 epoch astrometry")
+        print("=" * 55)
+
+        matched_sids = collect_matched_source_ids(output_dir)
+        print(f"  Cross-matched sources: {len(matched_sids)}")
+
+        # epoch cache is stored at output_dir/Gaia/epoch (without field),
+        # matching the path used by run_gaia_dr4_epoch
+        epoch_dir = output_dir / "Gaia" / "epoch"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+
+        epoch_data = download_epoch_astrometry(
+            matched_sids,
+            epoch_cache_dir=epoch_dir,
+            access=args.dr4_access,
+            prerelease_votable=args.dr4_prerelease_votable,
+            data_release=args.dr4_data_release,
+            credentials_file=args.dr4_credentials,
+            n_workers=min(args.n_processes, 8) if args.n_processes > 0 else 4,
+            force=args.force_rerun_dr4_epoch,
+        )
+        print(f"  Epoch data available: {len(epoch_data)} sources")
+
+        if epoch_data:
+            # Load the Gaia summary catalog to extract AGIS PM+parallax values
+            _gaia_csvs = sorted(_glob.glob(
+                str(output_dir / field / "Gaia" / "*_gaia.csv")
+            ))
+            if _gaia_csvs:
+                _gdf = _pd.read_csv(_gaia_csvs[-1])
+                _gdf["source_id"] = _gdf["source_id"].astype("int64")
+                _gaia_epoch_obs_for_solver = prepare_epoch_obs_for_solver(
+                    epoch_data, _gdf,
+                )
+                n_ep = len(_gaia_epoch_obs_for_solver)
+                print(f"  Precomputed AL obs for {n_ep} sources "
+                      f"(will be injected into BP3M solve)")
+            else:
+                print("  WARNING: no *_gaia.csv found — cannot prepare AL obs")
+
     # ── Step 5a: Synthetic data generation (optional) ─────────────────────────
 
     if args.test_synthetic:
@@ -866,6 +955,7 @@ def main():
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
+                exclude_2p_from_alignment=args.exclude_2p_from_alignment,
             )
             # ── Step 5b: Compare synthetic results to truth ────────────────────
             print("\n" + "=" * 55)
@@ -918,6 +1008,8 @@ def main():
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
+                gaia_epoch_obs=_gaia_epoch_obs_for_solver,
+                exclude_2p_from_alignment=args.exclude_2p_from_alignment,
             )
 
     # Save the command only on successful completion so interrupted runs

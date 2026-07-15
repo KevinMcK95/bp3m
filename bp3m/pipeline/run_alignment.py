@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -54,6 +55,8 @@ def run_alignment(  # noqa: C901
     plot_residuals: bool = False,
     plot_influence: bool = False,
     use_qso_anchors: bool = True,
+    gaia_epoch_obs: Optional[dict] = None,
+    exclude_2p_from_alignment: bool = False,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -200,7 +203,8 @@ def run_alignment(  # noqa: C901
     SolverClass = BP3MSolverSparse if use_sparse else BP3MSolver
     solver = SolverClass(imgs, filtered_spi, gaia_catalog,
                           star_id_to_idx, image_names, star_in_image,
-                          poly_order=poly_order)
+                          poly_order=poly_order,
+                          exclude_2p_from_alignment=exclude_2p_from_alignment)
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
 
@@ -270,6 +274,9 @@ def run_alignment(  # noqa: C901
             print(f"    Run cross-match step first to generate it (or pass --no_qso_anchors)")
     else:
         print("    Disabled (--no_qso_anchors)")
+
+    if gaia_epoch_obs:
+        solver._add_gaia_epoch_obs(gaia_epoch_obs)
 
     # ── Fit ───────────────────────────────────────────────────────────────────
     clip = clip_sigma if clip_sigma > 0 else None

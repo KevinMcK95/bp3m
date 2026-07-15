@@ -642,6 +642,7 @@ def run_alignment_v2(
     det_chi2_threshold: float | None = None,
     use_soft_weights: bool = False,
     student_t_nu: float = 50.0,
+    exclude_2p_from_alignment: bool = False,
 ) -> Path:
     """
     Run BP3M v2 alignment using the master_combined_v2.csv cross-match catalog.
@@ -800,6 +801,7 @@ def run_alignment_v2(
         imgs, filtered_spi, gaia_catalog,
         star_id_to_idx, image_names, star_in_image,
         poly_order=poly_order,
+        exclude_2p_from_alignment=exclude_2p_from_alignment,
     )
 
     # ── Override diffuse PM prior for HST-only stars ──────────────────────────
