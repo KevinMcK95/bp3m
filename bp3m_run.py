@@ -492,7 +492,7 @@ def main():
                 pass
 
     print("=" * 55)
-    print("GaiaHub Improved")
+    print("BP3M Analysis")
     print("=" * 55)
 
     _resolve_target(args)

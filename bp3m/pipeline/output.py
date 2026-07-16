@@ -1,5 +1,5 @@
 """
-Output formatting and summary utilities for the GaiaHub Improved pipeline.
+Output formatting and summary utilities for the BP3M Analysis pipeline.
 
 Provides human-readable summaries of pipeline outputs and helpers for
 writing supplementary products (e.g. FITS tables, region files).
