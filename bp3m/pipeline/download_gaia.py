@@ -198,7 +198,7 @@ def _query_mag_bin(args):
     import concurrent.futures
     import time
 
-    query, min_g, max_g, ind_dir, field, n, n_total = args
+    query, min_g, max_g, ind_dir, field, n, n_total, timeout = args
     full_q = (query +
               f" AND (phot_g_mean_mag > {min_g:.4f})"
               f" AND (phot_g_mean_mag <= {max_g:.4f})")
@@ -216,14 +216,14 @@ def _query_mag_bin(args):
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
                 future = exe.submit(_submit_gaia_async, full_q)
-                result = future.result(timeout=_QUERY_TIMEOUT)
+                result = future.result(timeout=timeout)
             if cache_path is not None:
                 result.to_csv(cache_path, index=False)
             print(f"  Bin {n}/{n_total}: {len(result)} stars  (G {min_g:.2f}–{max_g:.2f})")
             return result
         except concurrent.futures.TimeoutError:
             last_exc = TimeoutError(
-                f"Gaia TAP query timed out after {_QUERY_TIMEOUT}s"
+                f"Gaia TAP query timed out after {timeout}s"
             )
             wait = 30 * (attempt + 1)
             if attempt < _QUERY_RETRIES - 1:
@@ -327,6 +327,7 @@ def download_gaia(
     sigma_flux_excess: float = 3.0,
     only_5p: bool = False,
     n_processes: int = 4,
+    query_timeout: int = 300,
     force_redownload: bool = False,
     quiet: bool = False,
 ) -> pd.DataFrame:
@@ -417,7 +418,7 @@ def download_gaia(
     print(f"  Magnitude bins: {n_bins}  (area {area:.4f} deg²)")
 
     args = [
-        (query, bins[i+1], bins[i], ind_dir, field_name, i+1, n_bins)
+        (query, bins[i+1], bins[i], ind_dir, field_name, i+1, n_bins, query_timeout)
         for i in range(n_bins)
     ]
 

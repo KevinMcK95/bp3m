@@ -336,6 +336,9 @@ def _parse_args():
                      help='Skip Gaia and HST downloads (use existing files)')
     ctl.add_argument('--force_redownload_gaia', action='store_true',
                      help='Re-query Gaia archive even if local CSV already exists')
+    ctl.add_argument('--gaia_timeout', type=int, default=300,
+                     help='Per-bin Gaia TAP query timeout in seconds (default 300). '
+                          'Increase for large fields with slow archive responses.')
     ctl.add_argument('--force_redownload_hst', action='store_true',
                      help='Re-search MAST and re-download HST files even if cached')
     ctl.add_argument('--force_refit_psf', action='store_true',
@@ -514,6 +517,7 @@ def main():
             sigma_flux_excess=args.sigma_flux_excess,
             only_5p=args.only_5p,
             n_processes=args.n_processes,
+            query_timeout=args.gaia_timeout,
             force_redownload=args.force_redownload_gaia,
             quiet=args.quiet,
         )
