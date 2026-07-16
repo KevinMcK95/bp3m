@@ -54,6 +54,12 @@ _CCDCHIP_Y_OFFSET = {
     ('WFC3', 'IR',   1): 0.0,
 }
 
+# STDGDC tables for all two-chip cameras encode the hi-chip boundary at y_combined=2048,
+# matching the ACS/WFC physical gap.  WFC3/UVIS has a 3-pixel wider physical gap
+# (y_offset=2051 in _CHIP_CONFIG / _CCDCHIP_Y_OFFSET above), but the GDC lookup must
+# still use 2048 to stay consistent with how the table was built.
+_GDC_HI_CHIP_Y_OFFSET = 2048.0
+
 # MJD boundaries for ACS/WFC PSF servicing-mission era selection
 _SM3B_MJD = 52346.0   # 2002-03-12: start of SM3B era
 _SM4_MJD  = 54975.0   # 2009-05-24: start of SM4 era
@@ -576,7 +582,7 @@ def _apply_gdc_wcs(records, gdc, image_path, chips, instrume, detector, verbose=
                     if gdc is not None:
                         #transform ref coordinate to GDC frame (0-indexed input)
                         _rx, _ry, _ = apply_gdc(_crpix1_0,
-                                                 _crpix2_0 + _yoff,
+                                                 _crpix2_0 + min(_yoff, _GDC_HI_CHIP_Y_OFFSET),
                                                  gdc)
                         chip_wcs_vals[sci_ext]['CRPIX1_GDC'] = float(_rx[0])
                         chip_wcs_vals[sci_ext]['CRPIX2_GDC'] = float(_ry[0])
@@ -589,7 +595,8 @@ def _apply_gdc_wcs(records, gdc, image_path, chips, instrume, detector, verbose=
     # --- GDC ---
     if gdc is not None:
         x_comb = np.array([r.x + getattr(r, '_x_offset', 0.0) for r in records])
-        y_comb = np.array([r.y + getattr(r, '_y_offset', 0.0) for r in records])
+        y_comb = np.array([r.y + min(getattr(r, '_y_offset', 0.0), _GDC_HI_CHIP_Y_OFFSET)
+                           for r in records])
 
         x_gdc, y_gdc, mc = apply_gdc(x_comb, y_comb, gdc)
         J_gdc = _gdc_jacobian_batch(x_comb, y_comb, gdc)
