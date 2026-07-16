@@ -465,7 +465,8 @@ def build_index_maps(stars_per_image, gaia_catalog):
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def load_image_data_flc(data_root, field_name: str,
-                        pos_err_floor: float = _MIN_POS_ERR_PX):
+                        pos_err_floor: float = _MIN_POS_ERR_PX,
+                        restrict_images: "set[str] | frozenset[str] | None" = None):
     """
     Load BP3M inputs from the new FLC-based pipeline layout.
 
@@ -550,6 +551,8 @@ def load_image_data_flc(data_root, field_name: str,
     skipped = []
     for img_dir in img_dirs:
         img_name = img_dir.name
+        if restrict_images is not None and img_name not in restrict_images:
+            continue
 
         meta = _read_image_meta(img_dir, img_name)
         if meta is None:

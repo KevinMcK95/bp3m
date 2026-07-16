@@ -133,7 +133,8 @@ def run_alignment(  # noqa: C901
     # ── Load data ─────────────────────────────────────────────────────────────
     print(f"\n  Loading FLC pipeline data for '{field_name}'...")
     imgs, stars_per_image, gaia_catalog = load_image_data_flc(
-        data_root, field_name, pos_err_floor=pos_err_floor)
+        data_root, field_name, pos_err_floor=pos_err_floor,
+        restrict_images=set(images) if images is not None else None)
     if imgs is None or len(imgs) == 0:
         raise RuntimeError(
             f"No usable images found for '{field_name}'. "
