@@ -120,7 +120,7 @@ def _read_chip_info(flc_path: Path, cat_path: Path) -> dict:
     """
     _AMP_SPLITS = {
         ("ACS",  "WFC"):  2048.0,
-        ("WFC3", "UVIS"): 2051.0,
+        ("WFC3", "UVIS"): 2047.0,
     }
     with afits.open(flc_path, memmap=False) as hdu:
         h0 = hdu[0].header

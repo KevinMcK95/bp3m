@@ -348,7 +348,7 @@ def _build_stars_df(img_dir: Path, img_name: str,
 
 _AMP_SPLITS = {
     "ACSWFC":   {"x_split": 2048.0, "y_split": 2048.0},
-    "WFC3UVIS": {"x_split": 2048.0, "y_split": 2051.0},
+    "WFC3UVIS": {"x_split": 2048.0, "y_split": 2047.0},
 }
 _AMP_SPLITS_DEFAULT = {"x_split": 2048.0, "y_split": 2048.0}
 
@@ -363,7 +363,8 @@ def split_images_by_ccd(images, stars_per_image, min_stars_per_ccd: int = 20):
     """
     Split each image into two independent CCD halves along the Y boundary.
 
-    For ACS/WFC the chips meet at Y_orig = 2048; for WFC3/UVIS at Y_orig = 2051.
+    For ACS/WFC the chips meet at Y_orig = 2048; for WFC3/UVIS at Y_orig = 2047
+    (chip 1 starts at y_combined=2048, so lo: y≤2047, hi: y≥2048).
     The boundary is looked up per-image from ``_AMP_SPLITS`` using the
     ``instrument`` and ``detector`` fields stored in *images*.
 

@@ -37,7 +37,7 @@ _CHIP_CONFIG = {
     ('ACS',  'WFC'):  [(1, 3, 0.0), (4, 6, 2048.0)],
     ('ACS',  'HRC'):  [(1, 2, 0.0)],
     ('ACS',  'SBC'):  [(1, 2, 0.0)],
-    ('WFC3', 'UVIS'): [(1, 3, 0.0), (4, 6, 2051.0)],
+    ('WFC3', 'UVIS'): [(1, 3, 0.0), (4, 6, 2048.0)],
     ('WFC3', 'IR'):   [(1, 2, 0.0)],
 }
 
@@ -49,16 +49,17 @@ _CCDCHIP_Y_OFFSET = {
     ('ACS',  'WFC',  2): 0.0,
     ('ACS',  'HRC',  1): 0.0,
     ('ACS',  'SBC',  1): 0.0,
-    ('WFC3', 'UVIS', 1): 2051.0,
+    ('WFC3', 'UVIS', 1): 2048.0,
     ('WFC3', 'UVIS', 2): 0.0,
     ('WFC3', 'IR',   1): 0.0,
 }
 
-# STDGDC tables for all two-chip cameras encode the hi-chip boundary at y_combined=2048,
-# matching the ACS/WFC physical gap.  WFC3/UVIS has a 3-pixel wider physical gap
-# (y_offset=2051 in _CHIP_CONFIG / _CCDCHIP_Y_OFFSET above), but the GDC lookup must
-# still use 2048 to stay consistent with how the table was built.
-_GDC_HI_CHIP_Y_OFFSET = 2048.0
+# WFC3/UVIS chip 1 (ext 4) y_offset is 2048 to match the STDGDC table convention.
+# The Fortran hst1pass code (from which the STDGDC tables were built) places chip 1
+# at y_combined = chip_local_y + 2048, using only the first 2048 rows of each
+# 2051-row chip extension.  The combined frame is therefore 4096 rows, exactly
+# matching the 4096×4096 GDC grid.  The chip split threshold for lo/hi is y=2047
+# (lo: y_combined ≤ 2047, hi: y_combined > 2047 = ≥ 2048).
 
 # MJD boundaries for ACS/WFC PSF servicing-mission era selection
 _SM3B_MJD = 52346.0   # 2002-03-12: start of SM3B era
@@ -582,7 +583,7 @@ def _apply_gdc_wcs(records, gdc, image_path, chips, instrume, detector, verbose=
                     if gdc is not None:
                         #transform ref coordinate to GDC frame (0-indexed input)
                         _rx, _ry, _ = apply_gdc(_crpix1_0,
-                                                 _crpix2_0 + min(_yoff, _GDC_HI_CHIP_Y_OFFSET),
+                                                 _crpix2_0 + _yoff,
                                                  gdc)
                         chip_wcs_vals[sci_ext]['CRPIX1_GDC'] = float(_rx[0])
                         chip_wcs_vals[sci_ext]['CRPIX2_GDC'] = float(_ry[0])
@@ -595,8 +596,7 @@ def _apply_gdc_wcs(records, gdc, image_path, chips, instrume, detector, verbose=
     # --- GDC ---
     if gdc is not None:
         x_comb = np.array([r.x + getattr(r, '_x_offset', 0.0) for r in records])
-        y_comb = np.array([r.y + min(getattr(r, '_y_offset', 0.0), _GDC_HI_CHIP_Y_OFFSET)
-                           for r in records])
+        y_comb = np.array([r.y + getattr(r, '_y_offset', 0.0) for r in records])
 
         x_gdc, y_gdc, mc = apply_gdc(x_comb, y_comb, gdc)
         J_gdc = _gdc_jacobian_batch(x_comb, y_comb, gdc)
@@ -690,7 +690,7 @@ def load_image(path, sci_ext=1, dq_ext=None, dq_flags=None):
     - ACS/WFC ext 1 (chip 2, bottom): y_offset = 0
     - ACS/WFC ext 4 (chip 1, top):    y_offset = 2048
     - WFC3/UVIS ext 1 (chip 2, bottom): y_offset = 0
-    - WFC3/UVIS ext 4 (chip 1, top):    y_offset = 2051
+    - WFC3/UVIS ext 4 (chip 1, top):    y_offset = 2048
 
     Parameters
     ----------

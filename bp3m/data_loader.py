@@ -134,14 +134,15 @@ def load_image_data(data_root, field_name="Fornax_dSph"):
 # (pre-GDC) detector coordinates, keyed by instrument+detector (upper-case).
 #
 # ACS/WFC  : two 4096×2048 chips → combined height 4096; amp X boundary at 2048
-# WFC3/UVIS: two 4096×2051 chips → combined height 4102; amp X boundary at 2048
+# WFC3/UVIS: chips are 4096×2051 in FITS but only 2048 rows each are used by the
+#            STDGDC convention; combined height 4096; chip 1 at y_offset=2048.
 #
 # The Y value is the chip boundary (used by --split-ccd and --split-amp).
 # The X value is the amplifier boundary within each chip (used by --split-amp).
 
 _AMP_SPLITS = {
     "ACSWFC":   {"x_split": 2048.0, "y_split": 2048.0},
-    "WFC3UVIS": {"x_split": 2048.0, "y_split": 2051.0},
+    "WFC3UVIS": {"x_split": 2048.0, "y_split": 2047.0},
 }
 _AMP_SPLITS_DEFAULT = {"x_split": 2048.0, "y_split": 2048.0}
 
@@ -156,7 +157,8 @@ def split_images_by_ccd(images, stars_per_image, min_stars_per_ccd: int = 20):
     """
     Split each image into two independent CCD halves along the Y boundary.
 
-    For ACS/WFC the chips meet at Y_orig = 2048; for WFC3/UVIS at Y_orig = 2051.
+    For ACS/WFC the chips meet at Y_orig = 2048; for WFC3/UVIS at Y_orig = 2047
+    (chip 1 starts at y_combined=2048, so lo: y≤2047, hi: y≥2048).
     The boundary is looked up per-image from ``_AMP_SPLITS`` using the
     ``instrument`` and ``detector`` fields stored in *images*.
 

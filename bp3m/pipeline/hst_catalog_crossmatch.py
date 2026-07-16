@@ -80,7 +80,7 @@ except ImportError as exc:
 
 _AMP_Y_SPLITS = {
     ('ACS',  'WFC'):  2048,
-    ('WFC3', 'UVIS'): 2051,
+    ('WFC3', 'UVIS'): 2047,
     ('WFC3', 'IR'):   512,
 }
 
