@@ -998,7 +998,7 @@ def generate_synthetic_data(
             os.symlink(info["flc_path"].resolve(), dst_flc)
 
         # Write warm-start transformation.csv with true alignment parameters
-        # (instead of symlinking to the original GaiaHub fit) so that the
+        # (instead of symlinking to the original fit) so that the
         # solver starts near the truth and Phase 0 sees only noise-level residuals.
         _orig_tran = pd.read_csv(info["img_dir"] / "transformation.csv",
                                  index_col="parameter")["value"]

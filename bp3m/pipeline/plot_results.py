@@ -68,7 +68,8 @@ def make_plots(solver, images, gaia_catalog,
                mu_pop=None,
                v_mean_free=None,
                v_cov_free=None,
-               C_vT_free=None):
+               C_vT_free=None,
+               qso_anchor_ids=None):
     """
     Generate all diagnostic plots.
 
@@ -155,6 +156,18 @@ def make_plots(solver, images, gaia_catalog,
     _gc = solver.gaia_cat
     _gaia_ids = _gc["Gaia_id"].to_numpy(dtype=np.int64, na_value=0)
     hst_only  = ~has_gaia
+
+    # QSO anchors have prior-dominated (near-zero) BP3M uncertainties that are
+    # not astrometrically meaningful — exclude them from the uncertainty and
+    # improvement-factor panels so they don't collapse the y-axis.
+    _is_qso = np.zeros(len(_gaia_ids), dtype=bool)
+    if qso_anchor_ids is not None and len(qso_anchor_ids) > 0:
+        _qso_set = set(int(q) for q in qso_anchor_ids)
+        for _i, _gid in enumerate(_gaia_ids):
+            if _gid in _qso_set:
+                _is_qso[_i] = True
+    _not_qso = ~_is_qso
+    _gaia_not_qso = has_gaia & _not_qso
     _n_gc = len(_gc)
     if "pmra_xmatch" in _gc.columns:
         _pmra_xmatch  = np.array(
@@ -170,10 +183,10 @@ def make_plots(solver, images, gaia_catalog,
 
     for ax, gaia_pm, bp3m_pm_g, sig_g, sig_b_g, comp in zip(
             [ax_pmra, ax_pmdec],
-            [pmra_gaia[has_gaia],   pmdec_gaia[has_gaia]],
-            [pmra_bp3m[has_gaia],   pmdec_bp3m[has_gaia]],
-            [sig_pmra_gaia[has_gaia], sig_pmdec_gaia[has_gaia]],
-            [sig_pmra_bp3m[has_gaia], sig_pmdec_bp3m[has_gaia]],
+            [pmra_gaia[_gaia_not_qso],   pmdec_gaia[_gaia_not_qso]],
+            [pmra_bp3m[_gaia_not_qso],   pmdec_bp3m[_gaia_not_qso]],
+            [sig_pmra_gaia[_gaia_not_qso], sig_pmdec_gaia[_gaia_not_qso]],
+            [sig_pmra_bp3m[_gaia_not_qso], sig_pmdec_bp3m[_gaia_not_qso]],
             [r"$\mu_{\alpha*}$",    r"$\mu_\delta$"]):
         ax.errorbar(gaia_pm, bp3m_pm_g, xerr=sig_g, yerr=sig_b_g,
                     fmt='o', ms=3, lw=0.5, alpha=0.5, color='steelblue',
@@ -188,12 +201,13 @@ def make_plots(solver, images, gaia_catalog,
         ax.legend(fontsize=7, loc='upper left')
         _style_ax(ax)
 
-    gm = gmag[has_gaia]
-    ax_unc.scatter(gm, sig_pm_gaia[has_gaia],
-                   s=6, alpha=0.7, color='#444444', label='Gaia 5p', zorder=2)
     _bp3m_gaia_conv = bp3m_converged & has_gaia
     _bp3m_hst_conv  = bp3m_converged & hst_only
-    ax_unc.scatter(gmag[_bp3m_gaia_conv], sig_pm_bp3m[_bp3m_gaia_conv],
+    _bp3m_gaia_conv_nq = _bp3m_gaia_conv & _not_qso
+    gm_nq = gmag[_gaia_not_qso]
+    ax_unc.scatter(gm_nq, sig_pm_gaia[_gaia_not_qso],
+                   s=6, alpha=0.7, color='#444444', label='Gaia 5p', zorder=2)
+    ax_unc.scatter(gmag[_bp3m_gaia_conv_nq], sig_pm_bp3m[_bp3m_gaia_conv_nq],
                    s=6, alpha=0.7, color='steelblue', label='BP3M Gaia 5p', zorder=3)
     if _bp3m_hst_conv.any():
         ax_unc.scatter(gmag[_bp3m_hst_conv], sig_pm_bp3m[_bp3m_hst_conv],
@@ -207,7 +221,7 @@ def make_plots(solver, images, gaia_catalog,
     xlim = ax_unc.get_xlim()
     _style_ax(ax_unc)
 
-    ax_unc_improve.scatter(gm, sig_pm_gaia[has_gaia]/sig_pm_bp3m[has_gaia],
+    ax_unc_improve.scatter(gm_nq, sig_pm_gaia[_gaia_not_qso]/sig_pm_bp3m[_gaia_not_qso],
                    s=6, alpha=0.6, color='steelblue', zorder=2)
     ax_unc_improve.set_xlabel("Gaia G [mag]")
     ax_unc_improve.set_ylabel(r"PM Improvement Factor")
@@ -221,14 +235,15 @@ def make_plots(solver, images, gaia_catalog,
 
     if has_free:
         # Free version: BP3M column uses diffuse-prior PMs
-        pmra_bp3m_free_g   = _pmra_free[has_gaia]
-        pmdec_bp3m_free_g  = _pmdec_free[has_gaia]
-        sig_pmra_free_g    = _sig_pmra_free[has_gaia]
-        sig_pmdec_free_g   = _sig_pmdec_free[has_gaia]
-        sig_pm_free_g      = _pm_geom_unc(sig_pmra_free_g, sig_pmdec_free_g,
-                                          _rho_free[has_gaia])
-        _bp3m_gaia_conv_f  = _bp3m_conv_free & has_gaia
-        _bp3m_hst_conv_f   = _bp3m_conv_free & hst_only
+        pmra_bp3m_free_gnq   = _pmra_free[_gaia_not_qso]
+        pmdec_bp3m_free_gnq  = _pmdec_free[_gaia_not_qso]
+        sig_pmra_free_gnq    = _sig_pmra_free[_gaia_not_qso]
+        sig_pmdec_free_gnq   = _sig_pmdec_free[_gaia_not_qso]
+        sig_pm_free_gnq      = _pm_geom_unc(sig_pmra_free_gnq, sig_pmdec_free_gnq,
+                                            _rho_free[_gaia_not_qso])
+        _bp3m_gaia_conv_f    = _bp3m_conv_free & has_gaia
+        _bp3m_gaia_conv_f_nq = _bp3m_conv_free & _gaia_not_qso
+        _bp3m_hst_conv_f     = _bp3m_conv_free & hst_only
 
         fig = plt.figure(figsize=(13, 11/2*3), layout="constrained")
         gs  = fig.add_gridspec(3, 2)
@@ -239,10 +254,10 @@ def make_plots(solver, images, gaia_catalog,
 
         for ax, gaia_pm, bp3m_pm_g, sig_g, sig_b_g, comp in zip(
                 [ax_pmra, ax_pmdec],
-                [pmra_gaia[has_gaia],   pmdec_gaia[has_gaia]],
-                [pmra_bp3m_free_g,      pmdec_bp3m_free_g],
-                [sig_pmra_gaia[has_gaia], sig_pmdec_gaia[has_gaia]],
-                [sig_pmra_free_g,        sig_pmdec_free_g],
+                [pmra_gaia[_gaia_not_qso],   pmdec_gaia[_gaia_not_qso]],
+                [pmra_bp3m_free_gnq,          pmdec_bp3m_free_gnq],
+                [sig_pmra_gaia[_gaia_not_qso], sig_pmdec_gaia[_gaia_not_qso]],
+                [sig_pmra_free_gnq,            sig_pmdec_free_gnq],
                 [r"$\mu_{\alpha*}$",    r"$\mu_\delta$"]):
             ax.errorbar(gaia_pm, bp3m_pm_g, xerr=sig_g, yerr=sig_b_g,
                         fmt='o', ms=3, lw=0.5, alpha=0.5, color='steelblue',
@@ -257,10 +272,9 @@ def make_plots(solver, images, gaia_catalog,
             ax.legend(fontsize=7, loc='upper left')
             _style_ax(ax)
 
-        gm = gmag[has_gaia]
-        ax_unc.scatter(gm, sig_pm_gaia[has_gaia],
+        ax_unc.scatter(gm_nq, sig_pm_gaia[_gaia_not_qso],
                        s=6, alpha=0.7, color='#444444', label='Gaia 5p', zorder=2)
-        ax_unc.scatter(gmag[_bp3m_gaia_conv_f], _sig_pm_free[_bp3m_gaia_conv_f],
+        ax_unc.scatter(gmag[_bp3m_gaia_conv_f_nq], _sig_pm_free[_bp3m_gaia_conv_f_nq],
                        s=6, alpha=0.7, color='steelblue',
                        label='BP3M Gaia 5p (diffuse prior)', zorder=3)
         if _bp3m_hst_conv_f.any():
@@ -274,7 +288,7 @@ def make_plots(solver, images, gaia_catalog,
         ax_unc.set_yscale("log")
         _style_ax(ax_unc)
 
-        ax_unc_improve.scatter(gm, sig_pm_gaia[has_gaia] / _sig_pm_free[has_gaia],
+        ax_unc_improve.scatter(gm_nq, sig_pm_gaia[_gaia_not_qso] / _sig_pm_free[_gaia_not_qso],
                                s=6, alpha=0.6, color='steelblue', zorder=2)
         ax_unc_improve.set_xlabel("Gaia G [mag]")
         ax_unc_improve.set_ylabel("PM Improvement Factor (diffuse prior)")

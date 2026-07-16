@@ -214,6 +214,7 @@ def run_alignment(  # noqa: C901
     # of C_survey_inv and the matching secular-aberration RHS to
     # C_survey_inv_dot_v — the Gaia measurement contribution stays unchanged.
     print("\n  QSO anchor priors:")
+    _injected_qso_ids = []
     if use_qso_anchors:
         _qso_anchor_path = (Path(output_dir) / field_name / 'Gaia'
                             / f'{field_name}_qso_anchors.csv')
@@ -248,6 +249,7 @@ def run_alignment(  # noqa: C901
             _sigma_qso_pm_inv_sq  = (3.5e-4) ** -2
             _sigma_qso_plx_inv_sq = (1.0e-3) ** -2
             _n_injected = 0
+            _injected_qso_ids = []
 
             for _, _qrow in _qdf_ok.iterrows():
                 _sidx = star_id_to_idx.get(int(_qrow['source_id']))
@@ -262,6 +264,7 @@ def run_alignment(  # noqa: C901
                 solver.C_survey_inv_dot_v[_sidx, 2] += _sigma_qso_pm_inv_sq * _pmra_ab
                 solver.C_survey_inv_dot_v[_sidx, 3] += _sigma_qso_pm_inv_sq * _pmdec_ab
                 _n_injected += 1
+                _injected_qso_ids.append(int(_qrow['source_id']))
 
             if _n_injected > 0:
                 print(f"    Injected into alignment:       {_n_injected}  "
@@ -342,7 +345,8 @@ def run_alignment(  # noqa: C901
             make_plots(solver, imgs, gaia_catalog,
                        r_hat, v_hat, v_mean, v_cov, C_vT, C_r,
                        output_dir=output_bp3m,
-                       plot_residuals=plot_residuals)
+                       plot_residuals=plot_residuals,
+                       qso_anchor_ids=_injected_qso_ids)
         except Exception as exc:
             print(f"  WARNING: plots failed — {exc}")
 

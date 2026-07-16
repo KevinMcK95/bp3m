@@ -34,7 +34,7 @@ GAIA_REQUIRED_COLS = [
 # ── Gaia quality filtering ───────────────────────────────────────────────────
 
 def correct_flux_excess_factor(bp_rp, phot_bp_rp_excess_factor):
-    """Corrected flux excess factor (Riello et al. 2020 / GaiaHub convention)."""
+    """Corrected flux excess factor (Riello et al. 2020)."""
     bp_rp = np.asarray(bp_rp, dtype=float)
     C = np.asarray(phot_bp_rp_excess_factor, dtype=float)
     corr = np.zeros_like(bp_rp)

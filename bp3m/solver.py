@@ -8,7 +8,7 @@ marginalization for efficiency at scale.
 Coordinate conventions:
   - HST positions: x_c = X - Xo, y_c = Y - Yo  (centered on image pivot)
   - Gaia pseudo-image: xs = plane_project(ra, dec, ra0, dec0, pscale)
-    which gives ~(X_G - Wo) in the GaiaHub frame
+    which gives ~(X_G - Wo) in the detector frame
   - Both are in units of HST pixels (same pixel scale)
 
 The transformation model:

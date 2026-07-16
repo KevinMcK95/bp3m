@@ -170,7 +170,7 @@ def _build_query(source_table, ra, dec, width, height):
 
 
 def _mag_bins(min_mag, max_mag, area):
-    """Log-spaced magnitude bins matching GaiaHub's density-adaptive scheme."""
+    """Log-spaced magnitude bins using a density-adaptive scheme."""
     # n is the number of bin edges; minimum 2 to produce at least 1 bin.
     n = max(2, round((max_mag - min_mag) * max_mag**2 * area * 5e-5))
     return 1.0 + max_mag - np.logspace(

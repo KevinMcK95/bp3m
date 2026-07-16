@@ -103,7 +103,7 @@ def _make_query_params(
 
 def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
     """
-    Scan a GaiaHub lib/ directory to find instrument+filter combinations that
+    Scan a lib/ directory to find instrument+filter combinations that
     have BOTH a STDPSF and a STDGDC file.
 
     Parameters
@@ -234,7 +234,7 @@ def search_mast(
     if project is None:
         project = [telescope]
 
-    # Shrink box slightly to avoid edge artefacts (GaiaHub convention)
+    # Shrink box slightly to avoid edge artefacts
     cos_dec = np.cos(np.deg2rad(dec))
     margin_ra  = 0.056 / cos_dec
     margin_dec = 0.056

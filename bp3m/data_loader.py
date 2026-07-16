@@ -1,5 +1,5 @@
 """
-Load and organize BP3M input data from GaiaHub source summary CSVs.
+Load and organize BP3M input data from source summary CSVs.
 """
 
 import numpy as np
@@ -105,12 +105,12 @@ def load_image_data(data_root, field_name="Fornax_dSph"):
             "instrument": str(row["instrument"]),
             "detector": str(row["detector"]),
             "filter": str(row["filter"]),
-            # GaiaHub transformation pivot points
+            # Transformation pivot points
             # Xo, Yo = center of rotation in HST raw pixel coordinates
             # Wo, Zo = corresponding center in Gaia pseudo-image coordinates
             "Xo": float(row["Xo"]), "Yo": float(row["Yo"]),
             "Wo": float(row["Wo"]), "Zo": float(row["Zo"]),
-            # Initial GaiaHub transformation for reference
+            # Initial transformation for reference
             "AG": float(row["AG"]), "BG": float(row["BG"]),
             "CG": float(row["CG"]), "DG": float(row["DG"]),
         }

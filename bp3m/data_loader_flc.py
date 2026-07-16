@@ -171,7 +171,7 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
         # Gaia pseudo-image pivot (target of initial transformation)
         "Wo": xt_o,
         "Zo": yt_o,
-        # Initial GaiaHub-style transformation coefficients
+        # Initial transformation coefficients
         "AG": A, "BG": B, "CG": C, "DG": D,
         # Source pivot (needed to reconstruct the full initial transform)
         "xs_o": xs_o, "ys_o": ys_o,
@@ -344,7 +344,7 @@ def _build_stars_df(img_dir: Path, img_name: str,
 
 # ── CCD/amplifier split utilities ────────────────────────────────────────────
 # Moved here from data_loader.py so that all active pipeline code imports from
-# data_loader_flc and data_loader.py (GaiaHub-based loader) is unused.
+# data_loader_flc and data_loader.py (legacy loader) is unused.
 
 _AMP_SPLITS = {
     "ACSWFC":   {"x_split": 2048.0, "y_split": 2048.0},
