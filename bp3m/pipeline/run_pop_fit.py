@@ -585,20 +585,15 @@ def _joint_solve_pop(
 
     # ── Stellar posteriors ────────────────────────────────────────────────────
     C_vT = np.zeros_like(H_vv)
-    # Also compute C_vT for inactive member stars: Gaia-2p members have Gaia
-    # position + population prior in H_vv, making it non-singular even with
-    # no active HST detections.  This lets _compute_free_stellar_posterior
-    # correctly strip the population prior and apply the diffuse prior.
-    _need_cvT_mask = active_glob.copy()
-    _need_cvT_mask[member_sidx] = True
-    _need_cvT_sidx = np.where(_need_cvT_mask)[0]
-    if len(_need_cvT_sidx) > 0:
-        # Guard against truly data-less stars (zero H_vv diagonal)
-        _hdiag = np.diagonal(H_vv[_need_cvT_sidx], axis1=1, axis2=2)
-        _invertible = _hdiag.all(axis=1)
-        _safe_sidx = _need_cvT_sidx[_invertible]
-        if len(_safe_sidx) > 0:
-            C_vT[_safe_sidx] = np.linalg.inv(H_vv[_safe_sidx])
+    # Compute C_vT for every star whose H_vv is non-degenerate.
+    # This covers active stars, inactive members, AND non-active non-member 5p
+    # stars (which carry a full Gaia prior and should recover Gaia posteriors
+    # when n_hst_used=0).  The _invertible guard skips truly data-less stars.
+    _hdiag = np.diagonal(H_vv, axis1=1, axis2=2)
+    _invertible = _hdiag.all(axis=1)
+    _safe_sidx = np.where(_invertible)[0]
+    if len(_safe_sidx) > 0:
+        C_vT[_safe_sidx] = np.linalg.inv(H_vv[_safe_sidx])
     a_align = np.einsum('nij,nj->ni', C_vT, h_align)
     a       = np.einsum('nij,nj->ni', C_vT, h_all)
 

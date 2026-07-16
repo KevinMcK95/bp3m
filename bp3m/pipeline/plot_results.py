@@ -330,6 +330,7 @@ def make_plots(solver, images, gaia_catalog,
 
     _is_mem_gaia_h = is_member[has_gaia]       if is_member is not None else None
     _is_mem_bp3m_h = is_member[bp3m_converged] if is_member is not None else None
+    _has_members   = is_member is not None
 
     def _render_vd(axes, pmra_g, pmdec_g, c_g, pmra_b, pmdec_b, c_b,
                    is_m_g, is_m_b, vd_norm, title_bp3m='BP3M'):
@@ -364,10 +365,35 @@ def make_plots(solver, images, gaia_catalog,
                               loc='upper left', framealpha=0.7)
         return sc_last
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
-    sc_last = _render_vd(axes, gaia_pmra_h, gaia_pmdec_h, c_gaia,
+    def _add_mem_row_vd(axes_row, pmra_g, pmdec_g, c_g, is_m_g,
+                        pmra_b, pmdec_b, c_b, is_m_b, vd_norm,
+                        labels=("Gaia", "BP3M")):
+        """Scatter members only into a 2-element axes row with natural scaling."""
+        for col, pmra, pmdec, c_vals, is_m, label in zip(
+                [0, 1],
+                [pmra_g, pmra_b], [pmdec_g, pmdec_b], [c_g, c_b],
+                [is_m_g, is_m_b], labels):
+            ax = axes_row[col]
+            m = is_m if is_m is not None else np.ones(len(pmra), bool)
+            ax.scatter(pmra[m], pmdec[m], c=c_vals[m], norm=vd_norm,
+                       cmap=cmap, s=15, alpha=0.85, zorder=2)
+            ax.axhline(0, c='k', lw=1, ls='--', zorder=1e10)
+            ax.axvline(0, c='k', lw=1, ls='--', zorder=1e10)
+            _add_mu_pop_lines(ax, mu_pop)
+            ax.set_xlabel(r"$\mu_{\alpha*}$ [mas/yr]")
+            ax.set_ylabel(r"$\mu_\delta$ [mas/yr]")
+            ax.set_title(f"{label} — members only")
+            ax.set_aspect("equal")
+            _style_ax(ax)
+
+    _vd_nrows = 3 if _has_members else 2
+    fig, axes = plt.subplots(_vd_nrows, 2, figsize=(13, 6 * _vd_nrows), layout="constrained")
+    sc_last = _render_vd(axes[:2, :], gaia_pmra_h, gaia_pmdec_h, c_gaia,
                          bp3m_pmra_h, bp3m_pmdec_h, c_bp3m,
                          _is_mem_gaia_h, _is_mem_bp3m_h, norm)
+    if _has_members:
+        _add_mem_row_vd(axes[2, :], gaia_pmra_h, gaia_pmdec_h, c_gaia, _is_mem_gaia_h,
+                        bp3m_pmra_h, bp3m_pmdec_h, c_bp3m, _is_mem_bp3m_h, norm)
     cbar = fig.colorbar(sc_last, ax=axes, shrink=0.6, pad=0.02, aspect=30)
     cbar.set_label(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
     fig.suptitle("PM vector diagrams coloured by geometric-mean uncertainty", fontsize=13)
@@ -383,11 +409,15 @@ def make_plots(solver, images, gaia_catalog,
         _norm_free = mcolors.LogNorm(
             vmin=max(float(np.nanpercentile(_all_unc_free, 2)), 1e-6),
             vmax=float(np.nanpercentile(_all_unc_free, 98)))
-        fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
-        sc_last = _render_vd(axes, gaia_pmra_h, gaia_pmdec_h, c_gaia,
+        fig, axes = plt.subplots(_vd_nrows, 2, figsize=(13, 6 * _vd_nrows), layout="constrained")
+        sc_last = _render_vd(axes[:2, :], gaia_pmra_h, gaia_pmdec_h, c_gaia,
                              _bp3m_pmra_free_h, _bp3m_pmdec_free_h, _c_bp3m_free,
                              _is_mem_gaia_h, _is_m_free_h, _norm_free,
                              title_bp3m='BP3M (diffuse prior)')
+        if _has_members:
+            _add_mem_row_vd(axes[2, :], gaia_pmra_h, gaia_pmdec_h, c_gaia, _is_mem_gaia_h,
+                            _bp3m_pmra_free_h, _bp3m_pmdec_free_h, _c_bp3m_free,
+                            _is_m_free_h, _norm_free, labels=("Gaia", "BP3M (diffuse prior)"))
         cbar = fig.colorbar(sc_last, ax=axes, shrink=0.6, pad=0.02, aspect=30)
         cbar.set_label(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
         fig.suptitle("PM vector diagrams (diffuse prior) coloured by geometric-mean uncertainty",
@@ -436,11 +466,14 @@ def make_plots(solver, images, gaia_catalog,
     C_pm_gaia_h = solver.C_survey[has_gaia, 2:4, 2:4]
     C_pm_bp3m_h = C_pm_bp3m[bp3m_converged]
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
-    sc_last = _render_vd_eb(axes,
+    fig, axes = plt.subplots(_vd_nrows, 2, figsize=(13, 6 * _vd_nrows), layout="constrained")
+    sc_last = _render_vd_eb(axes[:2, :],
                             gaia_pmra_h, gaia_pmdec_h, c_gaia, C_pm_gaia_h,
                             bp3m_pmra_h, bp3m_pmdec_h, c_bp3m, C_pm_bp3m_h,
                             _is_mem_gaia_h, _is_mem_bp3m_h, norm)
+    if _has_members:
+        _add_mem_row_vd(axes[2, :], gaia_pmra_h, gaia_pmdec_h, c_gaia, _is_mem_gaia_h,
+                        bp3m_pmra_h, bp3m_pmdec_h, c_bp3m, _is_mem_bp3m_h, norm)
     cbar = fig.colorbar(sc_last, ax=axes, shrink=0.6, pad=0.02, aspect=30)
     cbar.set_label(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
     fig.suptitle(
@@ -451,13 +484,17 @@ def make_plots(solver, images, gaia_catalog,
 
     if has_free:
         _C_pm_bp3m_free_h = _C_pm_free[_bp3m_conv_free]
-        fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
-        sc_last = _render_vd_eb(axes,
+        fig, axes = plt.subplots(_vd_nrows, 2, figsize=(13, 6 * _vd_nrows), layout="constrained")
+        sc_last = _render_vd_eb(axes[:2, :],
                                 gaia_pmra_h, gaia_pmdec_h, c_gaia, C_pm_gaia_h,
                                 _bp3m_pmra_free_h, _bp3m_pmdec_free_h,
                                 _c_bp3m_free, _C_pm_bp3m_free_h,
                                 _is_mem_gaia_h, _is_m_free_h, _norm_free,
                                 title_bp3m='BP3M (diffuse prior)')
+        if _has_members:
+            _add_mem_row_vd(axes[2, :], gaia_pmra_h, gaia_pmdec_h, c_gaia, _is_mem_gaia_h,
+                            _bp3m_pmra_free_h, _bp3m_pmdec_free_h, _c_bp3m_free,
+                            _is_m_free_h, _norm_free, labels=("Gaia", "BP3M (diffuse prior)"))
         cbar = fig.colorbar(sc_last, ax=axes, shrink=0.6, pad=0.02, aspect=30)
         cbar.set_label(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
         fig.suptitle(
@@ -509,7 +546,7 @@ def make_plots(solver, images, gaia_catalog,
     norm_xo = _lin_norm(x_orig_star)
     norm_yo = _lin_norm(y_orig_star)
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
+    fig, axes = plt.subplots(_vd_nrows, 2, figsize=(13, 6 * _vd_nrows), layout="constrained")
 
     sc_xo = sc_yo = None
     for row, xlim, ylim, row_label in zip(
@@ -547,6 +584,25 @@ def make_plots(solver, images, gaia_catalog,
             if row == 0 and col == 1:
                 sc_yo = sc
 
+    if _has_members and _is_mem_bp3m_h is not None:
+        _m_b = _is_mem_bp3m_h
+        for col, c_vals, norm_c, coord_label in zip(
+                [0, 1],
+                [x_orig_star[_m_b], y_orig_star[_m_b]],
+                [norm_xo, norm_yo],
+                ["X_orig", "Y_orig"]):
+            ax = axes[2, col]
+            ax.scatter(bp3m_pmra_h[_m_b], bp3m_pmdec_h[_m_b],
+                       c=c_vals, norm=norm_c, cmap="plasma", s=15, alpha=0.85, zorder=2)
+            ax.axhline(0, c='k', lw=1, ls='--', zorder=1e10)
+            ax.axvline(0, c='k', lw=1, ls='--', zorder=1e10)
+            _add_mu_pop_lines(ax, mu_pop)
+            ax.set_xlabel(r"$\mu_{\alpha*}$ [mas/yr]")
+            ax.set_ylabel(r"$\mu_\delta$ [mas/yr]")
+            ax.set_title(f"BP3M — members only  (colour: {coord_label})")
+            ax.set_aspect("equal")
+            _style_ax(ax)
+
     cbar_xo = fig.colorbar(sc_xo, ax=axes[:, 0], shrink=0.6, pad=0.02, aspect=30)
     cbar_xo.set_label("X_orig [pixels]")
     cbar_yo = fig.colorbar(sc_yo, ax=axes[:, 1], shrink=0.6, pad=0.02, aspect=30)
@@ -573,7 +629,7 @@ def make_plots(solver, images, gaia_catalog,
         _free_zoom_xlim = (_bx_cen_f - _b_hw_f, _bx_cen_f + _b_hw_f)
         _free_zoom_ylim = (_by_cen_f - _b_hw_f, _by_cen_f + _b_hw_f)
 
-        fig, axes = plt.subplots(2, 2, figsize=(13, 12), layout="constrained")
+        fig, axes = plt.subplots(_vd_nrows, 2, figsize=(13, 6 * _vd_nrows), layout="constrained")
         sc_xo_f = sc_yo_f = None
         for row, xlim, ylim, row_label in zip(
                 [0, 1],
@@ -606,6 +662,26 @@ def make_plots(solver, images, gaia_catalog,
                                   loc='upper left', framealpha=0.7)
                 if row == 0 and col == 1:
                     sc_yo_f = sc
+
+        if _has_members and _is_m_free_h is not None:
+            _m_f = _is_m_free_h
+            for col, c_vals, norm_c, coord_label in zip(
+                    [0, 1],
+                    [_x_orig_free[_m_f], _y_orig_free[_m_f]],
+                    [_norm_xo_free, _norm_yo_free],
+                    ["X_orig", "Y_orig"]):
+                ax = axes[2, col]
+                ax.scatter(_bp3m_pmra_free_h[_m_f], _bp3m_pmdec_free_h[_m_f],
+                           c=c_vals, norm=norm_c, cmap="plasma", s=15, alpha=0.85, zorder=2)
+                ax.axhline(0, c='k', lw=1, ls='--', zorder=1e10)
+                ax.axvline(0, c='k', lw=1, ls='--', zorder=1e10)
+                _add_mu_pop_lines(ax, mu_pop)
+                ax.set_xlabel(r"$\mu_{\alpha*}$ [mas/yr]")
+                ax.set_ylabel(r"$\mu_\delta$ [mas/yr]")
+                ax.set_title(f"BP3M (diffuse prior) — members only  (colour: {coord_label})")
+                ax.set_aspect("equal")
+                _style_ax(ax)
+
         cbar_xo = fig.colorbar(sc_xo_f, ax=axes[:, 0], shrink=0.6, pad=0.02, aspect=30)
         cbar_xo.set_label("X_orig [pixels]")
         cbar_yo = fig.colorbar(sc_yo_f, ax=axes[:, 1], shrink=0.6, pad=0.02, aspect=30)
