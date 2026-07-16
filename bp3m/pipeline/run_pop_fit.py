@@ -1686,6 +1686,7 @@ def run_pop_fit(
     max_sigma_free_pm: float = 1.0,
     fit_members_only: bool = False,
     mu_pop_init: tuple[float, float] | None = None,
+    freeze_mu_pop_init: bool = False,
     poly_order: int | None = None,
     no_plots: bool = False,
     fit_cte: bool = False,
@@ -1972,20 +1973,27 @@ def run_pop_fit(
     # ── Bootstrap μ_pop from v1 PMs ──────────────────────────────────────────
     _mu_init_arr = (np.array([float(mu_pop_init[0]), float(mu_pop_init[1])])
                     if mu_pop_init is not None else None)
-    if _mu_init_arr is not None:
-        print(f"\n  Bootstrapping μ_pop from v1 bp3m PMs (sigma-clip seeded at "
-              f"({_mu_init_arr[0]:+.4f}, {_mu_init_arr[1]:+.4f}) mas/yr)...")
-    else:
-        print("\n  Bootstrapping μ_pop from v1 bp3m PMs (sigma-clip)...")
     if _v1_pm_loaded:
         _pmra_v1_only  = np.where(_v1_matched, _pmra_init,  np.nan)
         _pmdec_v1_only = np.where(_v1_matched, _pmdec_init, np.nan)
+    else:
+        _pmra_v1_only  = _pmra_init
+        _pmdec_v1_only = _pmdec_init
+
+    if freeze_mu_pop_init and _mu_init_arr is not None:
+        print(f"\n  Skipping bootstrap — using --mu_pop_init directly: "
+              f"({_mu_init_arr[0]:+.4f}, {_mu_init_arr[1]:+.4f}) mas/yr")
+        _mu_boot = _mu_init_arr.copy()
+    elif _v1_pm_loaded:
+        if _mu_init_arr is not None:
+            print(f"\n  Bootstrapping μ_pop from v1 bp3m PMs (sigma-clip seeded at "
+                  f"({_mu_init_arr[0]:+.4f}, {_mu_init_arr[1]:+.4f}) mas/yr)...")
+        else:
+            print("\n  Bootstrapping μ_pop from v1 bp3m PMs (sigma-clip)...")
         _mu_boot = _estimate_mu_pop_v1(_pmra_v1_only, _pmdec_v1_only,
                                        mu_init=_mu_init_arr)
     else:
         print("  WARNING: v1 PMs not loaded; using Gaia sigma-clip for μ_pop bootstrap")
-        _pmra_v1_only  = _pmra_init
-        _pmdec_v1_only = _pmdec_init
         _mu_boot = _estimate_mu_pop(gaia_catalog)
 
     # ── Initial member selection using v1 PMs only ────────────────────────────
@@ -2836,11 +2844,14 @@ def main():
                              'use_for_fit each iteration')
     parser.add_argument('--mu_pop_init', type=float, nargs=2,
                         metavar=('PMRA', 'PMDEC'), default=None,
-                        help='Initial μ_pop estimate in mas/yr (pmra pmdec). When provided, '
-                             'bypasses the empirical bootstrap and uses these values directly '
-                             'as the starting point and prior centre. Useful when N_members '
-                             'is small or a literature value is available '
+                        help='Initial μ_pop estimate in mas/yr (pmra pmdec). Seeds the '
+                             'sigma-clip bootstrap as the starting centre. Combine with '
+                             '--freeze_mu_pop_init to skip the bootstrap entirely. '
                              '(e.g. --mu_pop_init -0.06 -0.11)')
+    parser.add_argument('--freeze_mu_pop_init', action='store_true',
+                        help='Skip the sigma-clip bootstrap and use --mu_pop_init directly '
+                             'as the starting μ_pop and prior centre. Useful for sparse '
+                             'fields where the bootstrap wanders from the literature value.')
     parser.add_argument('--fit_cte', action='store_true',
                         help='After pop-fit convergence, run a CTE phase: warm-start the '
                              'CTE model (γ only, r and μ_pop fixed), then jointly fit '
@@ -2899,6 +2910,7 @@ def main():
         max_sigma_free_pm=args.max_sigma_free_pm,
         fit_members_only=args.fit_members_only,
         mu_pop_init=tuple(args.mu_pop_init) if args.mu_pop_init is not None else None,
+        freeze_mu_pop_init=args.freeze_mu_pop_init,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
         fit_cte=args.fit_cte,
