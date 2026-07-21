@@ -321,7 +321,7 @@ def download_gaia(
     search_height: float,
     output_dir: Path,
     field_name: str,
-    min_gmag: float = 16.0,
+    min_gmag: float = 0.0,
     max_gmag: float | None = None,
     source_table: str = 'gaiadr3.gaia_source',
     sigma_flux_excess: float = 3.0,
@@ -348,7 +348,7 @@ def download_gaia(
     search_width/height: box size (degrees)
     output_dir         : pipeline root directory
     field_name         : subdirectory name (e.g. 'Sculptor_dSph')
-    min_gmag           : brightest G magnitude to query
+    min_gmag           : brightest G magnitude to query (default 0 = no bright limit)
     max_gmag           : faintest G magnitude to query (None = no limit)
     source_table       : Gaia TAP table name
     sigma_flux_excess  : threshold for flux excess factor clipping

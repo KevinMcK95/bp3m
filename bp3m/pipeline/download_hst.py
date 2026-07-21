@@ -297,9 +297,11 @@ def search_mast(
             else:
                 raise
     im_sub   = im_type[1:].upper()   # '_flc' → 'FLC'
+    _AUX_TYPES = {'SPT', 'JIT', 'JIF'}
     mask = (
         ((prod_raw['productSubGroupDescription'] == im_sub) |
-         (prod_raw['productSubGroupDescription'] == 'DRZ')) &
+         (prod_raw['productSubGroupDescription'] == 'DRZ') |
+         (prod_raw['productSubGroupDescription'].isin(_AUX_TYPES))) &
         (prod_raw['obs_collection'] == telescope)
     )
     prod_df = prod_raw[mask].to_pandas()
@@ -331,26 +333,35 @@ def search_mast(
     prod_df = prod_df.merge(
         meta.rename(columns={'obsid': 'parent_obsid'}), on='parent_obsid', how='left')
 
-    # Filter by exposure time and (optionally) time baseline
+    # Filter by exposure time and (optionally) time baseline.
+    # Auxiliary products (SPT/JIT/JIF) have no i_exptime — keep them unconditionally.
     t_base_yr = time_baseline_days / 365.2422 if time_baseline_days is not None else -np.inf
     obs_df = obs_df[
         (obs_df['i_exptime'] >= t_exptime_min) &
         (obs_df['i_exptime'] <= t_exptime_max) &
         (obs_df['t_baseline'] >= t_base_yr)
     ]
+    _prod_is_aux = prod_df['productSubGroupDescription'].isin(_AUX_TYPES)
     prod_df = prod_df[
-        (prod_df['i_exptime'] >= t_exptime_min) &
-        (prod_df['i_exptime'] <= t_exptime_max) &
-        (prod_df['t_baseline'] >= t_base_yr)
+        _prod_is_aux | (
+            (prod_df['i_exptime'] >= t_exptime_min) &
+            (prod_df['i_exptime'] <= t_exptime_max) &
+            (prod_df['t_baseline'] >= t_base_yr)
+        )
     ]
 
     # Post-query date filter for obs_date_max
     if obs_date_max is not None:
         t_max_iso = Time(obs_date_max).mjd
         obs_df  = obs_df[obs_df['t_max'] <= t_max_iso]
-        prod_df = prod_df[prod_df['t_baseline'].notna()]   # already merged; filter via obsid
         keep_ids = set(obs_df['obsid'].astype(str))
-        prod_df = prod_df[prod_df['parent_obsid'].isin(keep_ids)]
+        # Aux products (SPT/JIT/JIF) follow the science observation filter.
+        _prod_is_aux2 = prod_df['productSubGroupDescription'].isin(_AUX_TYPES)
+        prod_df = prod_df[
+            (_prod_is_aux2 & prod_df['parent_obsid'].isin(keep_ids)) |
+            (~_prod_is_aux2 & prod_df['t_baseline'].notna() &
+             prod_df['parent_obsid'].isin(keep_ids))
+        ]
 
     # Filter products to only PSF+GDC-available instrument+filter combos
     if available_combos:
@@ -703,6 +714,46 @@ def download_hst_images(
         print(f"  NOTE: {len(failed_obsids)} failed observation(s) excluded from processing: "
               + ", ".join(sorted(failed_obsids)))
     _write_selected_obsids(prod_df, hst_dir, field_name, im_type, failed_obsids)
+
+    # Download auxiliary products (SPT/JIT/JIF) — skip files already on disk.
+    _aux_types = {'SPT', 'JIT', 'JIF'}
+    aux_df = prod_df[prod_df['productSubGroupDescription'].isin(_aux_types)].copy()
+    if not aux_df.empty and 'dataURI' in aux_df.columns:
+        mast_root_aux = hst_dir / "mastDownload" / tel_upper
+        need_dl = []
+        for _, row in aux_df.iterrows():
+            fname  = Path(row['dataURI']).name
+            obs_id = row.get('obs_id', '')
+            dest   = mast_root_aux / obs_id / fname
+            if not dest.exists() or (force_redownload and dest.exists()):
+                need_dl.append(row.name)
+        if need_dl:
+            aux_to_dl = aux_df.loc[need_dl]
+            print(f"\n  Downloading {len(aux_to_dl)} auxiliary (SPT/JIT/JIF) file(s)...")
+            _aux_delay = 10
+            for _aux_attempt in range(5):
+                try:
+                    try:
+                        Observations.download_products(
+                            Table.from_pandas(aux_to_dl), download_dir=str(hst_dir))
+                    except Exception:
+                        Observations.download_products(aux_to_dl, download_dir=str(hst_dir))
+                    break
+                except Exception as _e:
+                    if _aux_attempt < 4:
+                        print(f"  Aux download failed (attempt {_aux_attempt+1}/5): {_e}")
+                        print(f"  Retrying in {_aux_delay}s ...")
+                        _time.sleep(_aux_delay)
+                        _aux_delay *= 2
+                    else:
+                        print(f"  WARNING: auxiliary download failed — {_e}")
+                        break
+            else:
+                print("  Auxiliary download complete.")
+        else:
+            n_aux = len(aux_df)
+            print(f"  {n_aux} auxiliary (SPT/JIT/JIF) file(s) already on disk.")
+
     return obs_df, prod_df
 
 
