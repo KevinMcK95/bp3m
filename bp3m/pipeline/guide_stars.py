@@ -61,7 +61,7 @@ _GSC242_URL = ("https://gsss.stsci.edu/webservices/vo/CatalogSearch.aspx"
                "&FORMAT=VOTable&CAT=GSC242")
 
 # FGS approximate field radius from V1 axis (degrees); 14 arcmin + margin
-_FGS_SEARCH_RADIUS_DEG = 0.30
+_FGS_SEARCH_RADIUS_DEG = 0.50
 
 
 # ── GSC ID parsing ────────────────────────────────────────────────────────────
