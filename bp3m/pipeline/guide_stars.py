@@ -1,27 +1,33 @@
 """
 Identify HST guide stars used across all exposures, resolve their sky
-positions from GSC catalogs, and cross-match to Gaia DR3.
+positions from the STScI Guide Star Catalog 2.4.2, and cross-match to
+Gaia DR3.
 
 Flow:
-  1. Scan all *_spt.fits files → collect unique GSC IDs (DGESTAR/SGESTAR)
-     and per-exposure observation times.
-  2. Query VizieR for each ID to get RA/Dec at J2000.0:
-       N6UH###### → GSC 2.3.2  (VizieR I/305, column GSC2.3)
-       ##########  → GSC 1.x   (VizieR I/254, column GSC)
-  3. Gaia DR3 TAP cone search (r=30") around each GSC position.
-     For each candidate, propagate from Gaia J2016.0 → J2000.0 using
-     proper motion, perspective acceleration (vlos), and annual parallax
-     (GCRS transform).  Best match = smallest propagated sep vs GSC J2000.
-  4. Save {field_name}_guide_stars.csv in hst_dir.
+  1. Scan all *_spt.fits files → collect unique GSC IDs (DGESTAR/SGESTAR),
+     mean EXPSTART MJD, and mean V1 telescope pointing per guide star.
+  2. Query STScI GSC 2.4.2 web service (cone search around V1 pointing).
+     GSC 2.4.2 is the current operational HST guide star catalog; it
+     contains entries absent from the older VizieR-hosted GSC 2.3.2, and
+     already embeds Gaia DR1/DR2 source IDs.
+     Fall back to VizieR I/305 (GSC 2.3.2) or I/254 (GSC 1.x) if the
+     star is not found in GSC 2.4.2.
+  3. For each matched GSC entry that has a Gaia DR2 source ID: query
+     Gaia DR3 directly by source_id to retrieve up-to-date astrometry
+     (ra, dec, pmra, pmdec, parallax, radial_velocity).  If no DR2 ID is
+     available, fall back to a Gaia DR3 cone search.
+  4. Cross-match quality is assessed by propagating the Gaia J2016
+     position → J2000 apparent (GCRS, to match the nature of GSC
+     photographic plate observations) and comparing to the GSC position.
+  5. Save {field_name}_guide_stars.csv in hst_dir.
      Subsequent calls are incremental: new guide stars are resolved and
-     appended; existing entries are updated with current obs statistics and
-     re-propagated positions.
+     appended; existing entries have their obs statistics refreshed.
 
 Per-image positions:
   get_guide_star_position_at_epoch() propagates any entry from the CSV to
-  an arbitrary HST observation epoch, accounting for PM + parallax + vlos.
-  This is called separately for each FLC (e.g. from jitter_summary.py) to
-  obtain the guide star's sky position at the time of that image.
+  an arbitrary HST observation epoch, returning the barycentric ICRS
+  position (no aberration) suitable for comparing to the Gaia reference
+  frame used by BP3M.
 
 Usage (standalone):
     python -m bp3m.pipeline.guide_stars <hst_dir> [--field <name>] [--force]
@@ -30,6 +36,7 @@ Usage (standalone):
 from __future__ import annotations
 
 import argparse
+import io
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -45,8 +52,16 @@ import astropy.units as u
 # Gaia DR3 reference epoch (Julian year, TCB scale)
 _GAIA_EPOCH = Time(2016.0, format="jyear", scale="tcb")
 
-# GSC catalog epoch (J2000.0 for both GSC 1.x and GSC 2.3.2 coordinate system)
+# GSC catalog epoch for cross-match comparison
 _GSC_EPOCH = Time(2000.0, format="jyear")
+
+# STScI GSC 2.4.2 web service
+_GSC242_URL = ("https://gsss.stsci.edu/webservices/vo/CatalogSearch.aspx"
+               "?RA={ra:.6f}&DEC={dec:.6f}&SR={sr:.4f}"
+               "&FORMAT=VOTable&CAT=GSC242")
+
+# FGS approximate field radius from V1 axis (degrees); 14 arcmin + margin
+_FGS_SEARCH_RADIUS_DEG = 0.30
 
 
 # ── GSC ID parsing ────────────────────────────────────────────────────────────
@@ -68,7 +83,7 @@ def _parse_guide_star_entry(raw: str) -> tuple[str, str]:
 
 def _gsc_catalog_for_id(gsc_id: str) -> tuple[str, str]:
     """
-    (vizier_catalog, id_column) for the given GSC ID format.
+    VizieR fallback: (catalog, id_column) for the given GSC ID format.
     Starts with a letter → GSC 2.3.2 (I/305, 'GSC2.3')
     Purely numeric      → GSC 1.x   (I/254, 'GSC')
     """
@@ -82,51 +97,150 @@ def _gsc_catalog_for_id(gsc_id: str) -> tuple[str, str]:
 def collect_guide_star_ids(hst_dir: str | Path) -> pd.DataFrame:
     """
     Scan all *_spt.fits and return a DataFrame of unique guide stars with
-    usage counts and mean observation epoch.
+    usage counts, mean observation epoch, and mean V1 telescope pointing.
 
     Columns: gsc_id, fgs_unit, n_dominant, n_subdominant, mean_obs_mjd,
-             vizier_catalog, id_column.
+             mean_ra_v1, mean_dec_v1, vizier_catalog, id_column.
     """
     hst_dir = Path(hst_dir)
     mast_root = hst_dir / "mastDownload" / "HST"
 
-    counts: dict[tuple[str, str], dict] = defaultdict(
-        lambda: {"n_dominant": 0, "n_subdominant": 0, "obs_mjds": []})
+    counts: dict[tuple[str, str], dict] = defaultdict(lambda: {
+        "n_dominant": 0, "n_subdominant": 0,
+        "obs_mjds": [], "ra_v1s": [], "dec_v1s": [],
+    })
 
     for spt_path in sorted(mast_root.rglob("*_spt.fits")):
         with fits.open(spt_path) as hdul:
             h = hdul[0].header
             dom_raw  = h.get("DGESTAR", "") or ""
             sub_raw  = h.get("SGESTAR", "") or ""
-            expstart = h.get("EXPSTART")       # MJD
+            expstart = h.get("EXPSTART")
+            ra_v1    = h.get("RA_V1")
+            dec_v1   = h.get("DEC_V1")
         dom_id, dom_fgs = _parse_guide_star_entry(dom_raw)
         sub_id, sub_fgs = _parse_guide_star_entry(sub_raw)
-        if dom_id:
-            counts[(dom_id, dom_fgs)]["n_dominant"] += 1
+        for gid, fgs, role in ((dom_id, dom_fgs, "dominant"),
+                                (sub_id, sub_fgs, "subdominant")):
+            if not gid:
+                continue
+            c = counts[(gid, fgs)]
+            c[f"n_{role}"] += 1
             if expstart is not None:
-                counts[(dom_id, dom_fgs)]["obs_mjds"].append(float(expstart))
-        if sub_id:
-            counts[(sub_id, sub_fgs)]["n_subdominant"] += 1
-            if expstart is not None:
-                counts[(sub_id, sub_fgs)]["obs_mjds"].append(float(expstart))
+                c["obs_mjds"].append(float(expstart))
+            if ra_v1 is not None:
+                c["ra_v1s"].append(float(ra_v1))
+            if dec_v1 is not None:
+                c["dec_v1s"].append(float(dec_v1))
 
     rows = []
     for (gsc_id, fgs_unit), c in sorted(counts.items()):
         cat, col = _gsc_catalog_for_id(gsc_id)
-        mjds = c["obs_mjds"]
         rows.append({
             "gsc_id":         gsc_id,
             "fgs_unit":       fgs_unit,
             "n_dominant":     c["n_dominant"],
             "n_subdominant":  c["n_subdominant"],
-            "mean_obs_mjd":   float(np.mean(mjds)) if mjds else np.nan,
+            "mean_obs_mjd":   float(np.mean(c["obs_mjds"]))   if c["obs_mjds"]  else np.nan,
+            "mean_ra_v1":     float(np.mean(c["ra_v1s"]))     if c["ra_v1s"]   else np.nan,
+            "mean_dec_v1":    float(np.mean(c["dec_v1s"]))    if c["dec_v1s"]  else np.nan,
             "vizier_catalog": cat,
             "id_column":      col,
         })
     return pd.DataFrame(rows)
 
 
-# ── Step 2: VizieR GSC position lookup ───────────────────────────────────────
+# ── Step 2: GSC 2.4.2 position lookup ────────────────────────────────────────
+
+def _query_gsc242(gsc_id: str,
+                  ra_v1: float, dec_v1: float,
+                  radius_deg: float = _FGS_SEARCH_RADIUS_DEG,
+                  retries: int = 3) -> dict | None:
+    """
+    Cone search the STScI GSC 2.4.2 web service around the V1 telescope
+    pointing and return the matching entry for gsc_id, or None.
+
+    Returns a dict with keys: ra, dec, epoch, rapm, decpm, parallax,
+    gaia_dr2_source_id (int64 or None), mag_g (float).
+    """
+    import urllib.request
+    from astropy.io.votable import parse_single_table
+
+    url = _GSC242_URL.format(ra=ra_v1, dec=dec_v1, sr=radius_deg)
+    delay = 5
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                data = resp.read()
+            break
+        except Exception as e:
+            if attempt < retries - 1:
+                print(f"    GSC 2.4.2 retry {attempt+1}: {e}")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                print(f"    WARNING: GSC 2.4.2 query failed: {e}")
+                return None
+
+    try:
+        tbl = parse_single_table(io.BytesIO(data)).to_table()
+    except Exception as e:
+        print(f"    WARNING: GSC 2.4.2 parse failed: {e}")
+        return None
+
+    if len(tbl) == 0:
+        return None
+
+    # Match by hstID
+    ids = [str(x).strip() for x in tbl["hstID"]]
+    matches = [i for i, x in enumerate(ids) if x == gsc_id]
+    if not matches:
+        return None
+
+    row = tbl[matches[0]]
+
+    def _safe_float(col):
+        val = row[col]
+        try:
+            f = float(val)
+            return f if np.isfinite(f) else np.nan
+        except (TypeError, ValueError):
+            return np.nan
+
+    # Gaia DR2 source ID (prefer DR2 over DR1; will query DR3 from it)
+    dr2_id = None
+    for col in ("gaiaDr2SourceID", "gaiaDr1SourceID"):
+        if col in tbl.colnames:
+            val = str(row[col]).strip()
+            if val and val not in ("0", "", "--", "nan"):
+                try:
+                    dr2_id = int(val)
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+    # Best magnitude available
+    mag = np.nan
+    for col in ("gaiaGMag", "FpgMag", "VpgMag", "JpgMag", "VMag", "BMag"):
+        if col in tbl.colnames:
+            v = _safe_float(col)
+            if np.isfinite(v):
+                mag = v
+                break
+
+    return {
+        "ra":                _safe_float("ra"),
+        "dec":               _safe_float("dec"),
+        "epoch":             _safe_float("epoch"),
+        "rapm":              _safe_float("rapm"),
+        "decpm":             _safe_float("decpm"),
+        "parallax":          _safe_float("parallax"),
+        "gaia_dr2_source_id": dr2_id,
+        "mag":               mag,
+    }
+
+
+# ── VizieR fallback ───────────────────────────────────────────────────────────
 
 def _query_vizier_by_id(gsc_id: str, catalog: str, id_col: str,
                         retries: int = 3) -> tuple[float, float, float] | None:
@@ -170,26 +284,62 @@ def _query_vizier_by_id(gsc_id: str, catalog: str, id_col: str,
 
 
 def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
-    """Add ra_gsc, dec_gsc, mag_gsc columns from VizieR."""
-    ras, decs, mags = [], [], []
-    for _, row in gs_df.iterrows():
-        print(f"  Querying {row['vizier_catalog']} for {row['gsc_id']} ...",
-              end=" ")
-        result = _query_vizier_by_id(row["gsc_id"], row["vizier_catalog"],
-                                     row["id_column"])
-        if result:
-            ra, dec, mag = result
-            print(f"RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
-        else:
-            ra, dec, mag = np.nan, np.nan, np.nan
-            print("NOT FOUND")
-        ras.append(ra); decs.append(dec); mags.append(mag)
+    """
+    Resolve GSC positions using GSC 2.4.2 (primary) with VizieR fallback.
+    Adds ra_gsc, dec_gsc, mag_gsc, gaia_dr2_source_id, gsc_catalog columns.
+    """
+    cols = ["ra_gsc", "dec_gsc", "mag_gsc", "gaia_dr2_source_id", "gsc_catalog"]
+    for c in cols:
+        gs_df[c] = np.nan
+    gs_df["gaia_dr2_source_id"] = gs_df["gaia_dr2_source_id"].astype(object)
+    gs_df["gsc_catalog"] = ""
 
-    out = gs_df.copy()
-    out["ra_gsc"]  = ras
-    out["dec_gsc"] = decs
-    out["mag_gsc"] = mags
-    return out
+    for idx, row in gs_df.iterrows():
+        gsc_id  = row["gsc_id"]
+        ra_v1   = row.get("mean_ra_v1",  np.nan)
+        dec_v1  = row.get("mean_dec_v1", np.nan)
+
+        # ── GSC 2.4.2 (primary) ──────────────────────────────────────────
+        result242 = None
+        if np.isfinite(ra_v1) and np.isfinite(dec_v1):
+            print(f"  GSC 2.4.2 lookup for {gsc_id} ...", end=" ")
+            result242 = _query_gsc242(gsc_id, ra_v1, dec_v1)
+            if result242:
+                ra, dec = result242["ra"], result242["dec"]
+                if np.isfinite(ra) and np.isfinite(dec):
+                    print(f"RA={ra:.5f}  Dec={dec:.5f}  "
+                          f"mag={result242['mag']:.2f}  "
+                          f"gaia_dr2={result242['gaia_dr2_source_id']}")
+                    gs_df.at[idx, "ra_gsc"]             = ra
+                    gs_df.at[idx, "dec_gsc"]            = dec
+                    gs_df.at[idx, "mag_gsc"]            = result242["mag"]
+                    gs_df.at[idx, "gsc_catalog"]        = "GSC2.4.2"
+                    if result242["gaia_dr2_source_id"] is not None:
+                        gs_df.at[idx, "gaia_dr2_source_id"] = int(
+                            result242["gaia_dr2_source_id"])
+                    continue
+                else:
+                    print("position NaN")
+            else:
+                print("not found")
+        else:
+            print(f"  GSC 2.4.2 lookup for {gsc_id} ... skipped (no V1 pointing)")
+
+        # ── VizieR fallback ───────────────────────────────────────────────
+        cat, col = row["vizier_catalog"], row["id_column"]
+        print(f"  VizieR fallback ({cat}) for {gsc_id} ...", end=" ")
+        vres = _query_vizier_by_id(gsc_id, cat, col)
+        if vres:
+            ra, dec, mag = vres
+            print(f"RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
+            gs_df.at[idx, "ra_gsc"]      = ra
+            gs_df.at[idx, "dec_gsc"]     = dec
+            gs_df.at[idx, "mag_gsc"]     = mag
+            gs_df.at[idx, "gsc_catalog"] = cat
+        else:
+            print("NOT FOUND")
+
+    return gs_df
 
 
 # ── Astrometric propagation ───────────────────────────────────────────────────
@@ -204,19 +354,16 @@ def propagate_gaia_to_epoch(
     """
     Propagate a Gaia DR3 source from J2016.0 to target_time.
 
-    Two modes controlled by `apparent`:
+    apparent=False  (default — ICRS for HST pointing in Gaia frame)
+        Returns barycentric ICRS position: proper motion + perspective
+        acceleration (vlos).  No aberration.  Use for comparing to Gaia
+        catalog positions or recording the HST pointing in the Gaia frame.
 
-    apparent=False  (default — catalog / cross-match comparison)
-        Returns the barycentric ICRS position: proper motion +
-        perspective acceleration (vlos).  No aberration.  Use this to
-        compare against GSC catalog positions (which are also barycentric
-        ICRS astrometric coordinates, not apparent coordinates).
-
-    apparent=True   (actual observation position)
-        Returns the geocentric apparent position in GCRS: adds annual
-        parallax factors (Earth's orbital offset) and annual aberration
-        (~20") via an ICRS→GCRS frame transform.  Use this for computing
-        where a star actually appears in an HST image or in the FGS field.
+    apparent=True   (cross-match against observed catalog positions)
+        Returns geocentric apparent position (GCRS): adds annual parallax
+        and annual aberration (~20") via ICRS→GCRS transform.  Use for
+        comparing against GSC photographic-plate positions (which include
+        aberration of the plate epoch) to assess cross-match quality.
 
     Parameters
     ----------
@@ -247,11 +394,9 @@ def propagate_gaia_to_epoch(
     coord_t = coord.apply_space_motion(new_obstime=target_time)
 
     if apparent and have_dist:
-        # GCRS: annual parallax + aberration (actual apparent sky position)
         coord_gcrs = coord_t.transform_to(GCRS(obstime=target_time))
         return float(coord_gcrs.ra.deg), float(coord_gcrs.dec.deg)
     else:
-        # Barycentric ICRS after proper motion + perspective acceleration
         return float(coord_t.ra.deg), float(coord_t.dec.deg)
 
 
@@ -261,9 +406,9 @@ def get_guide_star_position_at_epoch(
     guide_stars_csv: str | Path,
 ) -> tuple[float, float] | None:
     """
-    Return the predicted (RA, Dec) in degrees for a guide star at obs_time,
-    using stored Gaia astrometric parameters.  Returns None if the source
-    is not found in the CSV or has no Gaia data.
+    Return the predicted barycentric ICRS (RA, Dec) in degrees for a guide
+    star at obs_time, using stored Gaia DR3 astrometric parameters.
+    Returns None if the source is not found or has no Gaia data.
     """
     df = pd.read_csv(guide_stars_csv, dtype={"gaia_source_id": "Int64"})
     row = df[df["gaia_source_id"] == gaia_source_id]
@@ -280,27 +425,67 @@ def get_guide_star_position_at_epoch(
         float(r["ra_gaia"]), float(r["dec_gaia"]),
         pmra, pmdec, plx, vlos,
         target_time=obs_time,
-        apparent=False,  # ICRS (no aberration): for HST pointing in Gaia frame
+        apparent=False,  # ICRS (no aberration): HST pointing in Gaia frame
     )
 
 
-# ── Step 3: Gaia cone search + cross-match ────────────────────────────────────
+# ── Step 3: Gaia DR3 lookup ───────────────────────────────────────────────────
+
+def _query_gaia_dr3_from_dr2_id(dr2_source_id: int) -> pd.Series | None:
+    """
+    Find the Gaia DR3 source corresponding to a DR2 source_id using the
+    gaiaedr3.dr2_neighbourhood cross-match table.
+
+    DR2 and DR3 source IDs are NOT guaranteed to be identical: Gaia's
+    source detection pipeline can merge or split sources between releases.
+    This table provides the authoritative DR2 → DR3 mapping.
+
+    Returns a Series with: source_id (DR3), dr2_source_id, dr3_source_id,
+    angular_distance, ra, dec, pmra, pmdec, parallax, radial_velocity,
+    phot_g_mean_mag.  If multiple DR3 matches exist (source splitting),
+    returns the closest by angular_distance.  Returns None if not found.
+    """
+    from astroquery.gaia import Gaia
+    Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"
+
+    adql = f"""
+    SELECT g.source_id, n.dr2_source_id, n.dr3_source_id,
+           n.angular_distance,
+           g.ra, g.dec, g.pmra, g.pmdec, g.parallax,
+           g.radial_velocity, g.phot_g_mean_mag
+    FROM gaiaedr3.dr2_neighbourhood AS n
+    JOIN gaiadr3.gaia_source AS g ON g.source_id = n.dr3_source_id
+    WHERE n.dr2_source_id = {dr2_source_id}
+    ORDER BY n.angular_distance ASC
+    """
+    try:
+        job = Gaia.launch_job(adql)
+        tbl = job.get_results()
+        if len(tbl) == 0:
+            return None
+        df = tbl.to_pandas()
+        if len(df) > 1:
+            print(f"    NOTE: DR2 id {dr2_source_id} maps to "
+                  f"{len(df)} DR3 sources; using closest "
+                  f"(sep={df.iloc[0]['angular_distance']:.1f} mas)")
+        return df.iloc[0]
+    except Exception as e:
+        print(f"    WARNING: DR2→DR3 lookup failed for {dr2_source_id}: {e}")
+        return None
+
 
 def _gaia_cone_search(ra: float, dec: float,
                       radius_arcsec: float = 30.0,
                       max_gmag: float = 16.0) -> pd.DataFrame | None:
     """
-    Query Gaia DR3 via TAP for sources within radius_arcsec of (ra, dec)
-    brighter than max_gmag.  Returns DataFrame or None.
-    Includes radial_velocity for perspective-acceleration propagation.
+    Fallback: Gaia DR3 cone search when no DR2 source ID is available.
     """
     from astroquery.gaia import Gaia
     Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"
 
     adql = f"""
     SELECT source_id, ra, dec, pmra, pmdec, parallax,
-           radial_velocity,
-           phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
+           radial_velocity, phot_g_mean_mag,
            DISTANCE(POINT('ICRS',{ra},{dec}),
                     POINT('ICRS',ra,dec)) * 3600.0 AS sep_arcsec_catalog
     FROM gaiadr3.gaia_source
@@ -318,37 +503,27 @@ def _gaia_cone_search(ra: float, dec: float,
         df["source_id"] = df["source_id"].astype("int64")
         return df
     except Exception as e:
-        print(f"    WARNING: Gaia TAP query failed: {e}")
+        print(f"    WARNING: Gaia cone search failed: {e}")
         return None
 
+
+# ── Step 4: cross-match ───────────────────────────────────────────────────────
 
 def crossmatch_to_gaia(gs_df: pd.DataFrame,
                        search_radius_arcsec: float = 30.0) -> pd.DataFrame:
     """
     Cross-match each guide star to Gaia DR3.
 
-    For each candidate Gaia source in the search cone, propagate its
-    position from J2016.0 → J2000.0 — including proper motion, perspective
-    acceleration, and annual parallax factors — then rank by angular
-    separation from the GSC J2000.0 position.  The closest propagated
-    position wins.
+    Primary path: if GSC 2.4.2 provided a Gaia DR2 source ID, query Gaia
+    DR3 directly by source_id — no position-based search needed.
 
-    The large search radius (default 30") is needed because high-PM guide
-    stars can move >10" between J2016 and J2000; ranking by propagated
-    sep instead of catalog sep correctly identifies the guide star regardless
-    of its proper motion.
+    Fallback path: Gaia DR3 cone search (30" radius) ranked by propagated
+    J2000 apparent separation (Gaia J2016 → J2000 GCRS vs GSC J2000) to
+    correctly handle high-PM guide stars.
 
-    Adds columns:
-      gaia_source_id         Gaia DR3 source_id (int64)
-      ra_gaia / dec_gaia     Gaia J2016.0 ICRS position (deg)
-      pmra_gaia / pmdec_gaia proper motion (mas/yr, pmra×cos δ)
-      parallax_gaia          Gaia parallax (mas)
-      vlos_gaia              Gaia radial velocity (km/s)
-      gmag_gaia              Gaia G magnitude
-      sep_catalog_arcsec     Gaia J2016 vs GSC J2000 separation (")
-      sep_J2000_arcsec       Gaia apparent at J2000 vs GSC J2000 (").
-                             Includes ~13-20" annual aberration systematic
-                             (same for all candidates → ranking is unaffected).
+    Adds columns: gaia_source_id, ra_gaia, dec_gaia, pmra_gaia, pmdec_gaia,
+    parallax_gaia, vlos_gaia, gmag_gaia, sep_catalog_arcsec,
+    sep_J2000_arcsec.
     """
     new_cols = [
         "gaia_source_id",
@@ -364,13 +539,30 @@ def crossmatch_to_gaia(gs_df: pd.DataFrame,
     gs_df["gaia_source_id"] = gs_df["gaia_source_id"].astype(object)
 
     for idx, row in gs_df.iterrows():
-        ra_gsc, dec_gsc = row["ra_gsc"], row["dec_gsc"]
+        ra_gsc  = row["ra_gsc"]
+        dec_gsc = row["dec_gsc"]
         if np.isnan(ra_gsc) or np.isnan(dec_gsc):
             continue
 
-        print(f"  Gaia search for {row['gsc_id']} "
-              f"at ({ra_gsc:.5f}, {dec_gsc:.5f}) ...", end=" ")
+        dr2_id = row.get("gaia_dr2_source_id")
+        have_dr2 = (dr2_id is not None
+                    and not (isinstance(dr2_id, float) and np.isnan(dr2_id)))
 
+        # ── Primary: DR2→DR3 cross-match via dr2_neighbourhood table ────────
+        if have_dr2:
+            print(f"  Gaia DR3 lookup for {row['gsc_id']} "
+                  f"(DR2 id={int(dr2_id)}) ...", end=" ")
+            gaia_row = _query_gaia_dr3_from_dr2_id(int(dr2_id))
+            if gaia_row is not None:
+                _fill_gaia_row(gs_df, idx, gaia_row, ra_gsc, dec_gsc,
+                               sep_cat_col="sep_catalog_arcsec",
+                               sep_j2000_col="sep_J2000_arcsec")
+                continue
+            print("not found in DR3 (falling back to cone search)")
+
+        # ── Fallback: cone search ranked by J2000 apparent sep ───────────
+        print(f"  Gaia cone search for {row['gsc_id']} "
+              f"at ({ra_gsc:.5f}, {dec_gsc:.5f}) ...", end=" ")
         candidates = _gaia_cone_search(ra_gsc, dec_gsc,
                                        radius_arcsec=search_radius_arcsec,
                                        max_gmag=16.0)
@@ -379,66 +571,112 @@ def crossmatch_to_gaia(gs_df: pd.DataFrame,
             continue
 
         gsc_sky = SkyCoord(ra_gsc * u.deg, dec_gsc * u.deg)
-
         best_sep_j2000 = np.inf
-        best_row       = None
-        best_cat_sep   = np.nan
+        best_cand      = None
 
         for _, cand in candidates.iterrows():
             pmra  = float(cand["pmra"])  if np.isfinite(float(cand["pmra"]  or np.nan)) else 0.0
             pmdec = float(cand["pmdec"]) if np.isfinite(float(cand["pmdec"] or np.nan)) else 0.0
-            plx   = float(cand["parallax"]) if np.isfinite(float(cand["parallax"] or np.nan)) else np.nan
-            vlos  = float(cand["radial_velocity"]) if np.isfinite(
-                float(cand["radial_velocity"] or np.nan)) else np.nan
+            plx   = float(cand["parallax"])         if np.isfinite(float(cand["parallax"]         or np.nan)) else np.nan
+            vlos  = float(cand["radial_velocity"])  if np.isfinite(float(cand["radial_velocity"]  or np.nan)) else np.nan
 
             ra_j2000, dec_j2000 = propagate_gaia_to_epoch(
                 float(cand["ra"]), float(cand["dec"]),
                 pmra, pmdec, plx, vlos,
                 target_time=_GSC_EPOCH,
-                apparent=True,   # GSC is from actual obs → compare apparent-to-apparent
+                apparent=True,  # GSC is from actual obs → compare apparent-to-apparent
             )
-            sep_j2000 = gsc_sky.separation(
+            sep = gsc_sky.separation(
                 SkyCoord(ra_j2000 * u.deg, dec_j2000 * u.deg)
             ).arcsec
+            if sep < best_sep_j2000:
+                best_sep_j2000 = sep
+                best_cand      = cand
 
-            if sep_j2000 < best_sep_j2000:
-                best_sep_j2000 = sep_j2000
-                best_row       = cand
-                best_cat_sep   = float(cand["sep_arcsec_catalog"])
-
-        if best_row is None:
+        if best_cand is None:
             print("no match")
             continue
 
-        vlos_val = float(best_row["radial_velocity"] or np.nan)
-        if not np.isfinite(vlos_val):
-            vlos_val = np.nan
-
-        pmra_val  = float(best_row["pmra"]  or np.nan)
-        pmdec_val = float(best_row["pmdec"] or np.nan)
-        plx_val   = float(best_row["parallax"] or np.nan)
-
-        gs_df.at[idx, "gaia_source_id"]     = int(best_row["source_id"])
-        gs_df.at[idx, "ra_gaia"]            = float(best_row["ra"])
-        gs_df.at[idx, "dec_gaia"]           = float(best_row["dec"])
-        gs_df.at[idx, "pmra_gaia"]          = pmra_val if np.isfinite(pmra_val)  else np.nan
-        gs_df.at[idx, "pmdec_gaia"]         = pmdec_val if np.isfinite(pmdec_val) else np.nan
-        gs_df.at[idx, "parallax_gaia"]      = plx_val if np.isfinite(plx_val)   else np.nan
-        gs_df.at[idx, "vlos_gaia"]          = vlos_val
-        gs_df.at[idx, "gmag_gaia"]          = float(best_row["phot_g_mean_mag"])
-        gs_df.at[idx, "sep_catalog_arcsec"] = best_cat_sep
-        gs_df.at[idx, "sep_J2000_arcsec"]   = float(best_sep_j2000)
-
-        pm_mag = float(np.hypot(pmra_val  if np.isfinite(pmra_val)  else 0.0,
-                                pmdec_val if np.isfinite(pmdec_val) else 0.0))
-        vlos_str = (f"  vlos={vlos_val:.1f} km/s"
-                    if np.isfinite(vlos_val) else "")
-        print(f"source_id={int(best_row['source_id'])}  "
-              f"G={float(best_row['phot_g_mean_mag']):.2f}  "
-              f"sep_cat={best_cat_sep:.3f}\"  sep_J2000={best_sep_j2000:.3f}\"  "
-              f"PM={pm_mag:.1f} mas/yr{vlos_str}")
+        best_cand = best_cand.copy()
+        best_cand["sep_arcsec_catalog"] = float(
+            SkyCoord(ra_gsc * u.deg, dec_gsc * u.deg).separation(
+                SkyCoord(float(best_cand["ra"]) * u.deg,
+                         float(best_cand["dec"]) * u.deg)
+            ).arcsec)
+        _fill_gaia_row(gs_df, idx, best_cand, ra_gsc, dec_gsc,
+                       sep_cat_col="sep_catalog_arcsec",
+                       sep_j2000_col="sep_J2000_arcsec",
+                       sep_j2000_val=best_sep_j2000)
 
     return gs_df
+
+
+def _fill_gaia_row(gs_df, idx, gaia_row, ra_gsc, dec_gsc,
+                   sep_cat_col, sep_j2000_col, sep_j2000_val=None):
+    """Populate Gaia columns from a gaia_row Series (DR3 query or cone cand)."""
+    def _f(col, default=np.nan):
+        v = gaia_row.get(col, default)
+        try:
+            f = float(v)
+            return f if np.isfinite(f) else np.nan
+        except (TypeError, ValueError):
+            return np.nan
+
+    pmra_val  = _f("pmra")
+    pmdec_val = _f("pmdec")
+    plx_val   = _f("parallax")
+    vlos_val  = _f("radial_velocity")
+    ra_g      = _f("ra")
+    dec_g     = _f("dec")
+    gmag      = _f("phot_g_mean_mag")
+
+    # catalog sep
+    if np.isfinite(ra_g) and np.isfinite(dec_g):
+        cat_sep = float(SkyCoord(ra_gsc * u.deg, dec_gsc * u.deg).separation(
+            SkyCoord(ra_g * u.deg, dec_g * u.deg)).arcsec)
+    else:
+        cat_sep = gaia_row.get("sep_arcsec_catalog", np.nan)
+        if cat_sep is None:
+            cat_sep = np.nan
+        cat_sep = float(cat_sep)
+
+    # J2000 apparent sep
+    if sep_j2000_val is None and np.isfinite(ra_g) and np.isfinite(dec_g):
+        ra_j2000, dec_j2000 = propagate_gaia_to_epoch(
+            ra_g, dec_g,
+            pmra_val  if np.isfinite(pmra_val)  else 0.0,
+            pmdec_val if np.isfinite(pmdec_val) else 0.0,
+            plx_val, vlos_val,
+            target_time=_GSC_EPOCH,
+            apparent=True,
+        )
+        sep_j2000_val = float(SkyCoord(ra_gsc * u.deg, dec_gsc * u.deg).separation(
+            SkyCoord(ra_j2000 * u.deg, dec_j2000 * u.deg)).arcsec)
+
+    try:
+        src_id = int(gaia_row["source_id"])
+    except (KeyError, TypeError, ValueError):
+        src_id = None
+
+    gs_df.at[idx, "gaia_source_id"]     = src_id
+    gs_df.at[idx, "ra_gaia"]            = ra_g
+    gs_df.at[idx, "dec_gaia"]           = dec_g
+    gs_df.at[idx, "pmra_gaia"]          = pmra_val
+    gs_df.at[idx, "pmdec_gaia"]         = pmdec_val
+    gs_df.at[idx, "parallax_gaia"]      = plx_val
+    gs_df.at[idx, "vlos_gaia"]          = vlos_val
+    gs_df.at[idx, "gmag_gaia"]          = gmag
+    gs_df.at[idx, sep_cat_col]          = cat_sep
+    gs_df.at[idx, sep_j2000_col]        = sep_j2000_val if sep_j2000_val is not None else np.nan
+
+    pm_mag = float(np.hypot(pmra_val  if np.isfinite(pmra_val)  else 0.0,
+                            pmdec_val if np.isfinite(pmdec_val) else 0.0))
+    vlos_str = (f"  vlos={vlos_val:.1f} km/s" if np.isfinite(vlos_val) else "")
+    print(f"source_id={src_id}  "
+          f"G={gmag:.2f}  "
+          f"sep_cat={cat_sep:.3f}\"  "
+          f"sep_J2000={sep_j2000_val:.3f}\"  "
+          f"PM={pm_mag:.1f} mas/yr{vlos_str}")
 
 
 # ── Incremental obs-epoch update ──────────────────────────────────────────────
@@ -446,21 +684,19 @@ def crossmatch_to_gaia(gs_df: pd.DataFrame,
 def _update_obs_stats(existing_df: pd.DataFrame,
                       current_scan: pd.DataFrame) -> pd.DataFrame:
     """
-    Update n_dominant, n_subdominant, mean_obs_mjd from current_scan for
-    all matching gsc_ids in existing_df.  Re-propagates ra_gaia_obs /
-    dec_gaia_obs using the (unchanged) Gaia astrometric parameters.
+    Refresh n_dominant, n_subdominant, mean_obs_mjd, mean_ra_v1, mean_dec_v1
+    from the current SPT scan for all matching gsc_ids.
     """
     scan_map = current_scan.set_index("gsc_id")
-
     for idx, row in existing_df.iterrows():
         gid = row["gsc_id"]
         if gid not in scan_map.index:
             continue
         sr = scan_map.loc[gid]
-        existing_df.at[idx, "n_dominant"]    = int(sr["n_dominant"])
-        existing_df.at[idx, "n_subdominant"] = int(sr["n_subdominant"])
-        existing_df.at[idx, "mean_obs_mjd"]  = float(sr["mean_obs_mjd"])
-
+        for col in ("n_dominant", "n_subdominant",
+                    "mean_obs_mjd", "mean_ra_v1", "mean_dec_v1"):
+            if col in sr.index:
+                existing_df.at[idx, col] = sr[col]
     return existing_df
 
 
@@ -470,28 +706,23 @@ def download_guide_stars(hst_dir: str | Path,
                          field_name: str | None = None,
                          force: bool = False) -> Path | None:
     """
-    Full pipeline: collect IDs → VizieR → Gaia (with J2000 propagation for
-    cross-match ranking) → save CSV.
+    Full pipeline: collect IDs → GSC 2.4.2 (+ VizieR fallback) →
+    Gaia DR3 (by source_id or cone search) → save CSV.
 
-    Incremental mode (default): if the CSV already exists, only new guide
-    stars (not yet in the CSV) are resolved and appended; existing entries
-    have their obs statistics refreshed.  Pass force=True to regenerate
+    Incremental: existing entries have obs statistics refreshed; new guide
+    stars are fully resolved and appended.  Pass force=True to regenerate
     from scratch.
     """
     hst_dir = Path(hst_dir)
-
     if field_name is None:
         field_name = hst_dir.parent.name
-
     out_csv = hst_dir / f"{field_name}_guide_stars.csv"
 
-    # Always scan SPT files (fast, local only)
     print("  Scanning SPT files for guide star IDs...")
     current_scan = collect_guide_star_ids(hst_dir)
     if current_scan.empty:
         print("  No guide star IDs found in SPT files.")
         return None
-
     current_ids = set(current_scan["gsc_id"].tolist())
 
     # ── incremental path ──────────────────────────────────────────────────
@@ -500,7 +731,6 @@ def download_guide_stars(hst_dir: str | Path,
         existing_ids = set(existing_df["gsc_id"].tolist())
         new_ids = current_ids - existing_ids
 
-        # Refresh obs stats for all existing entries
         existing_df = _update_obs_stats(existing_df, current_scan)
 
         if not new_ids:
@@ -510,24 +740,17 @@ def download_guide_stars(hst_dir: str | Path,
             return out_csv
 
         print(f"  {len(new_ids)} new guide star(s): {', '.join(sorted(new_ids))}")
-        new_rows_scan = current_scan[current_scan["gsc_id"].isin(new_ids)].copy()
-
-        print("  Resolving new positions from GSC catalogs (VizieR)...")
-        new_rows = resolve_gsc_positions(new_rows_scan)
+        new_rows = current_scan[current_scan["gsc_id"].isin(new_ids)].copy()
+        new_rows = resolve_gsc_positions(new_rows)
         n_res = new_rows["ra_gsc"].notna().sum()
         print(f"  Resolved {n_res}/{len(new_rows)} new guide star positions.")
-
         if n_res > 0:
-            print("  Cross-matching new guide stars to Gaia DR3 "
-                  "(Gaia J2016 → J2000 propagation)...")
             new_rows = crossmatch_to_gaia(new_rows)
             n_match = new_rows["gaia_source_id"].notna().sum()
             print(f"  Matched {n_match}/{n_res} new guide stars to Gaia DR3.")
 
-        # Normalise gaia_source_id dtype before concat
         _fix_gaia_id_dtype(new_rows)
         _fix_gaia_id_dtype(existing_df)
-
         merged = pd.concat([existing_df, new_rows], ignore_index=True)
         merged.to_csv(out_csv, index=False)
         print(f"  Updated: {out_csv.name}")
@@ -536,15 +759,12 @@ def download_guide_stars(hst_dir: str | Path,
     # ── full fresh run ────────────────────────────────────────────────────
     print(f"  Found {len(current_scan)} unique guide star(s): "
           + ", ".join(current_scan["gsc_id"].tolist()))
-
-    print("  Resolving positions from GSC catalogs (VizieR)...")
+    print("  Resolving positions from GSC 2.4.2 (VizieR fallback)...")
     gs_df = resolve_gsc_positions(current_scan)
     n_resolved = gs_df["ra_gsc"].notna().sum()
     print(f"  Resolved {n_resolved}/{len(gs_df)} guide star positions.")
-
     if n_resolved > 0:
-        print("  Cross-matching to Gaia DR3 "
-              "(Gaia J2016 → J2000 propagation for ranking)...")
+        print("  Cross-matching to Gaia DR3...")
         gs_df = crossmatch_to_gaia(gs_df)
         n_matched = gs_df["gaia_source_id"].notna().sum()
         print(f"  Matched {n_matched}/{n_resolved} guide stars to Gaia DR3.")
