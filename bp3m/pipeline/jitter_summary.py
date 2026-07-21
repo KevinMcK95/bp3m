@@ -84,18 +84,31 @@ def _jit_stats(jit_path: Path, rootname: str) -> dict:
         n = len(d)
         out["n_samples"] = int(n)
 
+        # Per-sample short-window RMS/P2P (high-frequency jitter only).
         for col in ("SI_V2_RMS", "SI_V2_P2P", "SI_V3_RMS", "SI_V3_P2P"):
             if col in d.names:
                 arr = d[col].astype(float)
                 out[f"{col}_median_arcsec"] = float(np.median(arr))
                 out[f"{col}_max_arcsec"]    = float(np.max(arr))
 
-        # combined SI RMS (arcsec), median over samples
-        if "SI_V2_RMS" in d.names and "SI_V3_RMS" in d.names:
-            combined = np.hypot(d["SI_V2_RMS"].astype(float),
-                                d["SI_V3_RMS"].astype(float))
-            out["SI_combined_RMS_median_arcsec"] = float(np.median(combined))
-            out["SI_combined_RMS_max_arcsec"]    = float(np.max(combined))
+        # Total SI RMS = quadrature sum of slow drift (std of SI_*_AVG over the
+        # full exposure) and high-frequency jitter (median of SI_*_RMS per sample).
+        # This is the quantity directly relevant to per-star positional smearing.
+        for axis, avg_col, rms_col in (
+            ("V2", "SI_V2_AVG", "SI_V2_RMS"),
+            ("V3", "SI_V3_AVG", "SI_V3_RMS"),
+        ):
+            if avg_col in d.names and rms_col in d.names:
+                drift_rms  = float(d[avg_col].astype(float).std())
+                hf_rms_med = float(np.median(d[rms_col].astype(float)))
+                out[f"SI_{axis}_total_RMS_arcsec"] = float(
+                    np.hypot(drift_rms, hf_rms_med))
+
+        # Combined (V2+V3) total SI RMS.
+        if "SI_V2_total_RMS_arcsec" in out and "SI_V3_total_RMS_arcsec" in out:
+            out["SI_combined_total_RMS_arcsec"] = float(
+                np.hypot(out["SI_V2_total_RMS_arcsec"],
+                         out["SI_V3_total_RMS_arcsec"]))
 
         # roll jitter (deg → mas): RMS and P2P of deviation from mean roll
         if "Roll" in d.names:
