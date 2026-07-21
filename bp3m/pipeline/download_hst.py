@@ -299,10 +299,10 @@ def search_mast(
                 raise
     im_sub   = im_type[1:].upper()   # '_flc' → 'FLC'
     _AUX_TYPES = {'SPT', 'JIT', 'JIF'}
+    _sub = prod_raw['productSubGroupDescription']
+    _aux_mask = (_sub == 'SPT') | (_sub == 'JIT') | (_sub == 'JIF')
     mask = (
-        ((prod_raw['productSubGroupDescription'] == im_sub) |
-         (prod_raw['productSubGroupDescription'] == 'DRZ') |
-         (prod_raw['productSubGroupDescription'].isin(_AUX_TYPES))) &
+        ((_sub == im_sub) | (_sub == 'DRZ') | _aux_mask) &
         (prod_raw['obs_collection'] == telescope)
     )
     prod_df = prod_raw[mask].to_pandas()
