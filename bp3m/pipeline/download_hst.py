@@ -654,13 +654,31 @@ def download_hst_images(
             print(f"  {len(broken)} broken file(s) removed; will re-download.")
         to_dl = to_dl.drop(index=already)
 
+    import time as _time
+
     if to_dl.empty:
         print("  All files already downloaded.")
         if failed_obsids:
             print(f"  NOTE: {len(failed_obsids)} failed observation(s) excluded from processing: "
                   + ", ".join(sorted(failed_obsids)))
         _write_selected_obsids(prod_df, hst_dir, field_name, im_type, failed_obsids)
-        # Fall through to aux download — SPT/JIT/JIF may not yet be on disk.
+
+        # Check whether any aux files are missing before deciding to return early.
+        _aux_types_check = {'SPT', 'JIT', 'JIF'}
+        _aux_df_check = prod_df[prod_df['productSubGroupDescription'].isin(_aux_types_check)]
+        _mast_root_check = hst_dir / "mastDownload" / tel_upper
+        _aux_missing = (
+            not _aux_df_check.empty
+            and 'dataURI' in _aux_df_check.columns
+            and any(
+                not (_mast_root_check / row.get('obs_id', '') / Path(row['dataURI']).name).exists()
+                for _, row in _aux_df_check.iterrows()
+            )
+        )
+        if not _aux_missing:
+            return obs_df, prod_df  # FLCs and aux all on disk — nothing to do.
+        # Some aux files are missing; fall through to download them without
+        # touching PSF caches (FLCs did not change).
     else:
         # Invalidate PSF caches for every file about to be downloaded so that a
         # partially-completed or interrupted download never leaves stale PSF outputs.
@@ -671,7 +689,6 @@ def download_hst_images(
                 _invalidate_psf_cache(_dest)
 
         print(f"\n  Downloading {len(to_dl)} {im_type} file(s) to {hst_dir}...")
-        import time as _time
         _dl_delay = 10
         for _dl_attempt in range(5):
             try:
@@ -715,7 +732,7 @@ def download_hst_images(
                   + ", ".join(sorted(failed_obsids)))
         _write_selected_obsids(prod_df, hst_dir, field_name, im_type, failed_obsids)
 
-    # Download auxiliary products (SPT/JIT/JIF) — skip files already on disk.
+    # Download auxiliary products (SPT/JIT/JIF) — no PSF cache invalidation.
     _aux_types = {'SPT', 'JIT', 'JIF'}
     aux_df = prod_df[prod_df['productSubGroupDescription'].isin(_aux_types)].copy()
     if not aux_df.empty and 'dataURI' in aux_df.columns:
