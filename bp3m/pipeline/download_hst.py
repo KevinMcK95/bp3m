@@ -777,6 +777,11 @@ def download_hst_images(
     from bp3m.pipeline.jitter_summary import summarise_jitter
     summarise_jitter(hst_dir)
 
+    # Resolve guide star sky positions and cross-match to Gaia (skips if
+    # the CSV already exists).
+    from bp3m.pipeline.guide_stars import download_guide_stars
+    download_guide_stars(hst_dir, field_name=field_name)
+
     return obs_df, prod_df
 
 
