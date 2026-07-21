@@ -85,8 +85,8 @@ def _parse_args():
 
     # ── Gaia ──────────────────────────────────────────────────────────────────
     g = p.add_argument_group('Gaia options')
-    g.add_argument('--min_gmag', type=float, default=16.0,
-                   help='Brightest G magnitude (default 16.0)')
+    g.add_argument('--min_gmag', type=float, default=0.0,
+                   help='Brightest G magnitude (default 0.0 = no bright limit)')
     g.add_argument('--max_gmag', type=float, default=None,
                    help='Faintest G magnitude (default: no limit)')
     g.add_argument('--source_table', type=str, default='gaiadr3.gaia_source',
@@ -504,6 +504,18 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     field = args.name
 
+    # Resolve the specific Gaia CSV path for this analysis so all later steps
+    # (data loading, alignment) use a consistent catalog rather than globbing
+    # all *_gaia.csv files in the directory.
+    from bp3m.pipeline.download_gaia import _cache_stem
+    _gaia_dir = output_dir / field / 'Gaia'
+    _gaia_stem = _cache_stem(field, args.ra, args.dec,
+                             args.search_width, args.search_height,
+                             args.min_gmag, args.max_gmag)
+    gaia_csv_path = _gaia_dir / f"{_gaia_stem}.csv"
+    if not gaia_csv_path.exists():
+        gaia_csv_path = None   # fall back to glob if not yet created
+
     # ── Step 1: Download Gaia ─────────────────────────────────────────────────
     gaia_df = None
     if not args.skip_download:
@@ -521,6 +533,9 @@ def main():
             force_redownload=args.force_redownload_gaia,
             quiet=args.quiet,
         )
+        # After download the CSV now exists; resolve the path for later steps.
+        if gaia_csv_path is None and _gaia_dir.joinpath(f"{_gaia_stem}.csv").exists():
+            gaia_csv_path = _gaia_dir / f"{_gaia_stem}.csv"
 
     # ── Step 2: Download HST ─────────────────────────────────────────────────
     if not args.skip_download:
@@ -853,7 +868,8 @@ def main():
             from bp3m.data_loader import build_index_maps
 
             _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
-                output_dir, field, pos_err_floor=args.bp3m_pos_err_floor)
+                output_dir, field, pos_err_floor=args.bp3m_pos_err_floor,
+                gaia_csv=gaia_csv_path)
             _, _indv_names, _ = build_index_maps(_spi_all, _gaia_all)
 
             if _bp3m_images is not None:
@@ -914,6 +930,7 @@ def main():
                         plot_residuals=args.plot_residuals,
                         plot_influence=args.plot_influence,
                         bp3m_dir=_indv_root / _img,
+                        gaia_csv=gaia_csv_path,
                     )
                     _n_ok += 1
                 except Exception as _exc:
@@ -960,6 +977,7 @@ def main():
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
+                gaia_csv=gaia_csv_path,
             )
             # ── Step 5b: Compare synthetic results to truth ────────────────────
             print("\n" + "=" * 55)
@@ -1014,6 +1032,7 @@ def main():
                 use_qso_anchors=not args.no_qso_anchors,
                 gaia_epoch_obs=_gaia_epoch_obs_for_solver,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
+                gaia_csv=gaia_csv_path,
             )
 
     # Save the command only on successful completion so interrupted runs

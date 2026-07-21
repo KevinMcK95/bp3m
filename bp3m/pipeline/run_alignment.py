@@ -57,6 +57,7 @@ def run_alignment(  # noqa: C901
     use_qso_anchors: bool = True,
     gaia_epoch_obs: Optional[dict] = None,
     exclude_2p_from_alignment: bool = False,
+    gaia_csv: "Path | None" = None,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -134,7 +135,8 @@ def run_alignment(  # noqa: C901
     print(f"\n  Loading FLC pipeline data for '{field_name}'...")
     imgs, stars_per_image, gaia_catalog = load_image_data_flc(
         data_root, field_name, pos_err_floor=pos_err_floor,
-        restrict_images=set(images) if images is not None else None)
+        restrict_images=set(images) if images is not None else None,
+        gaia_csv=gaia_csv)
     if imgs is None or len(imgs) == 0:
         raise RuntimeError(
             f"No usable images found for '{field_name}'. "
