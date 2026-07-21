@@ -772,6 +772,11 @@ def download_hst_images(
             n_aux = len(aux_df)
             print(f"  {n_aux} auxiliary (SPT/JIT/JIF) file(s) already on disk.")
 
+    # Summarise per-FLC jitter from JIT/JIF files (skips FLCs that already
+    # have a jitter_summary.json).
+    from bp3m.pipeline.jitter_summary import summarise_jitter
+    summarise_jitter(hst_dir)
+
     return obs_df, prod_df
 
 
