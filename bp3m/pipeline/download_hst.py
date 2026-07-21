@@ -98,6 +98,7 @@ def _make_query_params(
         "telescope":             telescope.upper(),
         "instruments":           sorted(instruments) if instruments else None,
         "lib_dir":               str(lib_dir) if lib_dir else None,
+        "download_aux":          True,
     }
 
 
