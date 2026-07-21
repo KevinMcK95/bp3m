@@ -660,60 +660,60 @@ def download_hst_images(
             print(f"  NOTE: {len(failed_obsids)} failed observation(s) excluded from processing: "
                   + ", ".join(sorted(failed_obsids)))
         _write_selected_obsids(prod_df, hst_dir, field_name, im_type, failed_obsids)
-        return obs_df, prod_df
+        # Fall through to aux download — SPT/JIT/JIF may not yet be on disk.
+    else:
+        # Invalidate PSF caches for every file about to be downloaded so that a
+        # partially-completed or interrupted download never leaves stale PSF outputs.
+        if 'dataURI' in to_dl.columns:
+            _mast_root = hst_dir / "mastDownload" / tel_upper
+            for _, _row in to_dl.iterrows():
+                _dest = _mast_root / _row.get('obs_id', '') / Path(_row['dataURI']).name
+                _invalidate_psf_cache(_dest)
 
-    # Invalidate PSF caches for every file about to be downloaded so that a
-    # partially-completed or interrupted download never leaves stale PSF outputs.
-    if 'dataURI' in to_dl.columns:
-        _mast_root = hst_dir / "mastDownload" / tel_upper
-        for _, _row in to_dl.iterrows():
-            _dest = _mast_root / _row.get('obs_id', '') / Path(_row['dataURI']).name
-            _invalidate_psf_cache(_dest)
-
-    print(f"\n  Downloading {len(to_dl)} {im_type} file(s) to {hst_dir}...")
-    import time as _time
-    _dl_delay = 10
-    for _dl_attempt in range(5):
-        try:
+        print(f"\n  Downloading {len(to_dl)} {im_type} file(s) to {hst_dir}...")
+        import time as _time
+        _dl_delay = 10
+        for _dl_attempt in range(5):
             try:
-                Observations.download_products(
-                    Table.from_pandas(to_dl), download_dir=str(hst_dir))
-            except Exception:
-                Observations.download_products(to_dl, download_dir=str(hst_dir))
-            break
-        except Exception as _e:
-            if _dl_attempt < 4:
-                print(f"  Download failed (attempt {_dl_attempt+1}/5): {_e}")
-                print(f"  Retrying in {_dl_delay}s ...")
-                _time.sleep(_dl_delay)
-                _dl_delay *= 2
-            else:
-                raise
+                try:
+                    Observations.download_products(
+                        Table.from_pandas(to_dl), download_dir=str(hst_dir))
+                except Exception:
+                    Observations.download_products(to_dl, download_dir=str(hst_dir))
+                break
+            except Exception as _e:
+                if _dl_attempt < 4:
+                    print(f"  Download failed (attempt {_dl_attempt+1}/5): {_e}")
+                    print(f"  Retrying in {_dl_delay}s ...")
+                    _time.sleep(_dl_delay)
+                    _dl_delay *= 2
+                else:
+                    raise
 
-    print("  Download complete.")
+        print("  Download complete.")
 
-    # Validate newly downloaded files for failed observations (EXPTIME=0).
-    if 'dataURI' in to_dl.columns:
-        mast_root_nd = hst_dir / "mastDownload" / tel_upper
-        for _, row in to_dl.iterrows():
-            obs_id = row.get('obs_id', '')
-            if obs_id in failed_obsids:
-                continue
-            fname = Path(row['dataURI']).name
-            dest = mast_root_nd / obs_id / fname
-            if not dest.exists():
-                continue
-            fail_reason = _check_exptime(dest)
-            if fail_reason:
-                print(f"  WARNING: {fname} is a failed observation ({fail_reason}) — "
-                      f"skipping all downstream steps.")
-                _invalidate_psf_cache(dest)
-                failed_obsids[obs_id] = fail_reason
+        # Validate newly downloaded files for failed observations (EXPTIME=0).
+        if 'dataURI' in to_dl.columns:
+            mast_root_nd = hst_dir / "mastDownload" / tel_upper
+            for _, row in to_dl.iterrows():
+                obs_id = row.get('obs_id', '')
+                if obs_id in failed_obsids:
+                    continue
+                fname = Path(row['dataURI']).name
+                dest = mast_root_nd / obs_id / fname
+                if not dest.exists():
+                    continue
+                fail_reason = _check_exptime(dest)
+                if fail_reason:
+                    print(f"  WARNING: {fname} is a failed observation ({fail_reason}) — "
+                          f"skipping all downstream steps.")
+                    _invalidate_psf_cache(dest)
+                    failed_obsids[obs_id] = fail_reason
 
-    if failed_obsids:
-        print(f"  NOTE: {len(failed_obsids)} failed observation(s) excluded from processing: "
-              + ", ".join(sorted(failed_obsids)))
-    _write_selected_obsids(prod_df, hst_dir, field_name, im_type, failed_obsids)
+        if failed_obsids:
+            print(f"  NOTE: {len(failed_obsids)} failed observation(s) excluded from processing: "
+                  + ", ".join(sorted(failed_obsids)))
+        _write_selected_obsids(prod_df, hst_dir, field_name, im_type, failed_obsids)
 
     # Download auxiliary products (SPT/JIT/JIF) — skip files already on disk.
     _aux_types = {'SPT', 'JIT', 'JIF'}
