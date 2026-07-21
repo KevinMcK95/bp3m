@@ -285,7 +285,12 @@ def _query_vizier_by_id(gsc_id: str, catalog: str, id_col: str,
 
 def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Resolve GSC positions using GSC 2.4.2 (primary) with VizieR fallback.
+    Resolve GSC positions using a three-tier fallback chain for every ID:
+      1. STScI GSC 2.4.2  (current operational catalog, has Gaia DR2 IDs)
+      2. VizieR I/305      (GSC 2.3.2, 2006 public release)
+      3. VizieR I/254      (GSC 1.x, photographic plates)
+
+    All three are tried in order regardless of ID format; the first hit wins.
     Adds ra_gsc, dec_gsc, mag_gsc, gaia_dr2_source_id, gsc_catalog columns.
     """
     cols = ["ra_gsc", "dec_gsc", "mag_gsc", "gaia_dr2_source_id", "gsc_catalog"]
@@ -295,12 +300,11 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
     gs_df["gsc_catalog"] = ""
 
     for idx, row in gs_df.iterrows():
-        gsc_id  = row["gsc_id"]
-        ra_v1   = row.get("mean_ra_v1",  np.nan)
-        dec_v1  = row.get("mean_dec_v1", np.nan)
+        gsc_id = row["gsc_id"]
+        ra_v1  = row.get("mean_ra_v1",  np.nan)
+        dec_v1 = row.get("mean_dec_v1", np.nan)
 
-        # ── GSC 2.4.2 (primary) ──────────────────────────────────────────
-        result242 = None
+        # ── 1. GSC 2.4.2 ─────────────────────────────────────────────────
         if np.isfinite(ra_v1) and np.isfinite(dec_v1):
             print(f"  GSC 2.4.2 lookup for {gsc_id} ...", end=" ")
             result242 = _query_gsc242(gsc_id, ra_v1, dec_v1)
@@ -310,10 +314,10 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
                     print(f"RA={ra:.5f}  Dec={dec:.5f}  "
                           f"mag={result242['mag']:.2f}  "
                           f"gaia_dr2={result242['gaia_dr2_source_id']}")
-                    gs_df.at[idx, "ra_gsc"]             = ra
-                    gs_df.at[idx, "dec_gsc"]            = dec
-                    gs_df.at[idx, "mag_gsc"]            = result242["mag"]
-                    gs_df.at[idx, "gsc_catalog"]        = "GSC2.4.2"
+                    gs_df.at[idx, "ra_gsc"]      = ra
+                    gs_df.at[idx, "dec_gsc"]     = dec
+                    gs_df.at[idx, "mag_gsc"]     = result242["mag"]
+                    gs_df.at[idx, "gsc_catalog"] = "GSC2.4.2"
                     if result242["gaia_dr2_source_id"] is not None:
                         gs_df.at[idx, "gaia_dr2_source_id"] = int(
                             result242["gaia_dr2_source_id"])
@@ -325,19 +329,32 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
         else:
             print(f"  GSC 2.4.2 lookup for {gsc_id} ... skipped (no V1 pointing)")
 
-        # ── VizieR fallback ───────────────────────────────────────────────
-        cat, col = row["vizier_catalog"], row["id_column"]
-        print(f"  VizieR fallback ({cat}) for {gsc_id} ...", end=" ")
-        vres = _query_vizier_by_id(gsc_id, cat, col)
+        # ── 2. VizieR I/305 (GSC 2.3.2) ──────────────────────────────────
+        print(f"  VizieR I/305 (GSC 2.3.2) for {gsc_id} ...", end=" ")
+        vres = _query_vizier_by_id(gsc_id, "I/305", "GSC2.3")
         if vres:
             ra, dec, mag = vres
             print(f"RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
             gs_df.at[idx, "ra_gsc"]      = ra
             gs_df.at[idx, "dec_gsc"]     = dec
             gs_df.at[idx, "mag_gsc"]     = mag
-            gs_df.at[idx, "gsc_catalog"] = cat
+            gs_df.at[idx, "gsc_catalog"] = "I/305"
+            continue
         else:
-            print("NOT FOUND")
+            print("not found")
+
+        # ── 3. VizieR I/254 (GSC 1.x) ────────────────────────────────────
+        print(f"  VizieR I/254 (GSC 1.x) for {gsc_id} ...", end=" ")
+        vres = _query_vizier_by_id(gsc_id, "I/254", "GSC")
+        if vres:
+            ra, dec, mag = vres
+            print(f"RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
+            gs_df.at[idx, "ra_gsc"]      = ra
+            gs_df.at[idx, "dec_gsc"]     = dec
+            gs_df.at[idx, "mag_gsc"]     = mag
+            gs_df.at[idx, "gsc_catalog"] = "I/254"
+        else:
+            print("NOT FOUND in any catalog")
 
     return gs_df
 
