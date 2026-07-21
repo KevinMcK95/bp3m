@@ -280,7 +280,7 @@ def get_guide_star_position_at_epoch(
         float(r["ra_gaia"]), float(r["dec_gaia"]),
         pmra, pmdec, plx, vlos,
         target_time=obs_time,
-        apparent=True,   # actual apparent position for image/FGS use
+        apparent=False,  # ICRS (no aberration): for HST pointing in Gaia frame
     )
 
 
@@ -346,7 +346,9 @@ def crossmatch_to_gaia(gs_df: pd.DataFrame,
       vlos_gaia              Gaia radial velocity (km/s)
       gmag_gaia              Gaia G magnitude
       sep_catalog_arcsec     Gaia J2016 vs GSC J2000 separation (")
-      sep_J2000_arcsec       Gaia propagated to J2000 vs GSC J2000 (")
+      sep_J2000_arcsec       Gaia apparent at J2000 vs GSC J2000 (").
+                             Includes ~13-20" annual aberration systematic
+                             (same for all candidates → ranking is unaffected).
     """
     new_cols = [
         "gaia_source_id",
@@ -393,7 +395,7 @@ def crossmatch_to_gaia(gs_df: pd.DataFrame,
                 float(cand["ra"]), float(cand["dec"]),
                 pmra, pmdec, plx, vlos,
                 target_time=_GSC_EPOCH,
-                apparent=False,  # catalog comparison: no aberration
+                apparent=True,   # GSC is from actual obs → compare apparent-to-apparent
             )
             sep_j2000 = gsc_sky.separation(
                 SkyCoord(ra_j2000 * u.deg, dec_j2000 * u.deg)
