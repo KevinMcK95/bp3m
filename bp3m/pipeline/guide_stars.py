@@ -199,25 +199,33 @@ def propagate_gaia_to_epoch(
     pmra: float, pmdec: float,
     parallax: float, radial_velocity: float,
     target_time: Time,
+    apparent: bool = False,
 ) -> tuple[float, float]:
     """
-    Propagate a Gaia DR3 source from J2016.0 to target_time and return the
-    apparent geocentric (RA, Dec) in degrees.
+    Propagate a Gaia DR3 source from J2016.0 to target_time.
 
-    Accounts for:
-      - Proper motion  (linear barycentric propagation via apply_space_motion)
-      - Perspective acceleration  (change in angular velocity due to radial
-        motion; only when vlos and parallax are both known)
-      - Annual parallax factors  (Earth's orbital offset from barycenter;
-        via GCRS frame transform, requires positive parallax)
+    Two modes controlled by `apparent`:
+
+    apparent=False  (default — catalog / cross-match comparison)
+        Returns the barycentric ICRS position: proper motion +
+        perspective acceleration (vlos).  No aberration.  Use this to
+        compare against GSC catalog positions (which are also barycentric
+        ICRS astrometric coordinates, not apparent coordinates).
+
+    apparent=True   (actual observation position)
+        Returns the geocentric apparent position in GCRS: adds annual
+        parallax factors (Earth's orbital offset) and annual aberration
+        (~20") via an ICRS→GCRS frame transform.  Use this for computing
+        where a star actually appears in an HST image or in the FGS field.
 
     Parameters
     ----------
     ra, dec         : Gaia ICRS position at J2016.0 (degrees)
     pmra, pmdec     : proper motion (mas/yr); pmra is pmra×cos(dec)
-    parallax        : mas; ≤0 or NaN → no distance, skip parallax/persp.
+    parallax        : mas; ≤0 or NaN → no distance (skip parallax/persp.)
     radial_velocity : km/s; NaN → skip perspective acceleration
-    target_time     : astropy Time of the observation
+    target_time     : astropy Time of the target epoch
+    apparent        : if True, return GCRS apparent position
     """
     have_dist = np.isfinite(parallax) and parallax > 0
     have_vlos = have_dist and np.isfinite(radial_velocity)
@@ -238,11 +246,12 @@ def propagate_gaia_to_epoch(
     coord = SkyCoord(**kwargs)
     coord_t = coord.apply_space_motion(new_obstime=target_time)
 
-    if have_dist:
-        # GCRS transform applies annual parallax via Earth's orbital position
+    if apparent and have_dist:
+        # GCRS: annual parallax + aberration (actual apparent sky position)
         coord_gcrs = coord_t.transform_to(GCRS(obstime=target_time))
         return float(coord_gcrs.ra.deg), float(coord_gcrs.dec.deg)
     else:
+        # Barycentric ICRS after proper motion + perspective acceleration
         return float(coord_t.ra.deg), float(coord_t.dec.deg)
 
 
@@ -271,6 +280,7 @@ def get_guide_star_position_at_epoch(
         float(r["ra_gaia"]), float(r["dec_gaia"]),
         pmra, pmdec, plx, vlos,
         target_time=obs_time,
+        apparent=True,   # actual apparent position for image/FGS use
     )
 
 
@@ -383,6 +393,7 @@ def crossmatch_to_gaia(gs_df: pd.DataFrame,
                 float(cand["ra"]), float(cand["dec"]),
                 pmra, pmdec, plx, vlos,
                 target_time=_GSC_EPOCH,
+                apparent=False,  # catalog comparison: no aberration
             )
             sep_j2000 = gsc_sky.separation(
                 SkyCoord(ra_j2000 * u.deg, dec_j2000 * u.deg)
