@@ -150,27 +150,23 @@ def collect_guide_star_ids(hst_dir: str | Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ── Step 2: GSC 2.4.2 position lookup ────────────────────────────────────────
+# ── Step 2: batch catalog fetches (one request per catalog per field) ─────────
 
-def _query_gsc242(gsc_id: str,
-                  ra_v1: float, dec_v1: float,
-                  radius_deg: float = _FGS_SEARCH_RADIUS_DEG,
-                  retries: int = 3) -> dict | None:
+def _fetch_gsc242_cone(ra_center: float, dec_center: float,
+                       radius_deg: float = _FGS_SEARCH_RADIUS_DEG,
+                       retries: int = 3):
     """
-    Cone search the STScI GSC 2.4.2 web service around the V1 telescope
-    pointing and return the matching entry for gsc_id, or None.
-
-    Returns a dict with keys: ra, dec, epoch, rapm, decpm, parallax,
-    gaia_dr2_source_id (int64 or None), mag_g (float).
+    Fetch the full STScI GSC 2.4.2 cone as an astropy Table, or None.
+    Called once per field; guide star IDs are matched from the returned table.
     """
     import urllib.request
     from astropy.io.votable import parse_single_table
 
-    url = _GSC242_URL.format(ra=ra_v1, dec=dec_v1, sr=radius_deg)
+    url = _GSC242_URL.format(ra=ra_center, dec=dec_center, sr=radius_deg)
     delay = 5
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(url, timeout=60) as resp:
+            with urllib.request.urlopen(url, timeout=90) as resp:
                 data = resp.read()
             break
         except Exception as e:
@@ -179,35 +175,65 @@ def _query_gsc242(gsc_id: str,
                 time.sleep(delay)
                 delay *= 2
             else:
-                print(f"    WARNING: GSC 2.4.2 query failed: {e}")
+                print(f"    WARNING: GSC 2.4.2 cone fetch failed: {e}")
                 return None
-
     try:
         tbl = parse_single_table(io.BytesIO(data)).to_table()
+        return tbl if len(tbl) > 0 else None
     except Exception as e:
         print(f"    WARNING: GSC 2.4.2 parse failed: {e}")
         return None
 
-    if len(tbl) == 0:
-        return None
 
-    # Match by hstID
-    ids = [str(x).strip() for x in tbl["hstID"]]
-    matches = [i for i, x in enumerate(ids) if x == gsc_id]
-    if not matches:
-        return None
+def _fetch_vizier_cone(catalog: str, id_col: str,
+                       ra_center: float, dec_center: float,
+                       radius_deg: float = _FGS_SEARCH_RADIUS_DEG,
+                       retries: int = 3):
+    """
+    Fetch a VizieR catalog cone as a DataFrame keyed by id_col, or None.
+    Called once per catalog per field.
+    """
+    from astroquery.vizier import Vizier
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
 
-    row = tbl[matches[0]]
-
-    def _safe_float(col):
-        val = row[col]
+    V = Vizier(columns=[id_col, "RAJ2000", "DEJ2000",
+                        "Vmag", "Fmag", "jmag", "Pmag"],
+               row_limit=10000)
+    coord = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
+    delay = 5
+    for attempt in range(retries):
         try:
-            f = float(val)
+            result = V.query_region(coord, radius=radius_deg * u.deg,
+                                    catalog=catalog)
+            break
+        except Exception as e:
+            if attempt < retries - 1:
+                print(f"    VizieR {catalog} retry {attempt+1}: {e}")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                print(f"    WARNING: VizieR {catalog} cone fetch failed: {e}")
+                return None
+
+    if not result or len(result) == 0:
+        return None
+    return result[0].to_pandas()
+
+
+def _gsc242_row_to_dict(tbl, row_idx: int) -> dict:
+    """Extract position/mag/DR2 ID from a GSC 2.4.2 table row."""
+    row = tbl[row_idx]
+
+    def _sf(col):
+        if col not in tbl.colnames:
+            return np.nan
+        try:
+            f = float(row[col])
             return f if np.isfinite(f) else np.nan
         except (TypeError, ValueError):
             return np.nan
 
-    # Gaia DR2 source ID (prefer DR2 over DR1; will query DR3 from it)
     dr2_id = None
     for col in ("gaiaDr2SourceID", "gaiaDr1SourceID"):
         if col in tbl.colnames:
@@ -219,78 +245,53 @@ def _query_gsc242(gsc_id: str,
                 except (ValueError, TypeError):
                     pass
 
-    # Best magnitude available
     mag = np.nan
     for col in ("gaiaGMag", "FpgMag", "VpgMag", "JpgMag", "VMag", "BMag"):
-        if col in tbl.colnames:
-            v = _safe_float(col)
-            if np.isfinite(v):
-                mag = v
-                break
+        v = _sf(col)
+        if np.isfinite(v):
+            mag = v
+            break
 
     return {
-        "ra":                _safe_float("ra"),
-        "dec":               _safe_float("dec"),
-        "epoch":             _safe_float("epoch"),
-        "rapm":              _safe_float("rapm"),
-        "decpm":             _safe_float("decpm"),
-        "parallax":          _safe_float("parallax"),
-        "gaia_dr2_source_id": dr2_id,
-        "mag":               mag,
+        "ra": _sf("ra"), "dec": _sf("dec"),
+        "gaia_dr2_source_id": dr2_id, "mag": mag,
     }
 
 
-# ── VizieR fallback ───────────────────────────────────────────────────────────
-
-def _query_vizier_by_id(gsc_id: str, catalog: str, id_col: str,
-                        retries: int = 3) -> tuple[float, float, float] | None:
-    """Return (ra_deg, dec_deg, mag) from VizieR, or None."""
-    from astroquery.vizier import Vizier
-
-    V = Vizier(columns=[id_col, "RAJ2000", "DEJ2000",
-                        "Vmag", "Fmag", "jmag", "Pmag"],
-               row_limit=5)
-    delay = 5
-    for attempt in range(retries):
-        try:
-            result = V.query_constraints(catalog=catalog, **{id_col: gsc_id})
-            break
-        except Exception as e:
-            if attempt < retries - 1:
-                print(f"    VizieR retry {attempt+1}: {e}")
-                time.sleep(delay)
-                delay *= 2
-            else:
-                print(f"    WARNING: VizieR failed for {gsc_id}: {e}")
-                return None
-
-    if not result or len(result) == 0 or len(result[0]) == 0:
+def _vizier_row_to_tuple(df, id_col: str, match_id: str):
+    """Return (ra, dec, mag) for the first row matching match_id, or None."""
+    rows = df[df[id_col].astype(str).str.strip() == match_id]
+    if rows.empty:
         return None
-
-    row = result[0][0]
+    row = rows.iloc[0]
     ra  = float(row["RAJ2000"])
     dec = float(row["DEJ2000"])
     mag = np.nan
     for mcol in ("Vmag", "jmag", "Fmag", "Pmag"):
-        if mcol in row.colnames:
+        if mcol in row.index:
             val = row[mcol]
-            if val is not None and not (hasattr(val, "mask") and val.mask):
-                try:
-                    mag = float(val)
+            try:
+                f = float(val)
+                if np.isfinite(f):
+                    mag = f
                     break
-                except (TypeError, ValueError):
-                    pass
+            except (TypeError, ValueError):
+                pass
     return ra, dec, mag
 
 
 def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Resolve GSC positions using a three-tier fallback chain for every ID:
+    Resolve GSC positions using a three-tier fallback chain:
       1. STScI GSC 2.4.2  (current operational catalog, has Gaia DR2 IDs)
       2. VizieR I/305      (GSC 2.3.2, 2006 public release)
       3. VizieR I/254      (GSC 1.x, photographic plates)
 
-    All three are tried in order regardless of ID format; the first hit wins.
+    Each catalog is fetched ONCE for the entire field (cone search around
+    the mean V1 telescope pointing), then all guide star IDs are matched
+    from the cached tables.  This reduces web requests from N_stars × 3
+    to 3 regardless of field size.
+
     Adds ra_gsc, dec_gsc, mag_gsc, gaia_dr2_source_id, gsc_catalog columns.
     """
     cols = ["ra_gsc", "dec_gsc", "mag_gsc", "gaia_dr2_source_id", "gsc_catalog"]
@@ -299,62 +300,80 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
     gs_df["gaia_dr2_source_id"] = gs_df["gaia_dr2_source_id"].astype(object)
     gs_df["gsc_catalog"] = ""
 
+    # Mean V1 pointing for this field
+    ra_center  = float(gs_df["mean_ra_v1"].dropna().mean())  if gs_df["mean_ra_v1"].notna().any()  else np.nan
+    dec_center = float(gs_df["mean_dec_v1"].dropna().mean()) if gs_df["mean_dec_v1"].notna().any() else np.nan
+    have_center = np.isfinite(ra_center) and np.isfinite(dec_center)
+
+    # ── Fetch all three catalogs once ─────────────────────────────────────
+    gsc242_tbl = None
+    gsc23_df   = None
+    gsc1_df    = None
+
+    if have_center:
+        print(f"  Fetching GSC 2.4.2 cone (center {ra_center:.4f}, "
+              f"{dec_center:.4f}, r={_FGS_SEARCH_RADIUS_DEG}°) ...", end=" ")
+        gsc242_tbl = _fetch_gsc242_cone(ra_center, dec_center)
+        print(f"{len(gsc242_tbl)} sources" if gsc242_tbl is not None else "failed")
+
+        print("  Fetching VizieR I/305 (GSC 2.3.2) cone ...", end=" ")
+        gsc23_df = _fetch_vizier_cone("I/305", "GSC2.3", ra_center, dec_center)
+        print(f"{len(gsc23_df)} sources" if gsc23_df is not None else "failed")
+
+        print("  Fetching VizieR I/254 (GSC 1.x) cone ...", end=" ")
+        gsc1_df = _fetch_vizier_cone("I/254", "GSC", ra_center, dec_center)
+        print(f"{len(gsc1_df)} sources" if gsc1_df is not None else "failed")
+    else:
+        print("  WARNING: no V1 pointing available — catalog fetches skipped")
+
+    # ── Match each guide star from cached tables ──────────────────────────
     for idx, row in gs_df.iterrows():
         gsc_id = row["gsc_id"]
-        ra_v1  = row.get("mean_ra_v1",  np.nan)
-        dec_v1 = row.get("mean_dec_v1", np.nan)
 
-        # ── 1. GSC 2.4.2 ─────────────────────────────────────────────────
-        if np.isfinite(ra_v1) and np.isfinite(dec_v1):
-            print(f"  GSC 2.4.2 lookup for {gsc_id} ...", end=" ")
-            result242 = _query_gsc242(gsc_id, ra_v1, dec_v1)
-            if result242:
-                ra, dec = result242["ra"], result242["dec"]
+        # 1. GSC 2.4.2
+        if gsc242_tbl is not None:
+            ids = [str(x).strip() for x in gsc242_tbl["hstID"]]
+            matches = [i for i, x in enumerate(ids) if x == gsc_id]
+            if matches:
+                d = _gsc242_row_to_dict(gsc242_tbl, matches[0])
+                ra, dec = d["ra"], d["dec"]
                 if np.isfinite(ra) and np.isfinite(dec):
-                    print(f"RA={ra:.5f}  Dec={dec:.5f}  "
-                          f"mag={result242['mag']:.2f}  "
-                          f"gaia_dr2={result242['gaia_dr2_source_id']}")
+                    print(f"  {gsc_id}: GSC 2.4.2  RA={ra:.5f}  Dec={dec:.5f}  "
+                          f"mag={d['mag']:.2f}  gaia_dr2={d['gaia_dr2_source_id']}")
                     gs_df.at[idx, "ra_gsc"]      = ra
                     gs_df.at[idx, "dec_gsc"]     = dec
-                    gs_df.at[idx, "mag_gsc"]     = result242["mag"]
+                    gs_df.at[idx, "mag_gsc"]     = d["mag"]
                     gs_df.at[idx, "gsc_catalog"] = "GSC2.4.2"
-                    if result242["gaia_dr2_source_id"] is not None:
+                    if d["gaia_dr2_source_id"] is not None:
                         gs_df.at[idx, "gaia_dr2_source_id"] = int(
-                            result242["gaia_dr2_source_id"])
+                            d["gaia_dr2_source_id"])
                     continue
-                else:
-                    print("position NaN")
-            else:
-                print("not found")
-        else:
-            print(f"  GSC 2.4.2 lookup for {gsc_id} ... skipped (no V1 pointing)")
 
-        # ── 2. VizieR I/305 (GSC 2.3.2) ──────────────────────────────────
-        print(f"  VizieR I/305 (GSC 2.3.2) for {gsc_id} ...", end=" ")
-        vres = _query_vizier_by_id(gsc_id, "I/305", "GSC2.3")
-        if vres:
-            ra, dec, mag = vres
-            print(f"RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
-            gs_df.at[idx, "ra_gsc"]      = ra
-            gs_df.at[idx, "dec_gsc"]     = dec
-            gs_df.at[idx, "mag_gsc"]     = mag
-            gs_df.at[idx, "gsc_catalog"] = "I/305"
-            continue
-        else:
-            print("not found")
+        # 2. VizieR I/305
+        if gsc23_df is not None:
+            vres = _vizier_row_to_tuple(gsc23_df, "GSC2.3", gsc_id)
+            if vres:
+                ra, dec, mag = vres
+                print(f"  {gsc_id}: I/305  RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
+                gs_df.at[idx, "ra_gsc"]      = ra
+                gs_df.at[idx, "dec_gsc"]     = dec
+                gs_df.at[idx, "mag_gsc"]     = mag
+                gs_df.at[idx, "gsc_catalog"] = "I/305"
+                continue
 
-        # ── 3. VizieR I/254 (GSC 1.x) ────────────────────────────────────
-        print(f"  VizieR I/254 (GSC 1.x) for {gsc_id} ...", end=" ")
-        vres = _query_vizier_by_id(gsc_id, "I/254", "GSC")
-        if vres:
-            ra, dec, mag = vres
-            print(f"RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
-            gs_df.at[idx, "ra_gsc"]      = ra
-            gs_df.at[idx, "dec_gsc"]     = dec
-            gs_df.at[idx, "mag_gsc"]     = mag
-            gs_df.at[idx, "gsc_catalog"] = "I/254"
-        else:
-            print("NOT FOUND in any catalog")
+        # 3. VizieR I/254
+        if gsc1_df is not None:
+            vres = _vizier_row_to_tuple(gsc1_df, "GSC", gsc_id)
+            if vres:
+                ra, dec, mag = vres
+                print(f"  {gsc_id}: I/254  RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
+                gs_df.at[idx, "ra_gsc"]      = ra
+                gs_df.at[idx, "dec_gsc"]     = dec
+                gs_df.at[idx, "mag_gsc"]     = mag
+                gs_df.at[idx, "gsc_catalog"] = "I/254"
+                continue
+
+        print(f"  {gsc_id}: NOT FOUND in any catalog")
 
     return gs_df
 
@@ -448,47 +467,53 @@ def get_guide_star_position_at_epoch(
 
 # ── Step 3: Gaia DR3 lookup ───────────────────────────────────────────────────
 
-def _query_gaia_dr3_from_dr2_id(dr2_source_id: int) -> pd.Series | None:
+def _query_gaia_dr3_batch(dr2_ids: list[int]) -> dict[int, pd.Series]:
     """
-    Find the Gaia DR3 source corresponding to a DR2 source_id using the
-    gaiaedr3.dr2_neighbourhood cross-match table.
-
-    DR2 and DR3 source IDs are NOT guaranteed to be identical: Gaia's
-    source detection pipeline can merge or split sources between releases.
-    This table provides the authoritative DR2 → DR3 mapping.
-
-    Returns a Series with: source_id (DR3), dr2_source_id, dr3_source_id,
-    angular_distance, ra, dec, pmra, pmdec, parallax, radial_velocity,
-    phot_g_mean_mag.  If multiple DR3 matches exist (source splitting),
-    returns the closest by angular_distance.  Returns None if not found.
+    Batch DR2→DR3 cross-match via gaiaedr3.dr2_neighbourhood.
+    Fetches all requested DR2 IDs in a single TAP query.
+    Returns {dr2_source_id: closest-DR3-row-as-Series}.
     """
     from astroquery.gaia import Gaia
     Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"
 
+    id_list = ", ".join(str(int(x)) for x in dr2_ids)
     adql = f"""
     SELECT g.source_id, n.dr2_source_id, n.dr3_source_id,
            n.angular_distance,
            g.ra, g.dec, g.pmra, g.pmdec, g.parallax,
-           g.radial_velocity, g.phot_g_mean_mag
+           g.radial_velocity, g.phot_g_mean_mag,
+           g.ra_error, g.dec_error, g.parallax_error,
+           g.pmra_error, g.pmdec_error,
+           g.ra_dec_corr, g.ra_parallax_corr, g.ra_pmra_corr, g.ra_pmdec_corr,
+           g.dec_parallax_corr, g.dec_pmra_corr, g.dec_pmdec_corr,
+           g.parallax_pmra_corr, g.parallax_pmdec_corr, g.pmra_pmdec_corr
     FROM gaiaedr3.dr2_neighbourhood AS n
     JOIN gaiadr3.gaia_source AS g ON g.source_id = n.dr3_source_id
-    WHERE n.dr2_source_id = {dr2_source_id}
+    WHERE n.dr2_source_id IN ({id_list})
     ORDER BY n.angular_distance ASC
     """
     try:
         job = Gaia.launch_job(adql)
         tbl = job.get_results()
-        if len(tbl) == 0:
-            return None
-        df = tbl.to_pandas()
-        if len(df) > 1:
-            print(f"    NOTE: DR2 id {dr2_source_id} maps to "
-                  f"{len(df)} DR3 sources; using closest "
-                  f"(sep={df.iloc[0]['angular_distance']:.1f} mas)")
-        return df.iloc[0]
     except Exception as e:
-        print(f"    WARNING: DR2→DR3 lookup failed for {dr2_source_id}: {e}")
-        return None
+        print(f"    WARNING: batch DR2→DR3 query failed: {e}")
+        return {}
+
+    if len(tbl) == 0:
+        return {}
+
+    df = tbl.to_pandas()
+    df["dr2_source_id"] = df["dr2_source_id"].astype("int64")
+
+    # For each DR2 ID keep only the closest DR3 match
+    result: dict[int, pd.Series] = {}
+    for dr2_id, group in df.groupby("dr2_source_id"):
+        group = group.sort_values("angular_distance")
+        if len(group) > 1:
+            print(f"    NOTE: DR2 id {dr2_id} maps to {len(group)} DR3 sources; "
+                  f"using closest (sep={group.iloc[0]['angular_distance']:.1f} mas)")
+        result[int(dr2_id)] = group.iloc[0]
+    return result
 
 
 def _gaia_cone_search(ra: float, dec: float,
@@ -503,6 +528,10 @@ def _gaia_cone_search(ra: float, dec: float,
     adql = f"""
     SELECT source_id, ra, dec, pmra, pmdec, parallax,
            radial_velocity, phot_g_mean_mag,
+           ra_error, dec_error, parallax_error, pmra_error, pmdec_error,
+           ra_dec_corr, ra_parallax_corr, ra_pmra_corr, ra_pmdec_corr,
+           dec_parallax_corr, dec_pmra_corr, dec_pmdec_corr,
+           parallax_pmra_corr, parallax_pmdec_corr, pmra_pmdec_corr,
            DISTANCE(POINT('ICRS',{ra},{dec}),
                     POINT('ICRS',ra,dec)) * 3600.0 AS sep_arcsec_catalog
     FROM gaiadr3.gaia_source
@@ -550,10 +579,36 @@ def crossmatch_to_gaia(gs_df: pd.DataFrame,
         "gmag_gaia",
         "sep_catalog_arcsec",
         "sep_J2000_arcsec",
+        # 5×5 astrometric covariance (errors in mas / mas/yr; correlations dimensionless)
+        # ordering: (ra, dec, parallax, pmra, pmdec)
+        "ra_error_gaia", "dec_error_gaia", "parallax_error_gaia",
+        "pmra_error_gaia", "pmdec_error_gaia",
+        "ra_dec_corr_gaia", "ra_parallax_corr_gaia",
+        "ra_pmra_corr_gaia", "ra_pmdec_corr_gaia",
+        "dec_parallax_corr_gaia", "dec_pmra_corr_gaia", "dec_pmdec_corr_gaia",
+        "parallax_pmra_corr_gaia", "parallax_pmdec_corr_gaia",
+        "pmra_pmdec_corr_gaia",
     ]
     for col in new_cols:
         gs_df[col] = np.nan
     gs_df["gaia_source_id"] = gs_df["gaia_source_id"].astype(object)
+
+    # ── Batch DR2→DR3 lookup: one TAP query for all stars with a DR2 ID ──────
+    def _valid_dr2(val):
+        return (val is not None
+                and not (isinstance(val, float) and np.isnan(val)))
+
+    dr2_ids = [
+        int(row["gaia_dr2_source_id"])
+        for _, row in gs_df.iterrows()
+        if _valid_dr2(row.get("gaia_dr2_source_id"))
+        and not np.isnan(float(row.get("ra_gsc", np.nan) or np.nan))
+    ]
+    dr3_cache: dict[int, pd.Series] = {}
+    if dr2_ids:
+        print(f"  Batch Gaia DR3 lookup for {len(dr2_ids)} DR2 IDs ...", end=" ")
+        dr3_cache = _query_gaia_dr3_batch(dr2_ids)
+        print(f"{len(dr3_cache)} matched")
 
     for idx, row in gs_df.iterrows():
         ra_gsc  = row["ra_gsc"]
@@ -561,21 +616,19 @@ def crossmatch_to_gaia(gs_df: pd.DataFrame,
         if np.isnan(ra_gsc) or np.isnan(dec_gsc):
             continue
 
-        dr2_id = row.get("gaia_dr2_source_id")
-        have_dr2 = (dr2_id is not None
-                    and not (isinstance(dr2_id, float) and np.isnan(dr2_id)))
+        dr2_id  = row.get("gaia_dr2_source_id")
+        have_dr2 = _valid_dr2(dr2_id)
 
-        # ── Primary: DR2→DR3 cross-match via dr2_neighbourhood table ────────
-        if have_dr2:
-            print(f"  Gaia DR3 lookup for {row['gsc_id']} "
-                  f"(DR2 id={int(dr2_id)}) ...", end=" ")
-            gaia_row = _query_gaia_dr3_from_dr2_id(int(dr2_id))
-            if gaia_row is not None:
-                _fill_gaia_row(gs_df, idx, gaia_row, ra_gsc, dec_gsc,
-                               sep_cat_col="sep_catalog_arcsec",
-                               sep_j2000_col="sep_J2000_arcsec")
-                continue
-            print("not found in DR3 (falling back to cone search)")
+        # ── Primary: DR2→DR3 result from batch cache ─────────────────────────
+        if have_dr2 and int(dr2_id) in dr3_cache:
+            gaia_row = dr3_cache[int(dr2_id)]
+            _fill_gaia_row(gs_df, idx, gaia_row, ra_gsc, dec_gsc,
+                           sep_cat_col="sep_catalog_arcsec",
+                           sep_j2000_col="sep_J2000_arcsec")
+            continue
+        elif have_dr2:
+            print(f"  {row['gsc_id']}: DR2 id {int(dr2_id)} not found in DR3 "
+                  f"(falling back to cone search)")
 
         # ── Fallback: cone search ranked by J2000 apparent sep ───────────
         print(f"  Gaia cone search for {row['gsc_id']} "
@@ -685,6 +738,27 @@ def _fill_gaia_row(gs_df, idx, gaia_row, ra_gsc, dec_gsc,
     gs_df.at[idx, "gmag_gaia"]          = gmag
     gs_df.at[idx, sep_cat_col]          = cat_sep
     gs_df.at[idx, sep_j2000_col]        = sep_j2000_val if sep_j2000_val is not None else np.nan
+
+    # 5×5 astrometric covariance columns
+    _cov_cols = [
+        ("ra_error_gaia",             "ra_error"),
+        ("dec_error_gaia",            "dec_error"),
+        ("parallax_error_gaia",       "parallax_error"),
+        ("pmra_error_gaia",           "pmra_error"),
+        ("pmdec_error_gaia",          "pmdec_error"),
+        ("ra_dec_corr_gaia",          "ra_dec_corr"),
+        ("ra_parallax_corr_gaia",     "ra_parallax_corr"),
+        ("ra_pmra_corr_gaia",         "ra_pmra_corr"),
+        ("ra_pmdec_corr_gaia",        "ra_pmdec_corr"),
+        ("dec_parallax_corr_gaia",    "dec_parallax_corr"),
+        ("dec_pmra_corr_gaia",        "dec_pmra_corr"),
+        ("dec_pmdec_corr_gaia",       "dec_pmdec_corr"),
+        ("parallax_pmra_corr_gaia",   "parallax_pmra_corr"),
+        ("parallax_pmdec_corr_gaia",  "parallax_pmdec_corr"),
+        ("pmra_pmdec_corr_gaia",      "pmra_pmdec_corr"),
+    ]
+    for out_col, src_col in _cov_cols:
+        gs_df.at[idx, out_col] = _f(src_col)
 
     pm_mag = float(np.hypot(pmra_val  if np.isfinite(pmra_val)  else 0.0,
                             pmdec_val if np.isfinite(pmdec_val) else 0.0))
