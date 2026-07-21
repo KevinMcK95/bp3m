@@ -97,6 +97,13 @@ def _jit_stats(jit_path: Path, rootname: str) -> dict:
             out["SI_combined_RMS_median_arcsec"] = float(np.median(combined))
             out["SI_combined_RMS_max_arcsec"]    = float(np.max(combined))
 
+        # roll jitter (deg → mas): RMS and P2P of deviation from mean roll
+        if "Roll" in d.names:
+            roll = d["Roll"].astype(float)
+            roll_drift_mas = (roll - roll.mean()) * 3_600_000.0
+            out["Roll_RMS_mas"] = float(roll_drift_mas.std())
+            out["Roll_P2P_mas"] = float(roll_drift_mas.max() - roll_drift_mas.min())
+
         # quality: fraction of samples with any flag set
         flag_cols = ("FGS_flags", "Recenter", "SlewFlag")
         flagged = np.zeros(n, dtype=bool)
