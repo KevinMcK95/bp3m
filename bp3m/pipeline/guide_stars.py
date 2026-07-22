@@ -287,10 +287,11 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
       2. VizieR I/305      (GSC 2.3.2, 2006 public release)
       3. VizieR I/254      (GSC 1.x, photographic plates)
 
-    Each catalog is fetched ONCE for the entire field (cone search around
-    the mean V1 telescope pointing), then all guide star IDs are matched
-    from the cached tables.  This reduces web requests from N_stars × 3
-    to 3 regardless of field size.
+    Each catalog is fetched PER GUIDE STAR using that star's own mean V1
+    telescope pointing as the cone center.  Results are cached by rounded
+    (ra, dec) so guide stars from the same visit share one fetch.  This
+    handles fields where different visits have widely separated V1 pointings
+    (e.g. multiple programs spanning >1° on sky).
 
     Adds ra_gsc, dec_gsc, mag_gsc, gaia_dr2_source_id, gsc_catalog columns.
     """
@@ -300,42 +301,67 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
     gs_df["gaia_dr2_source_id"] = gs_df["gaia_dr2_source_id"].astype(object)
     gs_df["gsc_catalog"] = ""
 
-    # Mean V1 pointing for this field
+    # Fallback center if a star has no V1 pointing
     ra_center  = float(gs_df["mean_ra_v1"].dropna().mean())  if gs_df["mean_ra_v1"].notna().any()  else np.nan
     dec_center = float(gs_df["mean_dec_v1"].dropna().mean()) if gs_df["mean_dec_v1"].notna().any() else np.nan
-    have_center = np.isfinite(ra_center) and np.isfinite(dec_center)
 
-    # ── Fetch all three catalogs once ─────────────────────────────────────
-    gsc242_tbl = None
-    gsc23_df   = None
-    gsc1_df    = None
-
-    if have_center:
-        print(f"  Fetching GSC 2.4.2 cone (center {ra_center:.4f}, "
-              f"{dec_center:.4f}, r={_FGS_SEARCH_RADIUS_DEG}°) ...", end=" ")
-        gsc242_tbl = _fetch_gsc242_cone(ra_center, dec_center)
-        print(f"{len(gsc242_tbl)} sources" if gsc242_tbl is not None else "failed")
-
-        print("  Fetching VizieR I/305 (GSC 2.3.2) cone ...", end=" ")
-        gsc23_df = _fetch_vizier_cone("I/305", "GSC2.3", ra_center, dec_center)
-        print(f"{len(gsc23_df)} sources" if gsc23_df is not None else "failed")
-
-        print("  Fetching VizieR I/254 (GSC 1.x) cone ...", end=" ")
-        gsc1_df = _fetch_vizier_cone("I/254", "GSC", ra_center, dec_center)
-        print(f"{len(gsc1_df)} sources" if gsc1_df is not None else "failed")
-    else:
+    if not (np.isfinite(ra_center) and np.isfinite(dec_center)):
         print("  WARNING: no V1 pointing available — catalog fetches skipped")
+        for idx in gs_df.index:
+            print(f"  {gs_df.at[idx, 'gsc_id']}: NOT FOUND in any catalog")
+        return gs_df
 
-    # ── Match each guide star from cached tables ──────────────────────────
+    # Caches keyed by (ra rounded to 2 dp, dec rounded to 2 dp) ≈ 0.6′ grid
+    _gsc242_cache: dict = {}
+    _gsc23_cache:  dict = {}
+    _gsc1_cache:   dict = {}
+
+    def _cache_key(ra, dec):
+        return (round(float(ra), 2), round(float(dec), 2))
+
+    def _gsc242_for(ra, dec):
+        k = _cache_key(ra, dec)
+        if k not in _gsc242_cache:
+            print(f"  Fetching GSC 2.4.2 cone (center {ra:.4f}, {dec:.4f}, "
+                  f"r={_FGS_SEARCH_RADIUS_DEG}°) ...", end=" ", flush=True)
+            tbl = _fetch_gsc242_cone(ra, dec)
+            print(f"{len(tbl)} sources" if tbl is not None else "failed")
+            _gsc242_cache[k] = tbl
+        return _gsc242_cache[k]
+
+    def _gsc23_for(ra, dec):
+        k = _cache_key(ra, dec)
+        if k not in _gsc23_cache:
+            print(f"  Fetching VizieR I/305 (GSC 2.3.2) cone (center "
+                  f"{ra:.4f}, {dec:.4f}) ...", end=" ", flush=True)
+            df = _fetch_vizier_cone("I/305", "GSC2.3", ra, dec)
+            print(f"{len(df)} sources" if df is not None else "failed")
+            _gsc23_cache[k] = df
+        return _gsc23_cache[k]
+
+    def _gsc1_for(ra, dec):
+        k = _cache_key(ra, dec)
+        if k not in _gsc1_cache:
+            print(f"  Fetching VizieR I/254 (GSC 1.x) cone (center "
+                  f"{ra:.4f}, {dec:.4f}) ...", end=" ", flush=True)
+            df = _fetch_vizier_cone("I/254", "GSC", ra, dec)
+            print(f"{len(df)} sources" if df is not None else "failed")
+            _gsc1_cache[k] = df
+        return _gsc1_cache[k]
+
+    # ── Match each guide star ─────────────────────────────────────────────
     for idx, row in gs_df.iterrows():
         gsc_id = row["gsc_id"]
+        ra_v1  = row["mean_ra_v1"]  if pd.notna(row["mean_ra_v1"])  else ra_center
+        dec_v1 = row["mean_dec_v1"] if pd.notna(row["mean_dec_v1"]) else dec_center
 
         # 1. GSC 2.4.2
-        if gsc242_tbl is not None:
-            ids = [str(x).strip() for x in gsc242_tbl["hstID"]]
+        tbl = _gsc242_for(ra_v1, dec_v1)
+        if tbl is not None:
+            ids = [str(x).strip() for x in tbl["hstID"]]
             matches = [i for i, x in enumerate(ids) if x == gsc_id]
             if matches:
-                d = _gsc242_row_to_dict(gsc242_tbl, matches[0])
+                d = _gsc242_row_to_dict(tbl, matches[0])
                 ra, dec = d["ra"], d["dec"]
                 if np.isfinite(ra) and np.isfinite(dec):
                     print(f"  {gsc_id}: GSC 2.4.2  RA={ra:.5f}  Dec={dec:.5f}  "
@@ -350,6 +376,7 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
                     continue
 
         # 2. VizieR I/305
+        gsc23_df = _gsc23_for(ra_v1, dec_v1)
         if gsc23_df is not None:
             vres = _vizier_row_to_tuple(gsc23_df, "GSC2.3", gsc_id)
             if vres:
@@ -362,6 +389,7 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
                 continue
 
         # 3. VizieR I/254
+        gsc1_df = _gsc1_for(ra_v1, dec_v1)
         if gsc1_df is not None:
             vres = _vizier_row_to_tuple(gsc1_df, "GSC", gsc_id)
             if vres:
