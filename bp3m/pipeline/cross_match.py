@@ -321,6 +321,22 @@ def run_cross_match(
         print("  All cross-matches up to date.")
         _validate_catalog_if_needed(field_name, output_dir)
         existing = [Path(f['root']) / "matched_gaia.csv" for f in folders]
+        # Still run QSO vetting if the anchors file is missing
+        if run_qso_vetting:
+            _anchor = Path(output_dir) / field_name / "Gaia" / f"{field_name}_qso_anchors.csv"
+            if not _anchor.exists():
+                try:
+                    from .qso_vetting import vet_qso_candidates
+                    print("\n" + "─" * 50)
+                    print("Step 4b: QSO anchor vetting")
+                    print("─" * 50)
+                    vet_qso_candidates(
+                        field_name=field_name,
+                        output_dir=output_dir,
+                        lib_dir=lib_dir,
+                    )
+                except Exception as _qexc:
+                    print(f"  WARNING: QSO vetting failed — {_qexc}")
         return [p for p in existing if p.exists()]
 
     print(f"  Gaia stars:  {len(gaia_df)}")
