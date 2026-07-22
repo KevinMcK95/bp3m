@@ -252,7 +252,7 @@ def _astrometric_cut(
     Covariance is scaled as in BP3M's solver (GAIA_SYS_DICT).
     For sources without a 5p/6p solution, astrometric_pass = False.
     """
-    qso_df = qso_df.copy()
+    qso_df = qso_df.reset_index(drop=True).copy()
     qso_df['has_5p_solution']    = False
     qso_df['chi2_astrometric']   = np.nan
     qso_df['astrometric_pass']   = False
@@ -267,8 +267,11 @@ def _astrometric_cut(
                   'pmra_pmdec_corr', 'parallax_pmra_corr', 'parallax_pmdec_corr',
                   'astrometric_params_solved']
     astro_cols = [c for c in astro_cols if c in gaia_astro.columns]
-    merged = qso_df.merge(
-        gaia_astro[astro_cols].rename(columns={'source_id': '_sid'}),
+    astro_sub = (gaia_astro[astro_cols]
+                 .drop_duplicates(subset=['source_id'])
+                 .reset_index(drop=True))
+    merged = qso_df.reset_index(drop=True).merge(
+        astro_sub.rename(columns={'source_id': '_sid'}),
         left_on='source_id', right_on='_sid', how='left'
     ).drop(columns=['_sid'], errors='ignore')
 
