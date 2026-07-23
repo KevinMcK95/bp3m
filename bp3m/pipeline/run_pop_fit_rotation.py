@@ -1556,6 +1556,53 @@ def run_pop_fit_rotation(
         }, _f, indent=2)
     print(f"  Saved: mu_pop.json, run_config.json")
 
+    if not no_plots:
+        # ── Residual maps (before = bp3m, after = pop-fit-rotation) ───────────
+        _plot_dir_res = output_pfr / 'plots' / 'residuals'
+        print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
+        try:
+            from bp3m.pipeline.run_pop_fit import _plot_pop_residual_maps
+            _plot_pop_residual_maps(
+                _plot_dir_res, image_names, solver,
+                r_before=r_bp3m,   v_before=v_bp3m,
+                r_after=r_current, v_after=v_mean,
+                C_vT_after=C_vT_final,
+                prefix='final',
+            )
+        except Exception as _exc:
+            print(f"  WARNING: residual maps failed — {_exc}")
+        solver._update_geometry(r_current, v_mean)
+
+        # ── make_plots (VPD, CMD, chi², etc.) ─────────────────────────────────
+        try:
+            from bp3m.pipeline.plot_results import make_plots
+            print("\n  Generating diagnostic plots...")
+            make_plots(solver, imgs, gaia_catalog,
+                       r_current, v_mean, v_mean_marg, v_cov, C_vT_final, C_r,
+                       output_dir=output_pfr,
+                       plot_residuals=False,
+                       member_sidx=member_sidx,
+                       mu_pop=mu_pop_current,
+                       v_mean_free=v_mean_free_marg,
+                       v_cov_free=v_cov_free_sol,
+                       C_vT_free=C_vT_free_sol)
+        except Exception as _exc:
+            print(f"  WARNING: make_plots failed — {_exc}")
+
+        # ── PM vs G-mag / HST x / HST y ───────────────────────────────────────
+        try:
+            from bp3m.pipeline.run_pop_fit import _plot_pm_vs_properties
+            _plot_dir_plots = output_pfr / 'plots'
+            _plot_dir_plots.mkdir(parents=True, exist_ok=True)
+            print("\n  Plotting PM vs properties...")
+            _plot_pm_vs_properties(
+                _plot_dir_plots, solver, image_names, gaia_catalog,
+                v_mean_free_marg, C_vT_free_sol,
+                member_sidx, mu_pop_current, sigma_pm, field_name,
+            )
+        except Exception as _exc:
+            print(f"  WARNING: _plot_pm_vs_properties failed — {_exc}")
+
     t_elapsed = time.time() - t_start
     print(f"\n  Done in {t_elapsed:.1f}s")
     return output_pfr
