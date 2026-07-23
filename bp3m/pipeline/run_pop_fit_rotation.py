@@ -121,7 +121,7 @@ _NGC300_TRING = np.array([
 
 GALAXY_PARAMS: dict[str, dict] = {
     'NGC_55': dict(
-        ra_cen=3.7233, dec_cen=-39.1967,        # deg
+        ra_cen=3.7246, dec_cen=-39.1964,   # Westmeier+2013 Table 1 kinematic centre
         d_kpc=1932.0,
         plx_pop=5.176e-4,                        # mas
         sigma_plx_tot=2.86e-5,                   # mas
@@ -135,7 +135,7 @@ GALAXY_PARAMS: dict[str, dict] = {
         tilted_ring=_NGC55_TRING,                # full tilted-ring model; overrides pa_deg/inc_deg
     ),
     'NGC_300': dict(
-        ra_cen=13.7229, dec_cen=-37.6844,
+        ra_cen=13.7229, dec_cen=-37.6844,  # Westmeier+2011 Table 1 kinematic centre
         d_kpc=2089.0,
         plx_pop=4.786e-4,
         sigma_plx_tot=1.323e-5,
