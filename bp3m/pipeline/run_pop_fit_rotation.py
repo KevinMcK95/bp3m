@@ -761,12 +761,15 @@ def _compute_free_stellar_posterior_rot(
 def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarray,
                          field_name: str) -> None:
     """
-    2×2 figure: member stars' sky positions (RA, Dec) coloured by
-    μ_ra* (left column) and μ_dec (right column), for the population-prior
-    (top row, pmra_bp3m / pmdec_bp3m) and diffuse-prior (bottom row,
-    pmra_bp3m_free / pmdec_bp3m_free) posteriors from stellar_astrometry.csv.
-    Colour scale is symmetric about mu_pop[0/1] with range set by the
-    95th percentile of |pm - mu_pop| across members.
+    3×2 figure: member stars' sky positions coloured by μ_ra* (left) and
+    μ_dec (right) for three rows:
+      row 0 — pop-prior posteriors  (pmra_bp3m / pmdec_bp3m)
+      row 1 — diffuse-prior posteriors (pmra_bp3m_free / pmdec_bp3m_free)
+      row 2 — gas-predicted PMs from tilted-ring model
+               (μ_pop + rot_pm_ra_masyr / μ_pop + rot_pm_dec_masyr)
+
+    Colour limits are computed from the data rows (rows 0 & 1) and reused
+    for the gas row so all three share the same scale.
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -784,28 +787,40 @@ def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarra
     ra_m  = mem['ra'].to_numpy(float)
     dec_m = mem['dec'].to_numpy(float)
 
-    cases = [
-        ('pop prior',     mem['pmra_bp3m'].to_numpy(float),      mem['pmdec_bp3m'].to_numpy(float)),
-        ('diffuse prior', mem['pmra_bp3m_free'].to_numpy(float),  mem['pmdec_bp3m_free'].to_numpy(float)),
+    pmra_pop    = mem['pmra_bp3m'].to_numpy(float)
+    pmdec_pop   = mem['pmdec_bp3m'].to_numpy(float)
+    pmra_free   = mem['pmra_bp3m_free'].to_numpy(float)
+    pmdec_free  = mem['pmdec_bp3m_free'].to_numpy(float)
+    pmra_gas    = mu_pop[0] + mem['rot_pm_ra_masyr'].to_numpy(float)
+    pmdec_gas   = mu_pop[1] + mem['rot_pm_dec_masyr'].to_numpy(float)
+
+    # Colour limits from data rows only, symmetric about mu_pop
+    spread_ra  = max(np.nanpercentile(np.abs(np.concatenate([pmra_pop,  pmra_free])  - mu_pop[0]), 95), 0.001)
+    spread_dec = max(np.nanpercentile(np.abs(np.concatenate([pmdec_pop, pmdec_free]) - mu_pop[1]), 95), 0.001)
+    limits = [(mu_pop[0] - spread_ra,  mu_pop[0] + spread_ra),
+              (mu_pop[1] - spread_dec, mu_pop[1] + spread_dec)]
+
+    rows = [
+        ('pop prior',         pmra_pop,  pmdec_pop),
+        ('diffuse prior',     pmra_free, pmdec_free),
+        ('gas (tilted-ring)', pmra_gas,  pmdec_gas),
     ]
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
+    fig, axes = plt.subplots(3, 2, figsize=(13, 13), constrained_layout=True)
     fig.suptitle(f'{field_name} — member PMs on sky (N={len(mem)})', fontsize=13)
 
-    for row, (prior_label, pmra_m, pmdec_m) in enumerate(cases):
-        for col, (pm_vals, pm_label, cen) in enumerate([
-            (pmra_m,  r'$\mu_{\alpha^*}$ (mas/yr)', mu_pop[0]),
-            (pmdec_m, r'$\mu_\delta$ (mas/yr)',     mu_pop[1]),
+    for row_idx, (row_label, pmra_m, pmdec_m) in enumerate(rows):
+        for col, (pm_vals, pm_label, (vmin, vmax)) in enumerate([
+            (pmra_m,  r'$\mu_{\alpha^*}$ (mas/yr)', limits[0]),
+            (pmdec_m, r'$\mu_\delta$ (mas/yr)',     limits[1]),
         ]):
-            ax = axes[row, col]
-            spread = np.nanpercentile(np.abs(pm_vals - cen), 95)
-            spread = max(spread, 0.001)
+            ax = axes[row_idx, col]
             sc = ax.scatter(ra_m, dec_m, c=pm_vals, s=6, cmap='RdBu_r',
-                            vmin=cen - spread, vmax=cen + spread, rasterized=True)
+                            vmin=vmin, vmax=vmax, rasterized=True)
             plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label=pm_label)
             ax.set_xlabel('RA (deg)')
             ax.set_ylabel('Dec (deg)')
-            ax.set_title(f'{prior_label}  —  {pm_label}')
+            ax.set_title(f'{row_label}  —  {pm_label}')
             ax.invert_xaxis()
 
     out_path = output_dir / 'sky_pm_members.png'
