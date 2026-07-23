@@ -756,6 +756,64 @@ def _compute_free_stellar_posterior_rot(
     return a_free, C_vT_free
 
 
+# ── Sky PM plot ────────────────────────────────────────────────────────────────
+
+def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarray,
+                         field_name: str) -> None:
+    """
+    2×2 figure: member stars' sky positions (RA, Dec) coloured by
+    μ_ra* (left column) and μ_dec (right column), for the population-prior
+    (top row, pmra_bp3m / pmdec_bp3m) and diffuse-prior (bottom row,
+    pmra_bp3m_free / pmdec_bp3m_free) posteriors from stellar_astrometry.csv.
+    Colour scale is symmetric about mu_pop[0/1] with range set by the
+    95th percentile of |pm - mu_pop| across members.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.read_csv(stellar_csv_path)
+    mem = df[df['is_member'].astype(bool)].copy()
+    if len(mem) == 0:
+        return
+
+    ra_m  = mem['ra'].to_numpy(float)
+    dec_m = mem['dec'].to_numpy(float)
+
+    cases = [
+        ('pop prior',     mem['pmra_bp3m'].to_numpy(float),      mem['pmdec_bp3m'].to_numpy(float)),
+        ('diffuse prior', mem['pmra_bp3m_free'].to_numpy(float),  mem['pmdec_bp3m_free'].to_numpy(float)),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
+    fig.suptitle(f'{field_name} — member PMs on sky (N={len(mem)})', fontsize=13)
+
+    for row, (prior_label, pmra_m, pmdec_m) in enumerate(cases):
+        for col, (pm_vals, pm_label, cen) in enumerate([
+            (pmra_m,  r'$\mu_{\alpha^*}$ (mas/yr)', mu_pop[0]),
+            (pmdec_m, r'$\mu_\delta$ (mas/yr)',     mu_pop[1]),
+        ]):
+            ax = axes[row, col]
+            spread = np.nanpercentile(np.abs(pm_vals - cen), 95)
+            spread = max(spread, 0.001)
+            sc = ax.scatter(ra_m, dec_m, c=pm_vals, s=6, cmap='RdBu_r',
+                            vmin=cen - spread, vmax=cen + spread, rasterized=True)
+            plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label=pm_label)
+            ax.set_xlabel('RA (deg)')
+            ax.set_ylabel('Dec (deg)')
+            ax.set_title(f'{prior_label}  —  {pm_label}')
+            ax.invert_xaxis()
+
+    out_path = output_dir / 'sky_pm_members.png'
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved: sky_pm_members.png")
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 def run_pop_fit_rotation(
@@ -1602,6 +1660,17 @@ def run_pop_fit_rotation(
             )
         except Exception as _exc:
             print(f"  WARNING: _plot_pm_vs_properties failed — {_exc}")
+
+        # ── Sky position coloured by PM ────────────────────────────────────────
+        try:
+            print("\n  Plotting sky PM map for members...")
+            _plot_sky_pm_members(
+                output_pfr / 'plots',
+                output_pfr / 'stellar_astrometry.csv',
+                mu_pop_current, field_name,
+            )
+        except Exception as _exc:
+            print(f"  WARNING: sky_pm_members plot failed — {_exc}")
 
     t_elapsed = time.time() - t_start
     print(f"\n  Done in {t_elapsed:.1f}s")
