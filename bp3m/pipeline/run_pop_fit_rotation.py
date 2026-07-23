@@ -1517,9 +1517,9 @@ def run_pop_fit_rotation(
         'mu_pop_prior_sigma':    float(mu_pop_prior_sigma),
         # Rotation model fields
         'f_star_mult':           float(f_current),
-        'sigma_f_star_mult':     float(sigma_f_final),
+        'sigma_f_star_mult':     None if np.isnan(sigma_f_final) else float(sigma_f_final),
         'theta_offset_deg':      float(np.degrees(theta_current)),
-        'sigma_theta_offset_deg': float(np.degrees(sigma_theta_final)),
+        'sigma_theta_offset_deg': None if np.isnan(sigma_theta_final) else float(np.degrees(sigma_theta_final)),
         'pa_deg':                float(gp['pa_deg']),
         'inc_deg':               float(gp['inc_deg']),
         'rotation_model':        'tilted_ring' if gp.get('tilted_ring') is not None else 'arctangent',
@@ -1548,9 +1548,9 @@ def run_pop_fit_rotation(
             'n_members': int(len(member_sidx)),
             'split_ccd': v1_split_ccd,
             'f_star_mult': float(f_current),
-            'sigma_f_star_mult': float(sigma_f_final),
+            'sigma_f_star_mult': None if np.isnan(sigma_f_final) else float(sigma_f_final),
             'theta_offset_deg': float(np.degrees(theta_current)),
-            'sigma_theta_offset_deg': float(np.degrees(sigma_theta_final)),
+            'sigma_theta_offset_deg': None if np.isnan(sigma_theta_final) else float(np.degrees(sigma_theta_final)),
             'fit_f': fit_f,
             'fit_theta': fit_theta,
         }, _f, indent=2)
