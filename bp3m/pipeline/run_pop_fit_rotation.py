@@ -1668,14 +1668,21 @@ def run_pop_fit_rotation(
             print(f"  WARNING: make_plots failed — {_exc}")
 
         # ── PM vs G-mag / HST x / HST y ───────────────────────────────────────
+        # Subtract per-star rotation offsets so the plot shows residuals from
+        # the expected rotation pattern rather than from mu_pop alone.
         try:
             from bp3m.pipeline.run_pop_fit import _plot_pm_vs_properties
             _plot_dir_plots = output_pfr / 'plots'
             _plot_dir_plots.mkdir(parents=True, exist_ok=True)
             print("\n  Plotting PM vs properties...")
+            _dmu_ra, _dmu_dec = compute_rotation_offsets(
+                gaia_ra, gaia_dec, gp, f=f_current, theta_offset=theta_current)
+            _v_free_rotcorr = v_mean_free_marg.copy()
+            _v_free_rotcorr[:, 2] -= _dmu_ra
+            _v_free_rotcorr[:, 3] -= _dmu_dec
             _plot_pm_vs_properties(
                 _plot_dir_plots, solver, image_names, gaia_catalog,
-                v_mean_free_marg, C_vT_free_sol,
+                _v_free_rotcorr, C_vT_free_sol,
                 member_sidx, mu_pop_current, sigma_pm, field_name,
             )
         except Exception as _exc:
