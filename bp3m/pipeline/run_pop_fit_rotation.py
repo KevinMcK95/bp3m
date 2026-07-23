@@ -1119,12 +1119,18 @@ def run_pop_fit_rotation(
     sigma_f_final = sigma_theta_final = np.nan
     if (fit_f or fit_theta) and n_iter_ft > 0:
         print(f"\n  Phase 4: f/θ fitting ({n_iter_ft} iterations, r fixed)...")
+        _ft_damp = 0.3  # damping for f/θ step to avoid oscillation
         for ft_iter in range(n_iter_ft):
             _, mu_pop_new, f_new, theta_new, C_shared_ft, C_vT, a_arr, _, _ = _solve(
                 member_sidx, mu_pop_current, r_current,
                 fix_r_arg=True,
                 fit_f_arg=fit_f, fit_theta_arg=fit_theta,
                 f_arg=f_current, theta_arg=theta_current)
+            # Damp the f/θ steps; full μ step
+            if fit_f:
+                f_new = f_current + _ft_damp * (f_new - f_current)
+            if fit_theta:
+                theta_new = theta_current + _ft_damp * (theta_new - theta_current)
             delta_mu    = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
             delta_f     = abs(f_new     - f_current)     if fit_f     else 0.0
             delta_theta = abs(theta_new - theta_current) if fit_theta else 0.0
