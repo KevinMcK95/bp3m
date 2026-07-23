@@ -2656,21 +2656,6 @@ def run_pop_fit(
 
     # ── Plots ─────────────────────────────────────────────────────────────────
     if not no_plots:
-        _plot_dir = output_pfr / 'plots' / 'residuals'
-        print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
-        try:
-            _plot_pop_residual_maps(
-                _plot_dir, image_names, solver,
-                r_before=r_bp3m,   v_before=v_bp3m,
-                r_after=r_current, v_after=v_mean,
-                C_vT_after=C_vT_final,
-                prefix='final',
-            )
-        except Exception as _exc:
-            print(f"  WARNING: residual maps failed — {_exc}")
-        # Restore geometry to final state for make_plots
-        solver._update_geometry(r_current, v_mean)
-
         if z_weights_final is not None and _p3_active is not None:
             try:
                 print("\n  Plotting soft-weight diagnostic...")
@@ -2732,6 +2717,21 @@ def run_pop_fit(
                 )
             except Exception as _exc:
                 print(f"  WARNING: _plot_qso_diagnostics failed — {_exc}")
+
+        # ── Residual maps — last ───────────────────────────────────────────────
+        _plot_dir = output_pfr / 'plots' / 'residuals'
+        print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
+        try:
+            _plot_pop_residual_maps(
+                _plot_dir, image_names, solver,
+                r_before=r_bp3m,   v_before=v_bp3m,
+                r_after=r_current, v_after=v_mean,
+                C_vT_after=C_vT_final,
+                prefix='final',
+            )
+        except Exception as _exc:
+            print(f"  WARNING: residual maps failed — {_exc}")
+        solver._update_geometry(r_current, v_mean)
 
     # ── Optional CTE phase ────────────────────────────────────────────────────
     if fit_cte:

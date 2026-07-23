@@ -1615,22 +1615,6 @@ def run_pop_fit_rotation(
     print(f"  Saved: mu_pop.json, run_config.json")
 
     if not no_plots:
-        # ── Residual maps (before = bp3m, after = pop-fit-rotation) ───────────
-        _plot_dir_res = output_pfr / 'plots' / 'residuals'
-        print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
-        try:
-            from bp3m.pipeline.run_pop_fit import _plot_pop_residual_maps
-            _plot_pop_residual_maps(
-                _plot_dir_res, image_names, solver,
-                r_before=r_bp3m,   v_before=v_bp3m,
-                r_after=r_current, v_after=v_mean,
-                C_vT_after=C_vT_final,
-                prefix='final',
-            )
-        except Exception as _exc:
-            print(f"  WARNING: residual maps failed — {_exc}")
-        solver._update_geometry(r_current, v_mean)
-
         # ── make_plots (VPD, CMD, chi², etc.) ─────────────────────────────────
         try:
             from bp3m.pipeline.plot_results import make_plots
@@ -1671,6 +1655,21 @@ def run_pop_fit_rotation(
             )
         except Exception as _exc:
             print(f"  WARNING: sky_pm_members plot failed — {_exc}")
+
+        # ── Residual maps (before = bp3m, after = pop-fit-rotation) — last ────
+        _plot_dir_res = output_pfr / 'plots' / 'residuals'
+        print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
+        try:
+            from bp3m.pipeline.run_pop_fit import _plot_pop_residual_maps
+            _plot_pop_residual_maps(
+                _plot_dir_res, image_names, solver,
+                r_before=r_bp3m,   v_before=v_bp3m,
+                r_after=r_current, v_after=v_mean,
+                C_vT_after=C_vT_final,
+                prefix='final',
+            )
+        except Exception as _exc:
+            print(f"  WARNING: residual maps failed — {_exc}")
 
     t_elapsed = time.time() - t_start
     print(f"\n  Done in {t_elapsed:.1f}s")
