@@ -62,6 +62,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 # ── Galaxy parameter table ─────────────────────────────────────────────────────
 
@@ -195,18 +196,18 @@ def compute_rotation_offsets_jacobian(
 
 # ── Modified _joint_solve_pop with rotation model ─────────────────────────────
 #
-# This is a copy of run_pop_fit._joint_solve_pop with the following changes:
-#   1. Extra arguments: rot_ra, rot_dec, f, theta_offset, gp,
-#      f_prior_inv_sq, theta_prior_inv_sq
-#   2. Shared parameter vector grows from [μ_pop] (size 2) to
-#      [μ_pop, f, θ] (size 4 in fix_r mode) or [r, μ_pop, f, θ] in joint mode.
-#   3. Member PM prior centre: μ_pop + (rot_ra[star], rot_dec[star]).
-#   4. Schur correction for the μ block is extended to include ∂rot/∂f
-#      and ∂rot/∂θ couplings.
+# Copy of run_pop_fit._joint_solve_pop with two targeted changes:
 #
-# TODO: implement the full modified solve.  Current stub returns the
-#       unmodified result from the base solver so the file is importable
-#       and testable end-to-end before the rotation coupling is wired in.
+#  1. Per-star member prior RHS:
+#       h_align/h_all[s, 2/3] += σ^{-2} · (μ_pop[0/1] + rot_ra/dec[s])
+#     (base code has σ^{-2} · μ_pop[0/1] only).
+#
+#  2. Schur RHS correction for μ_pop:
+#       rhs_mu += σ^{-2} · Σ a_s[2:4]        (same as base)
+#       rhs_mu -= σ^{-2} · Σ rot_ra/dec[s]   (NEW: rotation contribution)
+#
+# This is exact for fixed rotation (fit_f=False, fit_theta=False).
+# The 4D extension for free f/θ is deferred.
 
 def _joint_solve_pop_rot(
     solver,
@@ -224,70 +225,255 @@ def _joint_solve_pop_rot(
     qso_sidx: "np.ndarray | None" = None,
     qso_pmra: "np.ndarray | None" = None,
     qso_pmdec: "np.ndarray | None" = None,
-    # ── rotation model extras ─────────────────────────────────────────────
-    rot_ra: "np.ndarray | None" = None,    # (n_stars,) current rotation offsets
+    rot_ra: "np.ndarray | None" = None,
     rot_dec: "np.ndarray | None" = None,
-    jac_f_ra: "np.ndarray | None" = None,  # (n_stars,) ∂rot_ra/∂f
-    jac_f_dec: "np.ndarray | None" = None,
-    jac_t_ra: "np.ndarray | None" = None,  # (n_stars,) ∂rot_ra/∂θ
-    jac_t_dec: "np.ndarray | None" = None,
-    f_prior_inv_sq: float = 0.0,           # (1/σ_f)²
-    theta_prior_inv_sq: float = 0.0,       # (1/σ_θ)²
-    f_current: float = 1.0,
-    theta_current: float = 0.0,
-    f_prior: float = 1.0,
-    theta_prior: float = 0.0,
-):
+) -> tuple:
     """
-    Joint solve for (r, μ_pop, f, θ) with per-star rotation prior.
+    One Newton step for (Δr, Δμ_pop) with per-star rotation prior.
 
-    The shared system is extended:
-      fix_r=True  → 4×4 block: [μ_pop[0], μ_pop[1], f, θ]
-      fix_r=False → (n_r+4)×(n_r+4)
+    Per-star member prior centre: (μ_pop[0] + rot_ra[s], μ_pop[1] + rot_dec[s]).
+    For fixed rotation (rot_ra/rot_dec are constant arrays), this is exact.
 
-    Per-star prior centre for member s:
-      E[μ_ra*(s)]  = μ_pop[0] + rot_ra[s]
-      E[μ_dec(s)]  = μ_pop[1] + rot_dec[s]
-
-    where rot_ra[s] and rot_dec[s] depend on (f, θ) at the current linearisation
-    point, and the Jacobian (jac_f_ra etc.) supplies the coupling derivatives.
-
-    Returns same tuple as _joint_solve_pop plus (f_new, theta_new, C_ft).
+    Returns same 7-tuple as _joint_solve_pop.
     """
-    # ── Import and delegate to base solver ────────────────────────────────────
-    # STUB: until the full Schur extension is implemented, run the base solver
-    # with the rotation offsets absorbed into a shifted mu_pop_current.
-    # This is NOT correct for the f/θ gradients but allows end-to-end testing.
-    from bp3m.pipeline.run_pop_fit import _joint_solve_pop as _base_solve
+    try:
+        from tqdm import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(x, **kw):
+            return x
 
     _rot_ra  = rot_ra  if rot_ra  is not None else np.zeros(solver.n_stars)
     _rot_dec = rot_dec if rot_dec is not None else np.zeros(solver.n_stars)
 
-    # Temporarily shift h_align / h_all for member stars by rot_offset.
-    # This is exact for μ_pop but ignores the f/θ gradient coupling.
-    # TODO: replace with the full 4-parameter Schur extension.
-    _mu_shifted = mu_pop_current.copy()  # placeholder — full impl below
+    N_V   = 5
+    nr    = solver.N_R
+    n_r   = len(image_names) * nr
+    n_stars = solver.n_stars
 
-    result = _base_solve(
-        solver=solver,
-        image_names=image_names,
-        member_sidx=member_sidx,
-        mu_pop_current=_mu_shifted,
-        sigma_pm=sigma_pm,
-        plx_pop=plx_pop,
-        sigma_plx_tot=sigma_plx_tot,
-        C_pop_prior_inv=C_pop_prior_inv,
-        mu_pop_prior=mu_pop_prior,
-        r_current=r_current,
-        fix_r=fix_r,
-        z_weights=z_weights,
-        qso_sidx=qso_sidx,
-        qso_pmra=qso_pmra,
-        qso_pmdec=qso_pmdec,
-    )
-    # Unpack base result and pass through f/θ unchanged until full impl
-    r_hat, mu_pop_hat, C_shared, C_vT, a_arr, a_align, K_img = result
-    return r_hat, mu_pop_hat, f_current, theta_current, C_shared, C_vT, a_arr, a_align, K_img
+    sigma_pm_inv_sq  = sigma_pm ** -2
+    sigma_plx_inv_sq = sigma_plx_tot ** -2
+
+    if fix_r:
+        n_shared = 2
+    else:
+        n_shared = n_r + 2
+        idx_r  = slice(0, n_r)
+        idx_mu = slice(n_r, n_r + 2)
+
+    # ── H_vv: start from Gaia prior ───────────────────────────────────────────
+    H_vv = solver.C_survey_inv.copy()
+
+    _nonmem = np.ones(n_stars, dtype=bool)
+    _nonmem[member_sidx] = False
+    _nonmem_2p = _nonmem & (solver._C_VG_inv_per_star[:, 2] > 0)
+    if _nonmem_2p.any():
+        for _k in range(N_V):
+            H_vv[_nonmem_2p, _k, _k] += solver._C_VG_inv_per_star[_nonmem_2p, _k]
+
+    H_vv[member_sidx, 2, 2] += sigma_pm_inv_sq
+    H_vv[member_sidx, 3, 3] += sigma_pm_inv_sq
+    H_vv[member_sidx, 4, 4] += sigma_plx_inv_sq
+
+    h_align = solver.C_survey_inv_dot_v.copy()
+    h_all   = solver.C_survey_inv_dot_v.copy()
+
+    # ── Population prior RHS — rotation-corrected ────────────────────────────
+    h_align[member_sidx, 2] += sigma_pm_inv_sq * (mu_pop_current[0] + _rot_ra[member_sidx])
+    h_align[member_sidx, 3] += sigma_pm_inv_sq * (mu_pop_current[1] + _rot_dec[member_sidx])
+    h_all  [member_sidx, 2] += sigma_pm_inv_sq * (mu_pop_current[0] + _rot_ra[member_sidx])
+    h_all  [member_sidx, 3] += sigma_pm_inv_sq * (mu_pop_current[1] + _rot_dec[member_sidx])
+    h_align[member_sidx, 4] += sigma_plx_inv_sq * plx_pop
+    h_all  [member_sidx, 4] += sigma_plx_inv_sq * plx_pop
+
+    if qso_sidx is not None and len(qso_sidx) > 0:
+        _sigma_qso_pm_inv_sq  = (3.5e-4) ** -2
+        _sigma_qso_plx_inv_sq = (1.0e-3) ** -2
+        H_vv[qso_sidx, 2, 2] += _sigma_qso_pm_inv_sq
+        H_vv[qso_sidx, 3, 3] += _sigma_qso_pm_inv_sq
+        H_vv[qso_sidx, 4, 4] += _sigma_qso_plx_inv_sq
+        h_align[qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
+        h_align[qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
+        h_all  [qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
+        h_all  [qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
+
+    # ── Per-image accumulation ─────────────────────────────────────────────────
+    K_img       = {}
+    XCs_xresid  = {}
+    H_rr_block  = np.zeros((n_r, n_r))
+    active_glob = np.zeros(n_stars, dtype=bool)
+
+    for j_idx, img in enumerate(_tqdm(image_names, desc='  pop_rot_solve',
+                                      unit='img', ncols=90, leave=False)):
+        d = solver._img_data.get(img)
+        if d is None:
+            K_img[img] = None
+            continue
+
+        sidx    = d['sidx']
+        use_fit = d['use_for_fit']
+        use_any = use_fit | d.get('use_for_astrom', use_fit)
+
+        sidx_any = sidx[use_any]
+        sidx_fit = sidx[use_fit]
+        active_glob[sidx_any] = True
+
+        cs  = j_idx * nr
+        r_j = r_current[cs:cs + nr]
+
+        JU  = d['JU']
+        X   = d['X_mat']
+        xys = d['xys']
+
+        Cs     = solver._compute_Cs(img, r_j)
+        Cs_inv = np.linalg.inv(Cs)
+        if z_weights is not None:
+            _z = z_weights.get(img)
+            if _z is not None:
+                Cs_inv = Cs_inv * _z[:, None, None]
+
+        x_pred  = np.einsum('nkl,l->nk', X, r_j)
+        x_resid = xys - x_pred
+
+        JUT_Cs = np.einsum('nki,nkl->nil', JU, Cs_inv)
+        K      = np.einsum('nik,nkl->nil', JUT_Cs, X)
+        K_img[img] = K
+
+        np.add.at(H_vv, sidx_any,
+                  np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
+        np.subtract.at(h_align, sidx_fit,
+                       np.einsum('nik,nk->ni', JUT_Cs[use_fit], x_resid[use_fit]))
+        np.subtract.at(h_all, sidx_any,
+                       np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
+
+        if not fix_r:
+            XCsX = np.einsum('nki,nkl,nlj->ij',
+                             X[use_fit], Cs_inv[use_fit], X[use_fit])
+            H_rr_block[cs:cs + nr, cs:cs + nr] += XCsX + d['C_r_prior_inv']
+            XCs_xresid[img] = np.einsum('nki,nkl,nl->ni',
+                                         X[use_fit], Cs_inv[use_fit], x_resid[use_fit])
+
+    # ── Stellar posteriors ────────────────────────────────────────────────────
+    C_vT = np.zeros_like(H_vv)
+    _hdiag = np.diagonal(H_vv, axis1=1, axis2=2)
+    _invertible = _hdiag.all(axis=1)
+    _safe_sidx = np.where(_invertible)[0]
+    if len(_safe_sidx) > 0:
+        C_vT[_safe_sidx] = np.linalg.inv(H_vv[_safe_sidx])
+    a_align = np.einsum('nij,nj->ni', C_vT, h_align)
+    a       = np.einsum('nij,nj->ni', C_vT, h_all)
+
+    # ── Shared system (μ or r+μ) ───────────────────────────────────────────────
+    Lambda = np.zeros((n_shared, n_shared))
+    rhs    = np.zeros(n_shared)
+
+    n_mem = len(member_sidx)
+
+    H_mu   = C_pop_prior_inv.copy()
+    H_mu  += sigma_pm_inv_sq * n_mem * np.eye(2)
+    rhs_mu = (C_pop_prior_inv @ (mu_pop_prior - mu_pop_current)
+              - sigma_pm_inv_sq * n_mem * mu_pop_current)
+
+    if not fix_r:
+        Lambda[idx_r,  idx_r]  = H_rr_block
+        Lambda[idx_mu, idx_mu] = H_mu
+        for j_idx, img in enumerate(image_names):
+            d = solver._img_data.get(img)
+            if d is None:
+                continue
+            cs = j_idx * nr
+            rhs[cs:cs + nr] += d['C_r_prior_inv'] @ (d['r_prior'] - r_current[cs:cs + nr])
+            if img in XCs_xresid:
+                rhs[cs:cs + nr] += XCs_xresid[img].sum(axis=0)
+    else:
+        Lambda[:] = H_mu
+
+    # ── Schur correction for μ block ──────────────────────────────────────────
+    if n_mem > 0:
+        Cv_m = C_vT[member_sidx]
+        mu_mu_schur = sigma_pm_inv_sq ** 2 * Cv_m[:, 2:4, 2:4].sum(axis=0)
+        if fix_r:
+            Lambda -= mu_mu_schur
+        else:
+            Lambda[idx_mu, idx_mu] -= mu_mu_schur
+        # Schur RHS: posterior star means contribute, with rotation offset removed
+        rhs_mu += sigma_pm_inv_sq * a[member_sidx, 2:4].sum(axis=0)
+        rhs_mu -= sigma_pm_inv_sq * np.array([
+            _rot_ra[member_sidx].sum(),
+            _rot_dec[member_sidx].sum(),
+        ])
+
+    if fix_r:
+        rhs[:] = rhs_mu
+    else:
+        rhs[idx_mu] = rhs_mu
+
+    # ── Per-image Schur corrections (joint solve only) ────────────────────────
+    if not fix_r:
+        member_set = set(int(s) for s in member_sidx)
+
+        for j_idx, img in enumerate(image_names):
+            d = solver._img_data.get(img)
+            if d is None or K_img.get(img) is None:
+                continue
+
+            cs       = j_idx * nr
+            sidx     = d['sidx']
+            use_fit  = d['use_for_fit']
+            use_fmem = use_fit & np.array([int(s) in member_set for s in sidx], dtype=bool)
+
+            sidx_fit = sidx[use_fit]
+            K_fit    = K_img[img][use_fit]
+            Cv_fit   = C_vT[sidx_fit]
+
+            CvT_K_fit = np.einsum('nij,njk->nik', Cv_fit, K_fit)
+            Lambda[cs:cs + nr, cs:cs + nr] -= np.einsum('nji,njk->ik', K_fit, CvT_K_fit)
+            rhs[cs:cs + nr]                += np.einsum('nji,nj->i',   K_fit, a_align[sidx_fit])
+
+            if use_fmem.any():
+                sidx_fm  = sidx[use_fmem]
+                K_fm     = K_img[img][use_fmem]
+                CvT_M_fm = C_vT[sidx_fm, :, 2:4]
+                KT_CvT_M = np.einsum('nji,njk->ik', K_fm, CvT_M_fm)
+                Lambda[cs:cs + nr, idx_mu] -= sigma_pm_inv_sq * KT_CvT_M
+                Lambda[idx_mu, cs:cs + nr] -= sigma_pm_inv_sq * KT_CvT_M.T
+
+            for j2_idx, img2 in enumerate(image_names):
+                if j2_idx <= j_idx:
+                    continue
+                d2 = solver._img_data.get(img2)
+                if d2 is None or K_img.get(img2) is None:
+                    continue
+                use2   = d2['use_for_fit']
+                sidx2  = d2['sidx'][use2]
+                K2     = K_img[img2][use2]
+
+                common, ix1, ix2 = np.intersect1d(sidx_fit, sidx2, return_indices=True)
+                if len(common) == 0:
+                    continue
+
+                CvT_K2 = np.einsum('nij,njk->nik', C_vT[common], K2[ix2])
+                block  = np.einsum('nji,njk->ik', K_fit[ix1], CvT_K2)
+                cs2    = j2_idx * nr
+                Lambda[cs:cs + nr, cs2:cs2 + nr] -= block
+                Lambda[cs2:cs2 + nr, cs:cs + nr] -= block.T
+
+    # ── Solve with diagonal preconditioning ───────────────────────────────────
+    d_diag    = np.sqrt(np.maximum(np.abs(np.diag(Lambda)), 1e-30))
+    d_inv     = 1.0 / d_diag
+    Lambda_sc = d_inv[:, None] * Lambda * d_inv[None, :]
+    try:
+        C_sc = np.linalg.inv(Lambda_sc)
+    except np.linalg.LinAlgError:
+        C_sc = np.linalg.pinv(Lambda_sc)
+    C_shared = d_inv[:, None] * C_sc * d_inv[None, :]
+    delta    = C_shared @ rhs
+
+    if fix_r:
+        return r_current.copy(), mu_pop_current + delta, C_shared, C_vT, a, a_align, K_img
+    else:
+        return (r_current + delta[idx_r],
+                mu_pop_current + delta[idx_mu],
+                C_shared, C_vT, a, a_align, K_img)
 
 
 # ── Modified _select_members_from_a with rotation-corrected distance ──────────
@@ -303,6 +489,7 @@ def _select_members_from_a_rot(
     sigma_clip: float = 3.0,
     min_members: int = 5,
     max_sigma_free_pm: float = 1.0,
+    pm_sys_floor: float = 0.0,
 ) -> np.ndarray:
     """
     Select members by Mahalanobis distance from (μ_pop + rot_offset[star]).
@@ -310,8 +497,6 @@ def _select_members_from_a_rot(
     Identical to _select_members_from_a except delta_pm uses the
     per-star rotation-corrected expected PM.
     """
-    from bp3m.pipeline.run_pop_fit import _select_members_from_a as _base
-
     eidx = np.where(n_hst >= 1)[0]
     if len(eidx) < min_members:
         return eidx
@@ -324,13 +509,12 @@ def _select_members_from_a_rot(
     pmra  = a_arr[eidx, 2]
     pmdec = a_arr[eidx, 3]
 
-    # rotation-corrected expected PM for each candidate
     mu_exp_ra  = mu_pop[0] + rot_ra[eidx]
     mu_exp_dec = mu_pop[1] + rot_dec[eidx]
 
     C_pm_sub = C_vT[eidx, 2:4, 2:4].copy()
-    C_pm_sub[:, 0, 0] += sigma_pm ** 2
-    C_pm_sub[:, 1, 1] += sigma_pm ** 2
+    C_pm_sub[:, 0, 0] += sigma_pm ** 2 + pm_sys_floor ** 2
+    C_pm_sub[:, 1, 1] += sigma_pm ** 2 + pm_sys_floor ** 2
     delta_pm = np.column_stack([pmra - mu_exp_ra, pmdec - mu_exp_dec])
     chi2 = np.einsum('ni,nij,nj->n', delta_pm, np.linalg.inv(C_pm_sub), delta_pm)
 
@@ -385,7 +569,6 @@ def _compute_free_stellar_posterior_rot(
     H_mem[:, 3, 3] -= sigma_pm_inv_sq
     H_mem[:, 4, 4] -= sigma_plx_inv_sq
 
-    # Strip rotation-corrected prior centre
     h_mem[:, 2] -= sigma_pm_inv_sq * (mu_pop[0] + rot_ra[member_sidx])
     h_mem[:, 3] -= sigma_pm_inv_sq * (mu_pop[1] + rot_dec[member_sidx])
     h_mem[:, 4] -= sigma_plx_inv_sq * plx_pop
@@ -407,7 +590,7 @@ def _compute_free_stellar_posterior_rot(
 def run_pop_fit_rotation(
     output_dir: Path,
     field_name: str,
-    sigma_pm: float | None = None,       # defaults to gp['sigma_pm_disp']
+    sigma_pm: float | None = None,
     mu_pop_prior_sigma: float = 0.5,
     n_iter_mu: int = 20,
     n_iter_joint: int = 20,
@@ -426,8 +609,19 @@ def run_pop_fit_rotation(
     Run rotation-model pop-fit for NGC_55 or NGC_300.
 
     Uses hardcoded galaxy parameters from GALAXY_PARAMS.
-    Fits μ_pop jointly with (f, θ) if fit_f/fit_theta are True.
+    For the first tests use fit_f=False, fit_theta=False (fixed rotation at
+    f=1.0, theta=0.0).  Full f/θ fitting is a deferred extension.
     """
+    from bp3m.data_loader_flc import load_image_data_flc
+    from bp3m.data_loader_flc import build_index_maps, split_images_by_ccd
+    from bp3m.solver import BP3MSolver
+    from bp3m.pipeline.run_pop_fit import (
+        _load_bp3m_outputs, _apply_bp3m_flags,
+        _select_initial_members, _estimate_mu_pop_v1, _estimate_mu_pop,
+        _compute_alpha_updates,
+    )
+    from bp3m.pipeline.qso_vetting import find_qso_anchors
+
     gp = GALAXY_PARAMS.get(field_name)
     if gp is None:
         raise ValueError(
@@ -440,59 +634,698 @@ def run_pop_fit_rotation(
     if mu_pop_init is None:
         mu_pop_init = gp['mu_pop_init']
 
-    # TODO: implement full rotation-model solve loop.
-    #
-    # Outline:
-    #   1. Data loading (identical to run_pop_fit: load_image_data_flc,
-    #      build_index_maps, split_images_by_ccd, BP3MSolver).
-    #   2. Load BP3M v1 outputs (r_hat, alpha, use_for_fit flags) via
-    #      _load_bp3m_outputs and _apply_bp3m_flags from run_pop_fit.
-    #   3. Initialise: f=1.0, theta_offset=0.0.
-    #   4. Iteration loop (Phase 1: fix_r=True, then Phase 2: fix_r=False):
-    #      a. Compute rotation offsets for current (f, θ):
-    #           rot_ra, rot_dec = compute_rotation_offsets(
-    #               gaia_ra, gaia_dec, gp, f=f_current, theta_offset=theta_current)
-    #      b. Compute Jacobian for the Schur coupling:
-    #           jac_f_ra, jac_f_dec, jac_t_ra, jac_t_dec =
-    #               compute_rotation_offsets_jacobian(...)
-    #      c. Call _joint_solve_pop_rot (replacing _joint_solve_pop) with
-    #         current (f, θ) and Jacobian arrays.
-    #      d. Update member selection via _select_members_from_a_rot.
-    #      e. Update free posteriors via _compute_free_stellar_posterior_rot.
-    #      f. Re-linearise: update rot_ra, rot_dec, Jacobian for new (f, θ).
-    #   5. Phase 3 (alpha update): identical to run_pop_fit Phase 3.
-    #   6. Save results: mu_pop.json with added fields f_star_mult, theta_offset_deg.
-    #
-    # For now, fall back to the base run_pop_fit with the rotation offsets NOT
-    # yet fed into the solve.  Replace this once _joint_solve_pop_rot is complete.
-    from bp3m.pipeline.run_pop_fit import run_pop_fit as _base_run
+    plx_pop       = gp['plx_pop']
+    sigma_plx_tot = gp['sigma_plx_tot']
 
-    print(f"\n  [rotation model] Field: {field_name}")
+    t_start    = time.time()
+    data_root  = Path(output_dir)
+    bp3m_dir   = data_root / field_name / 'BP3M_results'
+    output_pfr = data_root / field_name / 'BP3M_pop_fit_results'
+    output_pfr.mkdir(parents=True, exist_ok=True)
+
+    # ── Read v1 run_config ─────────────────────────────────────────────────────
+    _cfg_path = bp3m_dir / 'run_config.json'
+    if not _cfg_path.exists():
+        raise FileNotFoundError(
+            f"BP3M_results/run_config.json not found at {_cfg_path}. Run bp3m first."
+        )
+    with open(_cfg_path) as _f:
+        v1_cfg = json.load(_f)
+
+    v1_image_names      = v1_cfg.get('image_names', [])
+    v1_split_ccd        = bool(v1_cfg.get('split_ccd', True))
+    min_stars_split_ccd = int(v1_cfg.get('min_stars_split_ccd', 20))
+    poly_order          = int(v1_cfg.get('poly_order', 1))
+
+    print("\n" + "─" * 60)
+    print("BP3M pop-fit (rotation model)")
+    print("─" * 60)
+    print(f"  field={field_name}")
     print(f"  PA={gp['pa_deg']}°  i={gp['inc_deg']}°  "
           f"V_rot={gp['v_rot_flat']} km/s  d={gp['d_kpc']} kpc")
-    print(f"  fit_f={fit_f}  fit_theta={fit_theta}  "
-          f"σ_f={gp['sigma_f']}  σ_θ={gp['sigma_theta_deg']}°")
-    print("  NOTE: rotation solve stub — currently delegating to base run_pop_fit")
+    print(f"  fit_f={fit_f}  fit_theta={fit_theta}")
+    print(f"  σ_pm={sigma_pm} mas/yr  plx_pop={plx_pop} mas  "
+          f"σ_plx_tot={sigma_plx_tot} mas")
+    print(f"  μ_pop prior σ={mu_pop_prior_sigma} mas/yr  "
+          f"member_sigma_clip={member_sigma_clip}  pm_sys_floor={pm_sys_floor} mas/yr")
+    print(f"  n_iter: μ={n_iter_mu}  joint={n_iter_joint}  alpha={n_iter_alpha}")
+    print(f"  poly_order={poly_order}  split_ccd={v1_split_ccd}  "
+          f"v1 images={len(v1_image_names)}")
 
-    return _base_run(
-        output_dir=output_dir,
-        field_name=field_name,
-        sigma_pm=sigma_pm,
-        plx_pop=gp['plx_pop'],
-        sigma_plx_tot=gp['sigma_plx_tot'],
-        mu_pop_prior_sigma=mu_pop_prior_sigma,
-        n_iter_mu=n_iter_mu,
-        n_iter_joint=n_iter_joint,
-        n_iter_alpha=n_iter_alpha,
-        alpha_damp=alpha_damp,
-        member_sigma_clip=member_sigma_clip,
-        pm_sys_floor=pm_sys_floor,
-        max_sigma_free_pm=max_sigma_free_pm,
-        mu_pop_init=mu_pop_init,
-        freeze_mu_pop_init=True,
-        no_plots=no_plots,
-        qso_anchors_csv=qso_anchors_csv,
-    )
+    # ── Load data ──────────────────────────────────────────────────────────────
+    print(f"\n  Loading bp3m input data for '{field_name}'...")
+    imgs, stars_per_image, gaia_catalog = load_image_data_flc(data_root, field_name)
+    if imgs is None or len(imgs) == 0:
+        raise RuntimeError(f"No usable images found for '{field_name}'.")
+
+    star_id_to_idx, image_names, star_in_image = build_index_maps(
+        stars_per_image, gaia_catalog)
+
+    if v1_image_names:
+        v1_bases = set()
+        for n in v1_image_names:
+            base = n[:-3] if n.endswith(('_hi', '_lo')) else n
+            v1_bases.add(base)
+        image_names = [n for n in image_names if n in v1_bases]
+    if not image_names:
+        raise RuntimeError("No images remain after filtering to v1 image set.")
+
+    filtered_spi = {n: stars_per_image[n] for n in image_names}
+
+    observed_ids: set = set()
+    for spi in filtered_spi.values():
+        observed_ids.update(spi['Gaia_id'].values)
+    gaia_catalog = (gaia_catalog[gaia_catalog['Gaia_id'].isin(observed_ids)]
+                    .reset_index(drop=True))
+    star_id_to_idx = {int(gid): i for i, gid in enumerate(gaia_catalog['Gaia_id'])}
+
+    imgs = {n: imgs[n] for n in image_names}
+
+    if v1_split_ccd:
+        imgs, filtered_spi = split_images_by_ccd(
+            imgs, filtered_spi, min_stars_per_ccd=min_stars_split_ccd)
+        image_names = sorted(filtered_spi.keys())
+        star_id_to_idx, image_names, star_in_image = build_index_maps(
+            filtered_spi, gaia_catalog)
+
+    if v1_image_names:
+        v1_set  = set(v1_image_names)
+        our_set = set(image_names)
+        extra   = our_set - v1_set
+        missing = v1_set - our_set
+        if extra:
+            print(f"  WARNING: {len(extra)} extra images not in v1 — dropping")
+            image_names  = [n for n in image_names if n in v1_set]
+            filtered_spi = {n: filtered_spi[n] for n in image_names}
+            imgs         = {n: imgs[n] for n in image_names}
+            star_id_to_idx, image_names, star_in_image = build_index_maps(
+                filtered_spi, gaia_catalog)
+        if missing:
+            print(f"  WARNING: {len(missing)} v1 images missing from loaded data: "
+                  f"{sorted(missing)[:5]} ...")
+
+    print(f"  Images: {len(image_names)}  ", end='')
+
+    # ── QSO anchor loading ────────────────────────────────────────────────────
+    _qso_sidx      = None
+    _qso_pmra_mas  = None
+    _qso_pmdec_mas = None
+    _n_qso_anchors = 0
+
+    _gaia_dir = data_root / field_name / 'Gaia'
+    if qso_anchors_csv is not None:
+        _anchor_paths = ([Path(qso_anchors_csv)]
+                         if not isinstance(qso_anchors_csv, list)
+                         else [Path(p) for p in qso_anchors_csv])
+    else:
+        _p = find_qso_anchors(_gaia_dir, field_name)
+        _all = sorted(_gaia_dir.glob(f"{field_name}_*_qso_anchors.csv"),
+                      key=lambda p: p.stat().st_mtime)
+        _anchor_paths = _all if _all else ([_p] if _p and _p.exists() else [])
+
+    _anchor_paths = [p for p in _anchor_paths if p.exists()]
+
+    if _anchor_paths:
+        try:
+            _qdfs = [pd.read_csv(p, dtype={'source_id': 'int64'})
+                     for p in _anchor_paths]
+            _qdf = (pd.concat(_qdfs, ignore_index=True)
+                    .drop_duplicates(subset=['source_id'])
+                    .reset_index(drop=True)
+                    if len(_qdfs) > 1 else _qdfs[0])
+            _qdf_anchors = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+            _nq_anch = len(_qdf_anchors)
+            print(f"  QSO vetted anchors: {_nq_anch}")
+
+            _qso_idx_list, _qso_pmra_list, _qso_pmdec_list = [], [], []
+            for _, _row in _qdf_anchors.iterrows():
+                _sidx = star_id_to_idx.get(int(_row['source_id']))
+                if _sidx is not None:
+                    _qso_idx_list.append(_sidx)
+                    _qso_pmra_list.append(float(_row['pmra_aberr_uas']) * 1e-3)
+                    _qso_pmdec_list.append(float(_row['pmdec_aberr_uas']) * 1e-3)
+            if _qso_idx_list:
+                _qso_sidx      = np.array(_qso_idx_list,  dtype=int)
+                _qso_pmra_mas  = np.array(_qso_pmra_list, dtype=float)
+                _qso_pmdec_mas = np.array(_qso_pmdec_list, dtype=float)
+                _n_qso_anchors = len(_qso_sidx)
+            print(f"    In HST field: {_n_qso_anchors}"
+                  + (" ← prior applied" if _n_qso_anchors > 0 else " (none in FOV)"))
+        except Exception as _qexc:
+            print(f"  WARNING: could not load QSO anchors — {_qexc}")
+    else:
+        print("  QSO anchor file not found")
+
+    # ── Build solver ──────────────────────────────────────────────────────────
+    solver = BP3MSolver(imgs, filtered_spi, gaia_catalog,
+                        star_id_to_idx, image_names, star_in_image,
+                        poly_order=poly_order)
+    print(f"Stars: {solver.n_stars}  N_R/image: {solver.N_R}")
+
+    # ── Load v1 r_hat and alpha ────────────────────────────────────────────────
+    print("\n  Loading v1 alignment parameters (r_hat, alpha)...")
+    r_bp3m = _load_bp3m_outputs(bp3m_dir, image_names, solver.N_R, solver)
+    solver._update_R(r_bp3m)
+    solver._update_geometry(r_bp3m, solver.v_survey)
+
+    # ── Load v1 bp3m posteriors for initial membership ────────────────────────
+    v1_astrom_path = bp3m_dir / 'stellar_astrometry.csv'
+    v_bp3m = solver.v_survey.copy()
+
+    _pmra_init       = gaia_catalog['pmra'].to_numpy(float).copy()
+    _pmdec_init      = gaia_catalog['pmdec'].to_numpy(float).copy()
+    _sig_pmra_init   = gaia_catalog['pmra_error'].to_numpy(float).copy()
+    _sig_pmdec_init  = gaia_catalog['pmdec_error'].to_numpy(float).copy()
+    _corr_pm_init    = (gaia_catalog['pmra_pmdec_corr'].to_numpy(float).copy()
+                        if 'pmra_pmdec_corr' in gaia_catalog.columns
+                        else np.zeros(solver.n_stars))
+    _gaia_sig_pmra  = _sig_pmra_init.copy()
+    _gaia_sig_pmdec = _sig_pmdec_init.copy()
+    _gaia_corr_pm   = _corr_pm_init.copy()
+
+    _v1_pm_loaded = False
+    _v1_matched   = np.zeros(solver.n_stars, dtype=bool)
+    if v1_astrom_path.exists():
+        try:
+            _v1 = pd.read_csv(v1_astrom_path)
+            _v1['Gaia_id'] = _v1['Gaia_id'].astype(np.int64)
+            _v1_idx = {int(g): i for i, g in enumerate(_v1['Gaia_id'])}
+            _v_cols = ['delta_racosdec_bp3m', 'delta_dec_bp3m',
+                       'pmra_bp3m', 'pmdec_bp3m', 'parallax_bp3m']
+            _pm_sig_cols = ['sigma_pmra_bp3m', 'sigma_pmdec_bp3m', 'corr_pmra_pmdec']
+            if all(c in _v1.columns for c in _v_cols):
+                _v1_arr = _v1[_v_cols].to_numpy(float)
+                for i, gid in enumerate(gaia_catalog['Gaia_id']):
+                    j = _v1_idx.get(int(gid))
+                    if j is not None:
+                        v_bp3m[i] = _v1_arr[j]
+            if all(c in _v1.columns for c in _pm_sig_cols):
+                _v1_pm  = _v1[['pmra_bp3m', 'pmdec_bp3m']].to_numpy(float)
+                _v1_sig = _v1[_pm_sig_cols].to_numpy(float)
+                for i, gid in enumerate(gaia_catalog['Gaia_id']):
+                    j = _v1_idx.get(int(gid))
+                    if j is not None:
+                        _pmra_init[i]      = _v1_pm[j, 0]
+                        _pmdec_init[i]     = _v1_pm[j, 1]
+                        _sig_pmra_init[i]  = _v1_sig[j, 0]
+                        _sig_pmdec_init[i] = _v1_sig[j, 1]
+                        _corr_pm_init[i]   = _v1_sig[j, 2]
+                        _v1_matched[i]     = True
+                _v1_pm_loaded = True
+                _sig_pmra_init  = np.where(np.isfinite(_sig_pmra_init),
+                                           _sig_pmra_init,  _gaia_sig_pmra)
+                _sig_pmdec_init = np.where(np.isfinite(_sig_pmdec_init),
+                                           _sig_pmdec_init, _gaia_sig_pmdec)
+                _corr_pm_init   = np.where(np.isfinite(_corr_pm_init),
+                                           _corr_pm_init,   _gaia_corr_pm)
+        except Exception as _exc:
+            print(f"  WARNING: could not load v1 posteriors — {_exc}")
+
+    # ── Apply v1 use_for_fit flags ─────────────────────────────────────────────
+    print("\n  Applying v1 detection flags...")
+    _apply_bp3m_flags(bp3m_dir, solver, image_names)
+
+    # ── Count HST detections per star ─────────────────────────────────────────
+    _n_hst_det = np.zeros(solver.n_stars, dtype=int)
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        _use_a = d.get('use_for_astrom', d['use_for_fit'])
+        np.add.at(_n_hst_det, d['sidx'][_use_a], 1)
+
+    # ── Bootstrap μ_pop ────────────────────────────────────────────────────────
+    _mu_init_arr = np.array([float(mu_pop_init[0]), float(mu_pop_init[1])])
+    if _v1_pm_loaded:
+        _pmra_v1_only  = np.where(_v1_matched, _pmra_init,  np.nan)
+        _pmdec_v1_only = np.where(_v1_matched, _pmdec_init, np.nan)
+    else:
+        _pmra_v1_only  = _pmra_init
+        _pmdec_v1_only = _pmdec_init
+
+    print(f"\n  Skipping bootstrap — using --mu_pop_init directly: "
+          f"({_mu_init_arr[0]:+.4f}, {_mu_init_arr[1]:+.4f}) mas/yr")
+    _mu_boot = _mu_init_arr.copy()
+
+    # ── Initial member selection ───────────────────────────────────────────────
+    print("\n  Selecting initial members from v1 bp3m PMs...")
+    member_sidx = _select_initial_members(
+        _pmra_v1_only, _pmdec_v1_only,
+        _sig_pmra_init, _sig_pmdec_init, _corr_pm_init,
+        _mu_boot, member_sigma_clip, sigma_pm, pm_sys_floor)
+    print(f"  Initial members: {len(member_sidx)}")
+
+    # ── μ_pop prior ────────────────────────────────────────────────────────────
+    _extra = sigma_pm ** 2 + pm_sys_floor ** 2
+    _mem_pm_ra   = _pmra_v1_only[member_sidx]
+    _mem_pm_dec  = _pmdec_v1_only[member_sidx]
+    _mem_sig_ra  = _sig_pmra_init[member_sidx]
+    _mem_sig_dec = _sig_pmdec_init[member_sidx]
+    _fin_m = np.isfinite(_mem_pm_ra) & np.isfinite(_mem_pm_dec)
+    if _fin_m.sum() >= 3:
+        _wra  = 1.0 / (_mem_sig_ra[_fin_m]  ** 2 + _extra)
+        _wdec = 1.0 / (_mem_sig_dec[_fin_m] ** 2 + _extra)
+        _mu_ra_v1   = float(np.sum(_wra  * _mem_pm_ra[_fin_m])  / np.sum(_wra))
+        _mu_dec_v1  = float(np.sum(_wdec * _mem_pm_dec[_fin_m]) / np.sum(_wdec))
+        _unc_ra_v1  = float(1.0 / np.sqrt(np.sum(_wra)))
+        _unc_dec_v1 = float(1.0 / np.sqrt(np.sum(_wdec)))
+        mu_pop_prior = np.array([_mu_ra_v1, _mu_dec_v1])
+    else:
+        print("  WARNING: too few members; using bootstrap center as prior")
+        mu_pop_prior = _mu_boot.copy()
+        _unc_ra_v1 = _unc_dec_v1 = 0.0
+    _n_prior_members = int(_fin_m.sum())
+    print(f"  μ_pop prior from v1 members (N={_n_prior_members}): "
+          f"({mu_pop_prior[0]:+.4f} ± {_unc_ra_v1:.4f}, "
+          f"{mu_pop_prior[1]:+.4f} ± {_unc_dec_v1:.4f}) mas/yr  "
+          f"[prior σ = ±{mu_pop_prior_sigma:.2f} mas/yr]")
+
+    C_pop_prior_inv = np.eye(2) / mu_pop_prior_sigma ** 2
+    mu_pop_current  = mu_pop_prior.copy()
+
+    solver.gaia_n_hst_used[:] = 0
+    for _img in image_names:
+        _d = solver._img_data.get(_img)
+        if _d is None:
+            continue
+        _use_any = _d['use_for_fit'] | _d.get('use_for_astrom', _d['use_for_fit'])
+        np.add.at(solver.gaia_n_hst_used, _d['sidx'][_use_any], 1)
+
+    # ── Precompute rotation offsets ────────────────────────────────────────────
+    f_current     = 1.0
+    theta_current = 0.0
+    gaia_ra  = gaia_catalog['ra'].to_numpy(float)
+    gaia_dec = gaia_catalog['dec'].to_numpy(float)
+    rot_ra, rot_dec = compute_rotation_offsets(
+        gaia_ra, gaia_dec, gp, f=f_current, theta_offset=theta_current)
+    print(f"\n  Rotation offsets (f={f_current}, θ={np.degrees(theta_current):.1f}°): "
+          f"rms(Δμ_ra*)={np.std(rot_ra):.4f}  "
+          f"rms(Δμ_dec)={np.std(rot_dec):.4f} mas/yr")
+
+    # ── Convenience wrapper ────────────────────────────────────────────────────
+    def _solve(member_sidx_arg, mu_pop_arg, r_arg,
+               fix_r_arg=False, z_weights_arg=None):
+        return _joint_solve_pop_rot(
+            solver, image_names,
+            member_sidx_arg, mu_pop_arg,
+            sigma_pm, plx_pop, sigma_plx_tot,
+            C_pop_prior_inv, mu_pop_prior,
+            r_arg, fix_r=fix_r_arg, z_weights=z_weights_arg,
+            qso_sidx=_qso_sidx,
+            qso_pmra=_qso_pmra_mas,
+            qso_pmdec=_qso_pmdec_mas,
+            rot_ra=rot_ra,
+            rot_dec=rot_dec,
+        )
+
+    def _free_posterior(a_arg, C_vT_arg, msidx_arg, mu_pop_arg):
+        return _compute_free_stellar_posterior_rot(
+            a_arg, C_vT_arg, msidx_arg,
+            sigma_pm, sigma_plx_tot, mu_pop_arg, plx_pop,
+            solver._C_VG_inv_per_star, rot_ra, rot_dec)
+
+    def _select_members(a_free_arg, mu_pop_arg, C_free_arg):
+        return _select_members_from_a_rot(
+            a_free_arg, mu_pop_arg, _n_hst_det, C_free_arg,
+            sigma_pm, rot_ra, rot_dec,
+            sigma_clip=member_sigma_clip,
+            max_sigma_free_pm=max_sigma_free_pm,
+            pm_sys_floor=pm_sys_floor)
+
+    # ── Phase 1: μ-only solve ─────────────────────────────────────────────────
+    print(f"\n  Phase 1: μ-only solve ({n_iter_mu} iterations, r fixed)...")
+    r_current = r_bp3m.copy()
+    C_shared_mu = None
+    for mu_iter in range(n_iter_mu):
+        _, mu_pop_new, C_shared_mu, C_vT, a_arr, _, _ = _solve(
+            member_sidx, mu_pop_current, r_current, fix_r_arg=True)
+        delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+        _mu_pop_used = mu_pop_current.copy()
+        mu_pop_current = mu_pop_new
+        _a_free, _C_free = _free_posterior(a_arr, C_vT, member_sidx, _mu_pop_used)
+        member_sidx = _select_members(_a_free, mu_pop_current, _C_free)
+        print(f"    iter {mu_iter + 1}/{n_iter_mu}: "
+              f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr  "
+              f"Δμ={delta_mu:.4e}  members={len(member_sidx)}")
+        if delta_mu < 1e-6:
+            print(f"    Converged.")
+            break
+
+    if C_shared_mu is not None:
+        sigma_mu_1 = np.sqrt(np.diag(C_shared_mu))
+        print(f"  Phase 1 final: μ_pop=({mu_pop_current[0]:+.4f} ± {sigma_mu_1[0]:.4f}, "
+              f"{mu_pop_current[1]:+.4f} ± {sigma_mu_1[1]:.4f}) mas/yr")
+
+    # ── Phase 2: joint solve ─────────────────────────────────────────────────
+    print(f"\n  Phase 2: joint solve ({n_iter_joint} iterations)...")
+    C_shared_joint = None
+    for jt_iter in range(n_iter_joint):
+        r_new, mu_pop_new, C_shared_joint, C_vT, a_arr, _, _ = _solve(
+            member_sidx, mu_pop_current, r_current)
+        delta_r  = float(np.max(np.abs(r_new - r_current)))
+        delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+        _mu_pop_used = mu_pop_current.copy()
+        r_current      = r_new
+        mu_pop_current = mu_pop_new
+        _a_free, _C_free = _free_posterior(a_arr, C_vT, member_sidx, _mu_pop_used)
+        member_sidx = _select_members(_a_free, mu_pop_current, _C_free)
+        print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
+              f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+              f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  members={len(member_sidx)}")
+        solver._update_R(r_current)
+        solver._update_geometry(r_current, a_arr)
+        if delta_r < 1e-6 and delta_mu < 1e-6:
+            print(f"    Converged.")
+            break
+
+    # ── Phase 3: joint solve + alpha update ───────────────────────────────────
+    if n_iter_alpha > 0:
+        print(f"\n  Phase 3: joint solve + alpha update ({n_iter_alpha} iterations)...")
+        C_shared_joint_p3 = C_shared_joint
+        for al_iter in range(n_iter_alpha):
+            r_new, mu_pop_new, C_shared_joint_p3, C_vT, a_arr, _, _ = _solve(
+                member_sidx, mu_pop_current, r_current)
+            solver._update_R(r_new)
+            solver._update_geometry(r_new, a_arr)
+
+            alpha_info = _compute_alpha_updates(solver, image_names, r_new, a_arr,
+                                                alpha_damp=alpha_damp)
+
+            delta_r     = float(np.max(np.abs(r_new - r_current)))
+            delta_mu    = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+            _mu_pop_used = mu_pop_current.copy()
+            r_current      = r_new
+            mu_pop_current = mu_pop_new
+            _a_free, _C_free = _free_posterior(a_arr, C_vT, member_sidx, _mu_pop_used)
+            member_sidx = _select_members(_a_free, mu_pop_current, _C_free)
+
+            delta_alpha_max = (max(abs(ai[5] - ai[3]) for ai in alpha_info)
+                               if alpha_info else 0.0)
+            print(f"    iter {al_iter + 1}/{n_iter_alpha}: "
+                  f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+                  f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  "
+                  f"Δα_max={delta_alpha_max:.3e}  members={len(member_sidx)}")
+            if delta_r < 1e-6 and delta_mu < 1e-6 and delta_alpha_max < 1e-4:
+                print(f"    Converged.")
+                break
+
+        C_shared_joint = C_shared_joint_p3
+
+    n_r = len(image_names) * solver.N_R
+    sigma_mu_joint = (np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
+                      if C_shared_joint is not None else np.array([np.nan, np.nan]))
+    print(f"\n  Final: μ_pop=({mu_pop_current[0]:+.4f} ± {sigma_mu_joint[0]:.4f}, "
+          f"{mu_pop_current[1]:+.4f} ± {sigma_mu_joint[1]:.4f}) mas/yr")
+    print(f"  f={f_current:.3f}  θ={np.degrees(theta_current):.2f}°")
+    print(f"  Final members: {len(member_sidx)}")
+
+    # ── Final posterior pass ───────────────────────────────────────────────────
+    print("\n  Final posterior pass...")
+    _, _, C_shared_final, C_vT_final, v_mean, _, K_img_final = _solve(
+        member_sidx, mu_pop_current, r_current)
+
+    # ── Analytic marginalised posteriors ──────────────────────────────────────
+    print("\n  Computing analytic marginalised posteriors...")
+    C_r    = C_shared_final[:n_r, :n_r]
+    C_mu   = C_shared_final[n_r:, n_r:]
+    C_r_mu = C_shared_final[:n_r, n_r:]
+
+    v_mean_marg, v_cov_r = solver.compute_analytic_posteriors(
+        r_current, C_r, v_mean, K_img_final, C_vT_final)
+
+    nr      = solver.N_R
+    n_r_tot = nr * solver.n_images
+    K_all   = np.zeros((solver.n_stars, 5, n_r_tot))
+    for _j, _img in enumerate(solver.image_names):
+        if K_img_final.get(_img) is None:
+            continue
+        _d = solver._img_data[_img]
+        _use = _d['use_for_fit'] | _d.get('use_for_astrom', _d['use_for_fit'])
+        if not _use.any():
+            continue
+        _sidx = _d['sidx'][_use]
+        np.add.at(K_all[:, :, _j * nr:_j * nr + nr], _sidx, K_img_final[_img][_use])
+
+    CvT_K = np.einsum('nij,njk->nik', C_vT_final, K_all)
+
+    B_all = np.zeros((solver.n_stars, 5, 2))
+    B_all[member_sidx] = (sigma_pm ** -2) * C_vT_final[member_sidx, :, 2:4]
+
+    C_extra_mu    = np.einsum('nik,kl,njl->nij', B_all, C_mu, B_all)
+    C_extra_cross = (np.einsum('nik,kl,njl->nij', CvT_K, C_r_mu,   B_all) +
+                     np.einsum('nik,kl,njl->nij', B_all,  C_r_mu.T, CvT_K))
+    v_cov      = v_cov_r + C_extra_cross + C_extra_mu
+    v_cov_full = v_cov + C_vT_final
+
+    # ── Diffuse-prior reference posteriors ─────────────────────────────────────
+    print("\n  Computing diffuse-prior (free) stellar posteriors...")
+    _, _, _, C_vT_free_sol, v_mean_free_cond, _, K_img_free = _solve(
+        np.array([], dtype=int), mu_pop_current, r_current, fix_r_arg=True)
+    v_mean_free_marg, v_cov_free_sol = solver.compute_analytic_posteriors(
+        r_current, C_r, v_mean_free_cond, K_img_free, C_vT_free_sol)
+
+    # ── Save results ───────────────────────────────────────────────────────────
+    print("\n  Saving results...")
+
+    from bp3m.pipeline.run_alignment import compute_chi2_per_star
+
+    # image_transformations.csv
+    _rows = []
+    for j_idx, img in enumerate(image_names):
+        cs    = j_idx * solver.N_R
+        r_j   = r_current[cs:cs + solver.N_R]
+        C_j   = C_r[cs:cs + solver.N_R, cs:cs + solver.N_R]
+        d_img = solver._img_data.get(img, {}) or {}
+        use_ast = d_img.get('use_for_astrom', d_img.get('use_for_fit', np.zeros(0, bool)))
+        a, b, c, d = r_j[:4]
+        _meta      = imgs.get(img, {})
+        _ra0_orig  = _meta.get('ra0',  float('nan'))
+        _dec0_orig = _meta.get('dec0', float('nan'))
+        _ra0_final  = _meta.get('ra0_final',  _ra0_orig)
+        _dec0_final = _meta.get('dec0_final', _dec0_orig)
+        _rows.append(dict(
+            image_name=img,
+            n_stars_alignment=int(np.sum(d_img.get('use_for_fit', np.zeros(0, bool)))),
+            n_stars_astrometry_only=int(np.sum(
+                use_ast & ~d_img.get('use_for_fit', np.zeros(0, bool)))),
+            a=a, b=b, c=c, d=d,
+            delta_ra0_mas=(_ra0_final - _ra0_orig) * 3_600_000.0 if solver.N_R > 4 else 0.0,
+            delta_dec0_mas=(_dec0_final - _dec0_orig) * 3_600_000.0 if solver.N_R > 5 else 0.0,
+            ra0_final=_ra0_final,
+            dec0_final=_dec0_final,
+            pixel_scale_mas=(np.sqrt(a * d - b * c)
+                             * imgs.get(img, {}).get('orig_pixel_scale', 50.0)),
+            rotation_deg=np.degrees(np.arctan2(b - c, a + d)),
+            on_skew=(a - d) / 2,
+            off_skew=(b + c) / 2,
+            sigma_a=np.sqrt(C_j[0, 0]),   sigma_b=np.sqrt(C_j[1, 1]),
+            sigma_c=np.sqrt(C_j[2, 2]),   sigma_d=np.sqrt(C_j[3, 3]),
+            sigma_dra0_mas=np.sqrt(C_j[4, 4]) if solver.N_R > 4 else 0.0,
+            sigma_ddec0_mas=np.sqrt(C_j[5, 5]) if solver.N_R > 5 else 0.0,
+            alpha=float(d_img.get('alpha_applied', 1.0)),
+            **{f'r_{k}': float(r_j[k]) for k in range(6, solver.N_R)},
+        ))
+    pd.DataFrame(_rows).to_csv(output_pfr / 'image_transformations.csv', index=False)
+    print(f"  Saved: image_transformations.csv  ({len(_rows)} images)")
+
+    # stellar_astrometry.csv
+    g = gaia_catalog.copy()
+    g['n_hst_used']      = solver.gaia_n_hst_used
+
+    n_align_per_star = np.zeros(solver.n_stars, dtype=int)
+    for img in image_names:
+        d_img = solver._img_data.get(img)
+        if d_img is not None:
+            np.add.at(n_align_per_star, d_img['sidx'][d_img['use_for_fit']], 1)
+    g['n_hst_alignment'] = n_align_per_star
+
+    chi2_hst, n_chi2 = compute_chi2_per_star(
+        solver, r_current, v_mean, image_names, use_key='use_for_astrom')
+    g['chi2_hst']     = chi2_hst
+    g['n_det_chi2']   = n_chi2
+    with np.errstate(invalid='ignore', divide='ignore'):
+        g['chi2_hst_red'] = np.where(n_chi2 > 0, chi2_hst / (2 * n_chi2), np.nan)
+
+    g['delta_racosdec_bp3m'] = v_mean_marg[:, 0]
+    g['delta_dec_bp3m']      = v_mean_marg[:, 1]
+    g['pmra_bp3m']           = v_mean_marg[:, 2]
+    g['pmdec_bp3m']          = v_mean_marg[:, 3]
+    g['parallax_bp3m']       = v_mean_marg[:, 4]
+
+    g['sigma_delta_racosdec'] = np.sqrt(np.maximum(v_cov_full[:, 0, 0], 0.0))
+    g['sigma_delta_dec']      = np.sqrt(np.maximum(v_cov_full[:, 1, 1], 0.0))
+    g['sigma_pmra_bp3m']      = np.sqrt(np.maximum(v_cov_full[:, 2, 2], 0.0))
+    g['sigma_pmdec_bp3m']     = np.sqrt(np.maximum(v_cov_full[:, 3, 3], 0.0))
+    g['sigma_parallax_bp3m']  = np.sqrt(np.maximum(v_cov_full[:, 4, 4], 0.0))
+
+    _sig = np.sqrt(np.maximum(np.diagonal(v_cov_full, axis1=1, axis2=2), 0.0))
+    for col, i, j in [
+        ('corr_dra_ddec', 0, 1), ('corr_dra_pmra', 0, 2),
+        ('corr_dra_pmdec', 0, 3), ('corr_dra_plx', 0, 4),
+        ('corr_ddec_pmra', 1, 2), ('corr_ddec_pmdec', 1, 3),
+        ('corr_ddec_plx', 1, 4), ('corr_pmra_pmdec', 2, 3),
+        ('corr_pmra_plx', 2, 4), ('corr_pmdec_plx', 3, 4),
+    ]:
+        denom = _sig[:, i] * _sig[:, j]
+        g[col] = np.where(denom > 0, v_cov_full[:, i, j] / denom, np.nan)
+
+    g['pmra_bp3m_cond']           = v_mean[:, 2]
+    g['pmdec_bp3m_cond']          = v_mean[:, 3]
+    g['parallax_bp3m_cond']       = v_mean[:, 4]
+    g['sigma_pmra_bp3m_cond']     = np.sqrt(np.maximum(C_vT_final[:, 2, 2], 0.0))
+    g['sigma_pmdec_bp3m_cond']    = np.sqrt(np.maximum(C_vT_final[:, 3, 3], 0.0))
+    g['sigma_parallax_bp3m_cond'] = np.sqrt(np.maximum(C_vT_final[:, 4, 4], 0.0))
+
+    g['pmra_bp3m_free_cond']     = v_mean_free_cond[:, 2]
+    g['pmdec_bp3m_free_cond']    = v_mean_free_cond[:, 3]
+    g['parallax_bp3m_free_cond'] = v_mean_free_cond[:, 4]
+    g['pmra_bp3m_free']          = v_mean_free_marg[:, 2]
+    g['pmdec_bp3m_free']         = v_mean_free_marg[:, 3]
+    g['parallax_bp3m_free']      = v_mean_free_marg[:, 4]
+
+    _is_member_arr = np.zeros(solver.n_stars, dtype=bool)
+    if member_sidx is not None and len(member_sidx) > 0:
+        _is_member_arr[member_sidx] = True
+    g['is_member'] = _is_member_arr
+
+    # Rotation model columns
+    g['rot_pm_ra_masyr']  = rot_ra
+    g['rot_pm_dec_masyr'] = rot_dec
+
+    g.to_csv(output_pfr / 'stellar_astrometry.csv', index=False)
+    print(f"  Saved: stellar_astrometry.csv  "
+          f"({len(g)} stars, {solver.gaia_n_hst_used.sum()} HST detections)")
+
+    # Covariance arrays
+    np.save(output_pfr / 'v_cov_marginalised.npy', v_cov)
+    np.save(output_pfr / 'C_vT.npy',              C_vT_final)
+    np.save(output_pfr / 'C_r.npy',               C_r)
+    np.save(output_pfr / 'C_joint.npy',            C_shared_final)
+    print(f"  Saved: v_cov_marginalised.npy, C_vT.npy, C_r.npy, C_joint.npy")
+
+    # Detection flags
+    _fit_data = {}; _astrom_data = {}; _idx_data = {}
+    for img in image_names:
+        d_img = solver._img_data.get(img)
+        if d_img is None:
+            continue
+        _fit_data[img]    = d_img['use_for_fit']
+        _astrom_data[img] = d_img.get('use_for_astrom', d_img['use_for_fit'])
+        _idx_data[img]    = d_img['sidx']
+    np.savez(output_pfr / 'use_for_fit.npz',    **_fit_data)
+    np.savez(output_pfr / 'use_for_astrom.npz', **_astrom_data)
+    np.savez(output_pfr / 'star_indices.npz',   **_idx_data)
+
+    # Per-detection GDC residuals
+    try:
+        gdc_fin = solver.compute_gdc_residuals(r_current, v_mean, C_r=C_r, C_vT=C_vT_final)
+        _det_data: dict = {}
+        n_det_total = 0
+        for img, rd in gdc_fin.items():
+            _det_data[f'{img}_X_c']            = rd['X_c']
+            _det_data[f'{img}_Y_c']            = rd['Y_c']
+            _det_data[f'{img}_dx_gdc']         = rd['dx_gdc']
+            _det_data[f'{img}_dy_gdc']         = rd['dy_gdc']
+            _det_data[f'{img}_C_hst']          = rd['C_hst']
+            _det_data[f'{img}_C_gdc_total']    = rd['C_gdc_total']
+            _det_data[f'{img}_sidx']           = rd['sidx']
+            _det_data[f'{img}_use_for_fit']    = rd['use_for_fit']
+            _det_data[f'{img}_use_for_astrom'] = rd['use_for_astrom']
+            n_det_total += len(rd['sidx'])
+        np.savez_compressed(output_pfr / 'detections.npz', **_det_data)
+        print(f"  Saved: detections.npz  ({len(gdc_fin)} images, {n_det_total} detections)")
+    except Exception as _exc:
+        print(f"  WARNING: detections.npz failed — {_exc}")
+
+    # mu_pop.json (with rotation model fields)
+    _C_mu_out = C_shared_final[n_r:, n_r:]
+    _corr_mu = (float(_C_mu_out[0, 1] / (sigma_mu_joint[0] * sigma_mu_joint[1]))
+                if (sigma_mu_joint[0] > 0 and sigma_mu_joint[1] > 0) else 0.0)
+
+    _g_pmra  = solver.v_survey[member_sidx, 2]
+    _g_pmdec = solver.v_survey[member_sidx, 3]
+    _g_C_pm  = solver.C_survey[member_sidx][:, 2:4, 2:4]
+    _g_ok    = (np.isfinite(_g_pmra) & np.isfinite(_g_pmdec) &
+                np.isfinite(_g_C_pm[:, 0, 0]) & (_g_C_pm[:, 0, 0] > 0) &
+                np.isfinite(_g_C_pm[:, 1, 1]) & (_g_C_pm[:, 1, 1] > 0))
+    if _g_ok.sum() >= 2:
+        _Lambda_g = np.zeros((2, 2))
+        _h_g      = np.zeros(2)
+        for _k in np.where(_g_ok)[0]:
+            _C_k     = _g_C_pm[_k].copy()
+            _C_k[0, 0] += sigma_pm ** 2
+            _C_k[1, 1] += sigma_pm ** 2
+            _Ci  = np.linalg.inv(_C_k)
+            _Lambda_g += _Ci
+            _h_g      += _Ci @ np.array([_g_pmra[_k], _g_pmdec[_k]])
+        _C_mu_g    = np.linalg.inv(_Lambda_g)
+        _mu_g      = _C_mu_g @ _h_g
+        _sig_g     = np.sqrt(np.diag(_C_mu_g))
+        _corr_mu_g = (float(_C_mu_g[0, 1] / (_sig_g[0] * _sig_g[1]))
+                      if (_sig_g[0] > 0 and _sig_g[1] > 0) else 0.0)
+    else:
+        _mu_g = np.array([np.nan, np.nan])
+        _sig_g = np.array([np.nan, np.nan])
+        _corr_mu_g = np.nan
+
+    mu_result = {
+        'mu_pop_ra_masyr':       float(mu_pop_current[0]),
+        'mu_pop_dec_masyr':      float(mu_pop_current[1]),
+        'sigma_mu_pop_ra':       float(sigma_mu_joint[0]),
+        'sigma_mu_pop_dec':      float(sigma_mu_joint[1]),
+        'corr_mu_pop_ra_dec':    _corr_mu,
+        'mu_gaia_ra_masyr':      float(_mu_g[0]),
+        'mu_gaia_dec_masyr':     float(_mu_g[1]),
+        'sigma_mu_gaia_ra':      float(_sig_g[0]),
+        'sigma_mu_gaia_dec':     float(_sig_g[1]),
+        'corr_mu_gaia_ra_dec':   _corr_mu_g,
+        'n_members':             int(len(member_sidx)),
+        'n_members_gaia_finite': int(_g_ok.sum()),
+        'sigma_pm_masyr':        float(sigma_pm),
+        'plx_pop_mas':           float(plx_pop),
+        'sigma_plx_tot_mas':     float(sigma_plx_tot),
+        'mu_pop_prior_ra':       float(mu_pop_prior[0]),
+        'mu_pop_prior_dec':      float(mu_pop_prior[1]),
+        'mu_pop_prior_sigma':    float(mu_pop_prior_sigma),
+        # Rotation model fields
+        'f_star_mult':           float(f_current),
+        'theta_offset_deg':      float(np.degrees(theta_current)),
+        'pa_deg':                float(gp['pa_deg']),
+        'inc_deg':               float(gp['inc_deg']),
+        'v_rot_flat_kms':        float(gp['v_rot_flat']),
+        'r_turn_kpc':            float(gp['r_turn_kpc']),
+        'd_kpc':                 float(gp['d_kpc']),
+        'fit_f':                 fit_f,
+        'fit_theta':             fit_theta,
+    }
+    with open(output_pfr / 'mu_pop.json', 'w') as _f:
+        json.dump(mu_result, _f, indent=2)
+
+    # run_config.json
+    with open(output_pfr / 'run_config.json', 'w') as _f:
+        json.dump({
+            'poly_order': poly_order, 'n_r_per_image': solver.N_R,
+            'n_images': len(image_names),
+            'n_stars': solver.n_stars, 'image_names': image_names,
+            'sigma_pm': sigma_pm, 'plx_pop': plx_pop,
+            'sigma_plx_tot': sigma_plx_tot,
+            'mu_pop_prior_sigma': mu_pop_prior_sigma,
+            'n_iter_mu': n_iter_mu, 'n_iter_joint': n_iter_joint,
+            'member_sigma_clip': member_sigma_clip,
+            'mu_pop_ra': float(mu_pop_current[0]),
+            'mu_pop_dec': float(mu_pop_current[1]),
+            'n_members': int(len(member_sidx)),
+            'split_ccd': v1_split_ccd,
+            'f_star_mult': float(f_current),
+            'theta_offset_deg': float(np.degrees(theta_current)),
+            'fit_f': fit_f,
+            'fit_theta': fit_theta,
+        }, _f, indent=2)
+    print(f"  Saved: mu_pop.json, run_config.json")
+
+    t_elapsed = time.time() - t_start
+    print(f"\n  Done in {t_elapsed:.1f}s")
+    return output_pfr
 
 
 def main():
