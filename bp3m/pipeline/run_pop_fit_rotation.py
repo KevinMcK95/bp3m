@@ -227,14 +227,21 @@ def _joint_solve_pop_rot(
     qso_pmdec: "np.ndarray | None" = None,
     rot_ra: "np.ndarray | None" = None,
     rot_dec: "np.ndarray | None" = None,
+    fit_f: bool = False,
+    fit_theta: bool = False,
+    f_current: float = 1.0,
+    theta_current: float = 0.0,
+    gp: "dict | None" = None,
+    gaia_ra: "np.ndarray | None" = None,
+    gaia_dec: "np.ndarray | None" = None,
 ) -> tuple:
     """
     One Newton step for (Δr, Δμ_pop) with per-star rotation prior.
 
     Per-star member prior centre: (μ_pop[0] + rot_ra[s], μ_pop[1] + rot_dec[s]).
-    For fixed rotation (rot_ra/rot_dec are constant arrays), this is exact.
+    When fit_f or fit_theta, jointly solves for f/θ alongside μ (fix_r=True only).
 
-    Returns same 7-tuple as _joint_solve_pop.
+    Returns 9-tuple: (r_hat, mu_pop_hat, f_new, theta_new, C_shared, C_vT, a, a_align, K_img).
     """
     try:
         from tqdm import tqdm as _tqdm
@@ -245,6 +252,19 @@ def _joint_solve_pop_rot(
     _rot_ra  = rot_ra  if rot_ra  is not None else np.zeros(solver.n_stars)
     _rot_dec = rot_dec if rot_dec is not None else np.zeros(solver.n_stars)
 
+    n_free = int(fit_f) + int(fit_theta)
+    assert fix_r or n_free == 0, "f/θ fitting requires fix_r=True"
+
+    # Jacobians for f/θ (only needed if n_free > 0)
+    _jfr = _jfd = _jtr = _jtd = None
+    if n_free > 0 and gp is not None and gaia_ra is not None:
+        _jfr, _jfd, _jtr, _jtd = compute_rotation_offsets_jacobian(
+            gaia_ra, gaia_dec, gp, f_current, theta_current)
+
+    # Indices for extended params
+    _idx_f = 2 if fit_f else None
+    _idx_t = (3 if fit_f else 2) if fit_theta else None
+
     N_V   = 5
     nr    = solver.N_R
     n_r   = len(image_names) * nr
@@ -254,7 +274,7 @@ def _joint_solve_pop_rot(
     sigma_plx_inv_sq = sigma_plx_tot ** -2
 
     if fix_r:
-        n_shared = 2
+        n_shared = 2 + n_free
     else:
         n_shared = n_r + 2
         idx_r  = slice(0, n_r)
@@ -385,14 +405,14 @@ def _joint_solve_pop_rot(
             if img in XCs_xresid:
                 rhs[cs:cs + nr] += XCs_xresid[img].sum(axis=0)
     else:
-        Lambda[:] = H_mu
+        Lambda[:2, :2] = H_mu
 
     # ── Schur correction for μ block ──────────────────────────────────────────
     if n_mem > 0:
         Cv_m = C_vT[member_sidx]
         mu_mu_schur = sigma_pm_inv_sq ** 2 * Cv_m[:, 2:4, 2:4].sum(axis=0)
         if fix_r:
-            Lambda -= mu_mu_schur
+            Lambda[:2, :2] -= mu_mu_schur
         else:
             Lambda[idx_mu, idx_mu] -= mu_mu_schur
         # Schur RHS: posterior star means contribute, with rotation offset removed
@@ -403,9 +423,63 @@ def _joint_solve_pop_rot(
         ])
 
     if fix_r:
-        rhs[:] = rhs_mu
+        rhs[:2] = rhs_mu
     else:
         rhs[idx_mu] = rhs_mu
+
+    # ── Extended block (f, θ) — fix_r only ───────────────────────────────────
+    if n_free > 0 and n_mem > 0 and _jfr is not None:
+        jacs = []
+        ext_indices = []
+        prior_inv_sqs = []
+        prior_centers = []
+        param_vals = []
+
+        if fit_f:
+            jacs.append(np.column_stack([_jfr[member_sidx], _jfd[member_sidx]]))
+            ext_indices.append(_idx_f)
+            _sf   = gp.get('sigma_f', 0.2) if gp else 0.2
+            _f0   = gp.get('f0', 1.0)      if gp else 1.0
+            prior_inv_sqs.append(_sf ** -2)
+            prior_centers.append(_f0)
+            param_vals.append(f_current)
+
+        if fit_theta:
+            jacs.append(np.column_stack([_jtr[member_sidx], _jtd[member_sidx]]))
+            ext_indices.append(_idx_t)
+            _st = (gp['sigma_theta_deg'] * _DEG2RAD) if gp else (10.0 * _DEG2RAD)
+            prior_inv_sqs.append(_st ** -2)
+            prior_centers.append(0.0)
+            param_vals.append(theta_current)
+
+        Cv_m_pm = C_vT[member_sidx, 2:4, 2:4]
+        a_pm_m  = a[member_sidx, 2:4]
+        rot_m   = np.column_stack([_rot_ra[member_sidx], _rot_dec[member_sidx]])
+        resid_m = a_pm_m - mu_pop_current[None, :] - rot_m
+
+        for ii, (i_idx, jac_i, p_inv_sq, p_ctr, p_val) in enumerate(
+                zip(ext_indices, jacs, prior_inv_sqs, prior_centers, param_vals)):
+            data_ii  = sigma_pm_inv_sq    * np.einsum('ni,ni->',  jac_i, jac_i)
+            schur_ii = sigma_pm_inv_sq**2 * np.einsum('ni,nij,nj->', jac_i, Cv_m_pm, jac_i)
+            Lambda[i_idx, i_idx] += p_inv_sq + data_ii - schur_ii
+
+            data_mu_i  = sigma_pm_inv_sq    * jac_i.sum(axis=0)
+            schur_mu_i = sigma_pm_inv_sq**2 * np.einsum('nij,nj->i', Cv_m_pm, jac_i)
+            Lambda[0, i_idx] += data_mu_i[0] - schur_mu_i[0]
+            Lambda[1, i_idx] += data_mu_i[1] - schur_mu_i[1]
+            Lambda[i_idx, 0]  = Lambda[0, i_idx]
+            Lambda[i_idx, 1]  = Lambda[1, i_idx]
+
+            rhs[i_idx] = (sigma_pm_inv_sq * np.einsum('ni,ni->', jac_i, resid_m)
+                          - p_inv_sq * (p_val - p_ctr))
+
+        if n_free == 2:
+            jac_0, jac_1 = jacs
+            i0, i1 = ext_indices
+            data_01  = sigma_pm_inv_sq    * np.einsum('ni,ni->',  jac_0, jac_1)
+            schur_01 = sigma_pm_inv_sq**2 * np.einsum('ni,nij,nj->', jac_0, Cv_m_pm, jac_1)
+            Lambda[i0, i1] += data_01 - schur_01
+            Lambda[i1, i0]  = Lambda[i0, i1]
 
     # ── Per-image Schur corrections (joint solve only) ────────────────────────
     if not fix_r:
@@ -469,10 +543,13 @@ def _joint_solve_pop_rot(
     delta    = C_shared @ rhs
 
     if fix_r:
-        return r_current.copy(), mu_pop_current + delta, C_shared, C_vT, a, a_align, K_img
+        f_new     = f_current     + delta[_idx_f] if (fit_f     and _idx_f is not None) else f_current
+        theta_new = theta_current + delta[_idx_t] if (fit_theta and _idx_t is not None) else theta_current
+        return r_current.copy(), mu_pop_current + delta[:2], f_new, theta_new, C_shared, C_vT, a, a_align, K_img
     else:
         return (r_current + delta[idx_r],
                 mu_pop_current + delta[idx_mu],
+                f_current, theta_current,
                 C_shared, C_vT, a, a_align, K_img)
 
 
@@ -601,6 +678,7 @@ def run_pop_fit_rotation(
     max_sigma_free_pm: float = 3.0,
     fit_f: bool = True,
     fit_theta: bool = True,
+    n_iter_ft: int = 20,
     mu_pop_init: tuple[float, float] | None = None,
     no_plots: bool = False,
     qso_anchors_csv: "Path | str | list | None" = None,
@@ -640,7 +718,7 @@ def run_pop_fit_rotation(
     t_start    = time.time()
     data_root  = Path(output_dir)
     bp3m_dir   = data_root / field_name / 'BP3M_results'
-    output_pfr = data_root / field_name / 'BP3M_pop_fit_results'
+    output_pfr = data_root / field_name / 'BP3M_pop_fit_rotation_results'
     output_pfr.mkdir(parents=True, exist_ok=True)
 
     # ── Read v1 run_config ─────────────────────────────────────────────────────
@@ -668,7 +746,7 @@ def run_pop_fit_rotation(
           f"σ_plx_tot={sigma_plx_tot} mas")
     print(f"  μ_pop prior σ={mu_pop_prior_sigma} mas/yr  "
           f"member_sigma_clip={member_sigma_clip}  pm_sys_floor={pm_sys_floor} mas/yr")
-    print(f"  n_iter: μ={n_iter_mu}  joint={n_iter_joint}  alpha={n_iter_alpha}")
+    print(f"  n_iter: μ={n_iter_mu}  joint={n_iter_joint}  alpha={n_iter_alpha}  ft={n_iter_ft}")
     print(f"  poly_order={poly_order}  split_ccd={v1_split_ccd}  "
           f"v1 images={len(v1_image_names)}")
 
@@ -924,7 +1002,9 @@ def run_pop_fit_rotation(
 
     # ── Convenience wrapper ────────────────────────────────────────────────────
     def _solve(member_sidx_arg, mu_pop_arg, r_arg,
-               fix_r_arg=False, z_weights_arg=None):
+               fix_r_arg=False, z_weights_arg=None,
+               fit_f_arg=False, fit_theta_arg=False,
+               f_arg=1.0, theta_arg=0.0):
         return _joint_solve_pop_rot(
             solver, image_names,
             member_sidx_arg, mu_pop_arg,
@@ -936,6 +1016,9 @@ def run_pop_fit_rotation(
             qso_pmdec=_qso_pmdec_mas,
             rot_ra=rot_ra,
             rot_dec=rot_dec,
+            fit_f=fit_f_arg, fit_theta=fit_theta_arg,
+            f_current=f_arg, theta_current=theta_arg,
+            gp=gp, gaia_ra=gaia_ra, gaia_dec=gaia_dec,
         )
 
     def _free_posterior(a_arg, C_vT_arg, msidx_arg, mu_pop_arg):
@@ -957,7 +1040,7 @@ def run_pop_fit_rotation(
     r_current = r_bp3m.copy()
     C_shared_mu = None
     for mu_iter in range(n_iter_mu):
-        _, mu_pop_new, C_shared_mu, C_vT, a_arr, _, _ = _solve(
+        _, mu_pop_new, _, _, C_shared_mu, C_vT, a_arr, _, _ = _solve(
             member_sidx, mu_pop_current, r_current, fix_r_arg=True)
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
         _mu_pop_used = mu_pop_current.copy()
@@ -980,7 +1063,7 @@ def run_pop_fit_rotation(
     print(f"\n  Phase 2: joint solve ({n_iter_joint} iterations)...")
     C_shared_joint = None
     for jt_iter in range(n_iter_joint):
-        r_new, mu_pop_new, C_shared_joint, C_vT, a_arr, _, _ = _solve(
+        r_new, mu_pop_new, _, _, C_shared_joint, C_vT, a_arr, _, _ = _solve(
             member_sidx, mu_pop_current, r_current)
         delta_r  = float(np.max(np.abs(r_new - r_current)))
         delta_mu = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
@@ -1003,7 +1086,7 @@ def run_pop_fit_rotation(
         print(f"\n  Phase 3: joint solve + alpha update ({n_iter_alpha} iterations)...")
         C_shared_joint_p3 = C_shared_joint
         for al_iter in range(n_iter_alpha):
-            r_new, mu_pop_new, C_shared_joint_p3, C_vT, a_arr, _, _ = _solve(
+            r_new, mu_pop_new, _, _, C_shared_joint_p3, C_vT, a_arr, _, _ = _solve(
                 member_sidx, mu_pop_current, r_current)
             solver._update_R(r_new)
             solver._update_geometry(r_new, a_arr)
@@ -1031,17 +1114,58 @@ def run_pop_fit_rotation(
 
         C_shared_joint = C_shared_joint_p3
 
+    # ── Phase 4: free f/θ fitting ─────────────────────────────────────────────
+    C_shared_ft = None
+    sigma_f_final = sigma_theta_final = np.nan
+    if (fit_f or fit_theta) and n_iter_ft > 0:
+        print(f"\n  Phase 4: f/θ fitting ({n_iter_ft} iterations, r fixed)...")
+        for ft_iter in range(n_iter_ft):
+            _, mu_pop_new, f_new, theta_new, C_shared_ft, C_vT, a_arr, _, _ = _solve(
+                member_sidx, mu_pop_current, r_current,
+                fix_r_arg=True,
+                fit_f_arg=fit_f, fit_theta_arg=fit_theta,
+                f_arg=f_current, theta_arg=theta_current)
+            delta_mu    = float(np.max(np.abs(mu_pop_new - mu_pop_current)))
+            delta_f     = abs(f_new     - f_current)     if fit_f     else 0.0
+            delta_theta = abs(theta_new - theta_current) if fit_theta else 0.0
+            _mu_pop_used = mu_pop_current.copy()
+            mu_pop_current = mu_pop_new
+            f_current      = f_new
+            theta_current  = theta_new
+            rot_ra, rot_dec = compute_rotation_offsets(
+                gaia_ra, gaia_dec, gp, f=f_current, theta_offset=theta_current)
+            _a_free, _C_free = _free_posterior(a_arr, C_vT, member_sidx, _mu_pop_used)
+            member_sidx = _select_members(_a_free, mu_pop_current, _C_free)
+            print(f"    iter {ft_iter + 1}/{n_iter_ft}: "
+                  f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+                  f"f={f_current:.4f}  θ={np.degrees(theta_current):+.3f}°  "
+                  f"Δμ={delta_mu:.3e}  Δf={delta_f:.3e}  "
+                  f"members={len(member_sidx)}")
+            if delta_mu < 1e-6 and delta_f < 1e-6 and delta_theta < 1e-8:
+                print(f"    Converged.")
+                break
+
+        if C_shared_ft is not None:
+            n_ext = int(fit_f) + int(fit_theta)
+            # C_shared_ft is (2+n_ext, 2+n_ext); f is [2], θ is [2 or 3]
+            if fit_f:
+                sigma_f_final = float(np.sqrt(max(C_shared_ft[2, 2], 0.0)))
+            if fit_theta:
+                _it = 3 if fit_f else 2
+                sigma_theta_final = float(np.sqrt(max(C_shared_ft[_it, _it], 0.0)))
+
     n_r = len(image_names) * solver.N_R
     sigma_mu_joint = (np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
                       if C_shared_joint is not None else np.array([np.nan, np.nan]))
     print(f"\n  Final: μ_pop=({mu_pop_current[0]:+.4f} ± {sigma_mu_joint[0]:.4f}, "
           f"{mu_pop_current[1]:+.4f} ± {sigma_mu_joint[1]:.4f}) mas/yr")
-    print(f"  f={f_current:.3f}  θ={np.degrees(theta_current):.2f}°")
+    print(f"  f={f_current:.4f} ± {sigma_f_final:.4f}  "
+          f"θ={np.degrees(theta_current):+.3f}° ± {np.degrees(sigma_theta_final):.3f}°")
     print(f"  Final members: {len(member_sidx)}")
 
     # ── Final posterior pass ───────────────────────────────────────────────────
     print("\n  Final posterior pass...")
-    _, _, C_shared_final, C_vT_final, v_mean, _, K_img_final = _solve(
+    _, _, _, _, C_shared_final, C_vT_final, v_mean, _, K_img_final = _solve(
         member_sidx, mu_pop_current, r_current)
 
     # ── Analytic marginalised posteriors ──────────────────────────────────────
@@ -1079,7 +1203,7 @@ def run_pop_fit_rotation(
 
     # ── Diffuse-prior reference posteriors ─────────────────────────────────────
     print("\n  Computing diffuse-prior (free) stellar posteriors...")
-    _, _, _, C_vT_free_sol, v_mean_free_cond, _, K_img_free = _solve(
+    _, _, _, _, _, C_vT_free_sol, v_mean_free_cond, _, K_img_free = _solve(
         np.array([], dtype=int), mu_pop_current, r_current, fix_r_arg=True)
     v_mean_free_marg, v_cov_free_sol = solver.compute_analytic_posteriors(
         r_current, C_r, v_mean_free_cond, K_img_free, C_vT_free_sol)
@@ -1289,7 +1413,9 @@ def run_pop_fit_rotation(
         'mu_pop_prior_sigma':    float(mu_pop_prior_sigma),
         # Rotation model fields
         'f_star_mult':           float(f_current),
+        'sigma_f_star_mult':     float(sigma_f_final),
         'theta_offset_deg':      float(np.degrees(theta_current)),
+        'sigma_theta_offset_deg': float(np.degrees(sigma_theta_final)),
         'pa_deg':                float(gp['pa_deg']),
         'inc_deg':               float(gp['inc_deg']),
         'v_rot_flat_kms':        float(gp['v_rot_flat']),
@@ -1311,13 +1437,16 @@ def run_pop_fit_rotation(
             'sigma_plx_tot': sigma_plx_tot,
             'mu_pop_prior_sigma': mu_pop_prior_sigma,
             'n_iter_mu': n_iter_mu, 'n_iter_joint': n_iter_joint,
+            'n_iter_ft': n_iter_ft,
             'member_sigma_clip': member_sigma_clip,
             'mu_pop_ra': float(mu_pop_current[0]),
             'mu_pop_dec': float(mu_pop_current[1]),
             'n_members': int(len(member_sidx)),
             'split_ccd': v1_split_ccd,
             'f_star_mult': float(f_current),
+            'sigma_f_star_mult': float(sigma_f_final),
             'theta_offset_deg': float(np.degrees(theta_current)),
+            'sigma_theta_offset_deg': float(np.degrees(sigma_theta_final)),
             'fit_f': fit_f,
             'fit_theta': fit_theta,
         }, _f, indent=2)
@@ -1355,6 +1484,8 @@ def main():
                         help='Hold f_star_mult fixed at 1.0')
     parser.add_argument('--no_fit_theta', action='store_true',
                         help='Hold theta_offset fixed at 0.0')
+    parser.add_argument('--n_iter_ft',    type=int, default=20,
+                        help='Phase 4 iterations for f/θ fitting (ignored if both --no_fit_f and --no_fit_theta)')
     parser.add_argument('--no_plots',     action='store_true')
     parser.add_argument('--qso_anchors_csv', type=str, default=None, nargs='+')
 
@@ -1374,6 +1505,7 @@ def main():
         max_sigma_free_pm=args.max_sigma_free_pm,
         fit_f=not args.no_fit_f,
         fit_theta=not args.no_fit_theta,
+        n_iter_ft=args.n_iter_ft,
         no_plots=args.no_plots,
         qso_anchors_csv=[Path(p) for p in args.qso_anchors_csv] if args.qso_anchors_csv else None,
     )
