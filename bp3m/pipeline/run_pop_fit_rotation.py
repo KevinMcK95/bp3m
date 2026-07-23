@@ -759,14 +759,14 @@ def _compute_free_stellar_posterior_rot(
 # ── Sky PM plot ────────────────────────────────────────────────────────────────
 
 def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarray,
-                         field_name: str) -> None:
+                         field_name: str, gp: dict) -> None:
     """
     3×2 figure: member stars' sky positions coloured by μ_ra* (left) and
     μ_dec (right) for three rows:
       row 0 — pop-prior posteriors  (pmra_bp3m / pmdec_bp3m)
       row 1 — diffuse-prior posteriors (pmra_bp3m_free / pmdec_bp3m_free)
-      row 2 — gas-predicted PMs from tilted-ring model
-               (μ_pop + rot_pm_ra_masyr / μ_pop + rot_pm_dec_masyr)
+      row 2 — gas-predicted PMs from tilted-ring model on a dense sky grid
+               (μ_pop + rot_offset evaluated at every grid point)
 
     Colour limits are computed from the data rows (rows 0 & 1) and reused
     for the gas row so all three share the same scale.
@@ -787,12 +787,10 @@ def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarra
     ra_m  = mem['ra'].to_numpy(float)
     dec_m = mem['dec'].to_numpy(float)
 
-    pmra_pop    = mem['pmra_bp3m'].to_numpy(float)
-    pmdec_pop   = mem['pmdec_bp3m'].to_numpy(float)
-    pmra_free   = mem['pmra_bp3m_free'].to_numpy(float)
-    pmdec_free  = mem['pmdec_bp3m_free'].to_numpy(float)
-    pmra_gas    = mu_pop[0] + mem['rot_pm_ra_masyr'].to_numpy(float)
-    pmdec_gas   = mu_pop[1] + mem['rot_pm_dec_masyr'].to_numpy(float)
+    pmra_pop   = mem['pmra_bp3m'].to_numpy(float)
+    pmdec_pop  = mem['pmdec_bp3m'].to_numpy(float)
+    pmra_free  = mem['pmra_bp3m_free'].to_numpy(float)
+    pmdec_free = mem['pmdec_bp3m_free'].to_numpy(float)
 
     # Colour limits from data rows only, symmetric about mu_pop
     spread_ra  = max(np.nanpercentile(np.abs(np.concatenate([pmra_pop,  pmra_free])  - mu_pop[0]), 95), 0.001)
@@ -800,16 +798,29 @@ def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarra
     limits = [(mu_pop[0] - spread_ra,  mu_pop[0] + spread_ra),
               (mu_pop[1] - spread_dec, mu_pop[1] + spread_dec)]
 
-    rows = [
-        ('pop prior',         pmra_pop,  pmdec_pop),
-        ('diffuse prior',     pmra_free, pmdec_free),
-        ('gas (tilted-ring)', pmra_gas,  pmdec_gas),
+    # Dense sky grid covering the field footprint
+    pad = 0.02  # deg
+    ra_lo,  ra_hi  = ra_m.min()  - pad, ra_m.max()  + pad
+    dec_lo, dec_hi = dec_m.min() - pad, dec_m.max() + pad
+    N_grid = 300
+    ra_vec  = np.linspace(ra_lo,  ra_hi,  N_grid)
+    dec_vec = np.linspace(dec_lo, dec_hi, N_grid)
+    ra_grid, dec_grid = np.meshgrid(ra_vec, dec_vec)
+    dmu_ra_grid, dmu_dec_grid = compute_rotation_offsets(
+        ra_grid.ravel(), dec_grid.ravel(), gp)
+    pmra_gas_grid  = (mu_pop[0] + dmu_ra_grid ).reshape(N_grid, N_grid)
+    pmdec_gas_grid = (mu_pop[1] + dmu_dec_grid).reshape(N_grid, N_grid)
+
+    data_rows = [
+        ('pop prior',     pmra_pop,  pmdec_pop),
+        ('diffuse prior', pmra_free, pmdec_free),
     ]
 
     fig, axes = plt.subplots(3, 2, figsize=(13, 13), constrained_layout=True)
     fig.suptitle(f'{field_name} — member PMs on sky (N={len(mem)})', fontsize=13)
 
-    for row_idx, (row_label, pmra_m, pmdec_m) in enumerate(rows):
+    # Rows 0 & 1: scatter of member posteriors
+    for row_idx, (row_label, pmra_m, pmdec_m) in enumerate(data_rows):
         for col, (pm_vals, pm_label, (vmin, vmax)) in enumerate([
             (pmra_m,  r'$\mu_{\alpha^*}$ (mas/yr)', limits[0]),
             (pmdec_m, r'$\mu_\delta$ (mas/yr)',     limits[1]),
@@ -822,6 +833,20 @@ def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarra
             ax.set_ylabel('Dec (deg)')
             ax.set_title(f'{row_label}  —  {pm_label}')
             ax.invert_xaxis()
+
+    # Row 2: gas model as a filled image over the full field
+    for col, (img, pm_label, (vmin, vmax)) in enumerate([
+        (pmra_gas_grid,  r'$\mu_{\alpha^*}$ (mas/yr)', limits[0]),
+        (pmdec_gas_grid, r'$\mu_\delta$ (mas/yr)',     limits[1]),
+    ]):
+        ax = axes[2, col]
+        im = ax.imshow(img, origin='lower', aspect='auto', cmap='RdBu_r',
+                       vmin=vmin, vmax=vmax,
+                       extent=[ra_hi, ra_lo, dec_lo, dec_hi])
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label=pm_label)
+        ax.set_xlabel('RA (deg)')
+        ax.set_ylabel('Dec (deg)')
+        ax.set_title(f'gas (tilted-ring)  —  {pm_label}')
 
     out_path = output_dir / 'sky_pm_members.png'
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
@@ -1666,7 +1691,7 @@ def run_pop_fit_rotation(
             _plot_sky_pm_members(
                 output_pfr / 'plots',
                 output_pfr / 'stellar_astrometry.csv',
-                mu_pop_current, field_name,
+                mu_pop_current, field_name, gp,
             )
         except Exception as _exc:
             print(f"  WARNING: sky_pm_members plot failed — {_exc}")
