@@ -69,43 +69,110 @@ import pandas as pd
 _DEG2RAD = np.pi / 180.0
 _ARCSEC2KPC = 4.84814e-6   # 1 arcsec at 1 kpc = 4.84814e-6 kpc
 
+# Tilted-ring models from HI kinematic studies.
+# Columns: projected ring radius (arcsec), V_rot (km/s), PA of receding major axis (deg), i (deg).
+
+# NGC 55 — Westmeier et al. 2013, Table 4
+_NGC55_TRING = np.array([
+    [150,   18.7, 110.3, 84.5],
+    [250,   37.0, 109.9, 81.0],
+    [350,   47.5, 109.8, 78.1],
+    [450,   59.2, 110.4, 76.4],
+    [550,   73.1, 109.7, 75.4],
+    [650,   80.6, 109.5, 75.1],
+    [750,   87.4, 109.4, 73.9],
+    [850,   90.6, 109.3, 73.1],
+    [950,   89.1, 108.7, 71.6],
+    [1050,  84.2, 107.5, 69.7],
+    [1150,  80.1, 104.9, 68.1],
+    [1250,  80.5, 102.0, 67.1],
+    [1350,  82.5,  99.5, 67.0],
+    [1450,  79.7,  97.4, 67.5],
+    [1550,  73.1,  97.5, 67.3],
+    [1650,  70.5,  95.8, 67.1],
+    [1750,  67.9,  95.6, 66.5],
+    [1850,  69.5,  93.6, 66.3],
+    [1950,  69.7,  93.4, 66.5],
+])
+
+# NGC 300 — Westmeier et al. 2011, Table 2
+_NGC300_TRING = np.array([
+    [100,   43.3, 290.6, 39.9],
+    [200,   66.5, 289.3, 40.5],
+    [300,   75.4, 289.5, 42.6],
+    [400,   80.3, 290.2, 44.6],
+    [500,   83.5, 289.9, 45.8],
+    [600,   88.4, 290.5, 46.5],
+    [700,   92.2, 293.2, 49.0],
+    [800,   95.7, 297.8, 51.0],
+    [900,   96.8, 304.4, 51.3],
+    [1000,  98.8, 311.1, 49.9],
+    [1100,  98.3, 316.4, 49.3],
+    [1200,  95.4, 319.4, 49.7],
+    [1300,  92.8, 321.6, 49.9],
+    [1400,  90.7, 324.2, 48.9],
+    [1500,  89.1, 327.1, 47.0],
+    [1600,  87.8, 329.6, 46.6],
+    [1700,  88.4, 331.4, 45.3],
+    [1800,  89.1, 331.9, 44.3],
+    [1900,  87.3, 332.0, 42.7],
+    [2000,  82.7, 331.7, 43.3],
+])
+
 GALAXY_PARAMS: dict[str, dict] = {
     'NGC_55': dict(
         ra_cen=3.7233, dec_cen=-39.1967,        # deg
         d_kpc=1932.0,
         plx_pop=5.176e-4,                        # mas
         sigma_plx_tot=2.86e-5,                   # mas
-        pa_deg=108.0,                            # receding major axis, N through E
-        inc_deg=84.0,
-        v_rot_flat=90.6,                         # km/s
-        r_turn_kpc=1.0,                          # inner turnover radius
-        sigma_pm_disp=0.001,                     # residual dispersion mas/yr (after rotation removed)
+        # Representative inner-disk values (for display / mu_pop.json only)
+        pa_deg=110.3,                            # PA of receding major axis at innermost ring
+        inc_deg=84.5,
+        sigma_pm_disp=0.001,                     # residual PM dispersion (mas/yr, after rotation removed)
         f0=1.0, sigma_f=0.20,                    # prior on f_star_mult
-        sigma_theta_deg=10.0,                    # prior on theta_offset
+        sigma_theta_deg=10.0,                    # prior on theta_offset (deg)
         mu_pop_init=(-0.0044, -0.0023),
+        tilted_ring=_NGC55_TRING,                # full tilted-ring model; overrides pa_deg/inc_deg
     ),
     'NGC_300': dict(
         ra_cen=13.7229, dec_cen=-37.6844,
         d_kpc=2089.0,
         plx_pop=4.786e-4,
         sigma_plx_tot=1.323e-5,
-        pa_deg=290.0,
-        inc_deg=42.0,
-        v_rot_flat=90.0,
-        r_turn_kpc=1.5,
+        pa_deg=290.6,
+        inc_deg=39.9,
         sigma_pm_disp=0.001,
         f0=1.0, sigma_f=0.20,
         sigma_theta_deg=10.0,
         mu_pop_init=(-0.0042, -0.0027),
+        tilted_ring=_NGC300_TRING,
     ),
 }
 
 
 # ── Rotation model geometry ────────────────────────────────────────────────────
-
-def _v_rot_func(R_kpc: np.ndarray, v_flat: float, r_turn: float) -> np.ndarray:
-    """Courteau (1997) arctangent rotation curve, flat beyond r_turn."""
-    return v_flat * (2 / np.pi) * np.arctan(R_kpc / max(r_turn, 1e-6))
+#
+# References
+# ----------
+# NGC 55 tilted-ring model:
+#   Westmeier, T., Brüns, C., & Kerp, J. 2013, MNRAS, 432, 3047 (Table 4)
+# NGC 300 tilted-ring model:
+#   Westmeier, T., Koribalski, B. S., & Braun, R. 2011, MNRAS, 410, 2217 (Table 2)
+#
+# Kinematic model geometry:
+#   van der Hulst, J. M., et al. 1992, AJ, 103, 1457
+#   Begeman, K. G. 1989, A&A, 223, 47
+#
+# The projected angular radius of each star is used to interpolate V_rot(ϑ),
+# PA(ϑ), and i(ϑ) from the HI tilted-ring table.  Each star is then deprojected
+# using its local ring parameters to obtain the azimuthal angle φ, and the
+# expected transverse velocity is projected back onto the sky:
+#
+#   v_ξ  = −V_rot · sin φ            [along deprojected major axis, km/s]
+#   v_η  = +V_rot · cos φ · cos i    [along minor axis on sky, km/s]
+#   Δμ_ra*  = (v_ξ sin PA + v_η cos PA) / (d_kpc · κ)
+#   Δμ_dec  = (v_ξ cos PA − v_η sin PA) / (d_kpc · κ)
+#   κ = 4.74047  km/s per (mas/yr · kpc)
 
 
 def compute_rotation_offsets(
@@ -118,51 +185,78 @@ def compute_rotation_offsets(
     """
     Compute per-star rotation PM offsets (Δμ_ra*, Δμ_dec) in mas/yr.
 
+    Uses the tilted-ring model stored in gp['tilted_ring'] (Westmeier et al.):
+    V_rot, PA, and inclination are linearly interpolated at each star's projected
+    angular radius.  theta_offset (radians) is added to every ring's PA as a
+    global kinematic offset free parameter.
+
     Parameters
     ----------
     ra_deg, dec_deg : star sky positions (degrees)
     gp              : galaxy parameter dict from GALAXY_PARAMS
-    f               : stellar/HI rotation speed ratio (free parameter)
-    theta_offset    : kinematic PA offset from literature PA (radians)
+    f               : stellar/HI rotation speed ratio (asymmetric-drift factor)
+    theta_offset    : global kinematic PA offset added to every ring's PA (radians)
 
     Returns
     -------
     dmu_ra, dmu_dec : (n_stars,) arrays in mas/yr
     """
     d_kpc   = gp['d_kpc']
-    pa_eff  = (gp['pa_deg'] * _DEG2RAD) + theta_offset
-    cos_i   = np.cos(gp['inc_deg'] * _DEG2RAD)
-    v_flat  = gp['v_rot_flat']
-    r_turn  = gp['r_turn_kpc']
     kappa   = 4.74047   # km/s per (mas/yr · kpc)
 
-    # Sky offsets in arcsec (East, North)
+    # Sky offsets in arcsec (East positive, North positive)
     cos_dec = np.cos(gp['dec_cen'] * _DEG2RAD)
-    x_as    = (ra_deg  - gp['ra_cen']) * cos_dec * 3600.0   # arcsec east
-    y_as    = (dec_deg - gp['dec_cen'])            * 3600.0  # arcsec north
+    x_as    = (ra_deg  - gp['ra_cen']) * cos_dec * 3600.0
+    y_as    = (dec_deg - gp['dec_cen'])            * 3600.0
 
-    # Project onto major / minor axis
-    xi  =  x_as * np.sin(pa_eff) + y_as * np.cos(pa_eff)   # along major axis
-    eta =  x_as * np.cos(pa_eff) - y_as * np.sin(pa_eff)   # along minor axis
+    tring = gp.get('tilted_ring')
+    if tring is not None:
+        # Projected angular radius for each star
+        r_as = np.sqrt(x_as**2 + y_as**2)
 
-    # Convert arcsec → kpc and deproject
+        # Interpolate ring parameters at each star's projected radius.
+        # np.interp clamps to first/last table value outside the range.
+        r_tbl    = tring[:, 0]
+        vrot_r   = np.interp(r_as, r_tbl, tring[:, 1])   # km/s
+        pa_r_rad = np.interp(r_as, r_tbl, tring[:, 2]) * _DEG2RAD + theta_offset
+        inc_r    = np.interp(r_as, r_tbl, tring[:, 3])   # degrees
+        cos_i    = np.cos(inc_r * _DEG2RAD)               # per-star array
+
+        V_rot = f * vrot_r
+
+    else:
+        # Fallback: single flat values from gp (no tilted-ring table)
+        pa_r_rad = gp['pa_deg'] * _DEG2RAD + theta_offset
+        cos_i    = np.cos(gp['inc_deg'] * _DEG2RAD)
+        # Arctangent rotation curve (Courteau 1997) requires deprojected R
+        # — computed below after xi/eta
+        V_rot    = None  # filled after deprojection
+
+    # Project sky offsets onto local major / minor axis
+    xi  =  x_as * np.sin(pa_r_rad) + y_as * np.cos(pa_r_rad)
+    eta =  x_as * np.cos(pa_r_rad) - y_as * np.sin(pa_r_rad)
+
+    # Deproject η → disk Y (guard against edge-on singularity)
+    cos_i_safe = np.where(np.abs(cos_i) > 0.05, cos_i,
+                          0.05 * np.sign(np.where(cos_i >= 0, 1.0, -1.0)))
     scale = d_kpc * _ARCSEC2KPC
     X     = xi  * scale
-    # Guard against edge-on singularity (cos_i ≈ 0 → clamp deprojection)
-    cos_i_safe = max(abs(cos_i), 0.05) * np.sign(cos_i) if cos_i != 0 else 0.05
-    Y     = (eta / cos_i_safe) * scale
+    Y     = eta / cos_i_safe * scale
 
-    R   = np.sqrt(X**2 + Y**2)
     phi = np.arctan2(Y, X)
 
-    V_rot = f * _v_rot_func(R, v_flat, r_turn)
+    if V_rot is None:
+        R     = np.sqrt(X**2 + Y**2)
+        v_flat = gp['v_rot_flat']
+        r_turn = gp['r_turn_kpc']
+        V_rot  = f * v_flat * (2.0 / np.pi) * np.arctan(R / max(r_turn, 1e-6))
 
-    # Sky velocity components (along/across major axis, then back to E/N)
+    # Transverse sky velocity components
     v_xi  = -V_rot * np.sin(phi)
     v_eta =  V_rot * np.cos(phi) * cos_i
 
-    v_east  = v_xi * np.sin(pa_eff) + v_eta * np.cos(pa_eff)
-    v_north = v_xi * np.cos(pa_eff) - v_eta * np.sin(pa_eff)
+    v_east  = v_xi * np.sin(pa_r_rad) + v_eta * np.cos(pa_r_rad)
+    v_north = v_xi * np.cos(pa_r_rad) - v_eta * np.sin(pa_r_rad)
 
     dmu_ra  = v_east  / (d_kpc * kappa)
     dmu_dec = v_north / (d_kpc * kappa)
@@ -739,8 +833,13 @@ def run_pop_fit_rotation(
     print("BP3M pop-fit (rotation model)")
     print("─" * 60)
     print(f"  field={field_name}")
+    _tring = gp.get('tilted_ring')
+    _rot_desc = (f"tilted-ring ({len(_tring)} rings, "
+                 f"Vrot={_tring[0,1]:.0f}–{_tring[-1,1]:.0f} km/s)"
+                 if _tring is not None
+                 else f"Vrot={gp.get('v_rot_flat','?')} km/s")
     print(f"  PA={gp['pa_deg']}°  i={gp['inc_deg']}°  "
-          f"V_rot={gp['v_rot_flat']} km/s  d={gp['d_kpc']} kpc")
+          f"{_rot_desc}  d={gp['d_kpc']} kpc")
     print(f"  fit_f={fit_f}  fit_theta={fit_theta}")
     print(f"  σ_pm={sigma_pm} mas/yr  plx_pop={plx_pop} mas  "
           f"σ_plx_tot={sigma_plx_tot} mas")
@@ -1423,8 +1522,8 @@ def run_pop_fit_rotation(
         'sigma_theta_offset_deg': float(np.degrees(sigma_theta_final)),
         'pa_deg':                float(gp['pa_deg']),
         'inc_deg':               float(gp['inc_deg']),
-        'v_rot_flat_kms':        float(gp['v_rot_flat']),
-        'r_turn_kpc':            float(gp['r_turn_kpc']),
+        'rotation_model':        'tilted_ring' if gp.get('tilted_ring') is not None else 'arctangent',
+        'n_tilted_rings':        int(len(gp['tilted_ring'])) if gp.get('tilted_ring') is not None else None,
         'd_kpc':                 float(gp['d_kpc']),
         'fit_f':                 fit_f,
         'fit_theta':             fit_theta,
