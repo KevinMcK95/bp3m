@@ -531,10 +531,17 @@ def download_hst_images(
     _qso_df     = None
     _anchor_df  = None
     _gaia_dir   = Path(output_dir) / field_name / "Gaia"
-    _qso_csvs   = sorted(_gaia_dir.glob("*_qso_candidates.csv"))
-    if _qso_csvs:
+    _qso_csv = (_gaia_dir /
+        f"{field_name}_ra{ra:.4f}_dec{dec:.4f}"
+        f"_w{search_width:.4f}_h{search_height:.4f}_qso_candidates.csv")
+    if not _qso_csv.exists():
+        # fallback: most recently modified file matching the pattern
+        _qso_csvs = sorted(_gaia_dir.glob("*_qso_candidates.csv"),
+                           key=lambda p: p.stat().st_mtime)
+        _qso_csv = _qso_csvs[-1] if _qso_csvs else None
+    if _qso_csv is not None and _qso_csv.exists():
         try:
-            _qso_df = pd.read_csv(_qso_csvs[0])
+            _qso_df = pd.read_csv(_qso_csv)
         except Exception:
             pass
     _anchor_csv = _gaia_dir / f"{field_name}_qso_anchors.csv"
@@ -926,6 +933,8 @@ def plot_footprints(
         cut_dec_hi = dec + search_height / 2
 
         # Collect bounds from footprints whose centroid lies inside the cutout.
+        # Gaia stars are intentionally excluded — they span the full search box
+        # and would zoom the plot out far beyond the HST images.
         all_ra, all_dec = [], []
         for _, row in obs_df.iterrows():
             bbox = _footprint_bbox(str(row.get('s_region', '')))
@@ -936,9 +945,6 @@ def plot_footprints(
             if cut_ra_lo <= cra <= cut_ra_hi and cut_dec_lo <= cdec <= cut_dec_hi:
                 all_ra  += [bbox[0], bbox[1]]
                 all_dec += [bbox[2], bbox[3]]
-        if gaia_df is not None and len(gaia_df) > 0:
-            all_ra  += list(gaia_df['ra'].values)
-            all_dec += list(gaia_df['dec'].values)
 
         if all_ra:
             span_ra  = max(all_ra)  - min(all_ra)
@@ -965,9 +971,6 @@ def plot_footprints(
             if bbox:
                 all_ra  += [bbox[0], bbox[1]]
                 all_dec += [bbox[2], bbox[3]]
-        if gaia_df is not None and len(gaia_df) > 0:
-            all_ra  += list(gaia_df['ra'].values)
-            all_dec += list(gaia_df['dec'].values)
         if not all_ra:
             plt.close(fig)
             return
