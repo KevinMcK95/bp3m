@@ -207,7 +207,7 @@ def run_cross_match(
     image_id: str | None = None,
     restrict_to_obsids: list[str] | None = None,
     lib_dir: "Path | None" = None,
-    run_qso_vetting: bool = True,
+    run_qso_vetting: bool = False,
 ) -> list[Path]:
     """
     Cross-match all PSF-fit HST catalogs in a field against Gaia.

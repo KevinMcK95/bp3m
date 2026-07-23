@@ -537,6 +537,27 @@ def main():
         if gaia_csv_path is None and _gaia_dir.joinpath(f"{_gaia_stem}.csv").exists():
             gaia_csv_path = _gaia_dir / f"{_gaia_stem}.csv"
 
+    # ── Step 1b: QSO anchor vetting (runs once per Gaia catalog) ─────────────
+    from bp3m.pipeline.qso_vetting import qso_anchors_path as _qap
+    _qso_anchors_csv = _qap(_gaia_dir, field, args.ra, args.dec,
+                             args.search_width, args.search_height)
+    if not args.no_qso_anchors and not _qso_anchors_csv.exists():
+        from bp3m.pipeline.qso_vetting import vet_qso_candidates
+        print("\n" + "─"*50)
+        print("Step 1b: QSO anchor vetting")
+        print("─"*50)
+        try:
+            vet_qso_candidates(
+                field_name=field, output_dir=output_dir,
+                ra=args.ra, dec=args.dec,
+                search_width=args.search_width, search_height=args.search_height,
+                lib_dir=Path(args.lib_dir) if args.lib_dir else None,
+            )
+        except Exception as _qe:
+            print(f"  WARNING: QSO vetting failed — {_qe}")
+    elif not args.no_qso_anchors and _qso_anchors_csv.exists():
+        print(f"\n  [Step 1b] QSO anchors already cached: {_qso_anchors_csv.name}")
+
     # ── Step 2: Download HST ─────────────────────────────────────────────────
     if not args.skip_download:
         from bp3m.pipeline.download_hst import download_hst_images
@@ -754,7 +775,7 @@ def main():
             force_rematch=args.force_rematch,
             restrict_to_obsids=_restrict,
             lib_dir=Path(args.lib_dir) if args.lib_dir else None,
-            run_qso_vetting=not args.no_qso_anchors,
+            run_qso_vetting=False,
         )
 
     # ── Step 4b: Gaia DR4 epoch astrometry (optional) ────────────────────────
@@ -931,6 +952,7 @@ def main():
                         plot_influence=args.plot_influence,
                         bp3m_dir=_indv_root / _img,
                         gaia_csv=gaia_csv_path,
+                        qso_anchors_csv=_qso_anchors_csv if _qso_anchors_csv.exists() else None,
                     )
                     _n_ok += 1
                 except Exception as _exc:
@@ -976,6 +998,7 @@ def main():
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
+                qso_anchors_csv=_qso_anchors_csv if _qso_anchors_csv.exists() else None,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
                 gaia_csv=gaia_csv_path,
             )
@@ -1030,6 +1053,7 @@ def main():
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
+                qso_anchors_csv=_qso_anchors_csv if _qso_anchors_csv.exists() else None,
                 gaia_epoch_obs=_gaia_epoch_obs_for_solver,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
                 gaia_csv=gaia_csv_path,

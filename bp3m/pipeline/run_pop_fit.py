@@ -1691,6 +1691,7 @@ def run_pop_fit(
     cte_n_iter: int = 10,
     lib_dir: "Path | None" = None,
     use_qso_anchors: bool = True,
+    qso_anchors_csv: "Path | str | list | None" = None,
 ) -> Path:
     """
     Run population PM fitting.
@@ -1806,19 +1807,41 @@ def run_pop_fit(
     _n_qso_anchors = 0
 
     if use_qso_anchors:
-        _qso_path = data_root / field_name / 'Gaia' / f'{field_name}_qso_anchors.csv'
-        if _qso_path.exists():
+        # Resolve which anchor CSV(s) to load.
+        # qso_anchors_csv may be a single path, a list of paths, or None.
+        # When None, fall back to globbing the Gaia dir (supports multiple
+        # search-parameter sets whose files are concatenated + deduped).
+        from .qso_vetting import find_qso_anchors
+        _gaia_dir = data_root / field_name / 'Gaia'
+        if qso_anchors_csv is not None:
+            _anchor_paths = ([Path(qso_anchors_csv)]
+                             if not isinstance(qso_anchors_csv, list)
+                             else [Path(p) for p in qso_anchors_csv])
+        else:
+            _p = find_qso_anchors(_gaia_dir, field_name)
+            # Also collect any additional parameterised files that exist
+            _all = sorted(_gaia_dir.glob(f"{field_name}_*_qso_anchors.csv"),
+                          key=lambda p: p.stat().st_mtime)
+            _anchor_paths = _all if _all else ([_p] if _p and _p.exists() else [])
+
+        _anchor_paths = [p for p in _anchor_paths if p.exists()]
+
+        if _anchor_paths:
             try:
-                _qdf = pd.read_csv(_qso_path, dtype={'source_id': 'int64'})
+                _qdfs = [pd.read_csv(p, dtype={'source_id': 'int64'})
+                         for p in _anchor_paths]
+                _qdf = (pd.concat(_qdfs, ignore_index=True)
+                        .drop_duplicates(subset=['source_id'])
+                        .reset_index(drop=True)
+                        if len(_qdfs) > 1 else _qdfs[0])
                 _qdf_anchors = _qdf[_qdf['is_qso_anchor'].fillna(False)]
 
-                # Vetting summary
                 _nq_total = len(_qdf)
                 _nq_5p    = int(_qdf['has_5p_solution'].sum())
                 _nq_astro = int(_qdf['astrometric_pass'].sum())
                 _nq_cat   = int(_qdf['catalog_match'].sum())
                 _nq_anch  = len(_qdf_anchors)
-                print(f"  QSO vetting summary:")
+                print(f"  QSO vetting summary ({len(_anchor_paths)} file(s)):")
                 print(f"    Gaia qso_candidates:          {_nq_total}")
                 print(f"    With 5p/6p solution:          {_nq_5p}")
                 print(f"    Astrometric cut (<3σ):        {_nq_astro}")
@@ -1844,35 +1867,8 @@ def run_pop_fit(
                          else "(none in HST FOV — prior not applied)"))
             except Exception as _qexc:
                 print(f"  WARNING: could not load QSO anchors — {_qexc}")
-        elif lib_dir is not None:
-            # Run vetting on demand if anchors CSV is missing but lib_dir given
-            try:
-                from .qso_vetting import vet_qso_candidates
-                print("  QSO anchor file not found — running vetting now...")
-                _qdf = vet_qso_candidates(
-                    field_name=field_name, output_dir=data_root, lib_dir=lib_dir
-                )
-                if _qdf is not None:
-                    _qdf_anchors = _qdf[_qdf['is_qso_anchor'].fillna(False)]
-                    _qso_idx_list = []
-                    _qso_pmra_list = []
-                    _qso_pmdec_list = []
-                    for _, _row in _qdf_anchors.iterrows():
-                        _sidx = star_id_to_idx.get(int(_row['source_id']))
-                        if _sidx is not None:
-                            _qso_idx_list.append(_sidx)
-                            _qso_pmra_list.append(float(_row['pmra_aberr_uas']) * 1e-3)
-                            _qso_pmdec_list.append(float(_row['pmdec_aberr_uas']) * 1e-3)
-                    if _qso_idx_list:
-                        _qso_sidx      = np.array(_qso_idx_list,  dtype=int)
-                        _qso_pmra_mas  = np.array(_qso_pmra_list, dtype=float)
-                        _qso_pmdec_mas = np.array(_qso_pmdec_list, dtype=float)
-                        _n_qso_anchors = len(_qso_sidx)
-                    print(f"  QSO anchors: {_n_qso_anchors} matched to solver")
-            except Exception as _qexc:
-                print(f"  WARNING: on-demand QSO vetting failed — {_qexc}")
         else:
-            print("  QSO anchor file not found; run cross-match first or pass --lib_dir")
+            print("  QSO anchor file not found; re-run from Phase 1 to generate it")
     else:
         print("  QSO anchors disabled (--no_qso_anchors)")
 
@@ -2865,9 +2861,13 @@ def main():
                              'is not yet present.  Reads config.toml if omitted.')
     parser.add_argument('--no_qso_anchors', action='store_true',
                         help='Disable QSO anchor priors.  By default the solver loads '
-                             '{field}/Gaia/{field}_qso_anchors.csv (produced by the '
-                             'cross-match step) and applies tight secular-aberration '
+                             '{field}/Gaia/{field}_*_qso_anchors.csv (produced at Phase 1) '
+                             'and applies tight secular-aberration '
                              'PM + zero-parallax priors to vetted QSOs.')
+    parser.add_argument('--qso_anchors_csv', type=str, default=None, nargs='+',
+                        help='Explicit path(s) to qso_anchors CSV file(s).  When multiple '
+                             'paths are given they are concatenated and deduped by source_id.  '
+                             'Overrides the default glob in {field}/Gaia/.')
 
     args = parser.parse_args()
 
@@ -2915,4 +2915,5 @@ def main():
         cte_n_iter=args.cte_n_iter,
         lib_dir=Path(_lib_dir_arg) if _lib_dir_arg else None,
         use_qso_anchors=not args.no_qso_anchors,
+        qso_anchors_csv=[Path(p) for p in args.qso_anchors_csv] if args.qso_anchors_csv else None,
     )

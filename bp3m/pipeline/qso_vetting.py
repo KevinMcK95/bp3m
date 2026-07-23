@@ -52,9 +52,50 @@ _PLX_SYS  = GAIA_SYS_DICT['parallax_sys_err']  # mas
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
+def qso_anchors_path(
+    gaia_dir: "Path | str",
+    field_name: str,
+    ra: float,
+    dec: float,
+    search_width: float,
+    search_height: float,
+) -> Path:
+    """Return the canonical parameterised path for a qso_anchors CSV."""
+    return (Path(gaia_dir) /
+            f"{field_name}_ra{ra:.4f}_dec{dec:+.4f}"
+            f"_w{search_width:.4f}_h{search_height:.4f}_qso_anchors.csv")
+
+
+def find_qso_anchors(gaia_dir: "Path | str", field_name: str,
+                     ra: float | None = None, dec: float | None = None,
+                     search_width: float | None = None,
+                     search_height: float | None = None) -> "Path | None":
+    """Return the best qso_anchors CSV path for a field.
+
+    When ra/dec/search_width/search_height are given, returns the exact
+    parameterised path (whether or not it exists yet).  Otherwise globs
+    for all matching files and returns the most recently modified one.
+    """
+    gaia_dir = Path(gaia_dir)
+    if all(v is not None for v in [ra, dec, search_width, search_height]):
+        return qso_anchors_path(gaia_dir, field_name, ra, dec,
+                                search_width, search_height)
+    matches = sorted(gaia_dir.glob(f"{field_name}_*_qso_anchors.csv"),
+                     key=lambda p: p.stat().st_mtime)
+    if matches:
+        return matches[-1]
+    # Legacy flat name fallback
+    legacy = gaia_dir / f"{field_name}_qso_anchors.csv"
+    return legacy if legacy.exists() else None
+
+
 def vet_qso_candidates(
     field_name: str,
     output_dir: "Path | str",
+    ra: float | None = None,
+    dec: float | None = None,
+    search_width: float | None = None,
+    search_height: float | None = None,
     lib_dir: "Path | None" = None,
     search_radius_arcsec: float = 1.5,
     sigma_cut: float = 3.0,
@@ -70,6 +111,11 @@ def vet_qso_candidates(
     ----------
     field_name, output_dir
         Same as used for download_gaia / run_cross_match.
+    ra, dec, search_width, search_height
+        Search-box parameters used to construct the parameterised output
+        filename ``{field}_ra{ra}_dec{dec}_w{sw}_h{sh}_qso_anchors.csv``.
+        When not provided (backward-compatibility), the legacy flat name
+        ``{field}_qso_anchors.csv`` is used instead.
     lib_dir
         BP3M library directory (from bp3m-setup).  If None or catalogs are
         missing, catalog matching is skipped (only gaia_crf_source passes).
@@ -91,17 +137,35 @@ def vet_qso_candidates(
     output_dir = Path(output_dir)
     gaia_dir   = output_dir / field_name / "Gaia"
 
-    out_path   = gaia_dir / f"{field_name}_qso_anchors.csv"
+    _have_coords = all(v is not None for v in [ra, dec, search_width, search_height])
+    if _have_coords:
+        out_path = qso_anchors_path(gaia_dir, field_name, ra, dec,
+                                    search_width, search_height)
+    else:
+        out_path = gaia_dir / f"{field_name}_qso_anchors.csv"
+
     if not force_rerun and out_path.exists():
         print(f"[QSO vetting] Loading cached: {out_path.name}")
         return pd.read_csv(out_path, dtype={'source_id': 'int64'})
 
     # ── Load qso_candidates CSV ───────────────────────────────────────────────
-    qso_paths = sorted(gaia_dir.glob("*_qso_candidates.csv"))
-    if not qso_paths:
+    if _have_coords:
+        _cand_name = (f"{field_name}_ra{ra:.4f}_dec{dec:+.4f}"
+                      f"_w{search_width:.4f}_h{search_height:.4f}_qso_candidates.csv")
+        _cand_path = gaia_dir / _cand_name
+        if not _cand_path.exists():
+            # fallback: most recently modified candidates file
+            _cands = sorted(gaia_dir.glob("*_qso_candidates.csv"),
+                            key=lambda p: p.stat().st_mtime)
+            _cand_path = _cands[-1] if _cands else None
+    else:
+        _cands = sorted(gaia_dir.glob("*_qso_candidates.csv"))
+        _cand_path = _cands[0] if _cands else None
+
+    if _cand_path is None or not _cand_path.exists():
         print("[QSO vetting] No qso_candidates CSV found — skipping.")
         return None
-    qso_df = pd.read_csv(qso_paths[0], dtype={'source_id': 'int64'})
+    qso_df = pd.read_csv(_cand_path, dtype={'source_id': 'int64'})
     print(f"\n[QSO vetting] Starting with {len(qso_df)} Gaia qso_candidates")
 
     # ── Load main Gaia CSV for astrometry ─────────────────────────────────────

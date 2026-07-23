@@ -55,6 +55,7 @@ def run_alignment(  # noqa: C901
     plot_residuals: bool = False,
     plot_influence: bool = False,
     use_qso_anchors: bool = True,
+    qso_anchors_csv: "Path | None" = None,
     gaia_epoch_obs: Optional[dict] = None,
     exclude_2p_from_alignment: bool = False,
     gaia_csv: "Path | None" = None,
@@ -219,8 +220,12 @@ def run_alignment(  # noqa: C901
     print("\n  QSO anchor priors:")
     _injected_qso_ids = []
     if use_qso_anchors:
-        _qso_anchor_path = (Path(output_dir) / field_name / 'Gaia'
-                            / f'{field_name}_qso_anchors.csv')
+        if qso_anchors_csv is not None:
+            _qso_anchor_path = Path(qso_anchors_csv)
+        else:
+            from .qso_vetting import find_qso_anchors
+            _qso_anchor_path = find_qso_anchors(
+                Path(output_dir) / field_name / 'Gaia', field_name) or Path('')
         if _qso_anchor_path.exists():
             import pandas as _qpd
 
@@ -276,8 +281,8 @@ def run_alignment(  # noqa: C901
                 print(f"    Injected into alignment:       0  "
                       f"(none of the {_n_anchors} vetted anchors are in the HST field)")
         else:
-            print(f"    QSO anchor file not found at {_qso_anchor_path.name}")
-            print(f"    Run cross-match step first to generate it (or pass --no_qso_anchors)")
+            print(f"    QSO anchor file not found ({_qso_anchor_path.name})")
+            print(f"    Re-run from Phase 1 to generate it (or pass --no_qso_anchors)")
     else:
         print("    Disabled (--no_qso_anchors)")
 

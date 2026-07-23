@@ -544,8 +544,9 @@ def download_hst_images(
             _qso_df = pd.read_csv(_qso_csv)
         except Exception:
             pass
-    _anchor_csv = _gaia_dir / f"{field_name}_qso_anchors.csv"
-    if _anchor_csv.exists():
+    from bp3m.pipeline.qso_vetting import find_qso_anchors as _fqa
+    _anchor_csv = _fqa(_gaia_dir, field_name, ra, dec, search_width, search_height)
+    if _anchor_csv is not None and _anchor_csv.exists():
         try:
             _adf = pd.read_csv(_anchor_csv, dtype={'source_id': 'int64'})
             _anchor_df = _adf[_adf['is_qso_anchor'].fillna(False)].copy()
