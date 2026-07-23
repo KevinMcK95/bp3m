@@ -866,6 +866,7 @@ def run_pop_fit_rotation(
     max_sigma_free_pm: float = 3.0,
     fit_f: bool = True,
     fit_theta: bool = True,
+    f_init: float = 1.0,
     n_iter_ft: int = 20,
     mu_pop_init: tuple[float, float] | None = None,
     no_plots: bool = False,
@@ -1183,7 +1184,7 @@ def run_pop_fit_rotation(
         np.add.at(solver.gaia_n_hst_used, _d['sidx'][_use_any], 1)
 
     # ── Precompute rotation offsets ────────────────────────────────────────────
-    f_current     = 1.0
+    f_current     = float(f_init)
     theta_current = 0.0
     gaia_ra  = gaia_catalog['ra'].to_numpy(float)
     gaia_dec = gaia_catalog['dec'].to_numpy(float)
@@ -1742,8 +1743,10 @@ def main():
     parser.add_argument('--member_sigma_clip', type=float, default=3.0)
     parser.add_argument('--pm_sys_floor', type=float, default=0.25)
     parser.add_argument('--max_sigma_free_pm', type=float, default=3.0)
+    parser.add_argument('--f_init',       type=float, default=1.0,
+                        help='Initial (and fixed, if --no_fit_f) stellar/HI rotation speed ratio (default 1.0)')
     parser.add_argument('--no_fit_f',     action='store_true',
-                        help='Hold f_star_mult fixed at 1.0')
+                        help='Hold f_star_mult fixed at f_init throughout')
     parser.add_argument('--no_fit_theta', action='store_true',
                         help='Hold theta_offset fixed at 0.0')
     parser.add_argument('--n_iter_ft',    type=int, default=20,
@@ -1767,6 +1770,7 @@ def main():
         max_sigma_free_pm=args.max_sigma_free_pm,
         fit_f=not args.no_fit_f,
         fit_theta=not args.no_fit_theta,
+        f_init=args.f_init,
         n_iter_ft=args.n_iter_ft,
         no_plots=args.no_plots,
         qso_anchors_csv=[Path(p) for p in args.qso_anchors_csv] if args.qso_anchors_csv else None,
