@@ -792,11 +792,16 @@ def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarra
     pmra_free  = mem['pmra_bp3m_free'].to_numpy(float)
     pmdec_free = mem['pmdec_bp3m_free'].to_numpy(float)
 
-    # Colour limits from data rows only, symmetric about mu_pop
-    spread_ra  = max(np.nanpercentile(np.abs(np.concatenate([pmra_pop,  pmra_free])  - mu_pop[0]), 95), 0.001)
-    spread_dec = max(np.nanpercentile(np.abs(np.concatenate([pmdec_pop, pmdec_free]) - mu_pop[1]), 95), 0.001)
-    limits = [(mu_pop[0] - spread_ra,  mu_pop[0] + spread_ra),
-              (mu_pop[1] - spread_dec, mu_pop[1] + spread_dec)]
+    # Rows 0 & 2 share limits from pop-prior data (narrow, comparable to gas model).
+    # Row 1 (diffuse prior) gets its own wider limits.
+    spread_ra_pop  = max(np.nanpercentile(np.abs(pmra_pop  - mu_pop[0]), 95), 0.001)
+    spread_dec_pop = max(np.nanpercentile(np.abs(pmdec_pop - mu_pop[1]), 95), 0.001)
+    spread_ra_free  = max(np.nanpercentile(np.abs(pmra_free  - mu_pop[0]), 95), 0.001)
+    spread_dec_free = max(np.nanpercentile(np.abs(pmdec_free - mu_pop[1]), 95), 0.001)
+    limits_pop  = [(mu_pop[0] - spread_ra_pop,  mu_pop[0] + spread_ra_pop),
+                   (mu_pop[1] - spread_dec_pop, mu_pop[1] + spread_dec_pop)]
+    limits_free = [(mu_pop[0] - spread_ra_free,  mu_pop[0] + spread_ra_free),
+                   (mu_pop[1] - spread_dec_free, mu_pop[1] + spread_dec_free)]
 
     # Dense sky grid covering the field footprint
     pad = 0.02  # deg
@@ -811,42 +816,33 @@ def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarra
     pmra_gas_grid  = (mu_pop[0] + dmu_ra_grid ).reshape(N_grid, N_grid)
     pmdec_gas_grid = (mu_pop[1] + dmu_dec_grid).reshape(N_grid, N_grid)
 
-    data_rows = [
-        ('pop prior',     pmra_pop,  pmdec_pop),
-        ('diffuse prior', pmra_free, pmdec_free),
+    # row_idx, label, pmra, pmdec, limits
+    rows = [
+        (0, 'pop prior',         pmra_pop,       pmdec_pop,       limits_pop),
+        (1, 'diffuse prior',     pmra_free,       pmdec_free,      limits_free),
+        (2, 'gas (tilted-ring)', pmra_gas_grid,  pmdec_gas_grid,  limits_pop),
     ]
 
     fig, axes = plt.subplots(3, 2, figsize=(13, 13), constrained_layout=True)
     fig.suptitle(f'{field_name} — member PMs on sky (N={len(mem)})', fontsize=13)
 
-    # Rows 0 & 1: scatter of member posteriors
-    for row_idx, (row_label, pmra_m, pmdec_m) in enumerate(data_rows):
+    for row_idx, row_label, pmra_vals, pmdec_vals, lims in rows:
         for col, (pm_vals, pm_label, (vmin, vmax)) in enumerate([
-            (pmra_m,  r'$\mu_{\alpha^*}$ (mas/yr)', limits[0]),
-            (pmdec_m, r'$\mu_\delta$ (mas/yr)',     limits[1]),
+            (pmra_vals,  r'$\mu_{\alpha^*}$ (mas/yr)', lims[0]),
+            (pmdec_vals, r'$\mu_\delta$ (mas/yr)',     lims[1]),
         ]):
             ax = axes[row_idx, col]
-            sc = ax.scatter(ra_m, dec_m, c=pm_vals, s=6, cmap='RdBu_r',
-                            vmin=vmin, vmax=vmax, rasterized=True)
+            if row_idx == 2:
+                sc = ax.pcolormesh(ra_vec, dec_vec, pm_vals, cmap='RdBu_r',
+                                   vmin=vmin, vmax=vmax, rasterized=True)
+            else:
+                sc = ax.scatter(ra_m, dec_m, c=pm_vals, s=6, cmap='RdBu_r',
+                                vmin=vmin, vmax=vmax, rasterized=True)
             plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label=pm_label)
             ax.set_xlabel('RA (deg)')
             ax.set_ylabel('Dec (deg)')
             ax.set_title(f'{row_label}  —  {pm_label}')
             ax.invert_xaxis()
-
-    # Row 2: gas model as a filled pcolormesh over the full field
-    for col, (img, pm_label, (vmin, vmax)) in enumerate([
-        (pmra_gas_grid,  r'$\mu_{\alpha^*}$ (mas/yr)', limits[0]),
-        (pmdec_gas_grid, r'$\mu_\delta$ (mas/yr)',     limits[1]),
-    ]):
-        ax = axes[2, col]
-        im = ax.pcolormesh(ra_vec, dec_vec, img, cmap='RdBu_r',
-                           vmin=vmin, vmax=vmax, rasterized=True)
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label=pm_label)
-        ax.set_xlabel('RA (deg)')
-        ax.set_ylabel('Dec (deg)')
-        ax.set_title(f'gas (tilted-ring)  —  {pm_label}')
-        ax.invert_xaxis()
 
     out_path = output_dir / 'sky_pm_members.png'
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
