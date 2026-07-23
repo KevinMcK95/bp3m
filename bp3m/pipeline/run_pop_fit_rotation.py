@@ -834,19 +834,19 @@ def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarra
             ax.set_title(f'{row_label}  —  {pm_label}')
             ax.invert_xaxis()
 
-    # Row 2: gas model as a filled image over the full field
+    # Row 2: gas model as a filled pcolormesh over the full field
     for col, (img, pm_label, (vmin, vmax)) in enumerate([
         (pmra_gas_grid,  r'$\mu_{\alpha^*}$ (mas/yr)', limits[0]),
         (pmdec_gas_grid, r'$\mu_\delta$ (mas/yr)',     limits[1]),
     ]):
         ax = axes[2, col]
-        im = ax.imshow(img, origin='lower', aspect='auto', cmap='RdBu_r',
-                       vmin=vmin, vmax=vmax,
-                       extent=[ra_hi, ra_lo, dec_lo, dec_hi])
+        im = ax.pcolormesh(ra_vec, dec_vec, img, cmap='RdBu_r',
+                           vmin=vmin, vmax=vmax, rasterized=True)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label=pm_label)
         ax.set_xlabel('RA (deg)')
         ax.set_ylabel('Dec (deg)')
         ax.set_title(f'gas (tilted-ring)  —  {pm_label}')
+        ax.invert_xaxis()
 
     out_path = output_dir / 'sky_pm_members.png'
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
