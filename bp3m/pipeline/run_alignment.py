@@ -225,8 +225,8 @@ def run_alignment(  # noqa: C901
         else:
             from .qso_vetting import find_qso_anchors
             _qso_anchor_path = find_qso_anchors(
-                Path(output_dir) / field_name / 'Gaia', field_name) or Path('')
-        if _qso_anchor_path.exists():
+                Path(output_dir) / field_name / 'Gaia', field_name)
+        if _qso_anchor_path is not None and _qso_anchor_path.exists():
             import pandas as _qpd
 
             _qdf     = _qpd.read_csv(_qso_anchor_path, dtype={'source_id': 'int64'})
@@ -281,7 +281,7 @@ def run_alignment(  # noqa: C901
                 print(f"    Injected into alignment:       0  "
                       f"(none of the {_n_anchors} vetted anchors are in the HST field)")
         else:
-            print(f"    QSO anchor file not found ({_qso_anchor_path.name})")
+            print(f"    QSO anchor file not found ({_qso_anchor_path.name if _qso_anchor_path else 'none'})")
             print(f"    Re-run from Phase 1 to generate it (or pass --no_qso_anchors)")
     else:
         print("    Disabled (--no_qso_anchors)")
