@@ -615,6 +615,15 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                           f"scale={scale_fit:.4f} (need {0.98*params['initial_scale']:.4f}–{1.02*params['initial_scale']:.4f}), "
                           f"rot={rot_fit:.3f}° (need |rot|<0.2°)")
             if _scale_ok and _rot_ok:
+                # Quality gate: average Mahalanobis² per pair.  Correct matches
+                # have avg_sigs² << 10; spurious fits (pairs geometrically
+                # inconsistent) have avg_sigs² >> 25 even after convergence.
+                _avg_sigs2 = chi2 / len(h_b_idx) if len(h_b_idx) > 0 else np.inf
+                if _avg_sigs2 > 25:
+                    _dbg['scale_rot_fail'] += 1   # reuse counter as generic reject
+                    if debug_verbose and _dbg['scale_rot_fail'] <= 5:
+                        print(f"    DBG chi2/n fail q<{qlim} m<{mlim:.1f}: avg_sigs²={_avg_sigs2:.1f} > 25")
+                    continue
                 red_chi2 = chi2 / (2*len(h_b_idx) - 4)
                 red_cost = cost - np.log(2*len(h_b_idx) - 4)
                 zp_tier = np.median(gaia_f['mag'][g_b_full_idx] - hst_d['mag'][h_b_idx])
