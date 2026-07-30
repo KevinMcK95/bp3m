@@ -615,15 +615,6 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                           f"scale={scale_fit:.4f} (need {0.98*params['initial_scale']:.4f}–{1.02*params['initial_scale']:.4f}), "
                           f"rot={rot_fit:.3f}° (need |rot|<0.2°)")
             if _scale_ok and _rot_ok:
-                # Quality gate: average Mahalanobis² per pair.  Correct matches
-                # have avg_sigs² << 10; spurious fits (pairs geometrically
-                # inconsistent) have avg_sigs² >> 25 even after convergence.
-                _avg_sigs2 = chi2 / len(h_b_idx) if len(h_b_idx) > 0 else np.inf
-                if _avg_sigs2 > 25:
-                    _dbg['scale_rot_fail'] += 1   # reuse counter as generic reject
-                    if debug_verbose and _dbg['scale_rot_fail'] <= 5:
-                        print(f"    DBG chi2/n fail q<{qlim} m<{mlim:.1f}: avg_sigs²={_avg_sigs2:.1f} > 25")
-                    continue
                 red_chi2 = chi2 / (2*len(h_b_idx) - 4)
                 red_cost = cost - np.log(2*len(h_b_idx) - 4)
                 zp_tier = np.median(gaia_f['mag'][g_b_full_idx] - hst_d['mag'][h_b_idx])
@@ -956,6 +947,21 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             best_all = best
         A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f = \
             _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor)
+
+        # Sanity check: if the 4P seed was spurious, the affine refinement
+        # diverges and produces pixel-scale residuals.  Correct matches have
+        # sub-pixel residuals (<0.5px); reject anything > 2px.
+        _xh_ref, _yh_ref = apply_affine(hst_data_all['x'][h_f], hst_data_all['y'][h_f],
+                                         A, B, C, D, xs_o, ys_o, xt_o, yt_o)
+        _dx_ref = gaia_field['x'][g_f] - _xh_ref
+        _dy_ref = gaia_field['y'][g_f] - _yh_ref
+        _ref_x = 0.5 * np.diff(np.nanpercentile(_dx_ref, [16, 84]))[0]
+        _ref_y = 0.5 * np.diff(np.nanpercentile(_dy_ref, [16, 84]))[0]
+        if max(_ref_x, _ref_y) > 2.0:
+            print(f"Finished {image_name}: Refinement residuals too large "
+                  f"({_ref_x:.2f},{_ref_y:.2f}px) — spurious 4P seed, skipping.", file=original_stdout)
+            return
+
         M = np.array([[A, B], [C, D]])
 
         # --- Final pass: gather all candidates with the converged transform ---
