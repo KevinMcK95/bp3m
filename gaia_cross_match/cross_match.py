@@ -840,6 +840,16 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             'qfit': hst_cat['qfit'].astype(float)[is_star],
             'chi2': hst_cat['chi2'].astype(float)[is_star],
         }
+        # All HST sources (stars + non-stars) with qfit/chi2 — used in the
+        # second round of discovery tiers when the stars-only round fails.
+        # Including non-stars gives more histogram pairs in sparse Gaia fields
+        # where only a few star-class sources overlap with Gaia positions.
+        hst_data_all_disc = {
+            'x': x_hst, 'y': y_hst, 'mag': mag_hst,
+            'C': C_pix_hst,
+            'qfit': hst_cat['qfit'].astype(float),
+            'chi2': hst_cat['chi2'].astype(float),
+        }
         # All sources (stars + non-stars) for 6P refinement and final pass.
         hst_data_all = {
             'x': x_hst, 'y': y_hst, 'mag': mag_hst,
@@ -847,48 +857,62 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         }
         tree_gaia_all = KDTree(np.column_stack([x_g_in, y_g_in]))
 
-        # --- 4P Discovery (tiered Gaia quality fallback) ---
-        # Tier 1: RUWE ≤ 1.4 + measured PM — cleanest positions and PMs.
-        # Tier 2: RUWE ≤ 1.4, any astrometric solution — adds 2p stars (PM=0,
-        #         large uncertainty via fillna in propagate_gaia_with_cov).
-        # Tier 3: all Gaia stars — last resort; bad-RUWE sources allowed.
-        #         Still gated by the scale/rotation sanity check inside discovery.
-        # The tier only controls the histogram seed; affine refinement and the
-        # final pass always use the full in-field Gaia catalog.
+        # --- 4P Discovery (tiered fallback) ---
+        # Round 1 — HST star candidates only (tight qfit/chi2 tiers, most reliable):
+        #   Tier 1: clean Gaia 5p (RUWE ≤ 1.4 + measured PM)
+        #   Tier 2: clean Gaia 5p + 2p (RUWE ≤ 1.4, any solution)
+        #   Tier 3: all Gaia (bad-RUWE allowed)
+        # Round 2 — all HST sources (stars + non-stars), more histogram pairs
+        # in sparse fields at the cost of noisier seeds:
+        #   Tier 4: clean Gaia 5p / all HST
+        #   Tier 5: clean Gaia 5p+2p / all HST
+        #   Tier 6: all Gaia / all HST  (last resort)
+        # In all cases the Gaia seed only controls the offset histogram; affine
+        # refinement and the final pass always use the full in-field Gaia catalog.
+        _all_gaia = np.ones(len(x_g_in), dtype=bool)
         _disc_tiers = [
-            ("clean 5p",    in_clean & in_has_pms),
-            ("clean 5p+2p", in_clean),
-            ("all Gaia",    np.ones(len(x_g_in), dtype=bool)),
+            # (label,               Gaia seed mask,         HST data,          stars-only flag)
+            ("clean 5p / HST stars",    in_clean & in_has_pms, hst_data,          True),
+            ("clean 5p+2p / HST stars", in_clean,              hst_data,          True),
+            ("all Gaia / HST stars",    _all_gaia,             hst_data,          True),
+            ("clean 5p / all HST",      in_clean & in_has_pms, hst_data_all_disc, False),
+            ("clean 5p+2p / all HST",   in_clean,              hst_data_all_disc, False),
+            ("all Gaia / all HST",      _all_gaia,             hst_data_all_disc, False),
         ]
-        best, used_tier = None, None
-        for _tier_name, _seed_mask in _disc_tiers:
+        best, used_tier, _used_stars_only = None, None, True
+        for _tier_name, _seed_mask, _hst_d, _stars_only in _disc_tiers:
             _n_seed = int(_seed_mask.sum())
             if _n_seed < 3:
-                print(f"  Skipping Gaia tier '{_tier_name}': only {_n_seed} stars available.")
+                print(f"  Skipping tier '{_tier_name}': only {_n_seed} Gaia stars available.")
                 continue
-            print(f"  Trying 4P discovery with {_tier_name} stars ({_n_seed} in field)...")
-            best = _run_4p_discovery(hst_data, gaia_field, params, max_mag_diff,
+            print(f"  Trying 4P discovery [{_tier_name}] ({_n_seed} Gaia in field, "
+                  f"{len(_hst_d['x'])} HST sources)...")
+            best = _run_4p_discovery(_hst_d, gaia_field, params, max_mag_diff,
                                       scale_sweep=scale_sweep,
                                       discovery_max_offset=discovery_max_offset,
                                       seed_quality_mask=_seed_mask)
             if best is not None:
                 used_tier = _tier_name
+                _used_stars_only = _stars_only
                 break
-            print(f"  4P Discovery failed with {_tier_name} stars — trying next tier...")
+            print(f"  4P Discovery failed [{_tier_name}] — trying next tier...")
         if best is None:
-            print(f"Finished {image_name}: 4P Discovery failed at all Gaia quality tiers.", file=original_stdout)
+            print(f"Finished {image_name}: 4P Discovery failed at all tiers.", file=original_stdout)
             return
-        print(f"  4P Discovery Succeeded [{used_tier}]: Best Tier Q<{best['q']}, Mag<{best['m']:.1f} "
-              f"({best['n_match']} stars, red_chi2={best['red_chi2']:.2f}, red_cost={best['red_cost']:.2f})")
+        print(f"  4P Discovery Succeeded [{used_tier}]: Best Q<{best['q']}, Mag<{best['m']:.1f} "
+              f"({best['n_match']} matches, red_chi2={best['red_chi2']:.2f}, red_cost={best['red_cost']:.2f})")
 
         # --- Save offset histogram plot for the best discovery tier ---
         _save_offset_histogram(best, image_name, hst['root'])
 
         # --- Affine Refinement (all sources) ---
-        # Seed indices from 4P discovery are into hst_data (star-only); remap
-        # them to full-array indices so _run_affine_refinement can work with
-        # hst_data_all which contains every source.
-        best_all = {**best, 'h_v': star_indices[best['h_v']]}
+        # Seed indices from 4P discovery index into the HST dataset used for that
+        # tier.  For the stars-only round, remap to full-array indices; for the
+        # all-sources round they are already full-array indices.
+        if _used_stars_only:
+            best_all = {**best, 'h_v': star_indices[best['h_v']]}
+        else:
+            best_all = best
         A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f = \
             _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor)
         M = np.array([[A, B], [C, D]])
