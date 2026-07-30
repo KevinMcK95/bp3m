@@ -435,7 +435,7 @@ def _save_offset_histogram(best, image_name, out_dir):
 
 
 def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, discovery_max_offset=50,
-                      seed_quality_mask=None):
+                      seed_quality_mask=None, debug_verbose=False):
     """
     Tier-walks qfit x mag limits to find a physically plausible 4P similarity seed.
 
@@ -467,6 +467,7 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
     mag_limits[-1] = hst_d['mag'].max()
 
     discovered = []
+    _dbg = {'valid_seed_fail': 0, 'dedup<3': 0, 'sigma_rej<3': 0, 'scale_rot_fail': 0}
     print(f"  Walking over {len(qfit_limits)*len(mag_limits)} tiers for 4P discovery...")
 
     for qlim in qfit_limits:
@@ -499,7 +500,7 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                 ds_range=(-0.02, 0.02) if scale_sweep else (0.0, 0.0), n_scales=41 if scale_sweep else 1,
                 return_histogram=True
             )
-            dx_off, dy_off, _ = offset_peaks[0]
+            dx_off, dy_off, _peak_score = offset_peaks[0]
             xg_tier = xg_s + best_ds * (xg_s - params['x_cen']) + dx_off
             yg_tier = yg_s + best_ds * (yg_s - params['y_cen']) + dy_off
 
@@ -513,6 +514,13 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                     valid_seed = True
                     break
             if not valid_seed:
+                _dbg['valid_seed_fail'] += 1
+                if debug_verbose and _dbg['valid_seed_fail'] <= 3:
+                    n40 = np.sum(dists < 40.0)
+                    n100 = np.sum(dists < 100.0)
+                    print(f"    DBG valid_seed fail q<{qlim} m<{mlim:.1f}: "
+                          f"peak=({dx_off:.1f},{dy_off:.1f}) score={_peak_score:.3f}, "
+                          f"n_hst={np.sum(h_mask)}, @40px={n40}, @100px={n100}")
                 continue
 
             # Greedy 1-to-1 cleanup using log-probability cost
@@ -525,6 +533,9 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
             mdf_seed = pd.DataFrame({'g_seed': g_v_seed, 'h_full': h_v_full, 'c': costs_seed})\
                          .sort_values('c').drop_duplicates('h_full').drop_duplicates('g_seed')
             if len(mdf_seed) < 3:
+                _dbg['dedup<3'] += 1
+                if debug_verbose and _dbg['dedup<3'] <= 3:
+                    print(f"    DBG dedup<3 q<{qlim} m<{mlim:.1f}: {np.sum(valid_idx)} pairs → {len(mdf_seed)} after dedup")
                 continue
 
             h_b_idx = mdf_seed['h_full'].values
@@ -581,11 +592,25 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
             g_b_full_idx = g_b_full_idx[curr_keep]
             h_b_idx = h_b_idx[curr_keep]
             if np.sum(good_v) < 3:
+                _dbg['sigma_rej<3'] += 1
+                if debug_verbose and _dbg['sigma_rej<3'] <= 3:
+                    print(f"    DBG sigma_rej<3 q<{qlim} m<{mlim:.1f}: "
+                          f"{len(mdf_seed)} pairs → {np.sum(good_v)} after rejection "
+                          f"(dists={np.round(np.sqrt(dx_v**2+dy_v**2),1).tolist()}, "
+                          f"sigs={np.round(sigs_v,2).tolist()})")
                 continue
 
             scale_fit = np.sqrt(A*D - B*C)
             rot_fit = np.degrees(np.arctan2(B - C, A + D))
-            if (0.98*params['initial_scale'] <= scale_fit <= 1.02*params['initial_scale']) and (abs(rot_fit) < 0.2):
+            _scale_ok = 0.98*params['initial_scale'] <= scale_fit <= 1.02*params['initial_scale']
+            _rot_ok = abs(rot_fit) < 0.2
+            if not (_scale_ok and _rot_ok):
+                _dbg['scale_rot_fail'] += 1
+                if debug_verbose and _dbg['scale_rot_fail'] <= 5:
+                    print(f"    DBG scale/rot fail q<{qlim} m<{mlim:.1f}: "
+                          f"scale={scale_fit:.4f} (need {0.98*params['initial_scale']:.4f}–{1.02*params['initial_scale']:.4f}), "
+                          f"rot={rot_fit:.3f}° (need |rot|<0.2°)")
+            if _scale_ok and _rot_ok:
                 red_chi2 = chi2 / (2*len(h_b_idx) - 4)
                 red_cost = cost - np.log(2*len(h_b_idx) - 4)
                 zp_tier = np.median(gaia_f['mag'][g_b_full_idx] - hst_d['mag'][h_b_idx])
@@ -605,6 +630,8 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                       f"offsets(ds={best_ds:+.4f}): {peaks_str}")
 
     if not discovered:
+        if debug_verbose:
+            print(f"    DBG failure summary: {_dbg}")
         return None
     return min(discovered, key=lambda x: x['red_cost'])
 
@@ -858,14 +885,14 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         tree_gaia_all = KDTree(np.column_stack([x_g_in, y_g_in]))
 
         # --- 4P Discovery (tiered fallback) ---
-        # Round 1 — HST star candidates only (tight qfit/chi2 tiers, most reliable):
-        #   Tier 1: clean Gaia 5p (RUWE ≤ 1.4 + measured PM)
-        #   Tier 2: clean Gaia 5p + 2p (RUWE ≤ 1.4, any solution)
-        #   Tier 3: all Gaia (bad-RUWE allowed)
-        # Round 2 — all HST sources (stars + non-stars), more histogram pairs
-        # in sparse fields at the cost of noisier seeds:
-        #   Tier 4: clean Gaia 5p / all HST
-        #   Tier 5: clean Gaia 5p+2p / all HST
+        # Within each Gaia quality tier, try HST star candidates first, then
+        # all HST sources (stars + non-stars).  Only advance to a looser Gaia
+        # quality when both HST variants fail.
+        #   Tier 1: clean Gaia 5p / HST stars
+        #   Tier 2: clean Gaia 5p / all HST
+        #   Tier 3: clean Gaia 5p+2p / HST stars
+        #   Tier 4: clean Gaia 5p+2p / all HST
+        #   Tier 5: all Gaia / HST stars
         #   Tier 6: all Gaia / all HST  (last resort)
         # In all cases the Gaia seed only controls the offset histogram; affine
         # refinement and the final pass always use the full in-field Gaia catalog.
@@ -873,10 +900,10 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         _disc_tiers = [
             # (label,               Gaia seed mask,         HST data,          stars-only flag)
             ("clean 5p / HST stars",    in_clean & in_has_pms, hst_data,          True),
-            ("clean 5p+2p / HST stars", in_clean,              hst_data,          True),
-            ("all Gaia / HST stars",    _all_gaia,             hst_data,          True),
             ("clean 5p / all HST",      in_clean & in_has_pms, hst_data_all_disc, False),
+            ("clean 5p+2p / HST stars", in_clean,              hst_data,          True),
             ("clean 5p+2p / all HST",   in_clean,              hst_data_all_disc, False),
+            ("all Gaia / HST stars",    _all_gaia,             hst_data,          True),
             ("all Gaia / all HST",      _all_gaia,             hst_data_all_disc, False),
         ]
         best, used_tier, _used_stars_only = None, None, True
@@ -890,7 +917,8 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             best = _run_4p_discovery(_hst_d, gaia_field, params, max_mag_diff,
                                       scale_sweep=scale_sweep,
                                       discovery_max_offset=discovery_max_offset,
-                                      seed_quality_mask=_seed_mask)
+                                      seed_quality_mask=_seed_mask,
+                                      debug_verbose=True)
             if best is not None:
                 used_tier = _tier_name
                 _used_stars_only = _stars_only
