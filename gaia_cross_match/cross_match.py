@@ -434,7 +434,8 @@ def _save_offset_histogram(best, image_name, out_dir):
                            os.path.join(out_dir, 'offset_histogram.png'))
 
 
-def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, discovery_max_offset=50):
+def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, discovery_max_offset=50,
+                      seed_quality_mask=None):
     """
     Tier-walks qfit x mag limits to find a physically plausible 4P similarity seed.
 
@@ -480,14 +481,19 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                 continue
             h_idx_tier = np.where(h_mask)[0]
 
-            curr_keep = np.ones(len(xg_s)).astype(bool)
-            if np.sum(gaia_f['has_pms'][seed_idx]) >= 3:
-                curr_keep = gaia_f['has_pms'][seed_idx].copy()
+            if seed_quality_mask is not None:
+                hist_keep = seed_quality_mask[seed_idx]
+            else:
+                hist_keep = np.ones(len(xg_s), dtype=bool)
+                if np.sum(gaia_f['has_pms'][seed_idx]) >= 3:
+                    hist_keep = gaia_f['has_pms'][seed_idx].copy()
+            if np.sum(hist_keep) < 3:
+                continue
 
             best_ds, offset_peaks, tier_hist, tier_xed, tier_yed = find_scale_and_offset(
-                xg_s[curr_keep], yg_s[curr_keep], gaia_f['err'][seed_idx][curr_keep],
+                xg_s[hist_keep], yg_s[hist_keep], gaia_f['err'][seed_idx][hist_keep],
                 hst_d['x'][h_idx_tier], hst_d['y'][h_idx_tier], hst_d['mag'][h_idx_tier],
-                cov1=Cg_s[curr_keep], cov2=hst_d['C'][h_idx_tier],
+                cov1=Cg_s[hist_keep], cov2=hst_d['C'][h_idx_tier],
                 x_cen=params['x_cen'], y_cen=params['y_cen'],
                 max_offset=discovery_max_offset, bin_size=1, top_n=3,
                 ds_range=(-0.02, 0.02) if scale_sweep else (0.0, 0.0), n_scales=41 if scale_sweep else 1,
@@ -761,6 +767,15 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         ra_in, dec_in = ra_prop[in_field], dec_prop[in_field]
         in_has_pms = has_gaia_pms[in_field]
 
+        # Gaia quality flag: RUWE ≤ 1.4 (precomputed as clean_label during download).
+        if 'clean_label' in gaia_df.columns:
+            in_clean = gaia_df['clean_label'].values[in_field].astype(bool)
+        elif 'ruwe' in gaia_df.columns:
+            _ruwe = gaia_df['ruwe'].values[in_field]
+            in_clean = np.isfinite(_ruwe) & (_ruwe <= 1.4)
+        else:
+            in_clean = np.ones(int(in_field.sum()), dtype=bool)
+
         # --- Load HST catalog ---
         hst_cat = fits.getdata(hst['catalog'])
 
@@ -832,12 +847,38 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         }
         tree_gaia_all = KDTree(np.column_stack([x_g_in, y_g_in]))
 
-        # --- 4P Discovery ---
-        best = _run_4p_discovery(hst_data, gaia_field, params, max_mag_diff, scale_sweep=scale_sweep, discovery_max_offset=discovery_max_offset)
+        # --- 4P Discovery (tiered Gaia quality fallback) ---
+        # Tier 1: RUWE ≤ 1.4 + measured PM — cleanest positions and PMs.
+        # Tier 2: RUWE ≤ 1.4, any astrometric solution — adds 2p stars (PM=0,
+        #         large uncertainty via fillna in propagate_gaia_with_cov).
+        # Tier 3: all Gaia stars — last resort; bad-RUWE sources allowed.
+        #         Still gated by the scale/rotation sanity check inside discovery.
+        # The tier only controls the histogram seed; affine refinement and the
+        # final pass always use the full in-field Gaia catalog.
+        _disc_tiers = [
+            ("clean 5p",    in_clean & in_has_pms),
+            ("clean 5p+2p", in_clean),
+            ("all Gaia",    np.ones(len(x_g_in), dtype=bool)),
+        ]
+        best, used_tier = None, None
+        for _tier_name, _seed_mask in _disc_tiers:
+            _n_seed = int(_seed_mask.sum())
+            if _n_seed < 3:
+                print(f"  Skipping Gaia tier '{_tier_name}': only {_n_seed} stars available.")
+                continue
+            print(f"  Trying 4P discovery with {_tier_name} stars ({_n_seed} in field)...")
+            best = _run_4p_discovery(hst_data, gaia_field, params, max_mag_diff,
+                                      scale_sweep=scale_sweep,
+                                      discovery_max_offset=discovery_max_offset,
+                                      seed_quality_mask=_seed_mask)
+            if best is not None:
+                used_tier = _tier_name
+                break
+            print(f"  4P Discovery failed with {_tier_name} stars — trying next tier...")
         if best is None:
-            print(f"Finished {image_name}: 4P Discovery failed to find physically plausible matches.", file=original_stdout)
+            print(f"Finished {image_name}: 4P Discovery failed at all Gaia quality tiers.", file=original_stdout)
             return
-        print(f"  4P Discovery Succeeded: Best Tier Q<{best['q']}, Mag<{best['m']:.1f} "
+        print(f"  4P Discovery Succeeded [{used_tier}]: Best Tier Q<{best['q']}, Mag<{best['m']:.1f} "
               f"({best['n_match']} stars, red_chi2={best['red_chi2']:.2f}, red_cost={best['red_cost']:.2f})")
 
         # --- Save offset histogram plot for the best discovery tier ---
