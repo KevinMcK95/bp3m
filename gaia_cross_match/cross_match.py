@@ -568,7 +568,13 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                 J[:, 0, 0], J[:, 0, 1], J[:, 0, 2] = dxh_v, -dyh_v, 1.0
                 J[:, 1, 0], J[:, 1, 1], J[:, 1, 3] = dyh_v, dxh_v, 1.0
                 C_model = np.einsum('nij,jk,nlk->nil', J, C_params, J)
-                C_tot_v = gaia_f['C'][g_b_full_idx] + C_proj + C_model
+                # Add a 1px discovery floor so chi2/cost are on a consistent
+                # scale regardless of Gaia quality (5p vs 2p) or star brightness.
+                # Correct matches have small pixel residuals → negative costs;
+                # false matches have large residuals → positive costs.
+                # The floor does not affect sigma rejection (which uses ds_4p).
+                _disc_floor = np.eye(2)[np.newaxis] * 1.0**2
+                C_tot_v = gaia_f['C'][g_b_full_idx] + C_proj + C_model + _disc_floor
                 sigs_v = compute_mahalanobis(dx_v, dy_v, C_tot_v)
                 costs_v = compute_logprob_cost(dx_v, dy_v, C_tot_v)
                 chi2 = np.sum(sigs_v[curr_keep])
