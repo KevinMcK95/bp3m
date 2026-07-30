@@ -581,7 +581,12 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                 if not np.isfinite(thresh):
                     thresh = cur_rad
 
-                good_v = (ds_4p < thresh) & (np.abs(mag_diffs - zp) < max_mag_diff) & (sigs_v < 5.0)
+                # Discovery sigma-rejection uses only the pixel-distance threshold.
+                # Gaia formal uncertainties (~0.01px) are far smaller than the
+                # multi-pixel residuals expected from a noisy 4-5 pair 4P fit, so a
+                # Mahalanobis threshold (sigs_v < 5) would always reject all pairs.
+                # The scale/rotation sanity check below catches spurious transforms.
+                good_v = (ds_4p < thresh) & (np.abs(mag_diffs - zp) < max_mag_diff)
                 if np.sum(good_v) < 3:
                     break
                 if np.all(curr_keep == good_v):
@@ -596,8 +601,7 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                 if debug_verbose and _dbg['sigma_rej<3'] <= 3:
                     print(f"    DBG sigma_rej<3 q<{qlim} m<{mlim:.1f}: "
                           f"{len(mdf_seed)} pairs → {np.sum(good_v)} after rejection "
-                          f"(dists={np.round(np.sqrt(dx_v**2+dy_v**2),1).tolist()}, "
-                          f"sigs={np.round(sigs_v,2).tolist()})")
+                          f"(dists={np.round(np.sqrt(dx_v**2+dy_v**2),1).tolist()})")
                 continue
 
             scale_fit = np.sqrt(A*D - B*C)
