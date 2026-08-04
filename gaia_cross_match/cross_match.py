@@ -16,6 +16,7 @@ from scipy.spatial import KDTree
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from .miracle_match import miracle_match, rd2x, rd2y
 from .catalog_matcher import fit_affine_weighted, fit_4p_weighted, apply_affine, compute_mahalanobis, compute_logprob_cost, find_offset, find_scale_and_offset
+from bp3m.instrument_config import get_instrument_config
 
 def load_gaia_data(target, data_dir):
     gaia_path = os.path.join(data_dir, target, "Gaia", "*_gaia.csv")
@@ -114,18 +115,9 @@ def get_hst_params(flc_file, catalog_file=None):
         x_cen   = primary_hdr.get('CRPIX1', naxis1 / 2.0)
         y_cen   = primary_hdr.get('CRPIX2', naxis2 / 2.0) + primary_y_offset
         orientat = primary_hdr.get('ORIENTAT', 0.0)
-        if instrument == 'ACS' and detector == 'WFC':
-            pixel_scale = 0.050
-            initial_scale = 0.9945
-        elif instrument == 'WFC3' and detector == 'UVIS':
-            pixel_scale = 0.040
-            initial_scale = 0.9941
-        elif instrument == 'WFC3' and detector == 'IR':
-            pixel_scale = 0.128
-            initial_scale = 1.0
-        else:
-            pixel_scale = 0.05
-            initial_scale = 1.0
+        _icfg = get_instrument_config(instrument, detector)
+        pixel_scale   = _icfg["pixel_scale"]
+        initial_scale = _icfg["initial_scale"]
 
         expstart = header0.get('EXPSTART', 51544); obs_epoch_mjd = expstart
 

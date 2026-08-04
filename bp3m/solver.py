@@ -91,7 +91,7 @@ def _make_image_prior(meta, poly_order=1):
     n_r = n_r_from_poly_order(poly_order)
 
     rot_rad = meta["orig_rot_deg"] * DEG2RAD
-    s = 1.0
+    s = meta.get("initial_scale_ratio", 1.0)
     a = np.cos(rot_rad)
     b = np.sin(rot_rad)
     c = -np.sin(rot_rad)
@@ -455,13 +455,6 @@ class BP3MSolver:
                 if n_rej > 0:
                     print(f"    {img}: rejected {n_rej}/{n_before} stars with "
                           f"initial residual > {_INIT_RESID_CLIP_PX:.0f} px")
-
-            # ── Set prior mean from cross-match solution ──────────────────────
-            # When transformation.csv provides (a,b,c,d), override the WCS-only
-            # prior mean so that Phase-0 residuals are computed at the correct
-            # transformation and stars can be re-admitted when no data contribute.
-            if _n_fcm:
-                r_prior[:_n_fcm] = fcm_abcd[:_n_fcm]
 
             self.gaia_n_hst_used[sidx[good_for_fitting]] += 1
 

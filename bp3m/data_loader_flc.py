@@ -38,6 +38,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from astropy.io import fits
+from bp3m.instrument_config import get_instrument_config
 
 # Minimum position uncertainty floor applied to PSF-fit centroids before they
 # reach BP3M.  Prevents astronomically large sigma_resid values for very bright
@@ -157,6 +158,10 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
         "orig_pixel_scale": orig_pixel_scale_mas,  # mas/pix (nominal, from CSV)
         "orig_rot_deg":    -orientat,
         "pixel_scale_ratio": ratio,
+        # Nominal initial scale ratio for this instrument/detector — used as
+        # the prior mean for pixel scale in _make_image_prior.  Sourced from
+        # instrument_config so cross-match and BP3M prior stay in sync.
+        "initial_scale_ratio": get_instrument_config(instrument, detector)["initial_scale"],
         "on_skew":  on_skew,
         "off_skew": off_skew,
         # Timing
