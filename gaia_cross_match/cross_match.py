@@ -622,7 +622,7 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                           f"rot={rot_fit:.3f}° (need |rot|<0.2°)")
             if _scale_ok and _rot_ok:
                 red_chi2 = chi2 / (2*len(h_b_idx) - 4)
-                red_cost = cost - np.log(2*len(h_b_idx) - 4)
+                red_cost = cost / len(h_b_idx)
                 zp_tier = np.median(gaia_f['mag'][g_b_full_idx] - hst_d['mag'][h_b_idx])
                 discovered.append({
                     'A': A, 'B': B, 'C': C, 'D': D,
