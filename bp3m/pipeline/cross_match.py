@@ -127,15 +127,12 @@ def _match_one(args):
     params_path = root / 'xmatch_params.json'
 
     try:
-        # Remove legacy sidecars and output before running so an interrupted
-        # or rejected match leaves no stale cache that could mark incomplete
-        # results as valid (e.g. process_single_image returning early on a
-        # spurious 4P seed should not leave the old matched_gaia.csv behind).
+        # Remove legacy sidecar before running.
         if params_path.exists():
             params_path.unlink()
+
         out = root / 'matched_gaia.csv'
-        if out.exists():
-            out.unlink()
+        pre_mtime = out.stat().st_mtime if out.exists() else None
 
         process_single_image(
             hst_dict, gaia_df,
@@ -147,14 +144,19 @@ def _match_one(args):
             discovery_max_offset=kwargs.get('discovery_max_offset', 50),
             use_resid_floor=kwargs.get('use_resid_floor', True),
         )
-        n = len(pd.read_csv(str(out))) if out.exists() else 0
-        if out.exists() and n > 0:
+        post_mtime = out.stat().st_mtime if out.exists() else None
+        file_updated = post_mtime is not None and post_mtime != pre_mtime
+        n = len(pd.read_csv(str(out))) if file_updated else 0
+        if file_updated and n > 0:
             if params_meta:
                 params_path.write_text(json.dumps(params_meta, indent=2))
             _write_xmatch_status(root, 'success', params_meta, n_matched=n)
         else:
-            # No output file produced (e.g. "4P Discovery failed") — treat as
-            # failed so subsequent runs skip rather than retry indefinitely.
+            # No new output (process_single_image returned early or found no
+            # matches).  Delete any stale matched_gaia.csv so the old result
+            # isn't mistaken for a fresh success on the next run.
+            if out.exists():
+                out.unlink()
             _write_xmatch_status(root, 'failed', params_meta,
                                   reason='no matches found (gaia_cross_match produced no output)')
         return name, n, None
