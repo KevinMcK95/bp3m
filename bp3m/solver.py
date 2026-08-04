@@ -56,15 +56,16 @@ _SIGMA_POS = 1e6   # effectively flat prior on Δα*, Δδ  (all sources)
 _SIGMA_PM  = 100.0  # mas/yr  (2p / HST-only only)
 
 # Image transformation prior uncertainties (1-sigma).
-# Empirically calibrated on Leo I, Fornax, and NGC 55 (110 half-images):
-#   Δrot rms ≈ 0.015°  p99 ≈ 0.063°  → 0.1° gives 1.6× margin on p99
-#   Δscale rms ≈ 0.5%  p99 ≈ 0.6%   → 1.5% gives 2.5× margin on p99
-#   skew rms ≈ 0.05–0.1%            → 0.5% gives 5× margin on p99
-# These are ~5–30× tighter than the previous values, which improves EM
-# convergence and reduces seed-specific bias in marginalised posteriors.
-_SIGMA_ROT_DEG  = 0.1    # degrees
-_SIGMA_SCALE    = 1.5e-2  # fractional pixel scale ratio
-_SIGMA_SKEW     = 5e-3   # on- and off-axis skew terms
+# Calibrated from posterior scatter across n_stars_alignment>50 images
+# (ACS n=3036, WFC3/UVIS n=1680) using robust percentile statistics:
+#   delta_ratio 68%hw ~ 0.0001  95%hw ~ 0.004  → 0.0002 gives 2× margin on 68%hw
+#   delta_rot   68%hw ~ 0.015°  95%hw ~ 0.037° → 0.05° gives 3× margin on 68%hw
+#   skew        68%hw ~ 0.0001  95%hw ~ 0.0007 → 0.001 gives 10× margin on 68%hw
+# 95% tails are outlier-driven; tighter priors actively regularise poorly-
+# constrained images (few stars) without impacting high-quality fits.
+_SIGMA_ROT_DEG  = 0.05   # degrees
+_SIGMA_SCALE    = 2e-4   # fractional pixel scale ratio
+_SIGMA_SKEW     = 1e-3   # on- and off-axis skew terms
 _SIGMA_POINTING = 5000.0  # RA0,Dec0 (MAS) = 5 arcsec; ~100 ACS WFC pixels; loose enough
                           # to absorb real HST pointing error, tight enough to regularise
                           # the tangent-point update in _update_geometry
