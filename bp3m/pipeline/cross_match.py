@@ -25,6 +25,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pandas as pd
 
+from bp3m.instrument_config import SIGMA_ROT_DEG, SIGMA_SCALE, SIGMA_SKEW
+
 
 def _find_image_folders(output_dir: Path, field_name: str,
                          telescope: str = 'HST', im_type: str = '_flc') -> list[dict]:
@@ -284,6 +286,9 @@ def run_cross_match(
         'scale_sweep':          scale_sweep,
         'discovery_max_offset': discovery_max_offset,
         'use_resid_floor':      use_resid_floor,
+        'sigma_rot_deg':        SIGMA_ROT_DEG,
+        'sigma_scale':          SIGMA_SCALE,
+        'sigma_skew':           SIGMA_SKEW,
     }
 
     work = []

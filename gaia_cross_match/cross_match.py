@@ -16,7 +16,7 @@ from scipy.spatial import KDTree
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from .miracle_match import miracle_match, rd2x, rd2y
 from .catalog_matcher import fit_affine_weighted, fit_4p_weighted, apply_affine, compute_mahalanobis, compute_logprob_cost, find_offset, find_scale_and_offset
-from bp3m.instrument_config import get_instrument_config
+from bp3m.instrument_config import get_instrument_config, SIGMA_ROT_DEG, SIGMA_SCALE, SIGMA_SKEW
 
 def load_gaia_data(target, data_dir):
     gaia_path = os.path.join(data_dir, target, "Gaia", "*_gaia.csv")
@@ -548,7 +548,10 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                     xg_b[curr_keep], yg_b[curr_keep],
                     hst_d['C'][h_b_idx[curr_keep]],
                     gaia_f['C'][g_b_full_idx[curr_keep]],
-                    initial_M=cur_M)
+                    initial_M=cur_M,
+                    scale_prior=params['initial_scale'],
+                    scale_sigma=SIGMA_SCALE,
+                    rot_sigma=np.radians(SIGMA_ROT_DEG))
                 A, B, C, D, xs_o, ys_o, xt_o, yt_o = res_4p
                 cur_M = np.array([[A, B], [C, D]])
 
@@ -658,7 +661,8 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
     xh_b, yh_b = hst_d['x'][h_idx_b], hst_d['y'][h_idx_b]
     xg_b, yg_b = gaia_f['x'][g_idx_b], gaia_f['y'][g_idx_b]
     fit_res, _, C_params, _ = fit_affine_weighted(
-        xh_b, yh_b, xg_b, yg_b, hst_d['C'][h_idx_b], gaia_f['C'][g_idx_b], initial_M=M)
+        xh_b, yh_b, xg_b, yg_b, hst_d['C'][h_idx_b], gaia_f['C'][g_idx_b],
+        initial_M=M, skew_prior=SIGMA_SKEW)
     A, B, C, D, xs_o, ys_o, xt_o, yt_o = fit_res
     M = np.array([[A, B], [C, D]])
 
@@ -712,7 +716,7 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
         h_f, g_f = good['h'].values, good['g'].values
         fit_res_new, _, C_params, _ = fit_affine_weighted(
             hst_d['x'][h_f], hst_d['y'][h_f], gaia_f['x'][g_f], gaia_f['y'][g_f],
-            hst_d['C'][h_f], gaia_f['C'][g_f], initial_M=M)
+            hst_d['C'][h_f], gaia_f['C'][g_f], initial_M=M, skew_prior=SIGMA_SKEW)
         change = np.abs(fit_res_new[0] - A) + np.abs(fit_res_new[1] - B)
         A, B, C, D, xs_o, ys_o, xt_o, yt_o = fit_res_new
         M = np.array([[A, B], [C, D]])

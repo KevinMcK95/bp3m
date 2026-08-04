@@ -42,6 +42,12 @@ from .astro_utils import (
     abcd_from_rotation_pixscale_skew, n_r_from_poly_order, compute_poly_jacobian,
     get_tele_position, michalik_sigma_plx_prior, RAD2MAS, DEG2RAD, GAIA_SYS_DICT
 )
+from .instrument_config import (
+    SIGMA_ROT_DEG  as _SIGMA_ROT_DEG,
+    SIGMA_SCALE    as _SIGMA_SCALE,
+    SIGMA_SKEW     as _SIGMA_SKEW,
+    SIGMA_POINTING as _SIGMA_POINTING,
+)
 
 N_R = 8     # r_j dimensions for poly_order=1 (backward-compat constant)
 N_V = 5     # v_T,i dimensions: (Δα*, Δδ, μα*, μδ, ϖ)
@@ -55,20 +61,9 @@ N_V = 5     # v_T,i dimensions: (Δα*, Δδ, μα*, μδ, ϖ)
 _SIGMA_POS = 1e6   # effectively flat prior on Δα*, Δδ  (all sources)
 _SIGMA_PM  = 100.0  # mas/yr  (2p / HST-only only)
 
-# Image transformation prior uncertainties (1-sigma).
-# Calibrated from posterior scatter across n_stars_alignment>50 images
-# (ACS n=3036, WFC3/UVIS n=1680) using robust percentile statistics:
-#   delta_ratio 68%hw ~ 0.0001  95%hw ~ 0.004  → 0.0002 gives 2× margin on 68%hw
-#   delta_rot   68%hw ~ 0.015°  95%hw ~ 0.037° → 0.05° gives 3× margin on 68%hw
-#   skew        68%hw ~ 0.0001  95%hw ~ 0.0007 → 0.001 gives 10× margin on 68%hw
-# 95% tails are outlier-driven; tighter priors actively regularise poorly-
-# constrained images (few stars) without impacting high-quality fits.
-_SIGMA_ROT_DEG  = 0.05   # degrees
-_SIGMA_SCALE    = 2e-4   # fractional pixel scale ratio
-_SIGMA_SKEW     = 1e-3   # on- and off-axis skew terms
-_SIGMA_POINTING = 5000.0  # RA0,Dec0 (MAS) = 5 arcsec; ~100 ACS WFC pixels; loose enough
-                          # to absorb real HST pointing error, tight enough to regularise
-                          # the tangent-point update in _update_geometry
+# Image transformation prior uncertainties (1-sigma) are defined in
+# instrument_config.py (SIGMA_ROT_DEG, SIGMA_SCALE, SIGMA_SKEW, SIGMA_POINTING)
+# and imported above as _SIGMA_* for backward compatibility with pipeline imports.
 
 # Initial residual filter applied in _precompute_geometry.
 # Stars whose corrected 2D residual (after removing bulk w,z offset)

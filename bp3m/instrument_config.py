@@ -1,10 +1,10 @@
 """
-Per-instrument nominal pixel scale and initial scale ratio for BP3M.
+Per-instrument nominal pixel scale, initial scale ratio, and shared fitting
+hyperpriors for BP3M.
 
-These values are used both in the Gaia cross-matching step (as the initial
-guess for the affine scale) and as the prior mean for the pixel scale ratio
-in the BP3M fit.  Keeping them in a single place ensures the two steps stay
-consistent whenever the values are updated.
+INSTRUMENT_CONFIG and SIGMA_* are used both in the Gaia cross-matching step
+and in the BP3M alignment fit so the two stages always use consistent priors.
+Keeping them here ensures any update propagates to both automatically.
 
 initial_scale ratios were derived from the posterior median pixel_scale_mas /
 nominal_pixel_scale_mas across all fields with n_stars_alignment > 50
@@ -25,6 +25,16 @@ INSTRUMENT_CONFIG = {
 
 # Fallback for unknown instruments
 _DEFAULT_CONFIG = {"pixel_scale": 0.050, "initial_scale": 1.0}
+
+# ---------------------------------------------------------------------------
+# Shared fitting hyperpriors
+# Used by both the Gaia cross-matching step (catalog_matcher.py) and the
+# BP3M alignment solver (solver.py).  Update here to propagate everywhere.
+# ---------------------------------------------------------------------------
+SIGMA_ROT_DEG  = 0.05     # rotation prior width (degrees)
+SIGMA_SCALE    = 2e-4     # pixel scale ratio prior width (fractional)
+SIGMA_SKEW     = 1e-3     # on- and off-axis skew prior width
+SIGMA_POINTING = 5000.0   # pointing offset prior width (mas); ~100 ACS pixels
 
 
 def get_instrument_config(instrument: str, detector: str) -> dict:
