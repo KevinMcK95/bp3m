@@ -2629,6 +2629,7 @@ def run_pop_fit(
         json.dump(mu_result, _f, indent=2)
 
     # 7. run_config.json
+    from bp3m.solver import _SIGMA_ROT_DEG, _SIGMA_SCALE, _SIGMA_SKEW, _SIGMA_POINTING
     with open(output_pfr / 'run_config.json', 'w') as _f:
         json.dump({
             'poly_order': poly_order, 'n_r_per_image': solver.N_R,
@@ -2643,6 +2644,20 @@ def run_pop_fit(
             'mu_pop_dec': float(mu_pop_current[1]),
             'n_members': int(len(member_sidx)),
             'split_ccd': v1_split_ccd,
+            'prior_hyperparams': {
+                'sigma_rot_deg':      _SIGMA_ROT_DEG,
+                'sigma_scale':        _SIGMA_SCALE,
+                'sigma_skew':         _SIGMA_SKEW,
+                'sigma_pointing_mas': _SIGMA_POINTING,
+            },
+            'image_priors': {
+                img: {
+                    'r_prior':       solver._img_data[img]['r_prior'].tolist(),
+                    'C_r_prior_inv': solver._img_data[img]['C_r_prior_inv'].tolist(),
+                }
+                for img in image_names
+                if img in solver._img_data
+            },
         }, _f, indent=2)
     print(f"  Saved: mu_pop.json, run_config.json")
 

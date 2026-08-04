@@ -566,12 +566,30 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
 
     # 6. Machine-readable run configuration for downstream tools (e.g. hst_catalog_crossmatch)
     import json as _json
+    from bp3m.solver import _SIGMA_ROT_DEG, _SIGMA_SCALE, _SIGMA_SKEW, _SIGMA_POINTING
     config = {
         'poly_order':   solver.poly_order,
         'n_r_per_image': solver.N_R,
         'n_images':     len(image_names),
         'n_stars':      solver.n_stars,
         'image_names':  image_names,   # ordered to match C_r blocks
+        # Prior hyperparameters (same for all images; per-image means below)
+        'prior_hyperparams': {
+            'sigma_rot_deg':     _SIGMA_ROT_DEG,
+            'sigma_scale':       _SIGMA_SCALE,
+            'sigma_skew':        _SIGMA_SKEW,
+            'sigma_pointing_mas': _SIGMA_POINTING,
+        },
+        # Per-image prior: mean vector r_prior and precision matrix C_r_prior_inv
+        # (C_r_prior_inv varies per image because the Jacobian depends on rotation)
+        'image_priors': {
+            img: {
+                'r_prior':       solver._img_data[img]['r_prior'].tolist(),
+                'C_r_prior_inv': solver._img_data[img]['C_r_prior_inv'].tolist(),
+            }
+            for img in image_names
+            if img in solver._img_data
+        },
     }
     if run_config:
         config.update(run_config)
