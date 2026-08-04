@@ -674,6 +674,7 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
     dx_v, dy_v = xg_b - xh_in_g, yg_b - yh_in_g
     resid_sigma_x = 0.5 * np.diff(np.nanpercentile(dx_v, [16, 84]))[0]
     resid_sigma_y = 0.5 * np.diff(np.nanpercentile(dy_v, [16, 84]))[0]
+    init_resid_x, init_resid_y = resid_sigma_x, resid_sigma_y
     resid_cov = np.diag(np.array([resid_sigma_x, resid_sigma_y])**2) if use_resid_floor else np.zeros((2, 2))
 
     ratio, rot = np.sqrt(A*D-B*C), np.degrees(np.arctan2(B-C, A+D))
@@ -735,7 +736,7 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
         if it > 5 and change < 1e-11:
             break
 
-    return A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f
+    return A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f, init_resid_x, init_resid_y
 
 
 # ---------------------------------------------------------------------------
@@ -951,21 +952,16 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             best_all = {**best, 'h_v': star_indices[best['h_v']]}
         else:
             best_all = best
-        A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f = \
+        A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f, _init_rx, _init_ry = \
             _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor)
 
-        # Sanity check: if the 4P seed was spurious, the affine refinement
-        # diverges and produces pixel-scale residuals.  Correct matches have
-        # sub-pixel residuals (<0.5px); reject anything > 2px.
-        _xh_ref, _yh_ref = apply_affine(hst_data_all['x'][h_f], hst_data_all['y'][h_f],
-                                         A, B, C, D, xs_o, ys_o, xt_o, yt_o)
-        _dx_ref = gaia_field['x'][g_f] - _xh_ref
-        _dy_ref = gaia_field['y'][g_f] - _yh_ref
-        _ref_x = 0.5 * np.diff(np.nanpercentile(_dx_ref, [16, 84]))[0]
-        _ref_y = 0.5 * np.diff(np.nanpercentile(_dy_ref, [16, 84]))[0]
-        if max(_ref_x, _ref_y) > 2.0:
-            print(f"Finished {image_name}: Refinement residuals too large "
-                  f"({_ref_x:.2f},{_ref_y:.2f}px) — spurious 4P seed, skipping.", file=original_stdout)
+        # Sanity check: if the 4P seed was spurious, the Init 6P residuals
+        # (on the seed pairs before any iteration inflates resid_cov) are large.
+        # Correct matches have sub-pixel Init 6P residuals; wrong matches have
+        # multi-pixel residuals even before the 6P iterates.
+        if max(_init_rx, _init_ry) > 2.0:
+            print(f"Finished {image_name}: Init 6P residuals too large "
+                  f"({_init_rx:.2f},{_init_ry:.2f}px) — spurious 4P seed, skipping.", file=original_stdout)
             return
 
         M = np.array([[A, B], [C, D]])
