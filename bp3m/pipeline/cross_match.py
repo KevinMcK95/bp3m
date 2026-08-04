@@ -127,10 +127,15 @@ def _match_one(args):
     params_path = root / 'xmatch_params.json'
 
     try:
-        # Remove legacy sidecar before running so an interrupted match
-        # leaves no stale cache that could mark incomplete results as valid.
+        # Remove legacy sidecars and output before running so an interrupted
+        # or rejected match leaves no stale cache that could mark incomplete
+        # results as valid (e.g. process_single_image returning early on a
+        # spurious 4P seed should not leave the old matched_gaia.csv behind).
         if params_path.exists():
             params_path.unlink()
+        out = root / 'matched_gaia.csv'
+        if out.exists():
+            out.unlink()
 
         process_single_image(
             hst_dict, gaia_df,
@@ -142,7 +147,6 @@ def _match_one(args):
             discovery_max_offset=kwargs.get('discovery_max_offset', 50),
             use_resid_floor=kwargs.get('use_resid_floor', True),
         )
-        out = root / 'matched_gaia.csv'
         n = len(pd.read_csv(str(out))) if out.exists() else 0
         if out.exists() and n > 0:
             if params_meta:
