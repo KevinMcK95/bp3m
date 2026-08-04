@@ -197,18 +197,18 @@ def _parse_args():
 
     # ── Cross-matching ────────────────────────────────────────────────────────
     xm = p.add_argument_group('Cross-matching (fast_cross_match)')
-    xm.add_argument('--cross_match_pix_floor', type=float, default=0.05,
-                    help='HST positional uncertainty floor in pixels applied during cross-matching (default 0.05)')
+    xm.add_argument('--cross_match_pix_floor', type=float, default=0.5,
+                    help='HST positional uncertainty floor in pixels applied during cross-matching (default 0.5)')
     xm.add_argument('--min_matches', type=int, default=3,
                     help='Minimum seed matches for 4P discovery (default 3)')
-    xm.add_argument('--max_mag_diff', type=float, default=3.0,
-                    help='Maximum Gaia–HST magnitude difference (default 3.0)')
+    xm.add_argument('--max_mag_diff', type=float, default=5.0,
+                    help='Maximum Gaia–HST magnitude difference (default 5.0)')
     xm.add_argument('--scale_sweep', action='store_true',
                     help='Enable pixel-scale sweep during 4P discovery (slower)')
     xm.add_argument('--discovery_max_offset', type=int, default=50,
                     help='Half-width of the offset histogram search during 4P discovery in pixels (default 50)')
-    xm.add_argument('--no_resid_floor', action='store_true',
-                    help='Disable the per-iteration empirical residual covariance floor during affine refinement')
+    xm.add_argument('--auto_resid_floor', action='store_true',
+                    help='Enable the per-iteration empirical residual covariance floor during affine refinement (default: off)')
     xm.add_argument('--no_qso_anchors', action='store_true',
                     help='Skip QSO anchor vetting (Quaia + MILLIQUAS cross-match + '
                          'astrometric cut). By default QSO vetting runs after cross-matching '
@@ -771,7 +771,7 @@ def main():
             max_mag_diff=args.max_mag_diff,
             scale_sweep=args.scale_sweep,
             discovery_max_offset=args.discovery_max_offset,
-            use_resid_floor=not args.no_resid_floor,
+            use_resid_floor=args.auto_resid_floor,
             force_rematch=args.force_rematch,
             restrict_to_obsids=_restrict,
             lib_dir=Path(args.lib_dir) if args.lib_dir else None,
