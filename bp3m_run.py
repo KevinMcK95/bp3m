@@ -216,7 +216,7 @@ def _parse_args():
 
     # ── Alignment (BP3M) ──────────────────────────────────────────────────────
     bp = p.add_argument_group('Bayesian alignment (BP3M)')
-    bp.add_argument('--n_bp3m_iter', type=int, default=20,
+    bp.add_argument('--n_bp3m_iter', type=int, default=50,
                     help='Maximum BP3M outer iterations (default 20)')
     bp.add_argument('--n_samples', type=int, default=1000,
                     help='Posterior samples for uncertainty estimation (default 1000). '
@@ -250,7 +250,7 @@ def _parse_args():
     bp.add_argument('--no_influence_clip', action='store_true',
                     help='Disable test-4 Cook\'s D influence clipping (default: enabled; '
                          'targets moderate-outlier high-leverage detections missed by the sigma threshold)')
-    bp.add_argument('--influence_d_thresh', type=float, default=1.0,
+    bp.add_argument('--influence_d_thresh', type=float, default=2.0,
                     help="Cook's D threshold for influence clipping (default 1.0)")
     bp.add_argument('--influence_sigma_min', type=float, default=5.0,
                     help='Minimum sigma_resid for influence clipping (default 2.0; '

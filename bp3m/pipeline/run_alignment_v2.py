@@ -634,7 +634,7 @@ def run_alignment_v2(
     hst_max_per_image: int = 1000,
     outlier_sigma: float = 5.0,
     use_influence_clip: bool = True,
-    influence_d_thresh: float = 1.0,   # same as V1; auto-scaled by V1/V2 C_r ratio at runtime
+    influence_d_thresh: float = 2.0,   # auto-scaled by V1/V2 C_r ratio at runtime
     influence_sigma_min: float = 5.0,
     hst_pm_sigma_diffuse: float = 100.0,
     bp3m_dir: Path | None = None,
