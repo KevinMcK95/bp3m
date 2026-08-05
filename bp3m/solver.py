@@ -74,16 +74,24 @@ _INIT_RESID_CLIP_PX = 100.0
 
 
 
-def _make_image_prior(meta, poly_order=1):
+def _make_image_prior(meta, poly_order=1,
+                      sigma_rot_deg=None, sigma_scale=None,
+                      sigma_skew=None, sigma_pointing=None):
     """
     Return (r_prior_j, C_r_prior_inv_j) for image j.
 
     r_j = (a, b, c, d, Δα0, Δδ0 [, poly terms...])
     Prior:
       (a,b,c,d) — from header rotation/scale (strong prior)
-      (Δα0,Δδ0) — sigma = _SIGMA_POINTING mas (loose; ~100 ACS WFC pixels)
+      (Δα0,Δδ0) — sigma = sigma_pointing mas (loose; ~100 ACS WFC pixels)
       poly terms — zero mean, flat prior (determined entirely by data)
+
+    sigma_* override the module-level defaults from instrument_config.py.
     """
+    if sigma_rot_deg  is None: sigma_rot_deg  = _SIGMA_ROT_DEG
+    if sigma_scale    is None: sigma_scale    = _SIGMA_SCALE
+    if sigma_skew     is None: sigma_skew     = _SIGMA_SKEW
+    if sigma_pointing is None: sigma_pointing = _SIGMA_POINTING
     n_r = n_r_from_poly_order(poly_order)
 
     rot_rad = meta["orig_rot_deg"] * DEG2RAD
@@ -105,7 +113,7 @@ def _make_image_prior(meta, poly_order=1):
         [-s*cr, -sr,  0,  1],
         [-s*sr,  cr, -1,  0],
     ])
-    sigma = np.array([_SIGMA_ROT_DEG * DEG2RAD, _SIGMA_SCALE, _SIGMA_SKEW, _SIGMA_SKEW])
+    sigma = np.array([sigma_rot_deg * DEG2RAD, sigma_scale, sigma_skew, sigma_skew])
     C_abcd = J @ np.diag(sigma**2) @ J.T   # (4, 4)
 
     # Full n_r × n_r prior precision matrix
@@ -115,8 +123,8 @@ def _make_image_prior(meta, poly_order=1):
     except np.linalg.LinAlgError:
         C_r_prior_inv[:4, :4] = np.diag(1.0 / np.diag(C_abcd + 1e-30 * np.eye(4)))
 
-    C_r_prior_inv[4, 4] = _SIGMA_POINTING ** -2  # Δα0
-    C_r_prior_inv[5, 5] = _SIGMA_POINTING ** -2  # Δδ0
+    C_r_prior_inv[4, 4] = sigma_pointing ** -2  # Δα0
+    C_r_prior_inv[5, 5] = sigma_pointing ** -2  # Δδ0
     # Indices 6+ (poly terms) remain zero — flat prior.
 
     return r_prior, C_r_prior_inv
@@ -138,7 +146,9 @@ class BP3MSolver:
 
     def __init__(self, images, stars_per_image, gaia_catalog,
                  star_id_to_idx, image_names, star_in_image,
-                 poly_order=1, exclude_2p_from_alignment=False):
+                 poly_order=1, exclude_2p_from_alignment=False,
+                 prior_sigma_rot_deg=None, prior_sigma_scale=None,
+                 prior_sigma_skew=None, prior_sigma_pointing=None):
         """
         Parameters
         ----------
@@ -148,12 +158,19 @@ class BP3MSolver:
               2 → adds degree-2 terms — 14 parameters per image
               3 → adds degree-2 and degree-3 terms — 22 parameters per image
             N_R(p) = 2 + (p+1)*(p+2)
+        prior_sigma_rot_deg, prior_sigma_scale, prior_sigma_skew, prior_sigma_pointing : float or None
+            Override the plate prior widths from instrument_config.py.
+            None uses the module-level defaults.
         """
         if poly_order < 1:
             raise ValueError(f"poly_order must be ≥ 1, got {poly_order}")
         self.poly_order = poly_order
         self.N_R = n_r_from_poly_order(poly_order)
         self.exclude_2p_from_alignment = exclude_2p_from_alignment
+        self._prior_sigma_rot_deg  = prior_sigma_rot_deg
+        self._prior_sigma_scale    = prior_sigma_scale
+        self._prior_sigma_skew     = prior_sigma_skew
+        self._prior_sigma_pointing = prior_sigma_pointing
 
         self.images = images
         self.stars_per_image = stars_per_image
@@ -410,7 +427,13 @@ class BP3MSolver:
             for k in range(n):
                 C_hst[k] = hst_position_cov(x_err[k], y_err[k], xy_cor[k])
 
-            r_prior, C_r_prior_inv = _make_image_prior(meta, poly_order=self.poly_order)
+            r_prior, C_r_prior_inv = _make_image_prior(
+                meta, poly_order=self.poly_order,
+                sigma_rot_deg=self._prior_sigma_rot_deg,
+                sigma_scale=self._prior_sigma_scale,
+                sigma_skew=self._prior_sigma_skew,
+                sigma_pointing=self._prior_sigma_pointing,
+            )
 
             # ── Build r_init (initial iterate) ───────────────────────────────
             # When transformation.csv provides (a,b,c,d) from fast_cross_match,

@@ -250,6 +250,14 @@ def _parse_args():
     bp.add_argument('--no_influence_clip', action='store_true',
                     help='Disable test-4 Cook\'s D influence clipping (default: enabled; '
                          'targets moderate-outlier high-leverage detections missed by the sigma threshold)')
+    bp.add_argument('--prior_sigma_rot_deg', type=float, default=None,
+                    help='Plate rotation prior width in degrees (default 0.05; pre-2026-08-04: 0.1)')
+    bp.add_argument('--prior_sigma_scale', type=float, default=None,
+                    help='Plate scale prior width, fractional (default 2e-4; pre-2026-08-04: 1.5e-2)')
+    bp.add_argument('--prior_sigma_skew', type=float, default=None,
+                    help='Plate skew prior width (default 1e-3; pre-2026-08-04: 5e-3)')
+    bp.add_argument('--prior_sigma_pointing', type=float, default=None,
+                    help='Pointing offset prior width in mas (default 5000.0)')
     bp.add_argument('--inflate_alpha_max', type=float, default=3.0,
                     help='Per-iteration cap on the alpha error-inflation multiplier (default 3.0; '
                          'pre-2026-08-05 default was 10.0)')
@@ -952,6 +960,10 @@ def main():
                         bp3m_min_stars=0,
                         checkpoint_dir=None,
                         use_influence_clip=not args.no_influence_clip,
+                        prior_sigma_rot_deg=args.prior_sigma_rot_deg,
+                        prior_sigma_scale=args.prior_sigma_scale,
+                        prior_sigma_skew=args.prior_sigma_skew,
+                        prior_sigma_pointing=args.prior_sigma_pointing,
                         inflate_alpha_max=args.inflate_alpha_max,
                         influence_d_thresh=args.influence_d_thresh,
                         influence_sigma_min=args.influence_sigma_min,
@@ -1002,6 +1014,10 @@ def main():
                 bp3m_min_stars=args.bp3m_min_stars,
                 checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
                 use_influence_clip=not args.no_influence_clip,
+                prior_sigma_rot_deg=args.prior_sigma_rot_deg,
+                prior_sigma_scale=args.prior_sigma_scale,
+                prior_sigma_skew=args.prior_sigma_skew,
+                prior_sigma_pointing=args.prior_sigma_pointing,
                 inflate_alpha_max=args.inflate_alpha_max,
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,
@@ -1060,6 +1076,10 @@ def main():
                 bp3m_min_stars=args.bp3m_min_stars,
                 checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
                 use_influence_clip=not args.no_influence_clip,
+                prior_sigma_rot_deg=args.prior_sigma_rot_deg,
+                prior_sigma_scale=args.prior_sigma_scale,
+                prior_sigma_skew=args.prior_sigma_skew,
+                prior_sigma_pointing=args.prior_sigma_pointing,
                 inflate_alpha_max=args.inflate_alpha_max,
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,

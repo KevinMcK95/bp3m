@@ -46,6 +46,10 @@ def run_alignment(  # noqa: C901
     bp3m_min_stars: int = 0,
     bp3m_dir: Path | None = None,
     checkpoint_dir: Path | None = None,
+    prior_sigma_rot_deg: float | None = None,
+    prior_sigma_scale: float | None = None,
+    prior_sigma_skew: float | None = None,
+    prior_sigma_pointing: float | None = None,
     inflate_alpha_max: float = 3.0,
     use_influence_clip: bool = True,
     influence_d_thresh: float = 1.0,
@@ -212,7 +216,11 @@ def run_alignment(  # noqa: C901
     solver = SolverClass(imgs, filtered_spi, gaia_catalog,
                           star_id_to_idx, image_names, star_in_image,
                           poly_order=poly_order,
-                          exclude_2p_from_alignment=exclude_2p_from_alignment)
+                          exclude_2p_from_alignment=exclude_2p_from_alignment,
+                          prior_sigma_rot_deg=prior_sigma_rot_deg,
+                          prior_sigma_scale=prior_sigma_scale,
+                          prior_sigma_skew=prior_sigma_skew,
+                          prior_sigma_pointing=prior_sigma_pointing)
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
 
