@@ -59,6 +59,7 @@ def run_alignment(  # noqa: C901
     gaia_epoch_obs: Optional[dict] = None,
     exclude_2p_from_alignment: bool = False,
     gaia_csv: "Path | None" = None,
+    verbose_tests: bool = False,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -300,6 +301,7 @@ def run_alignment(  # noqa: C901
         use_influence_clip=use_influence_clip,
         influence_d_thresh=influence_d_thresh,
         influence_sigma_min=influence_sigma_min,
+        verbose_tests=verbose_tests,
         use_two_tier=use_two_tier,
         no_align_prior=no_align_prior,
     )
