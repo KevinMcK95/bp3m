@@ -924,6 +924,12 @@ def run_pop_fit_rotation(
     min_stars_split_ccd = int(v1_cfg.get('min_stars_split_ccd', 20))
     poly_order          = int(v1_cfg.get('poly_order', 1))
 
+    _v1_hp = v1_cfg.get('prior_hyperparams', {})
+    v1_prior_sigma_rot_deg  = _v1_hp.get('sigma_rot_deg',     None)
+    v1_prior_sigma_scale    = _v1_hp.get('sigma_scale',        None)
+    v1_prior_sigma_skew     = _v1_hp.get('sigma_skew',         None)
+    v1_prior_sigma_pointing = _v1_hp.get('sigma_pointing_mas', None)
+
     print("\n" + "─" * 60)
     print("BP3M pop-fit (rotation model)")
     print("─" * 60)
@@ -1051,7 +1057,11 @@ def run_pop_fit_rotation(
     # ── Build solver ──────────────────────────────────────────────────────────
     solver = BP3MSolver(imgs, filtered_spi, gaia_catalog,
                         star_id_to_idx, image_names, star_in_image,
-                        poly_order=poly_order)
+                        poly_order=poly_order,
+                        prior_sigma_rot_deg=v1_prior_sigma_rot_deg,
+                        prior_sigma_scale=v1_prior_sigma_scale,
+                        prior_sigma_skew=v1_prior_sigma_skew,
+                        prior_sigma_pointing=v1_prior_sigma_pointing)
     print(f"Stars: {solver.n_stars}  N_R/image: {solver.N_R}")
 
     # ── Load v1 r_hat and alpha ────────────────────────────────────────────────
@@ -1650,10 +1660,10 @@ def run_pop_fit_rotation(
             'fit_f': fit_f,
             'fit_theta': fit_theta,
             'prior_hyperparams': {
-                'sigma_rot_deg':      _SIGMA_ROT_DEG,
-                'sigma_scale':        _SIGMA_SCALE,
-                'sigma_skew':         _SIGMA_SKEW,
-                'sigma_pointing_mas': _SIGMA_POINTING,
+                'sigma_rot_deg':      solver._prior_sigma_rot_deg,
+                'sigma_scale':        solver._prior_sigma_scale,
+                'sigma_skew':         solver._prior_sigma_skew,
+                'sigma_pointing_mas': solver._prior_sigma_pointing,
             },
             'image_priors': {
                 img: {
