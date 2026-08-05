@@ -1128,10 +1128,9 @@ class BP3MSolver:
             influence_d_thresh AND sigma_resid > influence_sigma_min.
             Cook's D captures moderate-residual, high-leverage detections that
             pass the sigma threshold but disproportionately pull r_hat.
-            Flags are re-evaluated fresh each outer iteration (not accumulated),
-            so a star excluded in one iteration can re-enter if it is no longer
-            high-influence at the updated r_hat.  Convergence is declared when
-            the flagged set is the same as the previous iteration.
+            Uses ratchet semantics: flagged pairs are permanently excluded
+            (never re-admitted by tests 1-3), guaranteeing monotonic convergence
+            of n_inf_new toward 0.
         influence_d_thresh : float, default 1.0
             Cook's D threshold for test-4.  D > 1 means removing this detection
             shifts r_hat by more than one sqrt(C_r) length.
@@ -1279,11 +1278,11 @@ class BP3MSolver:
 
         # ── Phase 2: EM-style outlier rejection ───────────────────────────────
         # Tests 1-3 (chi² / sigma) and test-4 (Cook's D influence) run
-        # together in the same outer loop.  Test-4 re-evaluates influence_excl
-        # fresh each outer iteration (reset before _update_use_for_fit), so
-        # a star that was high-influence at one r_hat can re-enter if the
-        # updated r_hat no longer makes it high-influence.  Convergence is
-        # declared when the test-4 flagged count is the same as last iteration.
+        # together in the same outer loop.  Test-4 uses a ratchet: newly
+        # flagged detections are added to _img_data[img]["influence_excl"],
+        # which _update_use_for_fit treats as a permanent ceiling so they
+        # can never be re-admitted by tests 1-3.  The ratchet guarantees
+        # monotonic convergence: n_inf_new decreases toward 0.
         _default_min = 4 if inflate_hst_errors else 2
         min_outer = int(min_outer_iters) if min_outer_iters is not None else _default_min
 
@@ -1356,18 +1355,8 @@ class BP3MSolver:
 
             ok_star_prev = np.ones(self.n_stars, dtype=bool)
             _n_consec_stable = 0  # consecutive iters with 0 tests-1/2/3 changes
-            n_inf_prev = -1       # test-4 count from previous iteration (-1 = not yet run)
 
             for it_outer in range(n_iter):
-                # Reset influence_excl before _update_use_for_fit so influence-
-                # excluded stars can re-enter via tests 1-3 and test-4 evaluates
-                # fresh Cook's D at the current r_hat.
-                if use_influence_clip and it_outer >= min_outer:
-                    for _img in self.image_names:
-                        _d = self._img_data.get(_img)
-                        if _d is not None and "influence_excl" in _d:
-                            _d["influence_excl"][:] = False
-
                 clip_info, ok_star_new, n_use_changed = self._update_use_for_fit(
                     r_hat, a_arr, C_r, C_vT, clip_sigma, iteration=it_outer,
                     ok_star_prev=ok_star_prev, inflate_errors=inflate_hst_errors,
@@ -1421,15 +1410,13 @@ class BP3MSolver:
 
                 ok_star_prev = ok_star_new.copy()
 
-                # Convergence: tests 1-2 stable AND test-4 flagged same count as
-                # previous iteration (same r_hat → same Cook's D → same stars).
+                # Convergence: tests 1-2 stable AND test-4 found nothing new.
+                # The ratchet guarantees n_inf_new → 0, so this always terminates.
                 if (n_global_changed == 0 and n_use_changed == 0
-                        and n_inf_new == n_inf_prev
+                        and n_inf_new == 0
                         and it_outer >= min_outer):
                     print(f"  Tests 1-4 stable — stopping.")
                     break
-
-                n_inf_prev = n_inf_new
 
                 r_hat, C_r, a_arr, K_img, C_vT = _inner_converge(
                     r_hat, f'outer {it_outer+1}')
@@ -1837,16 +1824,16 @@ class BP3MSolver:
     def _apply_influence_clip(self, r_hat, C_r, a_arr,
                                cooks_d_thresh=1.0, sigma_min=5.0):
         """
-        Test-4: influence-based clipping, re-evaluated fresh each outer iteration.
+        Test-4: influence-based clipping with ratchet semantics.
 
         Flags star-image pairs where Cook's D > cooks_d_thresh AND
-        sigma_resid > sigma_min.  Newly flagged pairs are written to
-        ``_img_data[img]["influence_excl"]``, which _update_use_for_fit
-        respects as a ceiling for the remainder of that outer iteration.
-        The caller resets influence_excl to all-False before each call so
-        the flagged set is always computed from the current r_hat.
-        Convergence is declared when the flagged count equals the previous
-        iteration's count (same r_hat → same Cook's D → same stars).
+        sigma_resid > sigma_min that are not already influence-excluded.
+        Newly flagged pairs are added to ``_img_data[img]["influence_excl"]``,
+        a persistent boolean mask that _update_use_for_fit respects as a hard
+        ceiling — flagged pairs are never re-admitted by tests 1-3.
+
+        The ratchet guarantees monotonic convergence: the influence_excl set
+        only grows, so the count of *new* flags must eventually reach zero.
 
         Cook's D_k = (X_k^T Cs_k^{-1} resid_k)^T C_r_j (X_k^T Cs_k^{-1} resid_k) / N_R
 
