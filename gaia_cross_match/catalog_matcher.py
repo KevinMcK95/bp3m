@@ -96,6 +96,10 @@ def fit_affine_weighted(x_src, y_src, x_tgt, y_tgt, cov_src, cov_tgt, initial_M=
         # scale, and skew jointly via the Jacobian at the current M estimate.
         C_abcd_inv = _make_abcd_prior_inv(initial_M, sigma_rot_deg, sigma_scale, sigma_skew)
         lhs[np.ix_(abcd_idx, abcd_idx)] += C_abcd_inv
+        # RHS term: pull toward prior mean = initial_M (not toward zero)
+        A0, B0, C0, D0 = (initial_M[0,0], initial_M[0,1], initial_M[1,0], initial_M[1,1]
+                          ) if initial_M is not None else (1.0, 0.0, 0.0, 1.0)
+        rhs[abcd_idx] += C_abcd_inv @ np.array([A0, B0, C0, D0])
     elif skew_prior > 0:
         # Legacy fallback: only constrains (A-D) and (B+C).
         w_prior = 1.0 / (skew_prior**2)
