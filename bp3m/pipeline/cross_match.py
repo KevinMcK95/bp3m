@@ -25,7 +25,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pandas as pd
 
-from bp3m.instrument_config import SIGMA_ROT_DEG, SIGMA_SCALE, SIGMA_SKEW
+from bp3m.instrument_config import (
+    SIGMA_ROT_DEG   as _DEFAULT_SIGMA_ROT_DEG,
+    SIGMA_SCALE     as _DEFAULT_SIGMA_SCALE,
+    SIGMA_SKEW      as _DEFAULT_SIGMA_SKEW,
+)
 
 
 def _find_image_folders(output_dir: Path, field_name: str,
@@ -216,6 +220,9 @@ def run_cross_match(
     restrict_to_obsids: list[str] | None = None,
     lib_dir: "Path | None" = None,
     run_qso_vetting: bool = False,
+    prior_sigma_rot_deg: float | None = None,
+    prior_sigma_scale: float | None = None,
+    prior_sigma_skew: float | None = None,
 ) -> list[Path]:
     """
     Cross-match all PSF-fit HST catalogs in a field against Gaia.
@@ -286,9 +293,9 @@ def run_cross_match(
         'scale_sweep':          scale_sweep,
         'discovery_max_offset': discovery_max_offset,
         'use_resid_floor':      use_resid_floor,
-        'sigma_rot_deg':        SIGMA_ROT_DEG,
-        'sigma_scale':          SIGMA_SCALE,
-        'sigma_skew':           SIGMA_SKEW,
+        'sigma_rot_deg':        prior_sigma_rot_deg if prior_sigma_rot_deg is not None else _DEFAULT_SIGMA_ROT_DEG,
+        'sigma_scale':          prior_sigma_scale   if prior_sigma_scale   is not None else _DEFAULT_SIGMA_SCALE,
+        'sigma_skew':           prior_sigma_skew    if prior_sigma_skew    is not None else _DEFAULT_SIGMA_SKEW,
     }
 
     work = []

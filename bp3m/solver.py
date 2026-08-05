@@ -167,10 +167,10 @@ class BP3MSolver:
         self.poly_order = poly_order
         self.N_R = n_r_from_poly_order(poly_order)
         self.exclude_2p_from_alignment = exclude_2p_from_alignment
-        self._prior_sigma_rot_deg  = prior_sigma_rot_deg
-        self._prior_sigma_scale    = prior_sigma_scale
-        self._prior_sigma_skew     = prior_sigma_skew
-        self._prior_sigma_pointing = prior_sigma_pointing
+        self._prior_sigma_rot_deg  = prior_sigma_rot_deg  if prior_sigma_rot_deg  is not None else _SIGMA_ROT_DEG
+        self._prior_sigma_scale    = prior_sigma_scale    if prior_sigma_scale    is not None else _SIGMA_SCALE
+        self._prior_sigma_skew     = prior_sigma_skew     if prior_sigma_skew     is not None else _SIGMA_SKEW
+        self._prior_sigma_pointing = prior_sigma_pointing if prior_sigma_pointing is not None else _SIGMA_POINTING
 
         self.images = images
         self.stars_per_image = stars_per_image
@@ -429,10 +429,10 @@ class BP3MSolver:
 
             r_prior, C_r_prior_inv = _make_image_prior(
                 meta, poly_order=self.poly_order,
-                sigma_rot_deg=self._prior_sigma_rot_deg,
-                sigma_scale=self._prior_sigma_scale,
-                sigma_skew=self._prior_sigma_skew,
-                sigma_pointing=self._prior_sigma_pointing,
+                sigma_rot_deg  = self._prior_sigma_rot_deg,
+                sigma_scale    = self._prior_sigma_scale,
+                sigma_skew     = self._prior_sigma_skew,
+                sigma_pointing = self._prior_sigma_pointing,
             )
 
             # ── Build r_init (initial iterate) ───────────────────────────────

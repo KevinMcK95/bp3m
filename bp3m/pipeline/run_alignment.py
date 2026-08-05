@@ -590,10 +590,10 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
         'image_names':  image_names,   # ordered to match C_r blocks
         # Prior hyperparameters (same for all images; per-image means below)
         'prior_hyperparams': {
-            'sigma_rot_deg':     _SIGMA_ROT_DEG,
-            'sigma_scale':       _SIGMA_SCALE,
-            'sigma_skew':        _SIGMA_SKEW,
-            'sigma_pointing_mas': _SIGMA_POINTING,
+            'sigma_rot_deg':      solver._prior_sigma_rot_deg,
+            'sigma_scale':        solver._prior_sigma_scale,
+            'sigma_skew':         solver._prior_sigma_skew,
+            'sigma_pointing_mas': solver._prior_sigma_pointing,
         },
         # Per-image prior: mean vector r_prior and precision matrix C_r_prior_inv
         # (C_r_prior_inv varies per image because the Jacobian depends on rotation)

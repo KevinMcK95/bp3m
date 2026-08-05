@@ -793,6 +793,9 @@ def main():
             restrict_to_obsids=_restrict,
             lib_dir=Path(args.lib_dir) if args.lib_dir else None,
             run_qso_vetting=False,
+            prior_sigma_rot_deg=args.prior_sigma_rot_deg,
+            prior_sigma_scale=args.prior_sigma_scale,
+            prior_sigma_skew=args.prior_sigma_skew,
         )
 
     # ── Step 4b: Gaia DR4 epoch astrometry (optional) ────────────────────────
