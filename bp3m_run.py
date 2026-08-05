@@ -252,7 +252,7 @@ def _parse_args():
                          'targets moderate-outlier high-leverage detections missed by the sigma threshold)')
     bp.add_argument('--influence_d_thresh', type=float, default=1.0,
                     help="Cook's D threshold for influence clipping (default 1.0)")
-    bp.add_argument('--influence_sigma_min', type=float, default=2.0,
+    bp.add_argument('--influence_sigma_min', type=float, default=5.0,
                     help='Minimum sigma_resid for influence clipping (default 2.0; '
                          'prevents removing well-fit high-leverage anchors)')
     bp.add_argument('--two_tier', action='store_true',
