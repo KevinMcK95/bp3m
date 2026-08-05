@@ -1131,9 +1131,11 @@ class BP3MSolver:
             Uses ratchet semantics: flagged pairs are permanently excluded
             (never re-admitted by tests 1-3), guaranteeing monotonic convergence
             of n_inf_new toward 0.
-        influence_d_thresh : float, default 1.0
-            Cook's D threshold for test-4.  D > 1 means removing this detection
-            shifts r_hat by more than one sqrt(C_r) length.
+        influence_d_thresh : float, default 2.0
+            Threshold on the null-normalised Cook's D (scaled_D = D*N_R/leverage).
+            Under the null E[scaled_D] = 1 regardless of image density, so
+            scaled_D > d_thresh means the detection is d_thresh times more
+            influential than expected for a well-fitting star.
         influence_sigma_min : float, default 5.0
             Minimum sigma_resid for a detection to be flagged by test-4.
             Prevents removing well-fit high-leverage stars (low residual, high
@@ -1826,7 +1828,7 @@ class BP3MSolver:
         """
         Test-4: influence-based clipping with ratchet semantics.
 
-        Flags star-image pairs where Cook's D > cooks_d_thresh AND
+        Flags star-image pairs where scaled_D > cooks_d_thresh AND
         sigma_resid > sigma_min that are not already influence-excluded.
         Newly flagged pairs are added to ``_img_data[img]["influence_excl"]``,
         a persistent boolean mask that _update_use_for_fit respects as a hard
@@ -1837,11 +1839,20 @@ class BP3MSolver:
 
         Cook's D_k = (X_k^T Cs_k^{-1} resid_k)^T C_r_j (X_k^T Cs_k^{-1} resid_k) / N_R
 
-        Under the null, E[D_k] = leverage_k / N_R, so D_k > 1 means the
-        one-step Newton shift in r_hat from removing this detection exceeds
-        one sqrt(C_r) length.  Combined with sigma_resid > sigma_min, this
-        targets moderate-outlier / high-leverage detections that pass the
-        sigma threshold but disproportionately pull r_hat.
+        Under the null, E[D_k] = leverage_k / N_R, where
+        leverage_k = tr(Cs_k^{-1} X_k C_r_j X_k^T).
+
+        Raw D_k is biased against sparse images: with few stars per image,
+        leverage_k is large so E[D_k] >> 1 even for well-fitting stars.
+        We therefore compare the null-normalised statistic:
+
+            scaled_D_k = D_k * N_R / leverage_k
+
+        Under the null E[scaled_D_k] = 1 regardless of image density, so
+        the threshold cooks_d_thresh has the same meaning for dense and sparse
+        images.  Combined with sigma_resid > sigma_min, this targets
+        detections whose influence is cooks_d_thresh times larger than
+        expected for a well-fitting star.
 
         Returns
         -------
@@ -1887,10 +1898,21 @@ class BP3MSolver:
             delta_r = XtCsR @ C_r_j
             cooks_d = np.sum(XtCsR * delta_r, axis=1) / nr
 
+            # Leverage: tr(Cs_inv_k @ X_k @ C_r_j @ X_k^T)  — (n,) scalar per star
+            XCrX     = np.einsum('nik,kl,njl->nij', X_mat, C_r_j, X_mat)  # (n,2,2)
+            leverage = np.einsum('nij,nji->n', Cs_inv, XCrX)               # (n,)
+
+            # Null-normalised Cook's D: scaled_D = D * N_R / leverage.
+            # E[scaled_D] = 1 under the null regardless of image density,
+            # so cooks_d_thresh means the same thing for sparse and dense images.
+            # Guard against near-zero leverage (numerically degenerate stars).
+            safe_lev  = np.where(leverage > 1e-12, leverage, np.inf)
+            scaled_d  = cooks_d * nr / safe_lev
+
             # Only consider pairs currently in use and not already excluded
             new_flag = (use
                         & ~already_excl
-                        & (cooks_d > cooks_d_thresh)
+                        & (scaled_d > cooks_d_thresh)
                         & (sigma_resid > sigma_min))
 
             if new_flag.any():
