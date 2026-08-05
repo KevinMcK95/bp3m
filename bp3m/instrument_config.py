@@ -32,7 +32,7 @@ _DEFAULT_CONFIG = {"pixel_scale": 0.050, "initial_scale": 1.0}
 # BP3M alignment solver (solver.py).  Update here to propagate everywhere.
 # ---------------------------------------------------------------------------
 SIGMA_ROT_DEG  = 0.05     # rotation prior width (degrees)
-SIGMA_SCALE    = 2e-4     # pixel scale ratio prior width (fractional)
+SIGMA_SCALE    = 5e-4     # pixel scale ratio prior width (fractional)
 SIGMA_SKEW     = 2e-4     # on- and off-axis skew prior width
 SIGMA_POINTING = 5000.0   # pointing offset prior width (mas); ~100 ACS pixels
 
