@@ -633,6 +633,7 @@ def run_alignment_v2(
     hst_max_pm_unc: float = 5.0,
     hst_max_per_image: int = 1000,
     outlier_sigma: float = 5.0,
+    inflate_alpha_max: float = 3.0,
     use_influence_clip: bool = True,
     influence_d_thresh: float = 2.0,   # auto-scaled by V1/V2 C_r ratio at runtime
     influence_sigma_min: float = 5.0,
@@ -1341,6 +1342,7 @@ def run_alignment_v2(
         n_iter=n_iter,
         clip_sigma=clip,
         inflate_hst_errors=True,   # alpha computed from data, same as v1
+        inflate_alpha_max=inflate_alpha_max,
         inflate_from_iter=0,       # v1 alpha is pre-validated: allow decrease from iter 0
         min_outer_iters=_min_outer,
         hst_fit_sigma_mult=0.5,    # HST-only must have tighter residuals to stay in alignment
