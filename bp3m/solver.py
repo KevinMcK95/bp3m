@@ -96,13 +96,8 @@ def _make_image_prior(meta, poly_order=1,
 
     rot_rad = meta["orig_rot_deg"] * DEG2RAD
     s = meta.get("initial_scale_ratio", 1.0)
-    a = np.cos(rot_rad)
-    b = np.sin(rot_rad)
-    c = -np.sin(rot_rad)
-    d = np.cos(rot_rad)
-
     r_prior = np.zeros(n_r)
-    r_prior[:4] = [a, b, c, d]
+    r_prior[:4] = [s*np.cos(rot_rad), s*np.sin(rot_rad), -s*np.sin(rot_rad), s*np.cos(rot_rad)]
     # r_prior[4:] = 0  (Δα0, Δδ0 and all poly terms start at zero)
 
     # Jacobian ∂(a,b,c,d)/∂(rot_rad, scale_ratio, on_skew, off_skew)
