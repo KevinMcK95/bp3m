@@ -255,6 +255,9 @@ def _parse_args():
     bp.add_argument('--influence_sigma_min', type=float, default=5.0,
                     help='Minimum sigma_resid for influence clipping (default 2.0; '
                          'prevents removing well-fit high-leverage anchors)')
+    bp.add_argument('--influence_min_frac', type=float, default=0.3,
+                    help='Min fraction of initial aligned stars to retain per image in '
+                         'test-4 (anti-cascade floor; default 0.3)')
     bp.add_argument('--two_tier', action='store_true',
                     help='Enable two-tier alignment/astrometry system: stars that fail '
                          'ok_gaia can still constrain their own astrometry at 3× the '
@@ -945,6 +948,7 @@ def main():
                         use_influence_clip=not args.no_influence_clip,
                         influence_d_thresh=args.influence_d_thresh,
                         influence_sigma_min=args.influence_sigma_min,
+                        influence_min_frac=args.influence_min_frac,
                         use_two_tier=args.two_tier,
                         no_align_prior=args.no_align_prior,
                         pos_err_floor=args.bp3m_pos_err_floor,
@@ -992,6 +996,7 @@ def main():
                 use_influence_clip=not args.no_influence_clip,
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,
+                influence_min_frac=args.influence_min_frac,
                 use_two_tier=args.two_tier,
                 no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
@@ -1047,6 +1052,7 @@ def main():
                 use_influence_clip=not args.no_influence_clip,
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,
+                influence_min_frac=args.influence_min_frac,
                 use_two_tier=args.two_tier,
                 no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,

@@ -1035,6 +1035,7 @@ class BP3MSolver:
             hst_fit_sigma_mult=0.5,
             prefilter=True, chi2_threshold=None, alpha_scale_chi2=False,
             use_influence_clip=True, influence_d_thresh=1.0, influence_sigma_min=5.0,
+            influence_min_frac=0.3,
             use_two_tier=False, per_iter_callback=None,
             use_soft_weights: bool = False,
             student_t_nu: float = 50.0,
@@ -1142,6 +1143,15 @@ class BP3MSolver:
             leverage is NOT a problem — it means the star is a good anchor).
             Raised to 5.0 (from the prior 2.0) to avoid over-clipping stars
             from long-baseline images where genuine Cook's D is naturally high.
+        influence_min_frac : float, default 0.3
+            Minimum fraction of an image's initial (first-call) aligned star
+            count that must be retained after influence exclusion.  The hard
+            floor per image is max(4, min_frac * n_use_0).  Within that budget,
+            stars are stripped in decreasing scaled_D order so the worst
+            offenders are always removed first.  The floor prevents cascade
+            collapse in sparse images: stripping a few stars raises leverage,
+            which would cause more stars to exceed the threshold without this
+            guard.
 
         per_iter_callback : callable or None, default None
             If provided, called as ``per_iter_callback(solver, it_outer)``
@@ -1387,7 +1397,8 @@ class BP3MSolver:
                     n_inf_new = self._apply_influence_clip(
                         r_hat, C_r, a_arr,
                         cooks_d_thresh=influence_d_thresh,
-                        sigma_min=influence_sigma_min)
+                        sigma_min=influence_sigma_min,
+                        min_frac=influence_min_frac)
                     n_total_changed += n_inf_new
 
                 print(f"\n  Outer iter {it_outer+1}: "
@@ -1824,7 +1835,8 @@ class BP3MSolver:
         return info, ok_star, n_use_changed
 
     def _apply_influence_clip(self, r_hat, C_r, a_arr,
-                               cooks_d_thresh=1.0, sigma_min=5.0):
+                               cooks_d_thresh=1.0, sigma_min=5.0,
+                               min_frac=0.3):
         """
         Test-4: influence-based clipping with ratchet semantics.
 
@@ -1854,6 +1866,20 @@ class BP3MSolver:
         detections whose influence is cooks_d_thresh times larger than
         expected for a well-fitting star.
 
+        To prevent cascade collapse in sparse images (stripping a few stars
+        raises leverage, causing more to flag, etc.), a per-image floor is
+        recorded on the first call: n_floor = max(4, min_frac * n_use_0).
+        Candidates are then stripped in decreasing scaled_D order, stopping
+        before the floor.  This ensures the worst offenders are removed first
+        without depleting an image to a degenerate state.
+
+        Parameters
+        ----------
+        min_frac : float
+            Minimum fraction of the original (first-call) aligned star count
+            to retain per image.  Default 0.3 — at most 70 % of stars may be
+            influence-excluded.
+
         Returns
         -------
         n_new : int  number of detections *newly* added to influence_excl
@@ -1870,10 +1896,12 @@ class BP3MSolver:
             if use.sum() < 4:
                 continue
 
-            # Initialise influence_excl on first call
+            # Initialise influence_excl and floor on first call
             if "influence_excl" not in d:
                 d["influence_excl"] = np.zeros(n, dtype=bool)
+                d["n_influence_floor"] = max(4, int(min_frac * use.sum()))
             already_excl = d["influence_excl"]
+            n_floor      = d["n_influence_floor"]
 
             cs    = j_idx * nr
             r_j   = r_hat[cs:cs + nr]
@@ -1909,18 +1937,27 @@ class BP3MSolver:
             safe_lev  = np.where(leverage > 1e-12, leverage, np.inf)
             scaled_d  = cooks_d * nr / safe_lev
 
-            # Only consider pairs currently in use and not already excluded
-            new_flag = (use
-                        & ~already_excl
-                        & (scaled_d > cooks_d_thresh)
-                        & (sigma_resid > sigma_min))
+            # Candidates: in-use, not already excluded, exceed both thresholds
+            candidates = (use
+                          & ~already_excl
+                          & (scaled_d > cooks_d_thresh)
+                          & (sigma_resid > sigma_min))
 
-            if new_flag.any():
-                # Guard: never drop below 4 stars per image
-                if (use & ~new_flag).sum() >= 4:
-                    d["influence_excl"] = already_excl | new_flag
-                    d["use_for_fit"]    = use & ~new_flag
-                    n_new += int(new_flag.sum())
+            if candidates.any():
+                # Strip in decreasing scaled_D order, stopping before n_floor.
+                # This removes the worst offenders first and prevents cascade
+                # collapse: as leverage grows with each stripped star, the floor
+                # cuts off the tail before the image becomes degenerate.
+                n_can_strip = max(0, use.sum() - n_floor)
+                if n_can_strip > 0:
+                    cand_idx = np.where(candidates)[0]
+                    order    = np.argsort(-scaled_d[cand_idx])
+                    take     = cand_idx[order[:n_can_strip]]
+                    actual_flag = np.zeros(n, dtype=bool)
+                    actual_flag[take] = True
+                    d["influence_excl"] = already_excl | actual_flag
+                    d["use_for_fit"]    = use & ~actual_flag
+                    n_new += int(actual_flag.sum())
 
         return n_new
 
