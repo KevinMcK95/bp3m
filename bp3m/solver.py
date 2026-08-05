@@ -1031,7 +1031,7 @@ class BP3MSolver:
     # ── Public fit interface ───────────────────────────────────────────────────
 
     def fit(self, n_iter=20, tol=1e-6, clip_sigma=4.5, inflate_hst_errors=False,
-            inflate_from_iter=3, inflate_alpha_max=10.0, min_outer_iters=None,
+            inflate_from_iter=3, inflate_alpha_max=3.0, min_outer_iters=None,
             hst_fit_sigma_mult=0.5,
             prefilter=True, chi2_threshold=None, alpha_scale_chi2=False,
             use_influence_clip=True, influence_d_thresh=1.0, influence_sigma_min=5.0,
@@ -1082,7 +1082,7 @@ class BP3MSolver:
             the very first EM iteration.  The update formula is always
             ``max(1.0, alpha_prev * alpha_raw)`` so alpha never drops below 1
             relative to C_hst_orig, regardless of this setting.
-        inflate_alpha_max : float, default 10.0
+        inflate_alpha_max : float, default 3.0
             Maximum value of alpha_raw allowed in a single iteration.  Caps
             explosive single-step alpha jumps that can occur when a poorly-
             constrained image shifts abruptly and drives residuals of other
@@ -1504,7 +1504,7 @@ class BP3MSolver:
                             adaptive_k=5.0, adaptive_delta=0.1,
                             sigma_pm_diffuse=100.0, sigma_plx_diffuse=20.0,
                             ok_star_prev=None, inflate_errors=False,
-                            inflate_from_iter=3, inflate_alpha_max=10.0,
+                            inflate_from_iter=3, inflate_alpha_max=3.0,
                             hst_fit_sigma_mult=0.5,
                             skip_star_tests=False,
                             chi2_threshold=None, alpha_scale_chi2=False):
