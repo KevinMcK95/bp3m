@@ -636,6 +636,7 @@ def run_alignment_v2(
     use_influence_clip: bool = True,
     influence_d_thresh: float = 2.0,   # auto-scaled by V1/V2 C_r ratio at runtime
     influence_sigma_min: float = 5.0,
+    influence_raw_cooks_d: bool = False,
     verbose_tests: bool = False,
     hst_pm_sigma_diffuse: float = 100.0,
     bp3m_dir: Path | None = None,
@@ -666,6 +667,7 @@ def run_alignment_v2(
     use_influence_clip : enable test-4 Cook's D influence clipping
     influence_d_thresh : Cook's D threshold
     influence_sigma_min : minimum sigma_resid for influence flagging
+    influence_raw_cooks_d : use raw Cook's D instead of null-normalised scaled_D
     verbose_tests : print per-iter breakdown of flagged dets by Gaia type (2p vs 5p/6p) and chip
     bp3m_dir      : override default bp3m location
     pos_err_floor : minimum positional uncertainty in pixels
@@ -1346,6 +1348,7 @@ def run_alignment_v2(
         use_influence_clip=use_influence_clip,
         influence_d_thresh=_infl_d_thresh_scaled,
         influence_sigma_min=influence_sigma_min,
+        influence_raw_cooks_d=influence_raw_cooks_d,
         verbose_tests=verbose_tests,
         use_two_tier=True,         # enables use_for_astrom tracking
         per_iter_callback=callback,

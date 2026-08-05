@@ -255,6 +255,9 @@ def _parse_args():
     bp.add_argument('--influence_sigma_min', type=float, default=5.0,
                     help='Minimum sigma_resid for influence clipping (default 2.0; '
                          'prevents removing well-fit high-leverage anchors)')
+    bp.add_argument('--influence_raw_cooks_d', action='store_true',
+                    help='Use raw Cook\'s D instead of null-normalised scaled_D=D*N_R/leverage. '
+                         'Raw D is biased against sparse images but matches pre-normalisation behaviour.')
     bp.add_argument('--verbose_tests', action='store_true',
                     help='Print per-iteration breakdown of flagged detections by '
                          'Gaia solution type (2p vs 5p/6p) and chip (_hi/_lo)')
@@ -948,6 +951,7 @@ def main():
                         use_influence_clip=not args.no_influence_clip,
                         influence_d_thresh=args.influence_d_thresh,
                         influence_sigma_min=args.influence_sigma_min,
+                        influence_raw_cooks_d=args.influence_raw_cooks_d,
                         verbose_tests=args.verbose_tests,
                         use_two_tier=args.two_tier,
                         no_align_prior=args.no_align_prior,
@@ -996,6 +1000,7 @@ def main():
                 use_influence_clip=not args.no_influence_clip,
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,
+                influence_raw_cooks_d=args.influence_raw_cooks_d,
                 verbose_tests=args.verbose_tests,
                 use_two_tier=args.two_tier,
                 no_align_prior=args.no_align_prior,
@@ -1052,6 +1057,7 @@ def main():
                 use_influence_clip=not args.no_influence_clip,
                 influence_d_thresh=args.influence_d_thresh,
                 influence_sigma_min=args.influence_sigma_min,
+                influence_raw_cooks_d=args.influence_raw_cooks_d,
                 verbose_tests=args.verbose_tests,
                 use_two_tier=args.two_tier,
                 no_align_prior=args.no_align_prior,

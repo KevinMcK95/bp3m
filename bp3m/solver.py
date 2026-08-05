@@ -1035,6 +1035,7 @@ class BP3MSolver:
             hst_fit_sigma_mult=0.5,
             prefilter=True, chi2_threshold=None, alpha_scale_chi2=False,
             use_influence_clip=True, influence_d_thresh=1.0, influence_sigma_min=5.0,
+            influence_raw_cooks_d=False,
             verbose_tests=False,
             use_two_tier=False, per_iter_callback=None,
             use_soft_weights: bool = False,
@@ -1143,6 +1144,11 @@ class BP3MSolver:
             leverage is NOT a problem — it means the star is a good anchor).
             Raised to 5.0 (from the prior 2.0) to avoid over-clipping stars
             from long-baseline images where genuine Cook's D is naturally high.
+        influence_raw_cooks_d : bool, default False
+            If True, compare raw Cook's D against the threshold instead of the
+            null-normalised scaled_D = D*N_R/leverage.  Raw D is biased against
+            sparse images (high leverage → elevated D even for well-fitting stars),
+            but can be useful for testing the effect of the normalisation.
         verbose_tests : bool, default False
             If True, print a per-iteration breakdown of flagged detections by
             Gaia solution type (2p vs 5p/6p) and by chip suffix (_hi/_lo)
@@ -1402,7 +1408,8 @@ class BP3MSolver:
                     n_inf_new, _t4_flagged_info = self._apply_influence_clip(
                         r_hat, C_r, a_arr,
                         cooks_d_thresh=influence_d_thresh,
-                        sigma_min=influence_sigma_min)
+                        sigma_min=influence_sigma_min,
+                        raw_cooks_d=influence_raw_cooks_d)
                     n_total_changed += n_inf_new
 
                 print(f"\n  Outer iter {it_outer+1}: "
@@ -1943,7 +1950,8 @@ class BP3MSolver:
               f"  (2p frac={(nu_2p/(nu_2p+nu_5p)):.2f})" if (nu_2p+nu_5p) else "")
 
     def _apply_influence_clip(self, r_hat, C_r, a_arr,
-                               cooks_d_thresh=1.0, sigma_min=5.0):
+                               cooks_d_thresh=1.0, sigma_min=5.0,
+                               raw_cooks_d=False):
         """
         Test-4: influence-based clipping with ratchet semantics.
 
@@ -2026,17 +2034,21 @@ class BP3MSolver:
             XCrX     = np.einsum('nik,kl,njl->nij', X_mat, C_r_j, X_mat)  # (n,2,2)
             leverage = np.einsum('nij,nji->n', Cs_inv, XCrX)               # (n,)
 
-            # Null-normalised Cook's D: scaled_D = D * N_R / leverage.
-            # E[scaled_D] = 1 under the null regardless of image density,
-            # so cooks_d_thresh means the same thing for sparse and dense images.
-            # Guard against near-zero leverage (numerically degenerate stars).
-            safe_lev  = np.where(leverage > 1e-12, leverage, np.inf)
-            scaled_d  = cooks_d * nr / safe_lev
+            # Cook's D statistic to compare against threshold.
+            # Default: null-normalised scaled_D = D * N_R / leverage so that
+            # E[scaled_D] = 1 regardless of image density.
+            # raw_cooks_d=True: use raw D (biased against sparse images but
+            # matches the pre-normalisation behaviour for testing).
+            if raw_cooks_d:
+                test_d = cooks_d
+            else:
+                safe_lev = np.where(leverage > 1e-12, leverage, np.inf)
+                test_d   = cooks_d * nr / safe_lev
 
             # Only consider pairs currently in use and not already excluded
             new_flag = (use
                         & ~already_excl
-                        & (scaled_d > cooks_d_thresh)
+                        & (test_d > cooks_d_thresh)
                         & (sigma_resid > sigma_min))
 
             if new_flag.any():
