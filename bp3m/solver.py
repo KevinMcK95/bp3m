@@ -47,6 +47,10 @@ from .instrument_config import (
     SIGMA_SCALE    as _SIGMA_SCALE,
     SIGMA_SKEW     as _SIGMA_SKEW,
     SIGMA_POINTING as _SIGMA_POINTING,
+    SIGMA_PAIR_ROT_DEG  as _SIGMA_PAIR_ROT_DEG,
+    SIGMA_PAIR_SCALE    as _SIGMA_PAIR_SCALE,
+    SIGMA_PAIR_SKEW     as _SIGMA_PAIR_SKEW,
+    SIGMA_PAIR_POINTING as _SIGMA_PAIR_POINTING,
 )
 
 N_R = 8     # r_j dimensions for poly_order=1 (backward-compat constant)
@@ -125,6 +129,48 @@ def _make_image_prior(meta, poly_order=1,
     return r_prior, C_r_prior_inv
 
 
+def _make_pair_coupling_inv(meta_hi, poly_order=1,
+                             sigma_pair_rot_deg=None, sigma_pair_scale=None,
+                             sigma_pair_skew=None, sigma_pair_pointing=None):
+    """
+    Return C_pair_inv (N_R × N_R) for the _hi/_lo chip coupling prior.
+
+    Prior: (param_hi − param_lo) ~ N(0, Σ_pair) for all 6 physical params
+    (rotation, scale, on_skew, off_skew, Δα0, Δδ0).  Poly terms (indices 6+)
+    are not coupled — higher-order distortions may genuinely differ per chip.
+
+    Caller adds +C_pair_inv to each chip's diagonal block and −C_pair_inv to
+    the off-diagonal cross blocks in H_rr.
+    """
+    if sigma_pair_rot_deg  is None: sigma_pair_rot_deg  = _SIGMA_PAIR_ROT_DEG
+    if sigma_pair_scale    is None: sigma_pair_scale    = _SIGMA_PAIR_SCALE
+    if sigma_pair_skew     is None: sigma_pair_skew     = _SIGMA_PAIR_SKEW
+    if sigma_pair_pointing is None: sigma_pair_pointing = _SIGMA_PAIR_POINTING
+
+    n_r = n_r_from_poly_order(poly_order)
+    rot_rad = meta_hi["orig_rot_deg"] * DEG2RAD
+    s = meta_hi.get("initial_scale_ratio", 1.0)
+    cr, sr = np.cos(rot_rad), np.sin(rot_rad)
+    J = np.array([
+        [-s*sr,  cr,  1,  0],
+        [ s*cr,  sr,  0,  1],
+        [-s*cr, -sr,  0,  1],
+        [-s*sr,  cr, -1,  0],
+    ])
+    sigma = np.array([sigma_pair_rot_deg * DEG2RAD, sigma_pair_scale,
+                      sigma_pair_skew, sigma_pair_skew])
+    C_pair_abcd = J @ np.diag(sigma ** 2) @ J.T
+
+    C_pair_inv = np.zeros((n_r, n_r))
+    try:
+        C_pair_inv[:4, :4] = np.linalg.inv(C_pair_abcd)
+    except np.linalg.LinAlgError:
+        C_pair_inv[:4, :4] = np.diag(1.0 / np.diag(C_pair_abcd + 1e-30 * np.eye(4)))
+    C_pair_inv[4, 4] = sigma_pair_pointing ** -2  # Δα0
+    C_pair_inv[5, 5] = sigma_pair_pointing ** -2  # Δδ0
+    return C_pair_inv
+
+
 class BP3MSolver:
     """
     Simultaneous HST-Gaia astrometric alignment and stellar PM/parallax update.
@@ -143,7 +189,9 @@ class BP3MSolver:
                  star_id_to_idx, image_names, star_in_image,
                  poly_order=1, exclude_2p_from_alignment=False,
                  prior_sigma_rot_deg=None, prior_sigma_scale=None,
-                 prior_sigma_skew=None, prior_sigma_pointing=None):
+                 prior_sigma_skew=None, prior_sigma_pointing=None,
+                 prior_sigma_pair_rot_deg=None, prior_sigma_pair_scale=None,
+                 prior_sigma_pair_skew=None, prior_sigma_pair_pointing=None):
         """
         Parameters
         ----------
@@ -166,6 +214,10 @@ class BP3MSolver:
         self._prior_sigma_scale    = prior_sigma_scale    if prior_sigma_scale    is not None else _SIGMA_SCALE
         self._prior_sigma_skew     = prior_sigma_skew     if prior_sigma_skew     is not None else _SIGMA_SKEW
         self._prior_sigma_pointing = prior_sigma_pointing if prior_sigma_pointing is not None else _SIGMA_POINTING
+        self._prior_sigma_pair_rot_deg  = prior_sigma_pair_rot_deg  if prior_sigma_pair_rot_deg  is not None else _SIGMA_PAIR_ROT_DEG
+        self._prior_sigma_pair_scale    = prior_sigma_pair_scale    if prior_sigma_pair_scale    is not None else _SIGMA_PAIR_SCALE
+        self._prior_sigma_pair_skew     = prior_sigma_pair_skew     if prior_sigma_pair_skew     is not None else _SIGMA_PAIR_SKEW
+        self._prior_sigma_pair_pointing = prior_sigma_pair_pointing if prior_sigma_pair_pointing is not None else _SIGMA_PAIR_POINTING
 
         self.images = images
         self.stars_per_image = stars_per_image
@@ -526,6 +578,36 @@ class BP3MSolver:
         for label, n_cat, n_img, n_admit, n_excl in rows:
             excl_str = f"  ← {n_excl} lost to ruwe/q_hst/resid filter" if n_excl > 0 else ""
             print(f"  {label:>3}  {n_cat:>7}  {n_img:>9}  {n_admit:>8}  {n_excl:>8}{excl_str}")
+
+        # ── Build _hi/_lo chip pair index and precomputed coupling matrices ──────
+        hi_map, lo_map = {}, {}
+        for j_idx, name in enumerate(self.image_names):
+            if name.endswith('_hi'):
+                hi_map[name[:-3]] = j_idx
+            elif name.endswith('_lo'):
+                lo_map[name[:-3]] = j_idx
+        self._chip_pairs = []
+        self._chip_pair_couplings = {}
+        for root, hi_idx in hi_map.items():
+            if root not in lo_map:
+                continue
+            lo_idx = lo_map[root]
+            meta_hi = self.images[self.image_names[hi_idx]]
+            C_cp = _make_pair_coupling_inv(
+                meta_hi, self.poly_order,
+                sigma_pair_rot_deg  = self._prior_sigma_pair_rot_deg,
+                sigma_pair_scale    = self._prior_sigma_pair_scale,
+                sigma_pair_skew     = self._prior_sigma_pair_skew,
+                sigma_pair_pointing = self._prior_sigma_pair_pointing,
+            )
+            self._chip_pairs.append((hi_idx, lo_idx))
+            self._chip_pair_couplings[(hi_idx, lo_idx)] = C_cp
+        if self._chip_pairs:
+            print(f"  Chip-pair coupling prior: {len(self._chip_pairs)} hi/lo pair(s)  "
+                  f"σ_pair=(rot={self._prior_sigma_pair_rot_deg}°, "
+                  f"scale={self._prior_sigma_pair_scale}, "
+                  f"skew={self._prior_sigma_pair_skew}, "
+                  f"point={self._prior_sigma_pair_pointing}mas)")
 
     def _init_transforms(self):
         """Initialise R_j (2×2 rotation matrix) from header info."""
@@ -938,6 +1020,15 @@ class BP3MSolver:
                 if not (self.exclude_2p_from_alignment and self.gaia_2p[i]):
                     h_align[i] += contrib['h_contrib']
 
+        # ── Hi/lo chip coupling prior: off-diagonal blocks in H_rr ───────────
+        for hi_idx, lo_idx in self._chip_pairs:
+            C_cp = self._chip_pair_couplings[(hi_idx, lo_idx)]
+            hi_cs, lo_cs = hi_idx * nr, lo_idx * nr
+            H_rr[hi_cs:hi_cs+nr, hi_cs:hi_cs+nr] += C_cp
+            H_rr[lo_cs:lo_cs+nr, lo_cs:lo_cs+nr] += C_cp
+            H_rr[hi_cs:hi_cs+nr, lo_cs:lo_cs+nr] -= C_cp
+            H_rr[lo_cs:lo_cs+nr, hi_cs:hi_cs+nr] -= C_cp
+
         # ── Invert H_vv → C_vT ────────────────────────────────────────────────
         C_vT    = np.linalg.inv(H_vv)
         a_align = np.einsum('nij,nj->ni', C_vT, h_align)  # for Schur complement rhs
@@ -997,6 +1088,14 @@ class BP3MSolver:
                 cs2 = j2_idx * nr
                 Cr_inv[cs:cs+nr,   cs2:cs2+nr] -= block
                 Cr_inv[cs2:cs2+nr, cs:cs+nr]   -= block.T
+
+        # ── Hi/lo chip coupling prior: rhs pull toward partner's current iterate ─
+        for hi_idx, lo_idx in self._chip_pairs:
+            C_cp = self._chip_pair_couplings[(hi_idx, lo_idx)]
+            hi_cs, lo_cs = hi_idx * nr, lo_idx * nr
+            diff = r_current[hi_cs:hi_cs+nr] - r_current[lo_cs:lo_cs+nr]
+            rhs[hi_cs:hi_cs+nr] -= C_cp @ diff
+            rhs[lo_cs:lo_cs+nr] += C_cp @ diff
 
         # ── Solve for Δr, then r_hat = r_current + Δr ─────────────────────────
         # Diagonal preconditioning: the (a,b,c,d) columns have scale ~2048 px

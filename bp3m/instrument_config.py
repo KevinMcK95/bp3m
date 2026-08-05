@@ -36,6 +36,16 @@ SIGMA_SCALE    = 5e-4     # pixel scale ratio prior width (fractional)
 SIGMA_SKEW     = 2e-4     # on- and off-axis skew prior width
 SIGMA_POINTING = 5000.0   # pointing offset prior width (mas); ~100 ACS pixels
 
+# ── Hi/lo chip-pair coupling prior ────────────────────────────────────────────
+# Constrains the *difference* between the two chips of the same ACS/WFC or
+# WFC3/UVIS exposure.  Helps anchor a data-starved chip to its partner.
+# Both chips experience the same telescope pointing, so all 6 parameters
+# (rotation, scale, skew, Δα0, Δδ0) are expected to be nearly identical.
+SIGMA_PAIR_ROT_DEG  = 0.01    # expected _hi/_lo rotation difference (deg)
+SIGMA_PAIR_SCALE    = 5e-4    # expected _hi/_lo scale difference
+SIGMA_PAIR_SKEW     = 2e-4    # expected _hi/_lo skew difference
+SIGMA_PAIR_POINTING = 100.0   # expected _hi/_lo pointing difference (mas)
+
 
 def get_instrument_config(instrument: str, detector: str) -> dict:
     """Return config dict for (instrument, detector), falling back to defaults."""

@@ -50,6 +50,10 @@ def run_alignment(  # noqa: C901
     prior_sigma_scale: float | None = None,
     prior_sigma_skew: float | None = None,
     prior_sigma_pointing: float | None = None,
+    prior_sigma_pair_rot_deg: float | None = None,
+    prior_sigma_pair_scale: float | None = None,
+    prior_sigma_pair_skew: float | None = None,
+    prior_sigma_pair_pointing: float | None = None,
     inflate_alpha_max: float = 3.0,
     use_influence_clip: bool = True,
     influence_d_thresh: float = 1.0,
@@ -220,7 +224,11 @@ def run_alignment(  # noqa: C901
                           prior_sigma_rot_deg=prior_sigma_rot_deg,
                           prior_sigma_scale=prior_sigma_scale,
                           prior_sigma_skew=prior_sigma_skew,
-                          prior_sigma_pointing=prior_sigma_pointing)
+                          prior_sigma_pointing=prior_sigma_pointing,
+                          prior_sigma_pair_rot_deg=prior_sigma_pair_rot_deg,
+                          prior_sigma_pair_scale=prior_sigma_pair_scale,
+                          prior_sigma_pair_skew=prior_sigma_pair_skew,
+                          prior_sigma_pair_pointing=prior_sigma_pair_pointing)
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
 
@@ -590,10 +598,14 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
         'image_names':  image_names,   # ordered to match C_r blocks
         # Prior hyperparameters (same for all images; per-image means below)
         'prior_hyperparams': {
-            'sigma_rot_deg':      solver._prior_sigma_rot_deg,
-            'sigma_scale':        solver._prior_sigma_scale,
-            'sigma_skew':         solver._prior_sigma_skew,
-            'sigma_pointing_mas': solver._prior_sigma_pointing,
+            'sigma_rot_deg':           solver._prior_sigma_rot_deg,
+            'sigma_scale':             solver._prior_sigma_scale,
+            'sigma_skew':              solver._prior_sigma_skew,
+            'sigma_pointing_mas':      solver._prior_sigma_pointing,
+            'sigma_pair_rot_deg':      solver._prior_sigma_pair_rot_deg,
+            'sigma_pair_scale':        solver._prior_sigma_pair_scale,
+            'sigma_pair_skew':         solver._prior_sigma_pair_skew,
+            'sigma_pair_pointing_mas': solver._prior_sigma_pair_pointing,
         },
         # Per-image prior: mean vector r_prior and precision matrix C_r_prior_inv
         # (C_r_prior_inv varies per image because the Jacobian depends on rotation)
