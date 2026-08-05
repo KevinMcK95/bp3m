@@ -427,7 +427,8 @@ def _save_offset_histogram(best, image_name, out_dir):
 
 
 def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, discovery_max_offset=50,
-                      seed_quality_mask=None, debug_verbose=False):
+                      seed_quality_mask=None, debug_verbose=False,
+                      sigma_rot_deg=None, sigma_scale=None):
     """
     Tier-walks qfit x mag limits to find a physically plausible 4P similarity seed.
 
@@ -550,8 +551,8 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                     gaia_f['C'][g_b_full_idx[curr_keep]],
                     initial_M=cur_M,
                     scale_prior=params['initial_scale'],
-                    scale_sigma=SIGMA_SCALE,
-                    rot_sigma=np.radians(SIGMA_ROT_DEG))
+                    scale_sigma=sigma_scale if sigma_scale is not None else SIGMA_SCALE,
+                    rot_sigma=np.radians(sigma_rot_deg if sigma_rot_deg is not None else SIGMA_ROT_DEG))
                 A, B, C, D, xs_o, ys_o, xt_o, yt_o = res_4p
                 cur_M = np.array([[A, B], [C, D]])
 
@@ -641,7 +642,8 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
     return min(discovered, key=lambda x: x['red_cost'])
 
 
-def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_resid_floor=True):
+def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_resid_floor=True,
+                           sigma_rot_deg=None, sigma_scale=None, sigma_skew=None):
     """
     Upgrades 4P seeds to a 6P affine transform and iterates until convergence.
 
@@ -662,7 +664,9 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
     xg_b, yg_b = gaia_f['x'][g_idx_b], gaia_f['y'][g_idx_b]
     fit_res, _, C_params, _ = fit_affine_weighted(
         xh_b, yh_b, xg_b, yg_b, hst_d['C'][h_idx_b], gaia_f['C'][g_idx_b],
-        initial_M=M, skew_prior=SIGMA_SKEW)
+        initial_M=M,
+        sigma_rot_deg=sigma_rot_deg, sigma_scale=sigma_scale, sigma_skew=sigma_skew,
+        skew_prior=SIGMA_SKEW if sigma_skew is None else 0)
     A, B, C, D, xs_o, ys_o, xt_o, yt_o = fit_res
     M = np.array([[A, B], [C, D]])
 
@@ -716,7 +720,9 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
         h_f, g_f = good['h'].values, good['g'].values
         fit_res_new, _, C_params, _ = fit_affine_weighted(
             hst_d['x'][h_f], hst_d['y'][h_f], gaia_f['x'][g_f], gaia_f['y'][g_f],
-            hst_d['C'][h_f], gaia_f['C'][g_f], initial_M=M, skew_prior=SIGMA_SKEW)
+            hst_d['C'][h_f], gaia_f['C'][g_f], initial_M=M,
+            sigma_rot_deg=sigma_rot_deg, sigma_scale=sigma_scale, sigma_skew=sigma_skew,
+            skew_prior=SIGMA_SKEW if sigma_skew is None else 0)
         change = np.abs(fit_res_new[0] - A) + np.abs(fit_res_new[1] - B)
         A, B, C, D, xs_o, ys_o, xt_o, yt_o = fit_res_new
         M = np.array([[A, B], [C, D]])
@@ -739,7 +745,7 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
 # Main per-image processor
 # ---------------------------------------------------------------------------
 
-def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True):
+def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True, sigma_rot_deg=None, sigma_scale=None, sigma_skew=None):
     start_time = time.time()
     image_name = os.path.basename(hst['flc']).replace("_flc.fits", "")
     log_file, original_stdout = os.path.join(hst['root'], "processing_log.txt"), sys.stdout
@@ -925,7 +931,9 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                                       scale_sweep=scale_sweep,
                                       discovery_max_offset=discovery_max_offset,
                                       seed_quality_mask=_seed_mask,
-                                      debug_verbose=True)
+                                      debug_verbose=True,
+                                      sigma_rot_deg=sigma_rot_deg,
+                                      sigma_scale=sigma_scale)
             if best is not None:
                 used_tier = _tier_name
                 _used_stars_only = _stars_only
@@ -949,7 +957,8 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         else:
             best_all = best
         A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f, _init_rx, _init_ry = \
-            _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor)
+            _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor,
+                                   sigma_rot_deg=sigma_rot_deg, sigma_scale=sigma_scale, sigma_skew=sigma_skew)
 
         # Sanity check: if the 4P seed was spurious, the Init 6P residuals
         # (on the seed pairs before any iteration inflates resid_cov) are large.

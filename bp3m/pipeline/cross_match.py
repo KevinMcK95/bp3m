@@ -149,6 +149,9 @@ def _match_one(args):
             scale_sweep=kwargs.get('scale_sweep', False),
             discovery_max_offset=kwargs.get('discovery_max_offset', 50),
             use_resid_floor=kwargs.get('use_resid_floor', True),
+            sigma_rot_deg=kwargs.get('prior_sigma_rot_deg', None),
+            sigma_scale=kwargs.get('prior_sigma_scale', None),
+            sigma_skew=kwargs.get('prior_sigma_skew', None),
         )
         post_mtime = out.stat().st_mtime if out.exists() else None
         file_updated = post_mtime is not None and post_mtime != pre_mtime
@@ -328,6 +331,9 @@ def run_cross_match(
             'discovery_max_offset': discovery_max_offset,
             'use_resid_floor':      use_resid_floor,
             'params_meta':          params_meta,
+            'prior_sigma_rot_deg':  prior_sigma_rot_deg,
+            'prior_sigma_scale':    prior_sigma_scale,
+            'prior_sigma_skew':     prior_sigma_skew,
         }))
 
     if skipped:

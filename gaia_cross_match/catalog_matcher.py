@@ -13,10 +13,45 @@ def get_inv_2x2(C):
     inv[:, 1, 0] = -C[:, 1, 0] / det
     return inv, det
 
-def fit_affine_weighted(x_src, y_src, x_tgt, y_tgt, cov_src, cov_tgt, initial_M=None, skew_prior=1e-4):
+def _make_abcd_prior_inv(initial_M, sigma_rot_deg, sigma_scale, sigma_skew):
     """
-    Weighted 6-parameter affine transform with skew priors.
-    skew_prior: expected size of (A-D) and (B+C).
+    Build the 4×4 prior precision matrix on (A, B, C, D) matching solver._make_image_prior.
+
+    Uses the Jacobian ∂(a,b,c,d)/∂(rot_rad, scale_ratio, on_skew, off_skew) evaluated at
+    the current rotation/scale estimate, so the prior is correct even when M ≠ identity.
+    """
+    if initial_M is not None and initial_M.shape == (2, 2):
+        A0, B0, C0, D0 = initial_M[0, 0], initial_M[0, 1], initial_M[1, 0], initial_M[1, 1]
+    else:
+        A0, B0, C0, D0 = 1.0, 0.0, 0.0, 1.0
+    s  = np.sqrt(max(A0 * D0 - B0 * C0, 1e-12))
+    rot_rad = np.arctan2(B0 - C0, A0 + D0)
+    sr, cr = np.sin(rot_rad), np.cos(rot_rad)
+    J = np.array([
+        [-s*sr,  cr,  1,  0],
+        [ s*cr,  sr,  0,  1],
+        [-s*cr, -sr,  0,  1],
+        [-s*sr,  cr, -1,  0],
+    ])
+    sigma = np.array([np.radians(sigma_rot_deg), sigma_scale, sigma_skew, sigma_skew])
+    C_abcd = J @ np.diag(sigma**2) @ J.T
+    try:
+        return np.linalg.inv(C_abcd)
+    except np.linalg.LinAlgError:
+        return np.diag(1.0 / np.diag(C_abcd + 1e-30 * np.eye(4)))
+
+
+def fit_affine_weighted(x_src, y_src, x_tgt, y_tgt, cov_src, cov_tgt, initial_M=None,
+                        skew_prior=1e-4,
+                        sigma_rot_deg=None, sigma_scale=None, sigma_skew=None):
+    """
+    Weighted 6-parameter affine transform with plate priors.
+
+    When sigma_rot_deg, sigma_scale, sigma_skew are all provided, builds the full
+    C_abcd prior via the same Jacobian used in solver._make_image_prior (constrains
+    rotation, scale, AND skew jointly).  Otherwise falls back to the legacy
+    skew_prior which only constrains (A-D) and (B+C).
+
     Returns (A, B, C, D, xs_o, ys_o, xt_o, yt_o), p_err, inv_lhs, chi2.
     """
     n = len(x_src)
@@ -53,19 +88,19 @@ def fit_affine_weighted(x_src, y_src, x_tgt, y_tgt, cov_src, cov_tgt, initial_M=
     rhs[:3] = np.sum(g * (wxx * dxt + wxy * dyt)[:, np.newaxis], axis=0)
     rhs[3:] = np.sum(g * (wxy * dxt + wyy * dyt)[:, np.newaxis], axis=0)
     
-    # --- Add Skew Priors ---
-    # We prioritize similarity: A=D and B=-C.
-    # Regularization penalty = 0.5 * (A-D)^2 / sig^2 + 0.5 * (B+C)^2 / sig^2
-    # d/dA = (A-D)/sig^2  => Add 1/sig^2 to lhs[0,0], -1/sig^2 to lhs[0,4]
-    # d/dD = (D-A)/sig^2  => Add 1/sig^2 to lhs[4,4], -1/sig^2 to lhs[4,0]
-    # d/dB = (B+C)/sig^2  => Add 1/sig^2 to lhs[1,1], 1/sig^2 to lhs[1,3]
-    # d/dC = (C+B)/sig^2  => Add 1/sig^2 to lhs[3,3], 1/sig^2 to lhs[3,1]
-    if skew_prior > 0:
+    # --- Add plate prior on (A, B, C, D) ---
+    # lhs layout: [A, B, xt_fit, C, D, yt_fit]  →  (A,B,C,D) at indices [0,1,3,4]
+    abcd_idx = np.array([0, 1, 3, 4])
+    if sigma_rot_deg is not None and sigma_scale is not None and sigma_skew is not None:
+        # Full C_abcd prior matching solver._make_image_prior: constrains rotation,
+        # scale, and skew jointly via the Jacobian at the current M estimate.
+        C_abcd_inv = _make_abcd_prior_inv(initial_M, sigma_rot_deg, sigma_scale, sigma_skew)
+        lhs[np.ix_(abcd_idx, abcd_idx)] += C_abcd_inv
+    elif skew_prior > 0:
+        # Legacy fallback: only constrains (A-D) and (B+C).
         w_prior = 1.0 / (skew_prior**2)
-        # A - D term
         lhs[0, 0] += w_prior; lhs[4, 4] += w_prior
         lhs[0, 4] -= w_prior; lhs[4, 0] -= w_prior
-        # B + C term
         lhs[1, 1] += w_prior; lhs[3, 3] += w_prior
         lhs[1, 3] += w_prior; lhs[3, 1] += w_prior
 
