@@ -636,7 +636,7 @@ def run_alignment_v2(
     use_influence_clip: bool = True,
     influence_d_thresh: float = 2.0,   # auto-scaled by V1/V2 C_r ratio at runtime
     influence_sigma_min: float = 5.0,
-    influence_min_frac: float = 0.3,
+    verbose_tests: bool = False,
     hst_pm_sigma_diffuse: float = 100.0,
     bp3m_dir: Path | None = None,
     pos_err_floor: float = 5e-3,
@@ -666,7 +666,7 @@ def run_alignment_v2(
     use_influence_clip : enable test-4 Cook's D influence clipping
     influence_d_thresh : Cook's D threshold
     influence_sigma_min : minimum sigma_resid for influence flagging
-    influence_min_frac : min fraction of initial aligned stars to retain per image (anti-cascade floor)
+    verbose_tests : print per-iter breakdown of flagged dets by Gaia type (2p vs 5p/6p) and chip
     bp3m_dir      : override default bp3m location
     pos_err_floor : minimum positional uncertainty in pixels
     det_chi2_threshold : if set, exclude (star, image) pairs whose per-detection
@@ -1346,7 +1346,7 @@ def run_alignment_v2(
         use_influence_clip=use_influence_clip,
         influence_d_thresh=_infl_d_thresh_scaled,
         influence_sigma_min=influence_sigma_min,
-        influence_min_frac=influence_min_frac,
+        verbose_tests=verbose_tests,
         use_two_tier=True,         # enables use_for_astrom tracking
         per_iter_callback=callback,
         use_soft_weights=use_soft_weights,
