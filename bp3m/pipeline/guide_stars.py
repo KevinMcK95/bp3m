@@ -23,6 +23,14 @@ Flow:
      Subsequent calls are incremental: new guide stars are resolved and
      appended; existing entries have their obs statistics refreshed.
 
+Catalog fetching strategy:
+  All catalogs are pre-fetched once per cluster of V1 telescope pointings
+  before the per-star loop.  For typical fields (one program, compact sky
+  coverage) this means 2–3 HTTP requests total instead of 3× N_stars.
+  GSC ID format determines which catalogs are needed:
+    alphanumeric (S99R…) → GSC 2.4.2 + VizieR I/305 only
+    purely numeric (0825…) → VizieR I/254 only
+
 Per-image positions:
   get_guide_star_position_at_epoch() propagates any entry from the CSV to
   an arbitrary HST observation epoch, returning the barycentric ICRS
@@ -62,6 +70,12 @@ _GSC242_URL = ("https://gsss.stsci.edu/webservices/vo/CatalogSearch.aspx"
 
 # FGS approximate field radius from V1 axis (degrees); 14 arcmin + margin
 _FGS_SEARCH_RADIUS_DEG = 0.50
+
+# Maximum radius for a single cluster cone search (degrees)
+_MAX_FETCH_RADIUS_DEG = 2.0
+
+# HST FGS operates to V≈14.5 (fine lock) or V≈17 (coarse track); 18 is a safe ceiling
+_GUIDE_STAR_MAG_LIMIT = 18.0
 
 
 # ── GSC ID parsing ────────────────────────────────────────────────────────────
@@ -150,6 +164,84 @@ def collect_guide_star_ids(hst_dir: str | Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ── Geometry helpers ──────────────────────────────────────────────────────────
+
+def _angular_sep_deg(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    """Great-circle separation in degrees (haversine)."""
+    ra1, dec1, ra2, dec2 = map(np.radians, [ra1, dec1, ra2, dec2])
+    dra = ra2 - ra1
+    ddec = dec2 - dec1
+    a = np.sin(ddec / 2) ** 2 + np.cos(dec1) * np.cos(dec2) * np.sin(dra / 2) ** 2
+    return np.degrees(2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0))))
+
+
+def _build_fetch_clusters(gs_df: pd.DataFrame) -> list[dict]:
+    """
+    Greedy clustering of V1 telescope pointings.
+
+    Groups the (ra_v1, dec_v1) pointing of each guide star into clusters such
+    that a single cone search of radius fetch_radius (≤ _MAX_FETCH_RADIUS_DEG)
+    covers every star's FGS field.  Returns a list of cluster dicts:
+        indices      – list of gs_df row indices in this cluster
+        center_ra    – mean RA of all V1 pointings (degrees)
+        center_dec   – mean Dec of all V1 pointings (degrees)
+        fetch_radius – cone radius needed (degrees)
+        has_alpha    – any alpha-format GSC IDs (→ need GSC 2.4.2 + I/305)
+        has_numeric  – any numeric-format GSC IDs (→ need I/254)
+    """
+    ra_fb  = float(gs_df["mean_ra_v1"].dropna().mean())  if gs_df["mean_ra_v1"].notna().any()  else 0.0
+    dec_fb = float(gs_df["mean_dec_v1"].dropna().mean()) if gs_df["mean_dec_v1"].notna().any() else 0.0
+
+    clusters: list[dict] = []
+    for idx, row in gs_df.iterrows():
+        ra  = float(row["mean_ra_v1"])  if pd.notna(row["mean_ra_v1"])  else ra_fb
+        dec = float(row["mean_dec_v1"]) if pd.notna(row["mean_dec_v1"]) else dec_fb
+
+        placed = False
+        for cl in clusters:
+            trial_ras  = cl["ras"]  + [ra]
+            trial_decs = cl["decs"] + [dec]
+            cen_ra  = float(np.mean(trial_ras))
+            cen_dec = float(np.mean(trial_decs))
+            max_sep = max(
+                _angular_sep_deg(cen_ra, cen_dec, r, d)
+                for r, d in zip(trial_ras, trial_decs)
+            )
+            fetch_r = max_sep + _FGS_SEARCH_RADIUS_DEG
+            if fetch_r <= _MAX_FETCH_RADIUS_DEG:
+                cl["indices"].append(idx)
+                cl["ras"].append(ra)
+                cl["decs"].append(dec)
+                cl["center_ra"]    = cen_ra
+                cl["center_dec"]   = cen_dec
+                cl["fetch_radius"] = fetch_r
+                placed = True
+                break
+        if not placed:
+            clusters.append({
+                "indices":      [idx],
+                "ras":          [ra],
+                "decs":         [dec],
+                "center_ra":    ra,
+                "center_dec":   dec,
+                "fetch_radius": _FGS_SEARCH_RADIUS_DEG,
+            })
+
+    for cl in clusters:
+        has_alpha = has_numeric = False
+        for idx in cl["indices"]:
+            gid = gs_df.at[idx, "gsc_id"]
+            if gid and gid[0].isalpha():
+                has_alpha = True
+            else:
+                has_numeric = True
+        cl["has_alpha"]   = has_alpha
+        cl["has_numeric"] = has_numeric
+        del cl["ras"], cl["decs"]  # no longer needed
+
+    return clusters
+
+
 # ── Step 2: batch catalog fetches (one request per catalog per field) ─────────
 
 def _fetch_gsc242_cone(ra_center: float, dec_center: float,
@@ -188,18 +280,27 @@ def _fetch_gsc242_cone(ra_center: float, dec_center: float,
 def _fetch_vizier_cone(catalog: str, id_col: str,
                        ra_center: float, dec_center: float,
                        radius_deg: float = _FGS_SEARCH_RADIUS_DEG,
+                       mag_limit: float | None = None,
                        retries: int = 3):
     """
     Fetch a VizieR catalog cone as a DataFrame keyed by id_col, or None.
-    Called once per catalog per field.
+    Called once per catalog per cluster; results are matched in-memory.
+
+    mag_limit: if set, add a server-side magnitude filter (Fmag for I/305,
+    Fmag for I/254) to avoid hitting the row limit on dense fields.
     """
     from astroquery.vizier import Vizier
     from astropy.coordinates import SkyCoord
     import astropy.units as u
 
+    col_filters: dict[str, str] = {}
+    if mag_limit is not None:
+        col_filters["Fmag"] = f"<{mag_limit}"
+
     V = Vizier(columns=[id_col, "RAJ2000", "DEJ2000",
                         "Vmag", "Fmag", "jmag", "Pmag"],
-               row_limit=10000)
+               row_limit=100000,
+               column_filters=col_filters)
     coord = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
     delay = 5
     for attempt in range(retries):
@@ -284,14 +385,19 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
     """
     Resolve GSC positions using a three-tier fallback chain:
       1. STScI GSC 2.4.2  (current operational catalog, has Gaia DR2 IDs)
-      2. VizieR I/305      (GSC 2.3.2, 2006 public release)
-      3. VizieR I/254      (GSC 1.x, photographic plates)
+      2. VizieR I/305      (GSC 2.3.2, 2006 public release) — alpha IDs only
+      3. VizieR I/254      (GSC 1.x, photographic plates)   — numeric IDs only
 
-    Each catalog is fetched PER GUIDE STAR using that star's own mean V1
-    telescope pointing as the cone center.  Results are cached by rounded
-    (ra, dec) so guide stars from the same visit share one fetch.  This
-    handles fields where different visits have widely separated V1 pointings
-    (e.g. multiple programs spanning >1° on sky).
+    Strategy: pre-fetch each catalog once per cluster of nearby V1 pointings
+    using _build_fetch_clusters(), then do all ID lookups in-memory.  For a
+    typical field (one HST program, compact sky coverage) this is 2–3 HTTP
+    requests total regardless of how many guide stars there are.
+
+    ID-type routing:
+      alphanumeric IDs (e.g. N6UH000265) are GSC 2.x format → try
+        GSC 2.4.2 then I/305; never in I/254.
+      purely numeric IDs (e.g. 0083300313) are GSC 1.x format → try I/254
+        only; never in GSC 2.4.2 or I/305.
 
     Adds ra_gsc, dec_gsc, mag_gsc, gaia_dr2_source_id, gsc_catalog columns.
     """
@@ -301,105 +407,112 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
     gs_df["gaia_dr2_source_id"] = gs_df["gaia_dr2_source_id"].astype(object)
     gs_df["gsc_catalog"] = ""
 
-    # Fallback center if a star has no V1 pointing
-    ra_center  = float(gs_df["mean_ra_v1"].dropna().mean())  if gs_df["mean_ra_v1"].notna().any()  else np.nan
-    dec_center = float(gs_df["mean_dec_v1"].dropna().mean()) if gs_df["mean_dec_v1"].notna().any() else np.nan
-
-    if not (np.isfinite(ra_center) and np.isfinite(dec_center)):
+    if not gs_df["mean_ra_v1"].notna().any():
         print("  WARNING: no V1 pointing available — catalog fetches skipped")
         for idx in gs_df.index:
             print(f"  {gs_df.at[idx, 'gsc_id']}: NOT FOUND in any catalog")
         return gs_df
 
-    # Caches keyed by (ra rounded to 2 dp, dec rounded to 2 dp) ≈ 0.6′ grid
-    _gsc242_cache: dict = {}
-    _gsc23_cache:  dict = {}
-    _gsc1_cache:   dict = {}
+    # ── Pre-fetch catalogs once per cluster ───────────────────────────────
+    clusters = _build_fetch_clusters(gs_df)
+    n_cl = len(clusters)
+    n_alpha   = sum(1 for cl in clusters if cl["has_alpha"])
+    n_numeric = sum(1 for cl in clusters if cl["has_numeric"])
+    print(f"  Pre-fetching catalogs: {n_cl} cluster(s), "
+          f"{n_alpha} need GSC2.4.2+I/305, {n_numeric} need I/254")
 
-    def _cache_key(ra, dec):
-        return (round(float(ra), 2), round(float(dec), 2))
+    cluster_gsc242: dict[int, object]        = {}
+    cluster_gsc23:  dict[int, pd.DataFrame]  = {}
+    cluster_gsc1:   dict[int, pd.DataFrame]  = {}
 
-    def _gsc242_for(ra, dec):
-        k = _cache_key(ra, dec)
-        if k not in _gsc242_cache:
-            print(f"  Fetching GSC 2.4.2 cone (center {ra:.4f}, {dec:.4f}, "
-                  f"r={_FGS_SEARCH_RADIUS_DEG}°) ...", end=" ", flush=True)
-            tbl = _fetch_gsc242_cone(ra, dec)
+    for ci, cl in enumerate(clusters):
+        ra_c  = cl["center_ra"]
+        dec_c = cl["center_dec"]
+        r_c   = cl["fetch_radius"]
+
+        if cl["has_alpha"]:
+            print(f"  Cluster {ci+1}/{n_cl} ({ra_c:.4f}, {dec_c:.4f}, r={r_c:.3f}°): "
+                  f"GSC 2.4.2 ...", end=" ", flush=True)
+            tbl = _fetch_gsc242_cone(ra_c, dec_c, radius_deg=r_c)
             print(f"{len(tbl)} sources" if tbl is not None else "failed")
-            _gsc242_cache[k] = tbl
-        return _gsc242_cache[k]
+            cluster_gsc242[ci] = tbl
 
-    def _gsc23_for(ra, dec):
-        k = _cache_key(ra, dec)
-        if k not in _gsc23_cache:
-            print(f"  Fetching VizieR I/305 (GSC 2.3.2) cone (center "
-                  f"{ra:.4f}, {dec:.4f}) ...", end=" ", flush=True)
-            df = _fetch_vizier_cone("I/305", "GSC2.3", ra, dec)
+            print(f"  Cluster {ci+1}/{n_cl}: VizieR I/305 (GSC 2.3.2) ...",
+                  end=" ", flush=True)
+            df = _fetch_vizier_cone("I/305", "GSC2.3", ra_c, dec_c,
+                                    radius_deg=r_c,
+                                    mag_limit=_GUIDE_STAR_MAG_LIMIT)
             print(f"{len(df)} sources" if df is not None else "failed")
-            _gsc23_cache[k] = df
-        return _gsc23_cache[k]
+            cluster_gsc23[ci] = df
 
-    def _gsc1_for(ra, dec):
-        k = _cache_key(ra, dec)
-        if k not in _gsc1_cache:
-            print(f"  Fetching VizieR I/254 (GSC 1.x) cone (center "
-                  f"{ra:.4f}, {dec:.4f}) ...", end=" ", flush=True)
-            df = _fetch_vizier_cone("I/254", "GSC", ra, dec)
+        if cl["has_numeric"]:
+            print(f"  Cluster {ci+1}/{n_cl}: VizieR I/254 (GSC 1.x) ...",
+                  end=" ", flush=True)
+            df = _fetch_vizier_cone("I/254", "GSC", ra_c, dec_c,
+                                    radius_deg=r_c,
+                                    mag_limit=_GUIDE_STAR_MAG_LIMIT)
             print(f"{len(df)} sources" if df is not None else "failed")
-            _gsc1_cache[k] = df
-        return _gsc1_cache[k]
+            cluster_gsc1[ci] = df
 
-    # ── Match each guide star ─────────────────────────────────────────────
+    # ── Build star-index → cluster-index map ──────────────────────────────
+    idx_to_ci: dict = {}
+    for ci, cl in enumerate(clusters):
+        for idx in cl["indices"]:
+            idx_to_ci[idx] = ci
+
+    # ── Match each guide star (in-memory lookups) ─────────────────────────
     for idx, row in gs_df.iterrows():
-        gsc_id = row["gsc_id"]
-        ra_v1  = row["mean_ra_v1"]  if pd.notna(row["mean_ra_v1"])  else ra_center
-        dec_v1 = row["mean_dec_v1"] if pd.notna(row["mean_dec_v1"]) else dec_center
+        gsc_id   = row["gsc_id"]
+        ci       = idx_to_ci.get(idx, 0)
+        is_alpha = bool(gsc_id and gsc_id[0].isalpha())
 
-        # 1. GSC 2.4.2
-        tbl = _gsc242_for(ra_v1, dec_v1)
-        if tbl is not None:
-            ids = [str(x).strip() for x in tbl["hstID"]]
-            matches = [i for i, x in enumerate(ids) if x == gsc_id]
-            if matches:
-                d = _gsc242_row_to_dict(tbl, matches[0])
-                ra, dec = d["ra"], d["dec"]
-                if np.isfinite(ra) and np.isfinite(dec):
-                    print(f"  {gsc_id}: GSC 2.4.2  RA={ra:.5f}  Dec={dec:.5f}  "
-                          f"mag={d['mag']:.2f}  gaia_dr2={d['gaia_dr2_source_id']}")
+        if is_alpha:
+            # 1. GSC 2.4.2
+            tbl = cluster_gsc242.get(ci)
+            if tbl is not None:
+                ids     = [str(x).strip() for x in tbl["hstID"]]
+                matches = [i for i, x in enumerate(ids) if x == gsc_id]
+                if matches:
+                    d = _gsc242_row_to_dict(tbl, matches[0])
+                    ra, dec = d["ra"], d["dec"]
+                    if np.isfinite(ra) and np.isfinite(dec):
+                        print(f"  {gsc_id}: GSC 2.4.2  RA={ra:.5f}  Dec={dec:.5f}  "
+                              f"mag={d['mag']:.2f}  gaia_dr2={d['gaia_dr2_source_id']}")
+                        gs_df.at[idx, "ra_gsc"]      = ra
+                        gs_df.at[idx, "dec_gsc"]     = dec
+                        gs_df.at[idx, "mag_gsc"]     = d["mag"]
+                        gs_df.at[idx, "gsc_catalog"] = "GSC2.4.2"
+                        if d["gaia_dr2_source_id"] is not None:
+                            gs_df.at[idx, "gaia_dr2_source_id"] = int(
+                                d["gaia_dr2_source_id"])
+                        continue
+
+            # 2. VizieR I/305 (alpha fallback)
+            gsc23_df = cluster_gsc23.get(ci)
+            if gsc23_df is not None:
+                vres = _vizier_row_to_tuple(gsc23_df, "GSC2.3", gsc_id)
+                if vres:
+                    ra, dec, mag = vres
+                    print(f"  {gsc_id}: I/305  RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
                     gs_df.at[idx, "ra_gsc"]      = ra
                     gs_df.at[idx, "dec_gsc"]     = dec
-                    gs_df.at[idx, "mag_gsc"]     = d["mag"]
-                    gs_df.at[idx, "gsc_catalog"] = "GSC2.4.2"
-                    if d["gaia_dr2_source_id"] is not None:
-                        gs_df.at[idx, "gaia_dr2_source_id"] = int(
-                            d["gaia_dr2_source_id"])
+                    gs_df.at[idx, "mag_gsc"]     = mag
+                    gs_df.at[idx, "gsc_catalog"] = "I/305"
                     continue
 
-        # 2. VizieR I/305
-        gsc23_df = _gsc23_for(ra_v1, dec_v1)
-        if gsc23_df is not None:
-            vres = _vizier_row_to_tuple(gsc23_df, "GSC2.3", gsc_id)
-            if vres:
-                ra, dec, mag = vres
-                print(f"  {gsc_id}: I/305  RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
-                gs_df.at[idx, "ra_gsc"]      = ra
-                gs_df.at[idx, "dec_gsc"]     = dec
-                gs_df.at[idx, "mag_gsc"]     = mag
-                gs_df.at[idx, "gsc_catalog"] = "I/305"
-                continue
-
-        # 3. VizieR I/254
-        gsc1_df = _gsc1_for(ra_v1, dec_v1)
-        if gsc1_df is not None:
-            vres = _vizier_row_to_tuple(gsc1_df, "GSC", gsc_id)
-            if vres:
-                ra, dec, mag = vres
-                print(f"  {gsc_id}: I/254  RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
-                gs_df.at[idx, "ra_gsc"]      = ra
-                gs_df.at[idx, "dec_gsc"]     = dec
-                gs_df.at[idx, "mag_gsc"]     = mag
-                gs_df.at[idx, "gsc_catalog"] = "I/254"
-                continue
+        else:
+            # 3. VizieR I/254 (numeric IDs only)
+            gsc1_df = cluster_gsc1.get(ci)
+            if gsc1_df is not None:
+                vres = _vizier_row_to_tuple(gsc1_df, "GSC", gsc_id)
+                if vres:
+                    ra, dec, mag = vres
+                    print(f"  {gsc_id}: I/254  RA={ra:.5f}  Dec={dec:.5f}  mag={mag:.2f}")
+                    gs_df.at[idx, "ra_gsc"]      = ra
+                    gs_df.at[idx, "dec_gsc"]     = dec
+                    gs_df.at[idx, "mag_gsc"]     = mag
+                    gs_df.at[idx, "gsc_catalog"] = "I/254"
+                    continue
 
         print(f"  {gsc_id}: NOT FOUND in any catalog")
 
