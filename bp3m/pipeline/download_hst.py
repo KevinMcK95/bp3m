@@ -410,6 +410,7 @@ def download_hst_images(
     instruments: list[str] | None = None,
     lib_dir: str | Path | None = None,
     gaia_df: 'pd.DataFrame | None' = None,
+    n_processes: int = 4,
     field_ids: list[int] | None = None,
     quiet: bool = False,
     force_redownload: bool = True,
@@ -681,7 +682,8 @@ def download_hst_images(
         broken         = []
         _cache_updates = {}
 
-        n_threads = min(8, len(_file_specs))
+        # Verification is I/O-bound; use at least 4 threads even if n_processes=1/2.
+        n_threads = min(max(n_processes, 4), len(_file_specs))
         with ThreadPoolExecutor(max_workers=n_threads) as _pool:
             _futures = {_pool.submit(_verify_one, s): s for s in _file_specs}
             with tqdm(total=len(_file_specs), desc="  Verifying cached files",

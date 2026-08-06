@@ -619,6 +619,7 @@ def main():
             field_ids=_parse_field_ids(args.field_ids),
             quiet=args.quiet,
             force_redownload=args.force_redownload_hst,
+            n_processes=args.n_processes,
         )
 
     # Read manifest of selected obsids written by step 2 (persists across runs)
