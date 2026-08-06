@@ -682,8 +682,7 @@ def download_hst_images(
         broken         = []
         _cache_updates = {}
 
-        # Verification is I/O-bound; use at least 4 threads even if n_processes=1/2.
-        n_threads = min(max(n_processes, 4), len(_file_specs))
+        n_threads = min(n_processes, len(_file_specs))
         with ThreadPoolExecutor(max_workers=n_threads) as _pool:
             _futures = {_pool.submit(_verify_one, s): s for s in _file_specs}
             with tqdm(total=len(_file_specs), desc="  Verifying cached files",
