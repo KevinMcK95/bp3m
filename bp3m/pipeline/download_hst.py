@@ -632,9 +632,12 @@ def download_hst_images(
                 broken.append(fname)
                 continue
 
-            # FITS integrity check for files that passed the size check
+            # FITS integrity check for files that passed the size check.
+            # Use memmap=True so image data is not loaded into RAM — header
+            # structure errors are still caught without a 30 GB RSS spike on
+            # fields with many cached files (e.g. Fornax: 107 FLC files = 17 GB).
             try:
-                with fits.open(dest, memmap=False) as hdul:
+                with fits.open(dest, memmap=True) as hdul:
                     hdul.verify('exception')
             except Exception as e:
                 print(f"  WARNING: {fname} failed FITS check ({e}) — will re-download.")
