@@ -174,28 +174,28 @@ def _match_one(args):
         return name, 0, str(exc)
 
 
-def _validate_catalog_if_needed(field_name: str, output_dir) -> None:
-    """Run validate_target if cross_match_catalog.csv is missing or stale.
+def _validate_catalog_if_needed(field_name: str, output_dir,
+                                force: bool = False) -> None:
+    """Run validate_target if cross_match_catalog.csv is missing, stale, or forced.
 
-    Stale means the catalog is present but missing the Gaia BP/RP photometry
-    columns added in the 2025-07 validator update.  Called both when all
-    cross-matches were already cached and after a fresh matching run, so the
-    catalog is always up to date before data_loader_flc.py reads it.
+    force=True is passed whenever any images were newly (re-)matched, so the
+    catalog always reflects the current state of the matched_gaia.csv files.
     """
     cat_path = Path(output_dir) / field_name / "cross_match_catalog.csv"
     _new_phot_cols = ('gaia_gmag_error', 'gaia_bpmag', 'gaia_bpmag_error',
                       'gaia_rpmag', 'gaia_rpmag_error')
 
-    needs_validate = False
-    if not cat_path.exists():
-        print("  cross_match_catalog.csv not found — running validator...")
-        needs_validate = True
-    else:
-        header = pd.read_csv(cat_path, nrows=0)
-        if not all(c in header.columns for c in _new_phot_cols):
-            print("  cross_match_catalog.csv is missing photometry columns — "
-                  "re-running validator to update it...")
+    needs_validate = force
+    if not needs_validate:
+        if not cat_path.exists():
+            print("  cross_match_catalog.csv not found — running validator...")
             needs_validate = True
+        else:
+            header = pd.read_csv(cat_path, nrows=0)
+            if not all(c in header.columns for c in _new_phot_cols):
+                print("  cross_match_catalog.csv is missing photometry columns — "
+                      "re-running validator to update it...")
+                needs_validate = True
 
     if needs_validate:
         try:
@@ -343,7 +343,7 @@ def run_cross_match(
               f"{', '.join(skipped_nophot)}")
     if not work:
         print("  All cross-matches up to date.")
-        _validate_catalog_if_needed(field_name, output_dir)
+        _validate_catalog_if_needed(field_name, output_dir, force=force_rematch)
         existing = [Path(f['root']) / "matched_gaia.csv" for f in folders]
         # Still run QSO vetting if the anchors file is missing
         if run_qso_vetting:
@@ -401,9 +401,9 @@ def run_cross_match(
                     if Path(f['root']).name == name
                 )) / "matched_gaia.csv")
 
-    # Run cross-image validation (always, after fresh matching)
+    # Run cross-image validation — always forced after any fresh matching.
     print("\n  Running cross-image validation...")
-    _validate_catalog_if_needed(field_name, output_dir)
+    _validate_catalog_if_needed(field_name, output_dir, force=True)
 
     # Include previously-cached successful results in the return list.
     # Exclude images flagged as skipped (no photometric calibration) or failed.
