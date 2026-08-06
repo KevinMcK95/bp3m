@@ -532,7 +532,9 @@ def load_master_v2(
     skipped_meta: list[str] = []
     base_meta_cache: dict[str, dict | None] = {}
 
-    for sub_name in sorted(all_sub_names):
+    from tqdm import tqdm
+    for sub_name in tqdm(sorted(all_sub_names), desc="  Loading image metadata",
+                         unit="img", dynamic_ncols=True):
         base = _sub_name_to_base(sub_name)
         if base not in base_meta_cache:
             img_dir = hst_root / base
@@ -628,7 +630,8 @@ def load_master_v2(
     stars_per_image: dict[str, pd.DataFrame] = {}
     skipped_fits: list[str] = []
 
-    for sub_name in sorted(img_records.keys()):
+    for sub_name in tqdm(sorted(img_records.keys()), desc="  Loading image catalogs",
+                         unit="img", dynamic_ncols=True):
         recs_img = img_records[sub_name]
         fits_data, half_width = _get_fits(sub_name)
         if fits_data is None:

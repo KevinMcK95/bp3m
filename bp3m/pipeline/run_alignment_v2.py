@@ -914,8 +914,10 @@ def run_alignment_v2(
 
         print("\n Phase 0: fixed-transformation pre-filter (v1 BP3M posterior)")
 
+        from tqdm import tqdm
         n_flagged_total = 0
-        for img in image_names:
+        for img in tqdm(image_names, desc="  Phase 0: pre-filter residuals",
+                        unit="img", dynamic_ncols=True):
             d = solver._img_data.get(img)
             if d is None:
                 continue

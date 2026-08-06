@@ -586,7 +586,10 @@ def reclassify_psf_catalogs(
 
     else:
         # Serial mode
-        for i, (img, wargs) in enumerate(zip(work, worker_args), 1):
+        from tqdm import tqdm
+        for i, (img, wargs) in tqdm(enumerate(zip(work, worker_args), 1),
+                                     total=len(work), desc="  Reclassifying catalogs",
+                                     unit="img", dynamic_ncols=True):
             catalog = img.parent / f"{img.stem}_catalog.fits"
             success, img_name, n_old, n_new, new_fx, new_fy, elapsed, err = \
                 _reclassify_one_image_worker(wargs)
@@ -722,11 +725,14 @@ def remeasure_psf_perturbation(
     print(f"Step 3c: Re-measuring PSF perturbation ({n_images} images)")
     print("─"*50)
 
+    from tqdm import tqdm
     done = []
-    for img_i, img in enumerate(images, 1):
+    for img_i, img in tqdm(enumerate(images, 1), total=n_images,
+                            desc="  Remeasuring PSF perturbations", unit="img",
+                            dynamic_ncols=True):
         catalog = img.parent / f"{img.stem}_catalog.fits"
         if not catalog.exists():
-            print(f"  [{img_i}/{n_images}] {field_name}  {img.name}: no catalog — run PSF fitting first")
+            tqdm.write(f"  [{img_i}/{n_images}] {field_name}  {img.name}: no catalog — run PSF fitting first")
             continue
 
         img_name = img.name
@@ -1867,7 +1873,9 @@ def run_psf_fitting(
 
     # ── Serial mode: one image at a time (current behaviour) ─────────────────
     else:
-        for img_i, img in enumerate(work, 1):
+        for img_i, img in tqdm(enumerate(work, 1), total=n_work,
+                                desc="  PSF fitting", unit="img",
+                                dynamic_ncols=True):
             catalog = img.parent / f"{img.stem}_catalog.fits"
 
             use_clean = clean_psf or (not apply_psf_delta) or force_refit

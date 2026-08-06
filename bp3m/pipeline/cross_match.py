@@ -305,10 +305,12 @@ def run_cross_match(
         'init_resid_max':       init_resid_max,
     }
 
+    from tqdm import tqdm
     work = []
     skipped = []
     skipped_nophot = []
-    for hst in folders:
+    for hst in tqdm(folders, desc="  Checking cross-match cache", unit="img",
+                    dynamic_ncols=True):
         root = Path(hst['root'])
         name = root.name
 
@@ -396,7 +398,8 @@ def run_cross_match(
                         if Path(f['root']).name == name
                     )) / "matched_gaia.csv")
     else:
-        for w in work:
+        for w in tqdm(work, desc="  Cross-matching", unit="img",
+                      dynamic_ncols=True):
             name, n, err = _match_one(w)
             if err:
                 print(f"  ERROR {name}: {err}")

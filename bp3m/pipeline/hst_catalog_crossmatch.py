@@ -649,7 +649,9 @@ def _compute_gaia_zp_per_image(hst_root: Path, image_names: list[str]) -> dict[s
         base = nm[:-3] if nm.endswith(('_hi', '_lo')) else nm
         bases_seen.add(base)
 
-    for base in sorted(bases_seen):
+    from tqdm import tqdm
+    for base in tqdm(sorted(bases_seen), desc="  Computing Gaia ZP", unit="img",
+                     dynamic_ncols=True):
         img_dir    = hst_root / base
         match_path = img_dir / 'matched_gaia.csv'
         if not match_path.exists():
@@ -1219,7 +1221,10 @@ def _phase2_gaia_catalog_anchor(
     matched_gids: set[int] = set()
 
     # ── Outer loop: one iteration per sub-image ───────────────────────────────
-    for sub_name, epoch_yr in epoch_lookup.items():
+    from tqdm import tqdm
+    for sub_name, epoch_yr in tqdm(epoch_lookup.items(),
+                                    desc="  Gaia anchoring", unit="img",
+                                    dynamic_ncols=True):
         sub_mask = (det_df['sub_name'] == sub_name) & (~det_df['has_gaia_match'])
         sub_grp  = det_df[sub_mask]
         if len(sub_grp) == 0:
@@ -1705,7 +1710,9 @@ def _within_filter_match(
         _ZP_MIN_INLIER = 30    # mode-inliers required
         _ZP_MAX_CORR   = zp_max_corr if zp_max_corr is not None else (0.0 if pre_zp_applied else 3.0)
 
-        for sub_name in remaining:
+        from tqdm import tqdm
+        for sub_name in tqdm(remaining, desc="  Building master catalog", unit="img",
+                             dynamic_ncols=True):
             cur_mask = fdf['sub_name'].values == sub_name
             cur_pos  = np.where(cur_mask)[0]
             if len(cur_pos) == 0:

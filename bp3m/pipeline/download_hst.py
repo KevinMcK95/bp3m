@@ -697,7 +697,9 @@ def download_hst_images(
         # partially-completed or interrupted download never leaves stale PSF outputs.
         if 'dataURI' in to_dl.columns:
             _mast_root = hst_dir / "mastDownload" / tel_upper
-            for _, _row in to_dl.iterrows():
+            for _, _row in tqdm(to_dl.iterrows(), total=len(to_dl),
+                                desc="  Invalidating PSF caches", unit="file",
+                                dynamic_ncols=True):
                 _dest = _mast_root / _row.get('obs_id', '') / Path(_row['dataURI']).name
                 _invalidate_psf_cache(_dest)
 
@@ -725,7 +727,9 @@ def download_hst_images(
         # Validate newly downloaded files for failed observations (EXPTIME=0).
         if 'dataURI' in to_dl.columns:
             mast_root_nd = hst_dir / "mastDownload" / tel_upper
-            for _, row in to_dl.iterrows():
+            for _, row in tqdm(to_dl.iterrows(), total=len(to_dl),
+                               desc="  Validating downloaded files", unit="file",
+                               dynamic_ncols=True):
                 obs_id = row.get('obs_id', '')
                 if obs_id in failed_obsids:
                     continue
