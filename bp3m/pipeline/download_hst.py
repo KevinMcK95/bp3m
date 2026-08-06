@@ -608,7 +608,6 @@ def download_hst_images(
     # Skip already-downloaded files unless force_redownload
     failed_obsids: dict[str, str] = {}  # obs_id → reason (kept on disk, skipped downstream)
     if not force_redownload and 'dataURI' in to_dl.columns:
-        import json
         from astropy.io import fits
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from tqdm import tqdm
