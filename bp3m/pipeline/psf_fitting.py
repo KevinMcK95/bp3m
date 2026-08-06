@@ -1039,8 +1039,9 @@ def _image_worker(args):
 
     t0 = time.perf_counter()
 
+    _hdr_info = _get_image_header_info(img_path)
     if _status_queue is not None:
-        _status_queue.put(('start', img_name))
+        _status_queue.put(('start', img_name, _hdr_info))
 
     try:
         with open(log_path, 'w', buffering=1) as _log:
@@ -1668,9 +1669,12 @@ def run_psf_fitting(
     # but the cache comparison uses only _fit_cache_keys.
     params_meta_disk = {'lib_dir': str(lib_dir), **params}
 
+    from tqdm import tqdm
+
     work = []
     skipped = []
-    for img in images:
+    for img in tqdm(images, desc="  Checking cached fits", unit="img",
+                    dynamic_ncols=True):
         catalog     = img.parent / f"{img.stem}_catalog.fits"
         params_path = img.parent / "psf_params.json"
 
@@ -1693,7 +1697,8 @@ def run_psf_fitting(
     # requested one.  A changed conc_limit should not re-fit but must reclassify.
     current_conc = params['conc_limit']
     needs_reclassify = []
-    for img in images:
+    for img in tqdm(images, desc="  Checking conc_limit", unit="img",
+                    dynamic_ncols=True):
         params_path = img.parent / "psf_params.json"
         catalog     = img.parent / f"{img.stem}_catalog.fits"
         if not catalog.exists() or not params_path.exists():
@@ -1772,9 +1777,6 @@ def run_psf_fitting(
                 n_img_iter, clean_psf, apply_psf_delta, force_refit,
             ))
 
-        # Print header info for all images before the pool starts.
-        _hdr_info = {img: _get_image_header_info(img) for img in work}
-
         _pool = _mp.Pool(
             processes=min(n_workers, n_work),
             initializer=_worker_pool_init,
@@ -1798,10 +1800,7 @@ def run_psf_fitting(
                     kind = msg[0]
                     img_nm = msg[1]
                     if kind == 'start':
-                        # Find the matching image path for header info.
-                        _img_match = next(
-                            (i for i in work if i.name == img_nm), None)
-                        info = _hdr_info.get(_img_match, {})
+                        _, img_nm, info = msg
                         _id  = info.get('instdet', '?')
                         _fi  = info.get('filter',  '?')
                         _et  = info.get('exptime',  0)
