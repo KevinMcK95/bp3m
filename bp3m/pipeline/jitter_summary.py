@@ -83,6 +83,8 @@ def _jit_stats(jit_path: Path, rootname: str) -> dict:
         d = hdul[idx].data
         n = len(d)
         out["n_samples"] = int(n)
+        if n == 0:
+            return out
 
         # Per-sample short-window RMS/P2P (high-frequency jitter only).
         for col in ("SI_V2_RMS", "SI_V2_P2P", "SI_V3_RMS", "SI_V3_P2P"):
