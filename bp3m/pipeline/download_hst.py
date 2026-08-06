@@ -885,6 +885,18 @@ def plot_footprints(
     # ── Footprint polygons ────────────────────────────────────────────────────
     filter_patches: dict[str, mpatches.Patch] = {}   # for legend
 
+    # Build search-box guard: footprints with centroids outside the cutout are
+    # silently skipped.  Without this, a single image with a corrupt/anomalous
+    # WCS s_region thousands of degrees away causes bbox_inches='tight' to
+    # allocate a RendererAgg buffer tens of GB in size.
+    if ra is not None and dec is not None and search_width and search_height:
+        _guard_ra_lo  = ra  - search_width  / 2 * 3   # 3× margin — clearly anomalous
+        _guard_ra_hi  = ra  + search_width  / 2 * 3
+        _guard_dec_lo = dec - search_height / 2 * 3
+        _guard_dec_hi = dec + search_height / 2 * 3
+    else:
+        _guard_ra_lo = _guard_ra_hi = _guard_dec_lo = _guard_dec_hi = None
+
     for _, row in obs_df.iterrows():
         filt    = str(row.get('filters', '')).strip().upper()
         fid     = int(row.get('field_id', 0))
@@ -894,6 +906,14 @@ def plot_footprints(
         polygons = _parse_polygons(s_region)
         if not polygons:
             continue
+
+        # Skip polygons whose centroid lies far outside the search box.
+        if _guard_ra_lo is not None:
+            cx = np.mean(polygons[0][:, 0])
+            cy = np.mean(polygons[0][:, 1])
+            if not (_guard_ra_lo <= cx <= _guard_ra_hi and
+                    _guard_dec_lo <= cy <= _guard_dec_hi):
+                continue
 
         for poly_verts in polygons:
             patch = MplPolygon(poly_verts, closed=True,
