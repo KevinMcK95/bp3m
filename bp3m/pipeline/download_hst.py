@@ -608,10 +608,11 @@ def download_hst_images(
     failed_obsids: dict[str, str] = {}  # obs_id → reason (kept on disk, skipped downstream)
     if not force_redownload and 'dataURI' in to_dl.columns:
         from astropy.io import fits
+        from tqdm import tqdm
         mast_root = hst_dir / "mastDownload" / tel_upper
         already = []
         broken = []
-        for _, row in to_dl.iterrows():
+        for _, row in tqdm(to_dl.iterrows(), total=len(to_dl), desc="  Verifying cached files", unit="file", dynamic_ncols=True):
             # MAST download path mirrors the URI structure:
             # mast:HST/product/jXXX_flc.fits → mastDownload/HST/jXXX/jXXX_flc.fits
             fname = Path(row['dataURI']).name
