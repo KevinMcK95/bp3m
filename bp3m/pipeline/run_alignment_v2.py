@@ -641,6 +641,7 @@ def run_alignment_v2(
     prior_sigma_pair_scale: float | None = None,
     prior_sigma_pair_skew: float | None = None,
     prior_sigma_pair_pointing: float | None = None,
+    use_pair_prior: bool = False,
     inflate_alpha_max: float = 3.0,
     use_influence_clip: bool = True,
     influence_d_thresh: float = 2.0,   # auto-scaled by V1/V2 C_r ratio at runtime
@@ -823,6 +824,7 @@ def run_alignment_v2(
         prior_sigma_pair_scale=prior_sigma_pair_scale,
         prior_sigma_pair_skew=prior_sigma_pair_skew,
         prior_sigma_pair_pointing=prior_sigma_pair_pointing,
+        use_pair_prior=use_pair_prior,
     )
 
     # ── Override diffuse PM prior for HST-only stars ──────────────────────────

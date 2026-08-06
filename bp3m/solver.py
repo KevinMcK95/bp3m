@@ -191,7 +191,8 @@ class BP3MSolver:
                  prior_sigma_rot_deg=None, prior_sigma_scale=None,
                  prior_sigma_skew=None, prior_sigma_pointing=None,
                  prior_sigma_pair_rot_deg=None, prior_sigma_pair_scale=None,
-                 prior_sigma_pair_skew=None, prior_sigma_pair_pointing=None):
+                 prior_sigma_pair_skew=None, prior_sigma_pair_pointing=None,
+                 use_pair_prior=False):
         """
         Parameters
         ----------
@@ -214,6 +215,7 @@ class BP3MSolver:
         self._prior_sigma_scale    = prior_sigma_scale    if prior_sigma_scale    is not None else _SIGMA_SCALE
         self._prior_sigma_skew     = prior_sigma_skew     if prior_sigma_skew     is not None else _SIGMA_SKEW
         self._prior_sigma_pointing = prior_sigma_pointing if prior_sigma_pointing is not None else _SIGMA_POINTING
+        self._use_pair_prior            = use_pair_prior
         self._prior_sigma_pair_rot_deg  = prior_sigma_pair_rot_deg  if prior_sigma_pair_rot_deg  is not None else _SIGMA_PAIR_ROT_DEG
         self._prior_sigma_pair_scale    = prior_sigma_pair_scale    if prior_sigma_pair_scale    is not None else _SIGMA_PAIR_SCALE
         self._prior_sigma_pair_skew     = prior_sigma_pair_skew     if prior_sigma_pair_skew     is not None else _SIGMA_PAIR_SKEW
@@ -580,34 +582,35 @@ class BP3MSolver:
             print(f"  {label:>3}  {n_cat:>7}  {n_img:>9}  {n_admit:>8}  {n_excl:>8}{excl_str}")
 
         # ── Build _hi/_lo chip pair index and precomputed coupling matrices ──────
-        hi_map, lo_map = {}, {}
-        for j_idx, name in enumerate(self.image_names):
-            if name.endswith('_hi'):
-                hi_map[name[:-3]] = j_idx
-            elif name.endswith('_lo'):
-                lo_map[name[:-3]] = j_idx
         self._chip_pairs = []
         self._chip_pair_couplings = {}
-        for root, hi_idx in hi_map.items():
-            if root not in lo_map:
-                continue
-            lo_idx = lo_map[root]
-            meta_hi = self.images[self.image_names[hi_idx]]
-            C_cp = _make_pair_coupling_inv(
-                meta_hi, self.poly_order,
-                sigma_pair_rot_deg  = self._prior_sigma_pair_rot_deg,
-                sigma_pair_scale    = self._prior_sigma_pair_scale,
-                sigma_pair_skew     = self._prior_sigma_pair_skew,
-                sigma_pair_pointing = self._prior_sigma_pair_pointing,
-            )
-            self._chip_pairs.append((hi_idx, lo_idx))
-            self._chip_pair_couplings[(hi_idx, lo_idx)] = C_cp
-        if self._chip_pairs:
-            print(f"  Chip-pair coupling prior: {len(self._chip_pairs)} hi/lo pair(s)  "
-                  f"σ_pair=(rot={self._prior_sigma_pair_rot_deg}°, "
-                  f"scale={self._prior_sigma_pair_scale}, "
-                  f"skew={self._prior_sigma_pair_skew}, "
-                  f"point={self._prior_sigma_pair_pointing}mas)")
+        if self._use_pair_prior:
+            hi_map, lo_map = {}, {}
+            for j_idx, name in enumerate(self.image_names):
+                if name.endswith('_hi'):
+                    hi_map[name[:-3]] = j_idx
+                elif name.endswith('_lo'):
+                    lo_map[name[:-3]] = j_idx
+            for root, hi_idx in hi_map.items():
+                if root not in lo_map:
+                    continue
+                lo_idx = lo_map[root]
+                meta_hi = self.images[self.image_names[hi_idx]]
+                C_cp = _make_pair_coupling_inv(
+                    meta_hi, self.poly_order,
+                    sigma_pair_rot_deg  = self._prior_sigma_pair_rot_deg,
+                    sigma_pair_scale    = self._prior_sigma_pair_scale,
+                    sigma_pair_skew     = self._prior_sigma_pair_skew,
+                    sigma_pair_pointing = self._prior_sigma_pair_pointing,
+                )
+                self._chip_pairs.append((hi_idx, lo_idx))
+                self._chip_pair_couplings[(hi_idx, lo_idx)] = C_cp
+            if self._chip_pairs:
+                print(f"  Chip-pair coupling prior: {len(self._chip_pairs)} hi/lo pair(s)  "
+                      f"σ_pair=(rot={self._prior_sigma_pair_rot_deg}°, "
+                      f"scale={self._prior_sigma_pair_scale}, "
+                      f"skew={self._prior_sigma_pair_skew}, "
+                      f"point={self._prior_sigma_pair_pointing}mas)")
 
     def _init_transforms(self):
         """Initialise R_j (2×2 rotation matrix) from header info."""

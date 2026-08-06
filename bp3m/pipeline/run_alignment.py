@@ -54,6 +54,7 @@ def run_alignment(  # noqa: C901
     prior_sigma_pair_scale: float | None = None,
     prior_sigma_pair_skew: float | None = None,
     prior_sigma_pair_pointing: float | None = None,
+    use_pair_prior: bool = False,
     inflate_alpha_max: float = 3.0,
     use_influence_clip: bool = True,
     influence_d_thresh: float = 1.0,
@@ -228,7 +229,8 @@ def run_alignment(  # noqa: C901
                           prior_sigma_pair_rot_deg=prior_sigma_pair_rot_deg,
                           prior_sigma_pair_scale=prior_sigma_pair_scale,
                           prior_sigma_pair_skew=prior_sigma_pair_skew,
-                          prior_sigma_pair_pointing=prior_sigma_pair_pointing)
+                          prior_sigma_pair_pointing=prior_sigma_pair_pointing,
+                          use_pair_prior=use_pair_prior)
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
 
@@ -602,6 +604,7 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
             'sigma_scale':             solver._prior_sigma_scale,
             'sigma_skew':              solver._prior_sigma_skew,
             'sigma_pointing_mas':      solver._prior_sigma_pointing,
+            'use_pair_prior':          solver._use_pair_prior,
             'sigma_pair_rot_deg':      solver._prior_sigma_pair_rot_deg,
             'sigma_pair_scale':        solver._prior_sigma_pair_scale,
             'sigma_pair_skew':         solver._prior_sigma_pair_skew,

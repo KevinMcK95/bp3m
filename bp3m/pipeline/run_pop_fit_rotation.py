@@ -929,10 +929,11 @@ def run_pop_fit_rotation(
     v1_prior_sigma_scale         = _v1_hp.get('sigma_scale',              None)
     v1_prior_sigma_skew          = _v1_hp.get('sigma_skew',               None)
     v1_prior_sigma_pointing      = _v1_hp.get('sigma_pointing_mas',       None)
-    v1_prior_sigma_pair_rot_deg  = _v1_hp.get('sigma_pair_rot_deg',       None)
-    v1_prior_sigma_pair_scale    = _v1_hp.get('sigma_pair_scale',          None)
-    v1_prior_sigma_pair_skew     = _v1_hp.get('sigma_pair_skew',           None)
-    v1_prior_sigma_pair_pointing = _v1_hp.get('sigma_pair_pointing_mas',   None)
+    v1_use_pair_prior            = _v1_hp.get('use_pair_prior',             False)
+    v1_prior_sigma_pair_rot_deg  = _v1_hp.get('sigma_pair_rot_deg',        None)
+    v1_prior_sigma_pair_scale    = _v1_hp.get('sigma_pair_scale',           None)
+    v1_prior_sigma_pair_skew     = _v1_hp.get('sigma_pair_skew',            None)
+    v1_prior_sigma_pair_pointing = _v1_hp.get('sigma_pair_pointing_mas',    None)
 
     print("\n" + "─" * 60)
     print("BP3M pop-fit (rotation model)")
@@ -1069,7 +1070,8 @@ def run_pop_fit_rotation(
                         prior_sigma_pair_rot_deg=v1_prior_sigma_pair_rot_deg,
                         prior_sigma_pair_scale=v1_prior_sigma_pair_scale,
                         prior_sigma_pair_skew=v1_prior_sigma_pair_skew,
-                        prior_sigma_pair_pointing=v1_prior_sigma_pair_pointing)
+                        prior_sigma_pair_pointing=v1_prior_sigma_pair_pointing,
+                        use_pair_prior=v1_use_pair_prior)
     print(f"Stars: {solver.n_stars}  N_R/image: {solver.N_R}")
 
     # ── Load v1 r_hat and alpha ────────────────────────────────────────────────
@@ -1672,6 +1674,7 @@ def run_pop_fit_rotation(
                 'sigma_scale':             solver._prior_sigma_scale,
                 'sigma_skew':              solver._prior_sigma_skew,
                 'sigma_pointing_mas':      solver._prior_sigma_pointing,
+                'use_pair_prior':          solver._use_pair_prior,
                 'sigma_pair_rot_deg':      solver._prior_sigma_pair_rot_deg,
                 'sigma_pair_scale':        solver._prior_sigma_pair_scale,
                 'sigma_pair_skew':         solver._prior_sigma_pair_skew,
