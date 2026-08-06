@@ -607,58 +607,117 @@ def download_hst_images(
     # Skip already-downloaded files unless force_redownload
     failed_obsids: dict[str, str] = {}  # obs_id → reason (kept on disk, skipped downstream)
     if not force_redownload and 'dataURI' in to_dl.columns:
+        import json
         from astropy.io import fits
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from tqdm import tqdm
-        mast_root = hst_dir / "mastDownload" / tel_upper
-        already = []
-        broken = []
-        for _, row in tqdm(to_dl.iterrows(), total=len(to_dl), desc="  Verifying cached files", unit="file", dynamic_ncols=True):
-            # MAST download path mirrors the URI structure:
-            # mast:HST/product/jXXX_flc.fits → mastDownload/HST/jXXX/jXXX_flc.fits
-            fname = Path(row['dataURI']).name
-            obs_id = row.get('obs_id', '')
-            dest = mast_root / obs_id / fname
+
+        mast_root  = hst_dir / "mastDownload" / tel_upper
+        _cache_path = hst_dir / ".verify_cache.json"
+
+        # mtime-based verification cache: {obs_id/fname: [size, mtime_ns, fail_reason]}
+        # Files whose size and mtime match the cache skip the FITS open entirely.
+        _vcache: dict = {}
+        if _cache_path.exists():
+            try:
+                _vcache = json.loads(_cache_path.read_text())
+            except Exception:
+                _vcache = {}
+
+        # Build per-file work items once so threads get plain values (no pandas ops).
+        _file_specs = []
+        for _idx, _row in to_dl.iterrows():
+            _fname    = Path(_row['dataURI']).name
+            _obs_id   = _row.get('obs_id', '')
+            _dest     = mast_root / _obs_id / _fname
+            _exp_size = _row.get('size', None)
+            _cache_key = f"{_obs_id}/{_fname}"
+            _file_specs.append((_dest, _exp_size, _cache_key, _idx, _obs_id, _fname))
+
+        def _verify_one(spec):
+            dest, exp_size, cache_key, row_idx, obs_id, fname = spec
+
             if not dest.exists():
-                continue
+                return spec, 'missing', None, None
 
-            disk_size = dest.stat().st_size
-            expected_size = row.get('size', None)
+            st        = dest.stat()
+            disk_size = st.st_size
 
-            # Fast size check: catches empty files and truncated downloads
-            if disk_size == 0 or (expected_size and disk_size != expected_size):
-                reason = "empty" if disk_size == 0 else f"size {disk_size} != expected {expected_size}"
-                print(f"  WARNING: {fname} is corrupt ({reason}) — will re-download.")
-                dest.unlink()
-                _invalidate_psf_cache(dest)
-                broken.append(fname)
-                continue
+            # Fast size check: catches empty files and truncated downloads.
+            if disk_size == 0 or (exp_size and disk_size != exp_size):
+                reason = ("empty" if disk_size == 0
+                          else f"size {disk_size} != expected {exp_size}")
+                return spec, 'broken', reason, None
 
-            # FITS integrity check for files that passed the size check.
-            # Use memmap=True so image data is not loaded into RAM — header
-            # structure errors are still caught without a 30 GB RSS spike on
-            # fields with many cached files (e.g. Fornax: 107 FLC files = 17 GB).
+            # mtime cache hit: file unchanged since last verification — skip FITS open.
+            cached = _vcache.get(cache_key)
+            if cached and cached[0] == disk_size and cached[1] == st.st_mtime_ns:
+                return spec, 'cached', cached[2], None   # cached[2] = fail_reason or None
+
+            # Full FITS verify + failed-observation check in one open.
+            # memmap=True avoids loading pixel data into RAM.
             try:
                 with fits.open(dest, memmap=True) as hdul:
                     hdul.verify('exception')
+                    h0        = hdul[0].header
+                    exptime   = h0.get('EXPTIME',  None)
+                    expflag   = h0.get('EXPFLAG',  'NORMAL').strip()
+                    has_hdrlet = any(h.name == 'HDRLET' for h in hdul)
             except Exception as e:
-                print(f"  WARNING: {fname} failed FITS check ({e}) — will re-download.")
-                dest.unlink()
-                _invalidate_psf_cache(dest)
-                broken.append(fname)
-                continue
+                return spec, 'broken', f"FITS error: {e}", None
 
-            # Failed-observation check: EXPTIME=0 means no real sky data collected.
-            # Keep the file on disk but exclude from downstream processing.
-            fail_reason = _check_exptime(dest)
-            if fail_reason:
-                print(f"  WARNING: {fname} is a failed observation ({fail_reason}) — "
-                      f"skipping all downstream steps.")
-                _invalidate_psf_cache(dest)
-                failed_obsids[obs_id] = fail_reason
-                already.append(row.name)  # don't re-download
-                continue
+            fail_reason = None
+            if exptime == 0:
+                fail_reason = "EXPTIME=0"
+            elif expflag and expflag != 'NORMAL':
+                fail_reason = f"EXPFLAG={expflag!r}"
+            elif not has_hdrlet:
+                fail_reason = "no HDRLET extensions"
 
-            already.append(row.name)
+            new_entry = [disk_size, st.st_mtime_ns, fail_reason]
+            return spec, 'verified', fail_reason, new_entry
+
+        already        = []
+        broken         = []
+        _cache_updates = {}
+
+        n_threads = min(8, len(_file_specs))
+        with ThreadPoolExecutor(max_workers=n_threads) as _pool:
+            _futures = {_pool.submit(_verify_one, s): s for s in _file_specs}
+            with tqdm(total=len(_file_specs), desc="  Verifying cached files",
+                      unit="file", dynamic_ncols=True) as _pbar:
+                for _fut in as_completed(_futures):
+                    _pbar.update(1)
+                    spec, status, detail, new_entry = _fut.result()
+                    dest, _, cache_key, row_idx, obs_id, fname = spec
+
+                    if status == 'missing':
+                        pass  # not on disk — will be downloaded
+
+                    elif status == 'broken':
+                        tqdm.write(f"  WARNING: {fname} is corrupt ({detail}) "
+                                   f"— will re-download.")
+                        if dest.exists():
+                            dest.unlink()
+                        _invalidate_psf_cache(dest)
+                        broken.append(fname)
+
+                    elif status in ('cached', 'verified'):
+                        if new_entry is not None:
+                            _cache_updates[cache_key] = new_entry
+                        if detail:   # detail == fail_reason
+                            tqdm.write(f"  WARNING: {fname} is a failed observation "
+                                       f"({detail}) — skipping all downstream steps.")
+                            _invalidate_psf_cache(dest)
+                            failed_obsids[obs_id] = detail
+                        already.append(row_idx)
+
+        # Persist updated cache entries for future runs.
+        _vcache.update(_cache_updates)
+        try:
+            _cache_path.write_text(json.dumps(_vcache))
+        except Exception:
+            pass
 
         if already:
             n_valid = len(already) - len(failed_obsids)
