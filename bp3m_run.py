@@ -386,6 +386,9 @@ def _parse_args():
                           'psf_delta.npy and psf_perturbation.png for each image.')
     ctl.add_argument('--force_rematch', action='store_true',
                      help='Re-run cross-matching even if matched_gaia.csv already exists')
+    ctl.add_argument('--force_validate', action='store_true',
+                     help='Re-run cross-image validation (regenerate cross_match_catalog.csv) '
+                          'without re-running cross-matching')
     ctl.add_argument('--skip_psf', action='store_true',
                      help='Skip PSF fitting (use existing catalogs)')
     ctl.add_argument('--skip_crossmatch', action='store_true',
@@ -793,10 +796,17 @@ def main():
             restrict_to_obsids=_restrict,
             lib_dir=Path(args.lib_dir) if args.lib_dir else None,
             run_qso_vetting=False,
+            force_validate=getattr(args, 'force_validate', False),
             prior_sigma_rot_deg=args.prior_sigma_rot_deg,
             prior_sigma_scale=args.prior_sigma_scale,
             prior_sigma_skew=args.prior_sigma_skew,
         )
+    elif getattr(args, 'force_validate', False):
+        from bp3m.pipeline.cross_match import _validate_catalog_if_needed
+        print("\n" + "─"*50)
+        print("Step 4: Cross-image validation (forced)")
+        print("─"*50)
+        _validate_catalog_if_needed(field, output_dir, force=True)
 
     # ── Step 4b: Gaia DR4 epoch astrometry (optional) ────────────────────────
     _gaia_epoch_obs_for_solver: dict | None = None

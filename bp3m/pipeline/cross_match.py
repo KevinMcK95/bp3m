@@ -223,6 +223,7 @@ def run_cross_match(
     restrict_to_obsids: list[str] | None = None,
     lib_dir: "Path | None" = None,
     run_qso_vetting: bool = False,
+    force_validate: bool = False,
     prior_sigma_rot_deg: float | None = None,
     prior_sigma_scale: float | None = None,
     prior_sigma_skew: float | None = None,
@@ -343,7 +344,8 @@ def run_cross_match(
               f"{', '.join(skipped_nophot)}")
     if not work:
         print("  All cross-matches up to date.")
-        _validate_catalog_if_needed(field_name, output_dir, force=force_rematch)
+        _validate_catalog_if_needed(field_name, output_dir,
+                                    force=force_rematch or force_validate)
         existing = [Path(f['root']) / "matched_gaia.csv" for f in folders]
         # Still run QSO vetting if the anchors file is missing
         if run_qso_vetting:
