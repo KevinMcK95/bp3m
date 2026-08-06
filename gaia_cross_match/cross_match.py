@@ -745,7 +745,7 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
 # Main per-image processor
 # ---------------------------------------------------------------------------
 
-def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True, sigma_rot_deg=None, sigma_scale=None, sigma_skew=None):
+def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True, sigma_rot_deg=None, sigma_scale=None, sigma_skew=None, init_resid_max=5.0):
     start_time = time.time()
     image_name = os.path.basename(hst['flc']).replace("_flc.fits", "")
     log_file, original_stdout = os.path.join(hst['root'], "processing_log.txt"), sys.stdout
@@ -964,7 +964,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         # (on the seed pairs before any iteration inflates resid_cov) are large.
         # Correct matches have sub-pixel Init 6P residuals; wrong matches have
         # multi-pixel residuals even before the 6P iterates.
-        if max(_init_rx, _init_ry) > 2.0:
+        if max(_init_rx, _init_ry) > init_resid_max:
             print(f"Finished {image_name}: Init 6P residuals too large "
                   f"({_init_rx:.2f},{_init_ry:.2f}px) — spurious 4P seed, skipping.", file=original_stdout)
             return

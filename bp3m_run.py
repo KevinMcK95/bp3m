@@ -209,6 +209,11 @@ def _parse_args():
                     help='Half-width of the offset histogram search during 4P discovery in pixels (default 50)')
     xm.add_argument('--auto_resid_floor', action='store_true',
                     help='Enable the per-iteration empirical residual covariance floor during affine refinement (default: off)')
+    xm.add_argument('--xmatch_init_resid_max', type=float, default=5.0,
+                    help='Maximum allowed init 6P residual (px) after 4P discovery before '
+                         'declaring the seed spurious and skipping the image (default 5.0). '
+                         'Fields with large Gaia scatter or long epoch baselines may need a '
+                         'higher value; use 2.0 to restore the old conservative behaviour.')
     xm.add_argument('--no_qso_anchors', action='store_true',
                     help='Skip QSO anchor vetting (Quaia + MILLIQUAS cross-match + '
                          'astrometric cut). By default QSO vetting runs after cross-matching '
@@ -800,6 +805,7 @@ def main():
             prior_sigma_rot_deg=args.prior_sigma_rot_deg,
             prior_sigma_scale=args.prior_sigma_scale,
             prior_sigma_skew=args.prior_sigma_skew,
+            init_resid_max=args.xmatch_init_resid_max,
         )
     elif getattr(args, 'force_validate', False):
         from bp3m.pipeline.cross_match import _validate_catalog_if_needed

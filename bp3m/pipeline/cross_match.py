@@ -152,6 +152,7 @@ def _match_one(args):
             sigma_rot_deg=kwargs.get('prior_sigma_rot_deg', None),
             sigma_scale=kwargs.get('prior_sigma_scale', None),
             sigma_skew=kwargs.get('prior_sigma_skew', None),
+            init_resid_max=kwargs.get('init_resid_max', 5.0),
         )
         post_mtime = out.stat().st_mtime if out.exists() else None
         file_updated = post_mtime is not None and post_mtime != pre_mtime
@@ -227,6 +228,7 @@ def run_cross_match(
     prior_sigma_rot_deg: float | None = None,
     prior_sigma_scale: float | None = None,
     prior_sigma_skew: float | None = None,
+    init_resid_max: float = 5.0,
 ) -> list[Path]:
     """
     Cross-match all PSF-fit HST catalogs in a field against Gaia.
@@ -300,6 +302,7 @@ def run_cross_match(
         'sigma_rot_deg':        prior_sigma_rot_deg if prior_sigma_rot_deg is not None else _DEFAULT_SIGMA_ROT_DEG,
         'sigma_scale':          prior_sigma_scale   if prior_sigma_scale   is not None else _DEFAULT_SIGMA_SCALE,
         'sigma_skew':           prior_sigma_skew    if prior_sigma_skew    is not None else _DEFAULT_SIGMA_SKEW,
+        'init_resid_max':       init_resid_max,
     }
 
     work = []
@@ -335,6 +338,7 @@ def run_cross_match(
             'prior_sigma_rot_deg':  prior_sigma_rot_deg,
             'prior_sigma_scale':    prior_sigma_scale,
             'prior_sigma_skew':     prior_sigma_skew,
+            'init_resid_max':       init_resid_max,
         }))
 
     if skipped:
