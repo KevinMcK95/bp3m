@@ -958,8 +958,9 @@ def main():
             print("─"*50)
 
             _n_ok, _n_fail = 0, 0
-            for _img in _indv_names:
-                print(f"\n  ── {_img} ──")
+            _n_total = len(_indv_names)
+            for _i_img, _img in enumerate(_indv_names, 1):
+                print(f"\n  ── {_img}  ({_i_img}/{_n_total}) ──")
                 try:
                     run_alignment(
                         output_dir=output_dir, field_name=field,
