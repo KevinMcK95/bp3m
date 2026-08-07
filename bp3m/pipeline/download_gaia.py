@@ -169,10 +169,10 @@ def _build_query(source_table, ra, dec, width, height):
     return f"SELECT source_id {cols} FROM {source_table} WHERE {box}"
 
 
-def _mag_bins(min_mag, max_mag, area, min_bins=1):
+def _mag_bins(min_mag, max_mag, area):
     """Log-spaced magnitude bins using a density-adaptive scheme."""
     # n is the number of bin edges; minimum 2 to produce at least 1 bin.
-    n = max(2, min_bins + 1, round((max_mag - min_mag) * max_mag**2 * area * 5e-5))
+    n = max(2, round((max_mag - min_mag) * max_mag**2 * area * 5e-5))
     return 1.0 + max_mag - np.logspace(
         log10(1.0), log10(1.0 + max_mag - min_mag), num=int(n))
 
@@ -328,7 +328,6 @@ def download_gaia(
     only_5p: bool = False,
     n_processes: int = 4,
     query_timeout: int = 300,
-    min_mag_bins: int = 1,
     force_redownload: bool = False,
     quiet: bool = False,
 ) -> pd.DataFrame:
@@ -413,7 +412,7 @@ def download_gaia(
     ind_dir.mkdir(exist_ok=True)
 
     area  = search_width * search_height * abs(np.cos(np.deg2rad(dec)))
-    bins  = _mag_bins(min_gmag, _max_gmag, area, min_bins=min_mag_bins)
+    bins  = _mag_bins(min_gmag, _max_gmag, area)
     n_bins = len(bins) - 1
 
     print(f"  Magnitude bins: {n_bins}  (area {area:.4f} deg²)")

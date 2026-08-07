@@ -361,10 +361,6 @@ def _parse_args():
     ctl.add_argument('--gaia_timeout', type=int, default=300,
                      help='Per-bin Gaia TAP query timeout in seconds (default 300). '
                           'Increase for large fields with slow archive responses.')
-    ctl.add_argument('--gaia_mag_bins', type=int, default=1,
-                     help='Minimum number of magnitude bins for the Gaia query (default 1). '
-                          'Increase for dense fields (e.g. near galactic plane) where a '
-                          'single G 0–22 query causes server 500 errors or timeouts.')
     ctl.add_argument('--force_redownload_hst', action='store_true',
                      help='Re-search MAST and re-download HST files even if cached')
     ctl.add_argument('--force_refit_psf', action='store_true',
@@ -559,7 +555,6 @@ def main():
             only_5p=args.only_5p,
             n_processes=args.n_processes,
             query_timeout=args.gaia_timeout,
-            min_mag_bins=args.gaia_mag_bins,
             force_redownload=args.force_redownload_gaia,
             quiet=args.quiet,
         )
