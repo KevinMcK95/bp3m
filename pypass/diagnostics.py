@@ -905,7 +905,9 @@ def plot_catalog_stats(records, output=None, title=None, floor_params=None):
         _qc_vals = np.clip(conc2_f[_qc_fin], 0.3, 2.5)
         import matplotlib.cm as _mcm
         import matplotlib.colors as _mco
-        _cmap_qc = _mcm.get_cmap('RdYlGn_r')
+        import matplotlib as _mpl
+        _cmap_qc = (_mpl.colormaps['RdYlGn_r'] if hasattr(_mpl, 'colormaps')
+                    else _mcm.get_cmap('RdYlGn_r'))
         _norm_qc = _mco.TwoSlopeNorm(vmin=0.3, vcenter=1.0, vmax=2.5)
         sc_qc = ax_qconc.scatter(mag_f[_qc_fin], q_f[_qc_fin],
                                  c=_qc_vals, cmap=_cmap_qc, norm=_norm_qc,

@@ -4064,7 +4064,9 @@ def _plot_joint_convergence(
         coef_labels += [f'l·{lbl}' for lbl in _spat_mag_labels]   # linear-in-time block
 
     # Build colormap: cycle through tab20 for nb coefficients
-    cmap    = cm.get_cmap('tab20', max(_nb, 1))
+    import matplotlib as _mpl
+    cmap    = (_mpl.colormaps['tab20'] if hasattr(_mpl, 'colormaps')
+               else cm.get_cmap('tab20', max(_nb, 1)))
     colors  = [cmap(i % 20) for i in range(_nb)]
     # Linestyles by magnitude order (first n_spatial-1 terms are m^0); repeat for time blocks
     n_sp    = _cte_n_spatial(_ref.spatial_order)
