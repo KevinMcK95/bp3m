@@ -869,6 +869,10 @@ def run_pop_fit_rotation(
     f_init: float = 1.0,
     n_iter_ft: int = 20,
     mu_pop_init: tuple[float, float] | None = None,
+    plx_pop: float | None = None,
+    sigma_plx_tot: float | None = None,
+    lvd_key: str | None = None,
+    lvd_dir: "Path | str | None" = None,
     no_plots: bool = False,
     use_qso_anchors: bool = True,
     qso_anchors_csv: "Path | str | list | None" = None,
@@ -902,8 +906,25 @@ def run_pop_fit_rotation(
     if mu_pop_init is None:
         mu_pop_init = gp['mu_pop_init']
 
-    plx_pop       = gp['plx_pop']
-    sigma_plx_tot = gp['sigma_plx_tot']
+    _plx_pop       = plx_pop       if plx_pop       is not None else gp['plx_pop']
+    _sigma_plx_tot = sigma_plx_tot if sigma_plx_tot is not None else gp['sigma_plx_tot']
+
+    if lvd_key is not None:
+        import os
+        from bp3m.pipeline.run_pop_fit import _lookup_lvd
+        _lvd_dir = (lvd_dir or os.environ.get('BP3M_LVD_DIR')
+                    or str(Path.home() / 'data_bootes' / 'bp3m'
+                           / 'local_volume_database' / 'data'))
+        try:
+            _lvd = _lookup_lvd(Path(_lvd_dir), lvd_key)
+            if plx_pop       is None and 'plx_pop'       in _lvd: _plx_pop       = _lvd['plx_pop']
+            if sigma_plx_tot is None and 'sigma_plx_tot' in _lvd: _sigma_plx_tot = _lvd['sigma_plx_tot']
+            if mu_pop_init   is None and 'mu_pop_init'   in _lvd: mu_pop_init    = _lvd['mu_pop_init']
+        except Exception as exc:
+            print(f"WARNING: LVD lookup failed ({exc}); using GALAXY_PARAMS values.")
+
+    plx_pop       = _plx_pop
+    sigma_plx_tot = _sigma_plx_tot
 
     t_start    = time.time()
     data_root  = Path(output_dir)
@@ -1806,6 +1827,15 @@ def main():
                         help='Hold theta_offset fixed at 0.0')
     parser.add_argument('--n_iter_ft',    type=int, default=20,
                         help='Phase 4 iterations for f/θ fitting (ignored if both --no_fit_f and --no_fit_theta)')
+    parser.add_argument('--plx_pop',       type=float, default=None,
+                        help='Cluster parallax (mas); overrides GALAXY_PARAMS and LVD')
+    parser.add_argument('--sigma_plx_tot', type=float, default=None,
+                        help='Parallax prior width (mas); overrides GALAXY_PARAMS and LVD')
+    parser.add_argument('--lvd_key',  type=str, default=None,
+                        help='LVD entry key to auto-fill plx_pop/sigma_plx_tot/mu_pop_init')
+    parser.add_argument('--lvd_dir',  type=str, default=None,
+                        help='Path to LVD data/ directory (falls back to $BP3M_LVD_DIR '
+                             'or ~/data_bootes/bp3m/local_volume_database/data/)')
     parser.add_argument('--no_plots',       action='store_true')
     parser.add_argument('--no_qso_anchors', action='store_true',
                         help='Disable QSO secular-aberration anchor prior')
@@ -1829,6 +1859,10 @@ def main():
         fit_theta=not args.no_fit_theta,
         f_init=args.f_init,
         n_iter_ft=args.n_iter_ft,
+        plx_pop=args.plx_pop,
+        sigma_plx_tot=args.sigma_plx_tot,
+        lvd_key=args.lvd_key,
+        lvd_dir=args.lvd_dir,
         no_plots=args.no_plots,
         use_qso_anchors=not args.no_qso_anchors,
         qso_anchors_csv=[Path(p) for p in args.qso_anchors_csv] if args.qso_anchors_csv else None,
