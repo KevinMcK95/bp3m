@@ -39,9 +39,14 @@ SIGMA_POINTING = 5000.0   # pointing offset prior width (mas); ~100 ACS pixels
 # ── Hi/lo chip-pair coupling prior ────────────────────────────────────────────
 # Constrains the *difference* between the two chips of the same ACS/WFC or
 # WFC3/UVIS exposure.  Helps anchor a data-starved chip to its partner.
-# Both chips experience the same telescope pointing, so all 6 parameters
-# (rotation, scale, skew, Δα0, Δδ0) are expected to be nearly identical.
-SIGMA_PAIR_ROT_DEG  = 0.01    # expected _hi/_lo rotation difference (deg)
+# Calibrated from std(hi−lo) across 3484 ACS and 2164 WFC3/UVIS paired images
+# (analyze_hyperpriors.py, hyperprior_stats.txt):
+#   rotation:  ACS 0.044°, WFC3 0.025°   → 0.10° (conservative, currently off)
+#   scale:     ACS 2.1e-4, WFC3 1.2e-4   → 5e-4 (unchanged; pair prior off)
+#   skew:      ACS ~1e-4,  WFC3 ~6e-5    → 2e-4 (unchanged; pair prior off)
+#   pointing:  ACS RA 115 mas / Dec 39 mas; WFC3 RA 15 mas / Dec 11 mas
+#              → 100 mas (unchanged; instrument-specific values deferred)
+SIGMA_PAIR_ROT_DEG  = 0.10    # expected _hi/_lo rotation difference (deg)
 SIGMA_PAIR_SCALE    = 5e-4    # expected _hi/_lo scale difference
 SIGMA_PAIR_SKEW     = 2e-4    # expected _hi/_lo skew difference
 SIGMA_PAIR_POINTING = 100.0   # expected _hi/_lo pointing difference (mas)
