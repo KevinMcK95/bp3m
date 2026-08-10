@@ -2821,7 +2821,7 @@ def _lookup_lvd(lvd_dir: Path, key: str) -> dict:
     subset of:
       plx_pop          — cluster parallax (mas), from distance_modulus
       sigma_plx_tot    — parallax prior width (mas), from distance uncertainty
-      mu_pop_init      — (pmra, pmdec) tuple (mas/yr), from pmra/pmdec_center
+      mu_pop_init      — (pmra, pmdec) tuple (mas/yr), from pmra/pmdec columns
       mu_pop_prior_sigma — prior width on μ_pop (mas/yr), 3× max(PM errors)
       d_kpc            — distance (kpc), for informational printing
     """
@@ -2859,14 +2859,13 @@ def _lookup_lvd(lvd_dir: Path, key: str) -> dict:
                 sigma_d = (d_hi - d_lo) / 2.0
                 params['sigma_plx_tot'] = sigma_d / d_kpc ** 2   # mas
 
-        pmra  = float(row.get('pmra_center',  np.nan))
-        pmdec = float(row.get('pmdec_center', np.nan))
+        pmra  = float(row.get('pmra',  np.nan))
+        pmdec = float(row.get('pmdec', np.nan))
         if np.isfinite(pmra) and np.isfinite(pmdec):
             params['mu_pop_init'] = (pmra, pmdec)
 
             pm_errs = [float(row.get(c, np.nan))
-                       for c in ('pmra_center_ep', 'pmra_center_em',
-                                 'pmdec_center_ep', 'pmdec_center_em')]
+                       for c in ('pmra_ep', 'pmra_em', 'pmdec_ep', 'pmdec_em')]
             pm_errs = [v for v in pm_errs if np.isfinite(v) and v > 0]
             if pm_errs:
                 params['mu_pop_prior_sigma'] = 3.0 * float(max(pm_errs))

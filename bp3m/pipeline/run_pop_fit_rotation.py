@@ -870,6 +870,7 @@ def run_pop_fit_rotation(
     n_iter_ft: int = 20,
     mu_pop_init: tuple[float, float] | None = None,
     no_plots: bool = False,
+    use_qso_anchors: bool = True,
     qso_anchors_csv: "Path | str | list | None" = None,
 ) -> Path:
     """
@@ -1016,48 +1017,62 @@ def run_pop_fit_rotation(
     _n_qso_anchors = 0
 
     _gaia_dir = data_root / field_name / 'Gaia'
-    if qso_anchors_csv is not None:
-        _anchor_paths = ([Path(qso_anchors_csv)]
-                         if not isinstance(qso_anchors_csv, list)
-                         else [Path(p) for p in qso_anchors_csv])
+    if use_qso_anchors:
+        if qso_anchors_csv is not None:
+            _anchor_paths = ([Path(qso_anchors_csv)]
+                             if not isinstance(qso_anchors_csv, list)
+                             else [Path(p) for p in qso_anchors_csv])
+        else:
+            _p = find_qso_anchors(_gaia_dir, field_name)
+            _all = sorted(_gaia_dir.glob(f"{field_name}_*_qso_anchors.csv"),
+                          key=lambda p: p.stat().st_mtime)
+            _anchor_paths = _all if _all else ([_p] if _p and _p.exists() else [])
+
+        _anchor_paths = [p for p in _anchor_paths if p.exists()]
+
+        if _anchor_paths:
+            try:
+                _qdfs = [pd.read_csv(p, dtype={'source_id': 'int64'})
+                         for p in _anchor_paths]
+                _qdf = (pd.concat(_qdfs, ignore_index=True)
+                        .drop_duplicates(subset=['source_id'])
+                        .reset_index(drop=True)
+                        if len(_qdfs) > 1 else _qdfs[0])
+                _qdf_anchors = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+
+                _nq_total = len(_qdf)
+                _nq_5p    = int(_qdf['has_5p_solution'].sum())
+                _nq_astro = int(_qdf['astrometric_pass'].sum())
+                _nq_cat   = int(_qdf['catalog_match'].sum())
+                _nq_anch  = len(_qdf_anchors)
+                print(f"  QSO vetting summary ({len(_anchor_paths)} file(s)):")
+                print(f"    Gaia qso_candidates:          {_nq_total}")
+                print(f"    With 5p/6p solution:          {_nq_5p}")
+                print(f"    Astrometric cut (<3σ):        {_nq_astro}")
+                print(f"    Catalog match (Quaia/MILLIQUAS/CRF3): {_nq_cat}")
+                print(f"    Vetted QSO anchors:           {_nq_anch}")
+
+                _qso_idx_list, _qso_pmra_list, _qso_pmdec_list = [], [], []
+                for _, _row in _qdf_anchors.iterrows():
+                    _sidx = star_id_to_idx.get(int(_row['source_id']))
+                    if _sidx is not None:
+                        _qso_idx_list.append(_sidx)
+                        _qso_pmra_list.append(float(_row['pmra_aberr_uas']) * 1e-3)
+                        _qso_pmdec_list.append(float(_row['pmdec_aberr_uas']) * 1e-3)
+                if _qso_idx_list:
+                    _qso_sidx      = np.array(_qso_idx_list,  dtype=int)
+                    _qso_pmra_mas  = np.array(_qso_pmra_list, dtype=float)
+                    _qso_pmdec_mas = np.array(_qso_pmdec_list, dtype=float)
+                    _n_qso_anchors = len(_qso_sidx)
+                print(f"    In HST field (in solver):     {_n_qso_anchors}  "
+                      + ("← tight σ_κ prior applied" if _n_qso_anchors > 0
+                         else "(none in HST FOV — prior not applied)"))
+            except Exception as _qexc:
+                print(f"  WARNING: could not load QSO anchors — {_qexc}")
+        else:
+            print("  QSO anchor file not found; re-run from Phase 1 to generate it")
     else:
-        _p = find_qso_anchors(_gaia_dir, field_name)
-        _all = sorted(_gaia_dir.glob(f"{field_name}_*_qso_anchors.csv"),
-                      key=lambda p: p.stat().st_mtime)
-        _anchor_paths = _all if _all else ([_p] if _p and _p.exists() else [])
-
-    _anchor_paths = [p for p in _anchor_paths if p.exists()]
-
-    if _anchor_paths:
-        try:
-            _qdfs = [pd.read_csv(p, dtype={'source_id': 'int64'})
-                     for p in _anchor_paths]
-            _qdf = (pd.concat(_qdfs, ignore_index=True)
-                    .drop_duplicates(subset=['source_id'])
-                    .reset_index(drop=True)
-                    if len(_qdfs) > 1 else _qdfs[0])
-            _qdf_anchors = _qdf[_qdf['is_qso_anchor'].fillna(False)]
-            _nq_anch = len(_qdf_anchors)
-            print(f"  QSO vetted anchors: {_nq_anch}")
-
-            _qso_idx_list, _qso_pmra_list, _qso_pmdec_list = [], [], []
-            for _, _row in _qdf_anchors.iterrows():
-                _sidx = star_id_to_idx.get(int(_row['source_id']))
-                if _sidx is not None:
-                    _qso_idx_list.append(_sidx)
-                    _qso_pmra_list.append(float(_row['pmra_aberr_uas']) * 1e-3)
-                    _qso_pmdec_list.append(float(_row['pmdec_aberr_uas']) * 1e-3)
-            if _qso_idx_list:
-                _qso_sidx      = np.array(_qso_idx_list,  dtype=int)
-                _qso_pmra_mas  = np.array(_qso_pmra_list, dtype=float)
-                _qso_pmdec_mas = np.array(_qso_pmdec_list, dtype=float)
-                _n_qso_anchors = len(_qso_sidx)
-            print(f"    In HST field: {_n_qso_anchors}"
-                  + (" ← prior applied" if _n_qso_anchors > 0 else " (none in FOV)"))
-        except Exception as _qexc:
-            print(f"  WARNING: could not load QSO anchors — {_qexc}")
-    else:
-        print("  QSO anchor file not found")
+        print("  QSO anchors disabled (--no_qso_anchors)")
 
     # ── Build solver ──────────────────────────────────────────────────────────
     solver = BP3MSolver(imgs, filtered_spi, gaia_catalog,
@@ -1791,7 +1806,9 @@ def main():
                         help='Hold theta_offset fixed at 0.0')
     parser.add_argument('--n_iter_ft',    type=int, default=20,
                         help='Phase 4 iterations for f/θ fitting (ignored if both --no_fit_f and --no_fit_theta)')
-    parser.add_argument('--no_plots',     action='store_true')
+    parser.add_argument('--no_plots',       action='store_true')
+    parser.add_argument('--no_qso_anchors', action='store_true',
+                        help='Disable QSO secular-aberration anchor prior')
     parser.add_argument('--qso_anchors_csv', type=str, default=None, nargs='+')
 
     args = parser.parse_args()
@@ -1813,5 +1830,6 @@ def main():
         f_init=args.f_init,
         n_iter_ft=args.n_iter_ft,
         no_plots=args.no_plots,
+        use_qso_anchors=not args.no_qso_anchors,
         qso_anchors_csv=[Path(p) for p in args.qso_anchors_csv] if args.qso_anchors_csv else None,
     )
