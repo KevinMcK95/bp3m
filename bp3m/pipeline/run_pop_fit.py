@@ -2814,6 +2814,69 @@ def run_pop_fit(
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
+def _lookup_lvd(lvd_dir: Path, key: str) -> dict:
+    """Look up an LVD entry by key and return derived pop-fit parameters.
+
+    Searches dwarf_all.csv then gc_harris.csv.  Returns a dict with any
+    subset of:
+      plx_pop          — cluster parallax (mas), from distance_modulus
+      sigma_plx_tot    — parallax prior width (mas), from distance uncertainty
+      mu_pop_init      — (pmra, pmdec) tuple (mas/yr), from pmra/pmdec_center
+      mu_pop_prior_sigma — prior width on μ_pop (mas/yr), 3× max(PM errors)
+      d_kpc            — distance (kpc), for informational printing
+    """
+    import numpy as np
+    import pandas as pd
+
+    lvd_dir = Path(lvd_dir)
+    for csv_name in ('dwarf_all.csv', 'gc_harris.csv'):
+        csv = lvd_dir / csv_name
+        if not csv.exists():
+            continue
+        df = pd.read_csv(csv, low_memory=False)
+        if 'key' not in df.columns:
+            continue
+        rows = df[df['key'] == key]
+        if len(rows) == 0:
+            continue
+
+        row = rows.iloc[0]
+        params: dict = {}
+
+        mu = float(row.get('distance_modulus', np.nan))
+        if np.isfinite(mu):
+            d_kpc = 10 ** (mu / 5 + 1) / 1000
+            params['plx_pop'] = 1.0 / d_kpc   # mas
+            params['d_kpc']   = d_kpc
+
+            mu_ep = float(row.get('distance_modulus_ep', np.nan))
+            mu_em = float(row.get('distance_modulus_em', np.nan))
+            errs  = [v for v in (mu_ep, mu_em) if np.isfinite(v)]
+            if errs:
+                err    = float(np.mean(errs))
+                d_hi   = 10 ** ((mu + err) / 5 + 1) / 1000
+                d_lo   = 10 ** ((mu - err) / 5 + 1) / 1000
+                sigma_d = (d_hi - d_lo) / 2.0
+                params['sigma_plx_tot'] = sigma_d / d_kpc ** 2   # mas
+
+        pmra  = float(row.get('pmra_center',  np.nan))
+        pmdec = float(row.get('pmdec_center', np.nan))
+        if np.isfinite(pmra) and np.isfinite(pmdec):
+            params['mu_pop_init'] = (pmra, pmdec)
+
+            pm_errs = [float(row.get(c, np.nan))
+                       for c in ('pmra_center_ep', 'pmra_center_em',
+                                 'pmdec_center_ep', 'pmdec_center_em')]
+            pm_errs = [v for v in pm_errs if np.isfinite(v) and v > 0]
+            if pm_errs:
+                params['mu_pop_prior_sigma'] = 3.0 * float(max(pm_errs))
+
+        return params
+
+    raise ValueError(f"LVD key {key!r} not found in {lvd_dir} "
+                     f"(searched dwarf_all.csv and gc_harris.csv)")
+
+
 def main():
     import argparse
 
@@ -2828,12 +2891,26 @@ def main():
                         help='Root output directory (same as passed to bp3m)')
     parser.add_argument('--sigma_pm', type=float, default=0.0075,
                         help='Cluster PM dispersion (mas/yr)')
-    parser.add_argument('--plx_pop', type=float, default=0.003873,
-                        help='Cluster parallax (mas)')
-    parser.add_argument('--sigma_plx_tot', type=float, default=0.0001425,
-                        help='Total parallax uncertainty (mas) for pop prior')
-    parser.add_argument('--mu_pop_prior_sigma', type=float, default=0.5,
-                        help='Gaussian prior width on μ_pop (mas/yr)')
+    parser.add_argument('--plx_pop', type=float, default=None,
+                        help='Cluster parallax (mas). Derived from --lvd_key distance if '
+                             'not given; otherwise defaults to 0.003873 (Leo I).')
+    parser.add_argument('--sigma_plx_tot', type=float, default=None,
+                        help='Total parallax uncertainty (mas) for pop prior. Derived from '
+                             '--lvd_key distance uncertainty if not given; otherwise '
+                             'defaults to 0.0001425 (Leo I).')
+    parser.add_argument('--mu_pop_prior_sigma', type=float, default=None,
+                        help='Gaussian prior width on μ_pop (mas/yr). If --lvd_key provides '
+                             'a literature PM uncertainty, set to 3× that value; otherwise '
+                             'defaults to 0.5.')
+    parser.add_argument('--lvd_key', type=str, default=None,
+                        help='Local Volume Database key (e.g. "leo_1", "ngc_0055") to '
+                             'automatically derive plx_pop, sigma_plx_tot, mu_pop_init, and '
+                             'mu_pop_prior_sigma. Explicit CLI values always override LVD '
+                             'values.')
+    parser.add_argument('--lvd_dir', type=str, default=None,
+                        help='Path to the LVD data directory containing dwarf_all.csv and '
+                             'gc_harris.csv. Falls back to $BP3M_LVD_DIR, then '
+                             '~/data_bootes/bp3m/local_volume_database/data/')
     parser.add_argument('--n_iter_mu', type=int, default=20,
                         help='Phase 1 (μ-only) solve iterations')
     parser.add_argument('--n_iter_joint', type=int, default=20,
@@ -2911,6 +2988,52 @@ def main():
 
     args = parser.parse_args()
 
+    # ── Resolve LVD-derived parameters ───────────────────────────────────────
+    _plx_pop          = args.plx_pop           # None if not given by user
+    _sigma_plx_tot    = args.sigma_plx_tot     # None if not given by user
+    _mu_pop_prior_sigma = args.mu_pop_prior_sigma  # None if not given by user
+    _mu_pop_init      = (tuple(args.mu_pop_init) if args.mu_pop_init is not None
+                         else None)
+
+    if args.lvd_key is not None:
+        import os
+        _lvd_dir = (args.lvd_dir
+                    or os.environ.get('BP3M_LVD_DIR')
+                    or str(Path.home() / 'data_bootes' / 'bp3m'
+                           / 'local_volume_database' / 'data'))
+        try:
+            _lvd = _lookup_lvd(Path(_lvd_dir), args.lvd_key)
+            print(f"LVD lookup for key={args.lvd_key!r} (dir={_lvd_dir}):")
+            if 'd_kpc' in _lvd:
+                print(f"  distance   = {_lvd['d_kpc']:.2f} kpc")
+            if 'plx_pop' in _lvd:
+                print(f"  plx_pop    = {_lvd['plx_pop']:.4e} mas")
+            if 'sigma_plx_tot' in _lvd:
+                print(f"  σ_plx_tot  = {_lvd['sigma_plx_tot']:.4e} mas")
+            if 'mu_pop_init' in _lvd:
+                print(f"  μ_pop_init = {_lvd['mu_pop_init']} mas/yr")
+            if 'mu_pop_prior_sigma' in _lvd:
+                print(f"  μ_pop σ    = {_lvd['mu_pop_prior_sigma']:.4f} mas/yr")
+            # Only fill in values the user did not supply explicitly
+            if _plx_pop is None:
+                _plx_pop = _lvd.get('plx_pop')
+            if _sigma_plx_tot is None:
+                _sigma_plx_tot = _lvd.get('sigma_plx_tot')
+            if _mu_pop_init is None and 'mu_pop_init' in _lvd:
+                _mu_pop_init = _lvd['mu_pop_init']
+            if _mu_pop_prior_sigma is None and 'mu_pop_prior_sigma' in _lvd:
+                _mu_pop_prior_sigma = _lvd['mu_pop_prior_sigma']
+        except Exception as exc:
+            print(f"WARNING: LVD lookup failed ({exc}); falling back to defaults.")
+
+    # Apply fallback defaults for any still-unset parameters
+    if _plx_pop is None:
+        _plx_pop = 0.003873
+    if _sigma_plx_tot is None:
+        _sigma_plx_tot = 0.0001425
+    if _mu_pop_prior_sigma is None:
+        _mu_pop_prior_sigma = 0.5
+
     # Resolve lib_dir: CLI arg > config.toml
     _lib_dir_arg = args.lib_dir
     if _lib_dir_arg is None:
@@ -2929,9 +3052,9 @@ def main():
         output_dir=Path(args.output_dir).resolve(),
         field_name=args.name.replace(' ', '_'),
         sigma_pm=args.sigma_pm,
-        plx_pop=args.plx_pop,
-        sigma_plx_tot=args.sigma_plx_tot,
-        mu_pop_prior_sigma=args.mu_pop_prior_sigma,
+        plx_pop=_plx_pop,
+        sigma_plx_tot=_sigma_plx_tot,
+        mu_pop_prior_sigma=_mu_pop_prior_sigma,
         n_iter_mu=args.n_iter_mu,
         n_iter_joint=args.n_iter_joint,
         n_iter_alpha=args.n_iter_alpha,
@@ -2944,7 +3067,7 @@ def main():
         pm_sys_floor=args.pm_sys_floor,
         max_sigma_free_pm=args.max_sigma_free_pm,
         fit_members_only=args.fit_members_only,
-        mu_pop_init=tuple(args.mu_pop_init) if args.mu_pop_init is not None else None,
+        mu_pop_init=_mu_pop_init,
         freeze_mu_pop_init=args.freeze_mu_pop_init,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
