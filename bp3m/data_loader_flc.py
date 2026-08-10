@@ -158,10 +158,13 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
         "orig_pixel_scale": orig_pixel_scale_mas,  # mas/pix (nominal, from CSV)
         "orig_rot_deg":    -orientat,
         "pixel_scale_ratio": ratio,
-        # Nominal initial scale ratio for this instrument/detector — used as
-        # the prior mean for pixel scale in _make_image_prior.  Sourced from
-        # instrument_config so cross-match and BP3M prior stay in sync.
+        # Per-instrument config: initial scale ratio (prior mean) and hyperprior
+        # sigma widths.  Sourced from instrument_config so cross-match and the
+        # BP3M solver always use consistent values.  Solver uses these as
+        # per-image defaults; explicit CLI overrides take precedence.
         "initial_scale_ratio": get_instrument_config(instrument, detector)["initial_scale"],
+        **{k: v for k, v in get_instrument_config(instrument, detector).items()
+           if k.startswith("sigma_")},
         "on_skew":  on_skew,
         "off_skew": off_skew,
         # Timing

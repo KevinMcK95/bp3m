@@ -92,10 +92,10 @@ def _make_image_prior(meta, poly_order=1,
 
     sigma_* override the module-level defaults from instrument_config.py.
     """
-    if sigma_rot_deg  is None: sigma_rot_deg  = _SIGMA_ROT_DEG
-    if sigma_scale    is None: sigma_scale    = _SIGMA_SCALE
-    if sigma_skew     is None: sigma_skew     = _SIGMA_SKEW
-    if sigma_pointing is None: sigma_pointing = _SIGMA_POINTING
+    if sigma_rot_deg  is None: sigma_rot_deg  = meta.get("sigma_rot_deg",  _SIGMA_ROT_DEG)
+    if sigma_scale    is None: sigma_scale    = meta.get("sigma_scale",    _SIGMA_SCALE)
+    if sigma_skew     is None: sigma_skew     = meta.get("sigma_skew",     _SIGMA_SKEW)
+    if sigma_pointing is None: sigma_pointing = meta.get("sigma_pointing", _SIGMA_POINTING)
     n_r = n_r_from_poly_order(poly_order)
 
     rot_rad = meta["orig_rot_deg"] * DEG2RAD
@@ -142,10 +142,10 @@ def _make_pair_coupling_inv(meta_hi, poly_order=1,
     Caller adds +C_pair_inv to each chip's diagonal block and −C_pair_inv to
     the off-diagonal cross blocks in H_rr.
     """
-    if sigma_pair_rot_deg  is None: sigma_pair_rot_deg  = _SIGMA_PAIR_ROT_DEG
-    if sigma_pair_scale    is None: sigma_pair_scale    = _SIGMA_PAIR_SCALE
-    if sigma_pair_skew     is None: sigma_pair_skew     = _SIGMA_PAIR_SKEW
-    if sigma_pair_pointing is None: sigma_pair_pointing = _SIGMA_PAIR_POINTING
+    if sigma_pair_rot_deg  is None: sigma_pair_rot_deg  = meta_hi.get("sigma_pair_rot_deg",  _SIGMA_PAIR_ROT_DEG)
+    if sigma_pair_scale    is None: sigma_pair_scale    = meta_hi.get("sigma_pair_scale",    _SIGMA_PAIR_SCALE)
+    if sigma_pair_skew     is None: sigma_pair_skew     = meta_hi.get("sigma_pair_skew",     _SIGMA_PAIR_SKEW)
+    if sigma_pair_pointing is None: sigma_pair_pointing = meta_hi.get("sigma_pair_pointing", _SIGMA_PAIR_POINTING)
 
     n_r = n_r_from_poly_order(poly_order)
     rot_rad = meta_hi["orig_rot_deg"] * DEG2RAD
@@ -211,6 +211,18 @@ class BP3MSolver:
         self.poly_order = poly_order
         self.N_R = n_r_from_poly_order(poly_order)
         self.exclude_2p_from_alignment = exclude_2p_from_alignment
+        # Raw CLI overrides (None = use per-instrument value embedded in image meta).
+        # _make_image_prior / _make_pair_coupling_inv fall back to meta then to
+        # module-level defaults when these are None.
+        self._sigma_rot_deg_cli       = prior_sigma_rot_deg
+        self._sigma_scale_cli         = prior_sigma_scale
+        self._sigma_skew_cli          = prior_sigma_skew
+        self._sigma_pointing_cli      = prior_sigma_pointing
+        self._sigma_pair_rot_deg_cli  = prior_sigma_pair_rot_deg
+        self._sigma_pair_scale_cli    = prior_sigma_pair_scale
+        self._sigma_pair_skew_cli     = prior_sigma_pair_skew
+        self._sigma_pair_pointing_cli = prior_sigma_pair_pointing
+        # Resolved values for logging / run_config.json (CLI override or global default).
         self._prior_sigma_rot_deg  = prior_sigma_rot_deg  if prior_sigma_rot_deg  is not None else _SIGMA_ROT_DEG
         self._prior_sigma_scale    = prior_sigma_scale    if prior_sigma_scale    is not None else _SIGMA_SCALE
         self._prior_sigma_skew     = prior_sigma_skew     if prior_sigma_skew     is not None else _SIGMA_SKEW
@@ -478,10 +490,10 @@ class BP3MSolver:
 
             r_prior, C_r_prior_inv = _make_image_prior(
                 meta, poly_order=self.poly_order,
-                sigma_rot_deg  = self._prior_sigma_rot_deg,
-                sigma_scale    = self._prior_sigma_scale,
-                sigma_skew     = self._prior_sigma_skew,
-                sigma_pointing = self._prior_sigma_pointing,
+                sigma_rot_deg  = self._sigma_rot_deg_cli,
+                sigma_scale    = self._sigma_scale_cli,
+                sigma_skew     = self._sigma_skew_cli,
+                sigma_pointing = self._sigma_pointing_cli,
             )
 
             # ── Build r_init (initial iterate) ───────────────────────────────
@@ -598,10 +610,10 @@ class BP3MSolver:
                 meta_hi = self.images[self.image_names[hi_idx]]
                 C_cp = _make_pair_coupling_inv(
                     meta_hi, self.poly_order,
-                    sigma_pair_rot_deg  = self._prior_sigma_pair_rot_deg,
-                    sigma_pair_scale    = self._prior_sigma_pair_scale,
-                    sigma_pair_skew     = self._prior_sigma_pair_skew,
-                    sigma_pair_pointing = self._prior_sigma_pair_pointing,
+                    sigma_pair_rot_deg  = self._sigma_pair_rot_deg_cli,
+                    sigma_pair_scale    = self._sigma_pair_scale_cli,
+                    sigma_pair_skew     = self._sigma_pair_skew_cli,
+                    sigma_pair_pointing = self._sigma_pair_pointing_cli,
                 )
                 self._chip_pairs.append((hi_idx, lo_idx))
                 self._chip_pair_couplings[(hi_idx, lo_idx)] = C_cp
