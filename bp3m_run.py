@@ -363,6 +363,13 @@ def _parse_args():
                           'Increase for large fields with slow archive responses.')
     ctl.add_argument('--force_redownload_hst', action='store_true',
                      help='Re-search MAST and re-download HST files even if cached')
+    ctl.add_argument('--mast_refresh_days', type=int, default=30, metavar='N',
+                     help='Re-query MAST if the cached obs table is older than N days '
+                          '(default 30). Set to 0 to always re-query, or use '
+                          '--skip_mast_download to never re-query.')
+    ctl.add_argument('--skip_mast_download', action='store_true',
+                     help='Use cached MAST obs table as-is, regardless of age. '
+                          'Useful when re-running alignment without network access.')
     ctl.add_argument('--force_refit_psf', action='store_true',
                      help='Re-run PSF fitting even if catalogs already exist, starting '
                           'from the bare stdpsf (ignores any stored psf_delta.npy). '
@@ -619,6 +626,8 @@ def main():
             field_ids=_parse_field_ids(args.field_ids),
             quiet=args.quiet,
             force_redownload=args.force_redownload_hst,
+            mast_refresh_days=args.mast_refresh_days,
+            skip_mast_download=args.skip_mast_download,
             n_processes=args.n_processes,
         )
 

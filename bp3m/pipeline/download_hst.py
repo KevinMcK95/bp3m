@@ -414,6 +414,8 @@ def download_hst_images(
     field_ids: list[int] | None = None,
     quiet: bool = False,
     force_redownload: bool = True,
+    mast_refresh_days: int | None = 30,
+    skip_mast_download: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Search MAST for images of a field and download them.
@@ -431,7 +433,11 @@ def download_hst_images(
     gaia_df         : Gaia catalogue DataFrame (used to count stars per footprint). Optional.
     field_ids       : list of 1-based field IDs to download (integers shown in the table).
                       None = all. Pass [0] to skip download and just return the table.
-    force_redownload: if True, re-query MAST and re-download even if cached files exist.
+    force_redownload    : if True, re-query MAST and re-download even if cached files exist.
+    mast_refresh_days   : re-query MAST if cached obs table is older than this many days
+                          (default 30).  Set to None to disable age-based refresh.
+    skip_mast_download  : if True, always use the cached obs table regardless of age or
+                          query-param changes (overrides mast_refresh_days and force_redownload).
 
     Returns
     -------
@@ -465,12 +471,19 @@ def download_hst_images(
     )
     params_sidecar = _query_params_sidecar(hst_dir, field_name)
 
-    use_cache = (
-        not force_redownload
-        and obs_csv.exists() and prod_csv.exists()
-        and params_sidecar.exists()
-    )
-    if use_cache:
+    if skip_mast_download:
+        use_cache = obs_csv.exists() and prod_csv.exists()
+        if not use_cache:
+            print("  WARNING: --skip_mast_download set but no cached obs table found; "
+                  "will query MAST.")
+    else:
+        use_cache = (
+            not force_redownload
+            and obs_csv.exists() and prod_csv.exists()
+            and params_sidecar.exists()
+        )
+
+    if use_cache and not skip_mast_download:
         stored_params = json.loads(params_sidecar.read_text())
         diffs = [f"    {k}: {stored_params.get(k)!r} → {current_params[k]!r}"
                  for k in current_params
@@ -481,17 +494,28 @@ def download_hst_images(
                 print(d)
             use_cache = False
 
+    if use_cache and not skip_mast_download and mast_refresh_days is not None:
+        import time as _time_mod
+        cache_age_days = (_time_mod.time() - obs_csv.stat().st_mtime) / 86400
+        if cache_age_days > mast_refresh_days:
+            print(f"  Cached obs table is {cache_age_days:.1f} days old "
+                  f"(threshold {mast_refresh_days} d) — re-querying MAST.")
+            use_cache = False
+
     if use_cache:
         print(f"  Loading cached observation table from {hst_dir}")
         try:
             obs_df  = pd.read_csv(obs_csv)
             prod_df = pd.read_csv(prod_csv)
         except pd.errors.EmptyDataError:
-            print("  Cached observation table is empty — no HST images found for this field.")
-            manifest = hst_dir / f"{field_name}_selected_obsids.json"
-            manifest.write_text("[]")
-            return
-    else:
+            if skip_mast_download:
+                print("  Cached observation table is empty — no HST images found for this field.")
+                manifest = hst_dir / f"{field_name}_selected_obsids.json"
+                manifest.write_text("[]")
+                return
+            print("  Cached observation table is empty — re-querying MAST.")
+            use_cache = False
+    if not use_cache:
         obs_df, prod_df = search_mast(
             ra, dec, search_width, search_height,
             hst_filters=hst_filters, project=project,
