@@ -483,8 +483,14 @@ def download_hst_images(
 
     if use_cache:
         print(f"  Loading cached observation table from {hst_dir}")
-        obs_df  = pd.read_csv(obs_csv)
-        prod_df = pd.read_csv(prod_csv)
+        try:
+            obs_df  = pd.read_csv(obs_csv)
+            prod_df = pd.read_csv(prod_csv)
+        except pd.errors.EmptyDataError:
+            print("  Cached observation table is empty — no HST images found for this field.")
+            manifest = hst_dir / f"{field_name}_selected_obsids.json"
+            manifest.write_text("[]")
+            return
     else:
         obs_df, prod_df = search_mast(
             ra, dec, search_width, search_height,
