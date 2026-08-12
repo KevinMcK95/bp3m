@@ -66,7 +66,7 @@ def run_alignment(  # noqa: C901
     plot_residuals: bool = False,
     plot_influence: bool = False,
     use_qso_anchors: bool = True,
-    qso_anchors_csv: "Path | None" = None,
+    qso_anchors_csv: "Path | list | None" = None,
     gaia_epoch_obs: Optional[dict] = None,
     exclude_2p_from_alignment: bool = False,
     gaia_csv: "Path | list | None" = None,
@@ -242,16 +242,26 @@ def run_alignment(  # noqa: C901
     print("\n  QSO anchor priors:")
     _injected_qso_ids = []
     if use_qso_anchors:
+        import pandas as _qpd
         if qso_anchors_csv is not None:
-            _qso_anchor_path = Path(qso_anchors_csv)
+            # Accept a single Path/str or a list of paths (multi-pointing)
+            _anchor_paths = (
+                [Path(p) for p in qso_anchors_csv]
+                if isinstance(qso_anchors_csv, list)
+                else [Path(qso_anchors_csv)]
+            )
+            _anchor_paths = [p for p in _anchor_paths if p.exists()]
         else:
             from .qso_vetting import find_qso_anchors
-            _qso_anchor_path = find_qso_anchors(
-                Path(output_dir) / field_name / 'Gaia', field_name)
-        if _qso_anchor_path is not None and _qso_anchor_path.exists():
-            import pandas as _qpd
+            _p = find_qso_anchors(Path(output_dir) / field_name / 'Gaia', field_name)
+            _anchor_paths = [_p] if _p is not None and _p.exists() else []
 
-            _qdf     = _qpd.read_csv(_qso_anchor_path, dtype={'source_id': 'int64'})
+        if _anchor_paths:
+            _qdf_parts = [_qpd.read_csv(p, dtype={'source_id': 'int64'})
+                          for p in _anchor_paths]
+            _qdf = (_qpd.concat(_qdf_parts, ignore_index=True)
+                    .drop_duplicates('source_id') if len(_qdf_parts) > 1
+                    else _qdf_parts[0])
             _n_gaia_candidates = len(_qdf)
             _qdf_ok  = _qdf[_qdf['is_qso_anchor'].fillna(False)]
             _n_anchors = len(_qdf_ok)
@@ -303,7 +313,7 @@ def run_alignment(  # noqa: C901
                 print(f"    Injected into alignment:       0  "
                       f"(none of the {_n_anchors} vetted anchors are in the HST field)")
         else:
-            print(f"    QSO anchor file not found ({_qso_anchor_path.name if _qso_anchor_path else 'none'})")
+            print(f"    QSO anchor file not found")
             print(f"    Re-run from Phase 1 to generate it (or pass --no_qso_anchors)")
     else:
         print("    Disabled (--no_qso_anchors)")
