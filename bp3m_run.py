@@ -695,6 +695,13 @@ def main():
         else _qso_anchors_csvs if _qso_anchors_csvs
         else None
     )
+    # Helper: True when the qso anchors value is non-empty (Path or non-empty list)
+    def _qso_exists(v):
+        if v is None:
+            return False
+        if isinstance(v, list):
+            return len(v) > 0
+        return v.exists()
 
     # ── Step 2: Download HST ─────────────────────────────────────────────────
     if not args.skip_download:
@@ -1130,7 +1137,7 @@ def main():
                         plot_influence=args.plot_influence,
                         bp3m_dir=_indv_root / _img,
                         gaia_csv=gaia_csv_path,
-                        qso_anchors_csv=_qso_anchors_csv if _qso_anchors_csv.exists() else None,
+                        qso_anchors_csv=_qso_anchors_csv if _qso_exists(_qso_anchors_csv) else None,
                     )
                     _n_ok += 1
                 except Exception as _exc:
@@ -1183,7 +1190,7 @@ def main():
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
-                qso_anchors_csv=_qso_anchors_csv if _qso_anchors_csv.exists() else None,
+                qso_anchors_csv=_qso_anchors_csv if _qso_exists(_qso_anchors_csv) else None,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
                 gaia_csv=gaia_csv_path,
             )
@@ -1245,7 +1252,7 @@ def main():
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
-                qso_anchors_csv=_qso_anchors_csv if _qso_anchors_csv.exists() else None,
+                qso_anchors_csv=_qso_anchors_csv if _qso_exists(_qso_anchors_csv) else None,
                 gaia_epoch_obs=_gaia_epoch_obs_for_solver,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
                 gaia_csv=gaia_csv_path,
