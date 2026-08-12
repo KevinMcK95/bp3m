@@ -475,7 +475,7 @@ def build_index_maps(stars_per_image, gaia_catalog):
 def load_image_data_flc(data_root, field_name: str,
                         pos_err_floor: float = _MIN_POS_ERR_PX,
                         restrict_images: "set[str] | frozenset[str] | None" = None,
-                        gaia_csv: "str | Path | None" = None):
+                        gaia_csv: "str | Path | list | None" = None):
     """
     Load BP3M inputs from the new FLC-based pipeline layout.
 
@@ -508,18 +508,31 @@ def load_image_data_flc(data_root, field_name: str,
 
     # ── Gaia catalog ──────────────────────────────────────────────────────────
     if gaia_csv is not None:
-        gaia_csv = Path(gaia_csv)
-        if not gaia_csv.exists():
-            raise FileNotFoundError(f"Gaia CSV not found: {gaia_csv}")
-        print(f"Loading Gaia catalog: {gaia_csv.name}")
-        gaia_raw = pd.read_csv(gaia_csv).rename(columns={"SOURCE_ID": "source_id"})
+        if isinstance(gaia_csv, (list, tuple)):
+            gaia_paths = [Path(p) for p in gaia_csv]
+            missing = [p for p in gaia_paths if not p.exists()]
+            if missing:
+                raise FileNotFoundError(f"Gaia CSV(s) not found: {missing}")
+            gaia_frames = [
+                pd.read_csv(p).rename(columns={"SOURCE_ID": "source_id"})
+                for p in gaia_paths
+            ]
+            gaia_raw = (pd.concat(gaia_frames, ignore_index=True)
+                        .drop_duplicates("source_id"))
+            print(f"Loading {len(gaia_paths)} Gaia catalogs "
+                  f"({len(gaia_raw)} unique stars)")
+        else:
+            gaia_csv = Path(gaia_csv)
+            if not gaia_csv.exists():
+                raise FileNotFoundError(f"Gaia CSV not found: {gaia_csv}")
+            print(f"Loading Gaia catalog: {gaia_csv.name}")
+            gaia_raw = pd.read_csv(gaia_csv).rename(columns={"SOURCE_ID": "source_id"})
     else:
         gaia_files = sorted(glob.glob(str(gaia_dir / "*_gaia.csv")))
         if not gaia_files:
             raise FileNotFoundError(f"No Gaia catalog files found in {gaia_dir}")
         if len(gaia_files) > 1:
-            print(f"WARNING: {len(gaia_files)} Gaia CSV files found; concatenating all.")
-            print(f"  Pass gaia_csv= to load a specific file.")
+            print(f"Loading {len(gaia_files)} Gaia CSV files (concatenated).")
         gaia_frames = [
             pd.read_csv(f).rename(columns={"SOURCE_ID": "source_id"})
             for f in gaia_files

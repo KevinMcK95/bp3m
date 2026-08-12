@@ -416,6 +416,7 @@ def download_hst_images(
     force_redownload: bool = True,
     mast_refresh_days: int | None = 30,
     skip_mast_download: bool = False,
+    extra_pointings: "list[tuple[float, float, float, float]] | None" = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Search MAST for images of a field and download them.
@@ -438,6 +439,9 @@ def download_hst_images(
                           (default 30).  Set to None to disable age-based refresh.
     skip_mast_download  : if True, always use the cached obs table regardless of age or
                           query-param changes (overrides mast_refresh_days and force_redownload).
+    extra_pointings     : additional (ra, dec, search_width, search_height) tuples to
+                          query and merge into the combined obs/products tables.
+                          The footprint plot shows all pointings together.
 
     Returns
     -------
@@ -463,12 +467,20 @@ def download_hst_images(
         else:
             print(f"  WARNING: No PSF+GDC combos found in {lib_dir}")
 
-    current_params = _make_query_params(
-        ra, dec, search_width, search_height,
-        hst_filters, t_exptime_min, t_exptime_max,
-        time_baseline_days, date_second_epoch_mjd,
-        obs_date_min, obs_date_max, im_type, telescope, instruments, lib_dir,
-    )
+    # Build the full list of (ra, dec, sw, sh) tuples for this run
+    all_pointings = [(ra, dec, search_width, search_height)] + list(extra_pointings or [])
+    n_pointings   = len(all_pointings)
+
+    # Per-pointing query params — used for cache validation
+    def _pparams(ra_i, dec_i, sw_i, sh_i):
+        return _make_query_params(
+            ra_i, dec_i, sw_i, sh_i,
+            hst_filters, t_exptime_min, t_exptime_max,
+            time_baseline_days, date_second_epoch_mjd,
+            obs_date_min, obs_date_max, im_type, telescope, instruments, lib_dir,
+        )
+
+    current_params_list = [_pparams(*p) for p in all_pointings]
     params_sidecar = _query_params_sidecar(hst_dir, field_name)
 
     if skip_mast_download:
@@ -484,15 +496,24 @@ def download_hst_images(
         )
 
     if use_cache and not skip_mast_download:
-        stored_params = json.loads(params_sidecar.read_text())
-        diffs = [f"    {k}: {stored_params.get(k)!r} → {current_params[k]!r}"
-                 for k in current_params
-                 if current_params[k] != stored_params.get(k)]
-        if diffs:
-            print("  Query params changed — re-searching MAST:")
-            for d in diffs:
-                print(d)
+        stored = json.loads(params_sidecar.read_text())
+        # Sidecar may be a legacy dict (single-pointing) or a list (multi)
+        stored_list = stored if isinstance(stored, list) else [stored]
+        if len(stored_list) != n_pointings:
+            print(f"  Number of pointings changed ({len(stored_list)} → {n_pointings}) "
+                  f"— re-querying MAST.")
             use_cache = False
+        else:
+            for i, (cur, sto) in enumerate(zip(current_params_list, stored_list)):
+                diffs = [f"    [{i}] {k}: {sto.get(k)!r} → {cur[k]!r}"
+                         for k in cur if cur[k] != sto.get(k)]
+                if diffs:
+                    lbl = f"pointing {i+1}" if n_pointings > 1 else "query"
+                    print(f"  {lbl} params changed — re-querying MAST:")
+                    for d in diffs:
+                        print(d)
+                    use_cache = False
+                    break
 
     if use_cache and not skip_mast_download and mast_refresh_days is not None:
         import time as _time_mod
@@ -516,20 +537,41 @@ def download_hst_images(
             print("  Cached observation table is empty — re-querying MAST.")
             use_cache = False
     if not use_cache:
-        obs_df, prod_df = search_mast(
-            ra, dec, search_width, search_height,
-            hst_filters=hst_filters, project=project,
-            t_exptime_min=t_exptime_min, t_exptime_max=t_exptime_max,
-            time_baseline_days=time_baseline_days,
-            date_second_epoch_mjd=date_second_epoch_mjd,
-            obs_date_min=obs_date_min, obs_date_max=obs_date_max,
-            im_type=im_type, telescope=telescope,
-            instruments=instruments,
-            available_combos=available_combos,
-        )
+        def _do_search(ra_i, dec_i, sw_i, sh_i):
+            return search_mast(
+                ra_i, dec_i, sw_i, sh_i,
+                hst_filters=hst_filters, project=project,
+                t_exptime_min=t_exptime_min, t_exptime_max=t_exptime_max,
+                time_baseline_days=time_baseline_days,
+                date_second_epoch_mjd=date_second_epoch_mjd,
+                obs_date_min=obs_date_min, obs_date_max=obs_date_max,
+                im_type=im_type, telescope=telescope,
+                instruments=instruments,
+                available_combos=available_combos,
+            )
+
+        if n_pointings == 1:
+            obs_df, prod_df = _do_search(*all_pointings[0])
+        else:
+            obs_parts, prod_parts = [], []
+            for i, (ra_i, dec_i, sw_i, sh_i) in enumerate(all_pointings):
+                print(f"  Querying MAST for pointing {i+1}/{n_pointings} "
+                      f"(RA={ra_i:.4f}, Dec={dec_i:+.4f}) ...")
+                o_i, p_i = _do_search(ra_i, dec_i, sw_i, sh_i)
+                obs_parts.append(o_i)
+                prod_parts.append(p_i)
+            obs_df  = (pd.concat(obs_parts,  ignore_index=True)
+                       .drop_duplicates(subset='obsid').reset_index(drop=True))
+            prod_df = (pd.concat(prod_parts, ignore_index=True)
+                       .drop_duplicates(subset=['parent_obsid', 'productFilename'])
+                       .reset_index(drop=True))
+
         obs_df.to_csv(obs_csv,   index=False)
         prod_df.to_csv(prod_csv, index=False)
-        params_sidecar.write_text(json.dumps(current_params, indent=2))
+        # Sidecar: list when multi-pointing, plain dict for single (legacy compat)
+        sidecar_data = (current_params_list[0] if n_pointings == 1
+                        else current_params_list)
+        params_sidecar.write_text(json.dumps(sidecar_data, indent=2))
 
     if obs_df.empty:
         print("  No observations found matching the criteria.")
@@ -560,13 +602,14 @@ def download_hst_images(
     # Save footprint plot — load qso_candidates + vetted qso_anchors if available
     footprint_png = hst_dir / f"{field_name}_footprints.png"
     _qso_df     = None
-    _anchor_df  = None
+    _anchor_dfs = []
     _gaia_dir   = Path(output_dir) / field_name / "Gaia"
+
+    # Collect QSO candidates from first pointing (fallback: most-recent file)
     _qso_csv = (_gaia_dir /
         f"{field_name}_ra{ra:.4f}_dec{dec:.4f}"
         f"_w{search_width:.4f}_h{search_height:.4f}_qso_candidates.csv")
     if not _qso_csv.exists():
-        # fallback: most recently modified file matching the pattern
         _qso_csvs = sorted(_gaia_dir.glob("*_qso_candidates.csv"),
                            key=lambda p: p.stat().st_mtime)
         _qso_csv = _qso_csvs[-1] if _qso_csvs else None
@@ -575,23 +618,34 @@ def download_hst_images(
             _qso_df = pd.read_csv(_qso_csv)
         except Exception:
             pass
+
+    # Collect QSO anchors from all pointings
     from bp3m.pipeline.qso_vetting import find_qso_anchors as _fqa
-    _anchor_csv = _fqa(_gaia_dir, field_name, ra, dec, search_width, search_height)
-    if _anchor_csv is not None and _anchor_csv.exists():
-        try:
-            _adf = pd.read_csv(_anchor_csv, dtype={'source_id': 'int64'})
-            _anchor_df = _adf[_adf['is_qso_anchor'].fillna(False)].copy()
-            if len(_anchor_df) == 0:
-                _anchor_df = None
-        except Exception:
-            pass
+    for _ra_i, _dec_i, _sw_i, _sh_i in all_pointings:
+        _anchor_csv = _fqa(_gaia_dir, field_name, _ra_i, _dec_i, _sw_i, _sh_i)
+        if _anchor_csv is not None and _anchor_csv.exists():
+            try:
+                _adf = pd.read_csv(_anchor_csv, dtype={'source_id': 'int64'})
+                _adf = _adf[_adf['is_qso_anchor'].fillna(False)]
+                if len(_adf) > 0:
+                    _anchor_dfs.append(_adf)
+            except Exception:
+                pass
+    _anchor_df = None
+    if _anchor_dfs:
+        _anchor_df = (pd.concat(_anchor_dfs, ignore_index=True)
+                      .drop_duplicates('source_id'))
+
+    # Footprint plot with all search boxes
+    _search_boxes = all_pointings if n_pointings > 1 else None
     try:
         plot_footprints(obs_df, footprint_png,
                         gaia_df=gaia_df, qso_df=_qso_df, anchor_df=_anchor_df,
                         field_name=field_name,
                         ra=ra, dec=dec,
                         search_width=search_width,
-                        search_height=search_height)
+                        search_height=search_height,
+                        search_boxes=_search_boxes)
     except Exception as _e:
         print(f"  WARNING: footprint plot failed — {_e}")
 
@@ -916,6 +970,7 @@ def plot_footprints(
     dec: float | None = None,
     search_width: float | None = None,
     search_height: float | None = None,
+    search_boxes: "list[tuple[float,float,float,float]] | None" = None,
 ) -> None:
     """
     Plot HST image footprints on the sky with Gaia stars in the background.
@@ -937,11 +992,14 @@ def plot_footprints(
                     cross-match + astrometric cut); plotted as larger gold stars
                     on top of the raw candidates.
     field_name    : used in the figure title.
-    ra, dec       : field centre (degrees).  When provided together with
+    ra, dec       : primary field centre (degrees).  When provided together with
                     search_width / search_height, the axes are fixed to the
-                    user-specified search box, preventing wildly-offset HST
-                    WCS entries from zooming the plot out.
-    search_width, search_height : search box full-width in degrees.
+                    user-specified search box.
+    search_width, search_height : primary search box full-width in degrees.
+    search_boxes  : for multi-pointing: list of (ra, dec, sw, sh) tuples, one
+                    per pointing.  When given, all boxes are drawn and the plot
+                    cutout encompasses the union of all boxes.  Overrides the
+                    single ra/dec/search_width/search_height for guard/cutout.
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -979,15 +1037,41 @@ def plot_footprints(
     # ── Footprint polygons ────────────────────────────────────────────────────
     filter_patches: dict[str, mpatches.Patch] = {}   # for legend
 
-    # Build search-box guard: footprints with centroids outside the cutout are
-    # silently skipped.  Without this, a single image with a corrupt/anomalous
-    # WCS s_region thousands of degrees away causes bbox_inches='tight' to
-    # allocate a RendererAgg buffer tens of GB in size.
-    if ra is not None and dec is not None and search_width and search_height:
-        _guard_ra_lo  = ra  - search_width  / 2 * 3   # 3× margin — clearly anomalous
-        _guard_ra_hi  = ra  + search_width  / 2 * 3
-        _guard_dec_lo = dec - search_height / 2 * 3
-        _guard_dec_hi = dec + search_height / 2 * 3
+    # Normalise search_boxes: use multi-pointing list if given, else build from
+    # single (ra, dec, sw, sh).  None → no guard / cutout.
+    _boxes: list[tuple[float, float, float, float]] | None = None
+    if search_boxes is not None and len(search_boxes) > 0:
+        _boxes = list(search_boxes)
+    elif ra is not None and dec is not None and search_width and search_height:
+        _boxes = [(ra, dec, search_width, search_height)]
+
+    # Draw all search boxes as dashed rectangles
+    if _boxes is not None:
+        for _bi, (_bra, _bdec, _bsw, _bsh) in enumerate(_boxes):
+            _rect_ra  = [_bra - _bsw/2, _bra + _bsw/2,
+                         _bra + _bsw/2, _bra - _bsw/2, _bra - _bsw/2]
+            _rect_dec = [_bdec - _bsh/2, _bdec - _bsh/2,
+                         _bdec + _bsh/2, _bdec + _bsh/2, _bdec - _bsh/2]
+            ax.plot(_rect_ra, _rect_dec, 'k--', lw=1.0, alpha=0.6, zorder=1,
+                    label='Search box' if _bi == 0 else None)
+
+    # Build search-box guard: footprints with centroids outside the union of all
+    # boxes (×3 margin) are silently skipped — prevents corrupt WCS s_region
+    # entries from ballooning the plot axes.
+    if _boxes is not None:
+        _guard_ra_lo  = min(b[0] - b[2]/2 for b in _boxes) * 1  # expand below
+        _guard_ra_hi  = max(b[0] + b[2]/2 for b in _boxes)
+        _guard_dec_lo = min(b[1] - b[3]/2 for b in _boxes)
+        _guard_dec_hi = max(b[1] + b[3]/2 for b in _boxes)
+        # Widen guard to 3× the full span so only truly anomalous entries are skipped
+        _span_ra  = _guard_ra_hi  - _guard_ra_lo
+        _span_dec = _guard_dec_hi - _guard_dec_lo
+        _cen_ra   = (_guard_ra_lo  + _guard_ra_hi)  / 2
+        _cen_dec  = (_guard_dec_lo + _guard_dec_hi) / 2
+        _guard_ra_lo  = _cen_ra  - _span_ra  * 1.5
+        _guard_ra_hi  = _cen_ra  + _span_ra  * 1.5
+        _guard_dec_lo = _cen_dec - _span_dec * 1.5
+        _guard_dec_hi = _cen_dec + _span_dec * 1.5
     else:
         _guard_ra_lo = _guard_ra_hi = _guard_dec_lo = _guard_dec_hi = None
 
@@ -1043,12 +1127,12 @@ def plot_footprints(
 
     pad_factor = 0.08
 
-    if ra is not None and dec is not None and search_width and search_height:
-        # search_width is already in RA degrees (expanded by 1/cos(dec) by the caller)
-        cut_ra_lo  = ra  - search_width  / 2
-        cut_ra_hi  = ra  + search_width  / 2
-        cut_dec_lo = dec - search_height / 2
-        cut_dec_hi = dec + search_height / 2
+    if _boxes is not None:
+        # Cutout = union of all search boxes
+        cut_ra_lo  = min(b[0] - b[2]/2 for b in _boxes)
+        cut_ra_hi  = max(b[0] + b[2]/2 for b in _boxes)
+        cut_dec_lo = min(b[1] - b[3]/2 for b in _boxes)
+        cut_dec_hi = max(b[1] + b[3]/2 for b in _boxes)
 
         # Collect bounds from footprints whose centroid lies inside the cutout.
         # Gaia stars are intentionally excluded — they span the full search box

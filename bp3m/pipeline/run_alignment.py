@@ -69,7 +69,7 @@ def run_alignment(  # noqa: C901
     qso_anchors_csv: "Path | None" = None,
     gaia_epoch_obs: Optional[dict] = None,
     exclude_2p_from_alignment: bool = False,
-    gaia_csv: "Path | None" = None,
+    gaia_csv: "Path | list | None" = None,
     verbose_tests: bool = False,
 ) -> Path:
     """

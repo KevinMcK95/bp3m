@@ -71,17 +71,19 @@ def _parse_args():
     tgt.add_argument('--name', type=str, default=None,
                      help='Target name (resolved via Simbad). '
                           'Used as the field directory name.')
-    tgt.add_argument('--ra',  type=float, default=None,
-                     help='Centre R.A. (degrees)')
-    tgt.add_argument('--dec', type=float, default=None,
-                     help='Centre Dec. (degrees)')
-    tgt.add_argument('--search_radius', type=float, default=None,
-                     help='Circular search radius (degrees). '
-                          'Converted to an equal-area box.')
+    tgt.add_argument('--ra',  type=float, nargs='+', default=None,
+                     help='Centre R.A. (degrees). Multiple values enable multi-pointing mode.')
+    tgt.add_argument('--dec', type=float, nargs='+', default=None,
+                     help='Centre Dec. (degrees). Must match the number of --ra values.')
+    tgt.add_argument('--search_radius', type=float, nargs='+', default=None,
+                     help='Circular search radius (degrees). A single value is broadcast '
+                          'to all pointings. Converted to an equal-area box per pointing.')
     tgt.add_argument('--search_width',  type=float, default=None,
-                     help='Search box width  (degrees, overrides --search_radius)')
+                     help='Search box width  (degrees, overrides --search_radius; '
+                          'applied uniformly to all pointings)')
     tgt.add_argument('--search_height', type=float, default=None,
-                     help='Search box height (degrees, overrides --search_radius)')
+                     help='Search box height (degrees, overrides --search_radius; '
+                          'applied uniformly to all pointings)')
 
     # ── Gaia ──────────────────────────────────────────────────────────────────
     g = p.add_argument_group('Gaia options')
@@ -452,51 +454,107 @@ def _parse_field_ids(raw: list[str] | None):
         return _FIELD_IDS_ALL
 
 
-def _resolve_target(args):
-    """Resolve target name to RA/Dec and compute search box. Mutates args."""
+def _resolve_pointings(args):
+    """
+    Resolve target coordinates into a list of (ra, dec, search_width, search_height)
+    pointings and store as args.pointings.
+
+    Also sets args.ra/dec/search_radius/search_width/search_height to the FIRST
+    pointing's values for backward compatibility with code that uses them directly.
+    """
     from bp3m.pipeline.download_gaia import resolve_target
 
-    if args.ra is None or args.dec is None:
+    ras  = list(args.ra)  if args.ra  is not None else None
+    decs = list(args.dec) if args.dec is not None else None
+
+    # ── Single-pointing from Simbad ───────────────────────────────────────────
+    if ras is None or decs is None:
         if args.name is None:
             print("ERROR: provide --name or both --ra and --dec.", file=sys.stderr)
             sys.exit(1)
+        if ras is not None or decs is not None:
+            print("ERROR: provide both --ra and --dec (or neither).", file=sys.stderr)
+            sys.exit(1)
         print(f"Resolving '{args.name}' via Simbad...")
+        auto_r = None
         try:
-            ra, dec, auto_r = resolve_target(args.name)
-            args.ra, args.dec = ra, dec
+            ra_s, dec_s, auto_r = resolve_target(args.name)
+            ras, decs = [ra_s], [dec_s]
             if args.search_radius is None and auto_r is not None:
-                args.search_radius = auto_r
                 print(f"  Auto search radius from Simbad: {auto_r:.3f} deg")
         except Exception as exc:
             print(f"  Simbad lookup failed: {exc}")
             if not args.quiet:
-                args.ra  = float(input('  Enter R.A. (degrees): '))
-                args.dec = float(input('  Enter Dec. (degrees): '))
+                ras  = [float(input('  Enter R.A. (degrees): '))]
+                decs = [float(input('  Enter Dec. (degrees): '))]
             else:
                 print("ERROR: Could not resolve target coordinates.", file=sys.stderr)
                 sys.exit(1)
+        if args.search_radius is None and auto_r is not None:
+            args.search_radius = [auto_r]
 
-    if args.search_radius is None:
+    # ── Validate ra/dec lengths ────────────────────────────────────────────────
+    if len(ras) != len(decs):
+        print(f"ERROR: --ra ({len(ras)} values) and --dec ({len(decs)} values) "
+              f"must have the same number of values.", file=sys.stderr)
+        sys.exit(1)
+    n = len(ras)
+
+    # Multi-pointing requires an explicit --name
+    if n > 1 and args.name is None:
+        print("ERROR: --name is required when multiple --ra/--dec values are given.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # ── Search radius per pointing ────────────────────────────────────────────
+    srs_raw = args.search_radius  # None | list[float]
+    if srs_raw is None:
         if not args.quiet:
-            args.search_radius = float(
+            _sr = float(
                 input('Search radius not set. Enter value in degrees [0.25]: ')
                 or 0.25)
         else:
-            args.search_radius = 0.25
+            _sr = 0.25
+        srs = [_sr] * n
+    elif len(srs_raw) == 1:
+        srs = list(srs_raw) * n       # broadcast
+    elif len(srs_raw) == n:
+        srs = list(srs_raw)
+    else:
+        print(f"ERROR: --search_radius must have 1 or {n} value(s), "
+              f"got {len(srs_raw)}.", file=sys.stderr)
+        sys.exit(1)
 
-    if args.search_width is None:
-        cos_dec = abs(np.cos(np.deg2rad(args.dec)))
-        args.search_width = 2.0 * args.search_radius / max(cos_dec, 0.01)
-    if args.search_height is None:
-        args.search_height = 2.0 * args.search_radius
+    # ── Build (ra, dec, sw, sh) per pointing ──────────────────────────────────
+    pointings: list[tuple[float, float, float, float]] = []
+    for ra_i, dec_i, sr_i in zip(ras, decs, srs):
+        sw_i = (args.search_width  if args.search_width  is not None
+                else 2.0 * sr_i / max(abs(np.cos(np.deg2rad(dec_i))), 0.01))
+        sh_i = (args.search_height if args.search_height is not None
+                else 2.0 * sr_i)
+        pointings.append((float(ra_i), float(dec_i), float(sw_i), float(sh_i)))
+
+    # ── Mutate args for backward compat (primary = first pointing) ────────────
+    args.ra            = pointings[0][0]
+    args.dec           = pointings[0][1]
+    args.search_width  = pointings[0][2]
+    args.search_height = pointings[0][3]
+    args.search_radius = srs[0]
+    args.pointings     = pointings
 
     if args.name is None:
         args.name = f"ra_{args.ra:.3f}_dec_{args.dec:.3f}"
     args.name = args.name.replace(' ', '_')
 
     print(f"\n  Field:  {args.name}")
-    print(f"  Centre: ({args.ra:.5f}, {args.dec:.5f}) deg")
-    print(f"  Box:    {args.search_width:.4f} × {args.search_height:.4f} deg")
+    if n == 1:
+        print(f"  Centre: ({args.ra:.5f}, {args.dec:.5f}) deg")
+        print(f"  Box:    {args.search_width:.4f} × {args.search_height:.4f} deg")
+    else:
+        print(f"  Multi-pointing ({n} pointings):")
+        for i, (ra_i, dec_i, sw_i, sh_i) in enumerate(pointings):
+            print(f"    [{i+1}] RA={ra_i:.5f}  Dec={dec_i:+.5f}  "
+                  f"box={sw_i:.4f}×{sh_i:.4f} deg")
 
 
 def main():
@@ -530,84 +588,138 @@ def main():
     print("BP3M Analysis")
     print("=" * 55)
 
-    _resolve_target(args)
+    _resolve_pointings(args)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     field = args.name
 
-    # Resolve the specific Gaia CSV path for this analysis so all later steps
-    # (data loading, alignment) use a consistent catalog rather than globbing
-    # all *_gaia.csv files in the directory.
+    # ── Gaia directory and per-pointing CSV paths ─────────────────────────────
     from bp3m.pipeline.download_gaia import _cache_stem
     _gaia_dir = output_dir / field / 'Gaia'
-    _gaia_stem = _cache_stem(field, args.ra, args.dec,
-                             args.search_width, args.search_height,
-                             args.min_gmag, args.max_gmag)
-    gaia_csv_path = _gaia_dir / f"{_gaia_stem}.csv"
-    if not gaia_csv_path.exists():
-        gaia_csv_path = None   # fall back to glob if not yet created
 
-    # ── Step 1: Download Gaia ─────────────────────────────────────────────────
+    def _gaia_csv_path_for(ra_i, dec_i, sw_i, sh_i):
+        stem = _cache_stem(field, ra_i, dec_i, sw_i, sh_i,
+                           args.min_gmag, args.max_gmag)
+        p = _gaia_dir / f"{stem}.csv"
+        return p if p.exists() else None
+
+    # ── Step 1: Download Gaia (one query per pointing) ────────────────────────
     gaia_df = None
+    gaia_csv_paths: list[Path] = []
+
     if not args.skip_download:
         from bp3m.pipeline.download_gaia import download_gaia
-        gaia_df = download_gaia(
-            ra=args.ra, dec=args.dec,
-            search_width=args.search_width, search_height=args.search_height,
-            output_dir=output_dir, field_name=field,
-            min_gmag=args.min_gmag, max_gmag=args.max_gmag,
-            source_table=args.source_table,
-            sigma_flux_excess=args.sigma_flux_excess,
-            only_5p=args.only_5p,
-            n_processes=args.n_processes,
-            query_timeout=args.gaia_timeout,
-            force_redownload=args.force_redownload_gaia,
-            quiet=args.quiet,
-        )
-        # After download the CSV now exists; resolve the path for later steps.
-        if gaia_csv_path is None and _gaia_dir.joinpath(f"{_gaia_stem}.csv").exists():
-            gaia_csv_path = _gaia_dir / f"{_gaia_stem}.csv"
-
-    # ── Step 1b: QSO anchor vetting (runs once per Gaia catalog) ─────────────
-    from bp3m.pipeline.qso_vetting import qso_anchors_path as _qap
-    _qso_anchors_csv = _qap(_gaia_dir, field, args.ra, args.dec,
-                             args.search_width, args.search_height)
-    if not args.no_qso_anchors and not _qso_anchors_csv.exists():
-        from bp3m.pipeline.qso_vetting import vet_qso_candidates
-        print("\n" + "─"*50)
-        print("Step 1b: QSO anchor vetting")
-        print("─"*50)
-        try:
-            vet_qso_candidates(
-                field_name=field, output_dir=output_dir,
-                ra=args.ra, dec=args.dec,
-                search_width=args.search_width, search_height=args.search_height,
-                lib_dir=Path(args.lib_dir) if args.lib_dir else None,
+        _n_pt = len(args.pointings)
+        for _pi, (_ra_i, _dec_i, _sw_i, _sh_i) in enumerate(args.pointings):
+            if _n_pt > 1:
+                print(f"\n  [Gaia pointing {_pi+1}/{_n_pt}] "
+                      f"RA={_ra_i:.5f}  Dec={_dec_i:+.5f}")
+            _gdf_i = download_gaia(
+                ra=_ra_i, dec=_dec_i,
+                search_width=_sw_i, search_height=_sh_i,
+                output_dir=output_dir, field_name=field,
+                min_gmag=args.min_gmag, max_gmag=args.max_gmag,
+                source_table=args.source_table,
+                sigma_flux_excess=args.sigma_flux_excess,
+                only_5p=args.only_5p,
+                n_processes=args.n_processes,
+                query_timeout=args.gaia_timeout,
+                force_redownload=args.force_redownload_gaia,
+                quiet=args.quiet,
             )
-        except Exception as _qe:
-            print(f"  WARNING: QSO vetting failed — {_qe}")
-    elif not args.no_qso_anchors and _qso_anchors_csv.exists():
-        print(f"\n  [Step 1b] QSO anchors already cached: {_qso_anchors_csv.name}")
+            _p_i = _gaia_csv_path_for(_ra_i, _dec_i, _sw_i, _sh_i)
+            if _p_i is not None:
+                gaia_csv_paths.append(_p_i)
+            if _gdf_i is not None and len(_gdf_i) > 0:
+                if gaia_df is None:
+                    gaia_df = _gdf_i
+                else:
+                    import pandas as _pd_gaia
+                    gaia_df = (_pd_gaia.concat([gaia_df, _gdf_i], ignore_index=True)
+                               .drop_duplicates('source_id')
+                               .reset_index(drop=True))
+
+    # Resolve any Gaia CSV paths not yet found (skip_download path)
+    for _ra_i, _dec_i, _sw_i, _sh_i in args.pointings:
+        _p_i = _gaia_csv_path_for(_ra_i, _dec_i, _sw_i, _sh_i)
+        if _p_i is not None and _p_i not in gaia_csv_paths:
+            gaia_csv_paths.append(_p_i)
+
+    # Write the Gaia file list sidecar so downstream tools know which files belong
+    import json as _json_gaia
+    _gaia_dir.mkdir(parents=True, exist_ok=True)
+    _gaia_files_json = _gaia_dir / f"{field}_gaia_files.json"
+    _gaia_files_json.write_text(
+        _json_gaia.dumps([str(p) for p in gaia_csv_paths], indent=2))
+
+    # For alignment etc., pass explicit list (avoids stale-file glob)
+    # Single-pointing: pass the one path; multi-pointing: pass the list.
+    gaia_csv_path: Path | list | None = (
+        gaia_csv_paths[0] if len(gaia_csv_paths) == 1
+        else gaia_csv_paths if gaia_csv_paths
+        else None
+    )
+
+    # ── Step 1b: QSO anchor vetting (one run per pointing) ───────────────────
+    from bp3m.pipeline.qso_vetting import qso_anchors_path as _qap
+    _qso_anchors_csvs: list[Path] = []
+    _any_qso_new = False
+    for _ra_i, _dec_i, _sw_i, _sh_i in args.pointings:
+        _qso_csv_i = _qap(_gaia_dir, field, _ra_i, _dec_i, _sw_i, _sh_i)
+        if not args.no_qso_anchors and not _qso_csv_i.exists():
+            if not _any_qso_new:
+                from bp3m.pipeline.qso_vetting import vet_qso_candidates
+                print("\n" + "─"*50)
+                print("Step 1b: QSO anchor vetting")
+                print("─"*50)
+                _any_qso_new = True
+            try:
+                vet_qso_candidates(
+                    field_name=field, output_dir=output_dir,
+                    ra=_ra_i, dec=_dec_i,
+                    search_width=_sw_i, search_height=_sh_i,
+                    lib_dir=Path(args.lib_dir) if args.lib_dir else None,
+                )
+            except Exception as _qe:
+                print(f"  WARNING: QSO vetting failed — {_qe}")
+        if _qso_csv_i.exists():
+            _qso_anchors_csvs.append(_qso_csv_i)
+    if not _any_qso_new and _qso_anchors_csvs:
+        print(f"\n  [Step 1b] QSO anchors already cached "
+              f"({len(_qso_anchors_csvs)} pointing(s))")
+
+    # Alignment accepts a single CSV or a list
+    _qso_anchors_csv: Path | list | None = (
+        _qso_anchors_csvs[0] if len(_qso_anchors_csvs) == 1
+        else _qso_anchors_csvs if _qso_anchors_csvs
+        else None
+    )
 
     # ── Step 2: Download HST ─────────────────────────────────────────────────
     if not args.skip_download:
         from bp3m.pipeline.download_hst import download_hst_images
         # Load Gaia catalog for footprint star counts if not already in memory
-        if gaia_df is None:
+        if gaia_df is None and gaia_csv_paths:
             from bp3m.pipeline.explore_utils import load_gaia_catalog
-            from bp3m.pipeline.download_gaia import _cache_stem
-            _gaia_dir = output_dir / field / 'Gaia'
-            _stem = _cache_stem(field, args.ra, args.dec,
-                                args.search_width, args.search_height,
-                                args.min_gmag, args.max_gmag)
-            _gaia_csv = _gaia_dir / f"{_stem}.csv"
-            if not _gaia_csv.exists():
-                # Fall back to any CSV in the Gaia directory
-                _candidates = list(_gaia_dir.glob("*.csv"))
-                _gaia_csv = _candidates[0] if _candidates else _gaia_csv
-            if _gaia_csv.exists():
-                gaia_df = load_gaia_catalog(_gaia_csv)
+            _frames = []
+            for _gp in gaia_csv_paths:
+                try:
+                    _frames.append(load_gaia_catalog(_gp))
+                except Exception:
+                    pass
+            if _frames:
+                import pandas as _pd_g2
+                gaia_df = (_pd_g2.concat(_frames, ignore_index=True)
+                           .drop_duplicates('source_id').reset_index(drop=True)
+                           if len(_frames) > 1 else _frames[0])
+        if gaia_df is None:
+            # Last-resort fallback: glob any Gaia CSV
+            _candidates = sorted(_gaia_dir.glob("*_gaia.csv"))
+            if _candidates:
+                from bp3m.pipeline.explore_utils import load_gaia_catalog
+                gaia_df = load_gaia_catalog(_candidates[0])
+        _extra_pt = args.pointings[1:] if len(args.pointings) > 1 else None
         download_hst_images(
             ra=args.ra, dec=args.dec,
             search_width=args.search_width, search_height=args.search_height,
@@ -629,6 +741,7 @@ def main():
             mast_refresh_days=args.mast_refresh_days,
             skip_mast_download=args.skip_mast_download,
             n_processes=args.n_processes,
+            extra_pointings=_extra_pt,
         )
 
     # Read manifest of selected obsids written by step 2 (persists across runs)
@@ -861,12 +974,23 @@ def main():
         print(f"  Epoch data available: {len(epoch_data)} sources")
 
         if epoch_data:
-            # Load the Gaia summary catalog to extract AGIS PM+parallax values
-            _gaia_csvs = sorted(_glob.glob(
-                str(output_dir / field / "Gaia" / "*_gaia.csv")
-            ))
-            if _gaia_csvs:
-                _gdf = _pd.read_csv(_gaia_csvs[-1])
+            # Load the Gaia summary catalog to extract AGIS PM+parallax values.
+            # Prefer the gaia_files.json sidecar (multi-pointing aware) over glob.
+            _gaia_files_json_ep = output_dir / field / "Gaia" / f"{field}_gaia_files.json"
+            if _gaia_files_json_ep.exists():
+                try:
+                    import json as _json_ep
+                    _gaia_csvs_ep = json.loads(_gaia_files_json_ep.read_text())
+                except Exception:
+                    _gaia_csvs_ep = []
+            else:
+                _gaia_csvs_ep = sorted(_glob.glob(
+                    str(output_dir / field / "Gaia" / "*_gaia.csv")))
+            if _gaia_csvs_ep:
+                _gdf_parts = [_pd.read_csv(p) for p in _gaia_csvs_ep]
+                _gdf = (_pd.concat(_gdf_parts, ignore_index=True)
+                        .drop_duplicates("source_id") if len(_gdf_parts) > 1
+                        else _gdf_parts[0])
                 _gdf["source_id"] = _gdf["source_id"].astype("int64")
                 _gaia_epoch_obs_for_solver = prepare_epoch_obs_for_solver(
                     epoch_data, _gdf,
