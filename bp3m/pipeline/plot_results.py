@@ -3,6 +3,7 @@ Diagnostic plots comparing BP3M astrometry to Gaia.
 """
 
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -181,22 +182,76 @@ def make_plots(solver, images, gaia_catalog,
         _pmdec_xmatch = np.full(_n_gc, np.nan)
     hst_has_xmatch = hst_only & np.isfinite(_pmra_xmatch) & np.isfinite(_pmdec_xmatch)
 
-    for ax, gaia_pm, bp3m_pm_g, sig_g, sig_b_g, comp in zip(
+    # ── DELVE source categorisation ───────────────────────────────────────────
+    # has_delve_pm: Gaia-matched star that also has a full DELVE PM covariance.
+    # DELVE-only: negative Gaia_id (synthetic row, no Gaia 5p astrometry).
+    _d_pmra_err  = pd.to_numeric(_gc.get("delve_pmra_error",  pd.Series(dtype=float)),
+                                 errors='coerce').to_numpy(float)
+    _d_pmdec_err = pd.to_numeric(_gc.get("delve_pmdec_error", pd.Series(dtype=float)),
+                                 errors='coerce').to_numpy(float)
+    _d_pmra_val  = pd.to_numeric(_gc.get("delve_pmra",  pd.Series(dtype=float)),
+                                 errors='coerce').to_numpy(float)
+    _d_pmdec_val = pd.to_numeric(_gc.get("delve_pmdec", pd.Series(dtype=float)),
+                                 errors='coerce').to_numpy(float)
+    has_delve_pm = (np.isfinite(_d_pmra_err) & (_d_pmra_err > 0) &
+                    np.isfinite(_d_pmdec_err) & (_d_pmdec_err > 0) &
+                    has_gaia)
+    _delve_only  = hst_only  # negative Gaia_id ↔ DELVE-only source
+    _gaia_delve_nq = _gaia_not_qso & has_delve_pm
+    _gaia_only_nq  = _gaia_not_qso & ~has_delve_pm
+
+    for ax, gaia_pm, bp3m_pm_g, sig_g, sig_b_g, d_pm, d_sig, comp in zip(
             [ax_pmra, ax_pmdec],
-            [pmra_gaia[_gaia_not_qso],   pmdec_gaia[_gaia_not_qso]],
-            [pmra_bp3m[_gaia_not_qso],   pmdec_bp3m[_gaia_not_qso]],
-            [sig_pmra_gaia[_gaia_not_qso], sig_pmdec_gaia[_gaia_not_qso]],
-            [sig_pmra_bp3m[_gaia_not_qso], sig_pmdec_bp3m[_gaia_not_qso]],
+            [pmra_gaia,   pmdec_gaia],
+            [pmra_bp3m,   pmdec_bp3m],
+            [sig_pmra_gaia, sig_pmdec_gaia],
+            [sig_pmra_bp3m, sig_pmdec_bp3m],
+            [_d_pmra_val,   _d_pmdec_val],
+            [_d_pmra_err,   _d_pmdec_err],
             [r"$\mu_{\alpha*}$",    r"$\mu_\delta$"]):
-        ax.errorbar(gaia_pm, bp3m_pm_g, xerr=sig_g, yerr=sig_b_g,
-                    fmt='o', ms=3, lw=0.5, alpha=0.5, color='steelblue',
-                    label='Gaia-matched', zorder=2)
-        lim = _padded_lim(gaia_pm, bp3m_pm_g)
+        # Gaia-only stars (grey)
+        if _gaia_only_nq.any():
+            ax.errorbar(gaia_pm[_gaia_only_nq], bp3m_pm_g[_gaia_only_nq],
+                        xerr=sig_g[_gaia_only_nq], yerr=sig_b_g[_gaia_only_nq],
+                        fmt='o', ms=3, lw=0.5, alpha=0.5, color='grey',
+                        label='Gaia only', zorder=2)
+        # Gaia+DELVE stars (steelblue)
+        if _gaia_delve_nq.any():
+            ax.errorbar(gaia_pm[_gaia_delve_nq], bp3m_pm_g[_gaia_delve_nq],
+                        xerr=sig_g[_gaia_delve_nq], yerr=sig_b_g[_gaia_delve_nq],
+                        fmt='o', ms=3, lw=0.5, alpha=0.6, color='steelblue',
+                        label='Gaia+DELVE', zorder=3)
+            # Overlay DELVE PM as diamond markers with DELVE error bars
+            _dm = _gaia_delve_nq & np.isfinite(d_pm)
+            if _dm.any():
+                ax.errorbar(d_pm[_dm], bp3m_pm_g[_dm],
+                            xerr=d_sig[_dm], yerr=sig_b_g[_dm],
+                            fmt='D', ms=4, lw=0.5, alpha=0.5, color='dodgerblue',
+                            label='DELVE PM (for Gaia+DELVE)', zorder=3)
+        # DELVE-only stars (orange triangles, x=DELVE PM)
+        _do_pm = _delve_only & np.isfinite(d_pm) & np.isfinite(d_sig) & (d_sig > 0)
+        if _do_pm.any():
+            ax.errorbar(d_pm[_do_pm], bp3m_pm_g[_do_pm],
+                        xerr=d_sig[_do_pm], yerr=sig_b_g[_do_pm],
+                        fmt='^', ms=4, lw=0.5, alpha=0.6, color='darkorange',
+                        label='DELVE only', zorder=3)
+
+        all_x = np.concatenate([
+            gaia_pm[_gaia_not_qso],
+            d_pm[_gaia_delve_nq][np.isfinite(d_pm[_gaia_delve_nq])],
+            d_pm[_do_pm] if _do_pm.any() else np.array([]),
+        ])
+        all_y = np.concatenate([
+            bp3m_pm_g[_gaia_not_qso],
+            bp3m_pm_g[_gaia_delve_nq],
+            bp3m_pm_g[_do_pm] if _do_pm.any() else np.array([]),
+        ])
+        lim = _padded_lim(all_x, all_y)
         ax.plot(lim, lim, 'k--', lw=1, zorder=4)
         ax.set_xlim(lim); ax.set_ylim(lim)
-        ax.set_xlabel(f"{comp} Gaia [mas/yr]")
+        ax.set_xlabel(f"{comp} prior [mas/yr]")
         ax.set_ylabel(f"{comp} BP3M [mas/yr]")
-        ax.set_title(f"{comp}: BP3M vs Gaia (Gaia-matched only)")
+        ax.set_title(f"{comp}: BP3M vs prior PM")
         ax.set_aspect("equal")
         ax.legend(fontsize=7, loc='upper left')
         _style_ax(ax)
@@ -206,13 +261,29 @@ def make_plots(solver, images, gaia_catalog,
     _bp3m_gaia_conv_nq = _bp3m_gaia_conv & _not_qso
     gm_nq = gmag[_gaia_not_qso]
     ax_unc.scatter(gm_nq, sig_pm_gaia[_gaia_not_qso],
-                   s=6, alpha=0.7, color='#444444', label='Gaia 5p', zorder=2)
-    ax_unc.scatter(gmag[_bp3m_gaia_conv_nq], sig_pm_bp3m[_bp3m_gaia_conv_nq],
-                   s=6, alpha=0.7, color='steelblue', label='BP3M Gaia 5p', zorder=3)
+                   s=6, alpha=0.7, color='#444444', label='Gaia prior', zorder=2)
+    # DELVE-alone PM uncertainty (geometric mean of delve_pmra_error, delve_pmdec_error)
+    _d_sig_pm = np.where(
+        np.isfinite(_d_pmra_err) & (_d_pmra_err > 0) &
+        np.isfinite(_d_pmdec_err) & (_d_pmdec_err > 0),
+        np.sqrt(_d_pmra_err * _d_pmdec_err), np.nan)
+    _has_delve_unc = np.isfinite(_d_sig_pm) & _not_qso
+    if _has_delve_unc.any():
+        ax_unc.scatter(gmag[_has_delve_unc], _d_sig_pm[_has_delve_unc],
+                       s=6, alpha=0.6, color='dodgerblue', marker='D',
+                       label='DELVE prior', zorder=2)
+    if (_bp3m_gaia_conv_nq & ~has_delve_pm).any():
+        ax_unc.scatter(gmag[_bp3m_gaia_conv_nq & ~has_delve_pm],
+                       sig_pm_bp3m[_bp3m_gaia_conv_nq & ~has_delve_pm],
+                       s=6, alpha=0.7, color='grey', label='BP3M Gaia only', zorder=3)
+    if (_bp3m_gaia_conv_nq & has_delve_pm).any():
+        ax_unc.scatter(gmag[_bp3m_gaia_conv_nq & has_delve_pm],
+                       sig_pm_bp3m[_bp3m_gaia_conv_nq & has_delve_pm],
+                       s=6, alpha=0.7, color='steelblue', label='BP3M Gaia+DELVE', zorder=3)
     if _bp3m_hst_conv.any():
         ax_unc.scatter(gmag[_bp3m_hst_conv], sig_pm_bp3m[_bp3m_hst_conv],
                        s=10, alpha=0.8, color='darkorange', marker='^',
-                       label='BP3M Gaia 2p + HST', zorder=4)
+                       label='BP3M DELVE only', zorder=4)
     ax_unc.set_xlabel("G [mag]")
     ax_unc.set_ylabel(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
     ax_unc.set_title(r"Geometric-mean PM uncertainty $(\det\,C_{\mu})^{1/4}$ vs magnitude")
@@ -221,13 +292,18 @@ def make_plots(solver, images, gaia_catalog,
     xlim = ax_unc.get_xlim()
     _style_ax(ax_unc)
 
-    ax_unc_improve.scatter(gm_nq, sig_pm_gaia[_gaia_not_qso]/sig_pm_bp3m[_gaia_not_qso],
-                   s=6, alpha=0.6, color='steelblue', zorder=2)
+    ax_unc_improve.scatter(gmag[_gaia_only_nq], sig_pm_gaia[_gaia_only_nq]/sig_pm_bp3m[_gaia_only_nq],
+                   s=6, alpha=0.6, color='grey', label='Gaia only', zorder=2)
+    if _gaia_delve_nq.any():
+        ax_unc_improve.scatter(gmag[_gaia_delve_nq],
+                               sig_pm_gaia[_gaia_delve_nq]/sig_pm_bp3m[_gaia_delve_nq],
+                               s=6, alpha=0.6, color='steelblue', label='Gaia+DELVE', zorder=3)
     ax_unc_improve.set_xlabel("Gaia G [mag]")
     ax_unc_improve.set_ylabel(r"PM Improvement Factor")
     ax_unc_improve.set_title(r"PM uncertainty Improvement vs magnitude compared to Gaia-alone")
     ax_unc_improve.set_xlim(xlim)
     ax_unc_improve.axhline(1.0,c='k',lw=2,ls='--',zorder=-1e10)
+    ax_unc_improve.legend(fontsize=7)
     _style_ax(ax_unc_improve)
 
     fig.suptitle("Proper motion comparison", fontsize=13)
