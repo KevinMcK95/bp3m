@@ -291,6 +291,11 @@ def make_plots(solver, images, gaia_catalog,
         ax_unc.scatter(gmag[_bp3m_gaia_conv_nq & has_delve_pm],
                        sig_pm_bp3m[_bp3m_gaia_conv_nq & has_delve_pm],
                        s=6, alpha=0.7, color='steelblue', label='BP3M Gaia+DELVE', zorder=3)
+    _bp3m_gaia2p_conv = bp3m_converged & (_gaia_ids > 0) & ~has_gaia
+    if _bp3m_gaia2p_conv.any():
+        ax_unc.scatter(gmag[_bp3m_gaia2p_conv], sig_pm_bp3m[_bp3m_gaia2p_conv],
+                       s=8, alpha=0.8, color='mediumpurple', marker='s',
+                       label='BP3M Gaia 2p', zorder=4)
     if _bp3m_hst_conv.any():
         ax_unc.scatter(gmag[_bp3m_hst_conv], sig_pm_bp3m[_bp3m_hst_conv],
                        s=10, alpha=0.8, color='darkorange', marker='^',
