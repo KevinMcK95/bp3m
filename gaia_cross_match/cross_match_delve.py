@@ -445,10 +445,24 @@ def process_single_image_delve(
         zmag_d_in = (delve_df['z_mag'].values[in_fld]
                      if 'z_mag' in delve_df.columns
                      else np.full(int(in_fld.sum()), np.nan))
-        pmra_d_in = delve_df['pmra'].values[in_fld]
-        pmdec_d_in= delve_df['pmdec'].values[in_fld]
-        ra_d_in   = ra_prop[in_fld];  dec_d_in = dec_prop[in_fld]
+        pmra_d_in  = delve_df['pmra'].values[in_fld]
+        pmdec_d_in = delve_df['pmdec'].values[in_fld]
+        ra_d_in    = ra_prop[in_fld];  dec_d_in = dec_prop[in_fld]
         all_have_pms = np.ones(int(in_fld.sum()), dtype=bool)  # always True for DELVE
+
+        def _col_in(col, default=np.nan):
+            arr = (delve_df[col].values[in_fld]
+                   if col in delve_df.columns
+                   else np.full(int(in_fld.sum()), default))
+            return arr.astype(float)
+
+        pmra_error_d_in  = _col_in('pmra_error')
+        pmdec_error_d_in = _col_in('pmdec_error')
+        pmra_pmdec_corr_d_in = _col_in('pmra_pmdec_corr', 0.0)
+        parallax_d_in    = _col_in('parallax')
+        parallax_error_d_in  = _col_in('parallax_error')
+        ra_error_d_in    = _col_in('ra_error')
+        dec_error_d_in   = _col_in('dec_error')
 
         # Build the in-field population DataFrame for diagnostic plot backgrounds
         delve_field_df = pd.DataFrame({
@@ -675,8 +689,15 @@ def process_single_image_delve(
         output['delve_gmag']        = gmag_d_in[fm['g_idx'].values]
         output['delve_imag']        = imag_d_in[fm['g_idx'].values]
         output['delve_zmag']        = zmag_d_in[fm['g_idx'].values]
-        output['delve_pmra']        = pmra_d_in[fm['g_idx'].values]
-        output['delve_pmdec']       = pmdec_d_in[fm['g_idx'].values]
+        output['delve_pmra']             = pmra_d_in[fm['g_idx'].values]
+        output['delve_pmdec']            = pmdec_d_in[fm['g_idx'].values]
+        output['delve_pmra_error']       = pmra_error_d_in[fm['g_idx'].values]
+        output['delve_pmdec_error']      = pmdec_error_d_in[fm['g_idx'].values]
+        output['delve_pmra_pmdec_corr']  = pmra_pmdec_corr_d_in[fm['g_idx'].values]
+        output['delve_parallax']         = parallax_d_in[fm['g_idx'].values]
+        output['delve_parallax_error']   = parallax_error_d_in[fm['g_idx'].values]
+        output['delve_ra_error']         = ra_error_d_in[fm['g_idx'].values]
+        output['delve_dec_error']        = dec_error_d_in[fm['g_idx'].values]
         if 'mtype' in delve_df.columns:
             output['delve_mtype']   = delve_df['mtype'].values[dlv_global_idx]
         if 'healpix_pixel' in delve_df.columns:

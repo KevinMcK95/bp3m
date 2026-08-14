@@ -350,6 +350,83 @@ def _build_stars_df(img_dir: Path, img_name: str,
     return df
 
 
+def _build_delve_only_stars_df(
+    img_dir: Path,
+    img_name: str,
+    gaia_hst_indices: set,
+    delve_id_to_gaia_id: dict,
+    pos_err_floor: float = _MIN_POS_ERR_PX,
+) -> pd.DataFrame | None:
+    """
+    Build a stars_df for DELVE-only detections (hst_index not in matched_gaia.csv).
+    Reads positions and errors from the PSF catalog by hst_index.
+
+    Parameters
+    ----------
+    gaia_hst_indices   : set of hst_index values already claimed by matched_gaia.csv
+    delve_id_to_gaia_id: dict mapping delve_source_id (int64) → synthetic negative Gaia_id
+    """
+    cat_path   = img_dir / f"{img_name}_flc_catalog.fits"
+    delve_path = img_dir / "matched_delve.csv"
+    if not cat_path.exists() or not delve_path.exists():
+        return None
+
+    delve = pd.read_csv(delve_path)
+    if 'hst_index' not in delve.columns or 'delve_source_id' not in delve.columns:
+        return None
+    delve_only = delve[~delve['hst_index'].isin(gaia_hst_indices)].copy()
+    if len(delve_only) == 0:
+        return None
+
+    with fits.open(cat_path, memmap=False) as hdu:
+        tbl = hdu[1].data
+        cat_x      = tbl["x"].astype(float)
+        cat_y      = tbl["y"].astype(float)
+        cat_xgdc   = tbl["x_gdc"].astype(float)
+        cat_ygdc   = tbl["y_gdc"].astype(float)
+        cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
+        cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
+        cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
+        cat_mag    = tbl["mag"].astype(float)
+        cat_qfit   = tbl["qfit"].astype(float)
+        cat_n_sat  = tbl["n_sat"].astype(int)
+
+    hst_idx       = delve_only['hst_index'].values.astype(int)
+    delve_src_ids = delve_only['delve_source_id'].values.astype(np.int64)
+    gaia_ids      = np.array([delve_id_to_gaia_id.get(int(did), 0)
+                               for did in delve_src_ids], dtype=np.int64)
+    # Drop any that have no mapping (shouldn't happen)
+    valid = gaia_ids != 0
+    if not valid.all():
+        hst_idx       = hst_idx[valid]
+        gaia_ids      = gaia_ids[valid]
+
+    sig_x = np.maximum(np.sqrt(np.maximum(cat_cov_xx[hst_idx], 0.0)), pos_err_floor)
+    sig_y = np.maximum(np.sqrt(np.maximum(cat_cov_yy[hst_idx], 0.0)), pos_err_floor)
+    denom = sig_x * sig_y
+    corr  = np.where(denom > 0, cat_cov_xy[hst_idx] / denom, 0.0)
+    corr  = np.clip(corr, -0.9999, 0.9999)
+
+    half_width  = 3
+    window_area = (2 * half_width + 1) ** 2
+    ok_sat = (cat_n_sat[hst_idx] / window_area) < _MAX_SAT_FRAC
+
+    return pd.DataFrame({
+        "Gaia_id":         gaia_ids,
+        "X":               cat_xgdc[hst_idx],
+        "Y":               cat_ygdc[hst_idx],
+        "X_orig":          cat_x[hst_idx],
+        "Y_orig":          cat_y[hst_idx],
+        "x_hst_err":       sig_x,
+        "y_hst_err":       sig_y,
+        "xy_hst_corr":     corr,
+        "q_hst":           cat_qfit[hst_idx],
+        "mag":             cat_mag[hst_idx],
+        "use_for_alignment": ok_sat,
+        "use_for_fit":       ok_sat,
+    })
+
+
 # ── CCD/amplifier split utilities ────────────────────────────────────────────
 # Moved here from data_loader.py so that all active pipeline code imports from
 # data_loader_flc and data_loader.py (legacy loader) is unused.
@@ -660,6 +737,7 @@ def load_image_data_flc(data_root, field_name: str,
     # The is_star tier (all > any > neither) naturally emerges from how populated
     # non_star_images is: is_star_all_images=True stars have no non_star_images.
     xm_path = field_path / "cross_match_catalog.csv"
+    xm = None
     if xm_path.exists():
         xm = pd.read_csv(xm_path, dtype={"gaia_source_id": str})
         has_star_cols = "is_star_any_image" in xm.columns
@@ -733,6 +811,128 @@ def load_image_data_flc(data_root, field_name: str,
         .sort_values("Gaia_id")
         .reset_index(drop=True)
     )
+
+    # ── DELVE prior enrichment ─────────────────────────────────────────────────
+    # Merge per-source DELVE PM covariance columns onto gaia_catalog so the
+    # solver can tighten the PM prior for Gaia+DELVE matched stars.
+    _DELVE_PRIOR_COLS = [
+        'delve_pmra', 'delve_pmdec',
+        'delve_pmra_error', 'delve_pmdec_error', 'delve_pmra_pmdec_corr',
+        'delve_parallax', 'delve_parallax_error',
+        'delve_ra_error', 'delve_dec_error',
+    ]
+    if xm is not None:
+        xm_gaia = xm[xm['gaia_source_id'].notna()].copy()
+        avail = [c for c in _DELVE_PRIOR_COLS if c in xm_gaia.columns]
+        if avail:
+            xm_gaia['_gid'] = pd.to_numeric(
+                xm_gaia['gaia_source_id'], errors='coerce')
+            xm_prior = (xm_gaia.dropna(subset=['_gid'])
+                        .groupby('_gid')[avail].first().reset_index()
+                        .rename(columns={'_gid': 'Gaia_id'}))
+            xm_prior['Gaia_id'] = xm_prior['Gaia_id'].astype(np.int64)
+            gaia_catalog = gaia_catalog.merge(xm_prior, on='Gaia_id', how='left')
+            n_delve_pm = int(gaia_catalog.get('delve_pmra_error', pd.Series(dtype=float)).notna().sum())
+            print(f"  DELVE priors merged: {n_delve_pm} Gaia sources with DELVE PM covariance")
+
+    # ── DELVE-only star loading ────────────────────────────────────────────────
+    # Collect DELVE sources (across all images) whose HST detections were never
+    # matched to Gaia.  Add them as synthetic catalog rows so the solver can
+    # constrain their PMs using the DELVE prior.
+    delve_only_rows: list[dict] = []    # one entry per unique delve_source_id
+    delve_id_to_gaia_id: dict[int, int] = {}
+
+    for img_dir in img_dirs:
+        img_name = img_dir.name
+        if restrict_images is not None and img_name not in restrict_images:
+            continue
+        if img_name not in images:
+            continue
+
+        delve_path = img_dir / "matched_delve.csv"
+        gaia_path  = img_dir / "matched_gaia.csv"
+        if not delve_path.exists():
+            continue
+
+        delve = pd.read_csv(delve_path)
+        if 'hst_index' not in delve.columns or 'delve_source_id' not in delve.columns:
+            continue
+
+        gaia_hst_idx: set = set()
+        if gaia_path.exists():
+            gaia_match = pd.read_csv(gaia_path, usecols=['hst_index'])
+            gaia_hst_idx = set(gaia_match['hst_index'].tolist())
+
+        delve_only = delve[~delve['hst_index'].isin(gaia_hst_idx)].copy()
+        for _, row in delve_only.iterrows():
+            did = int(row['delve_source_id'])
+            if did not in delve_id_to_gaia_id:
+                # synthetic negative Gaia_id — unique, negative, fits int64
+                delve_id_to_gaia_id[did] = -did
+                # Collect astrometry for the synthetic catalog entry
+                delve_only_rows.append({
+                    'delve_source_id': did,
+                    'ra':    row.get('delve_ra_prop', np.nan),
+                    'dec':   row.get('delve_dec_prop', np.nan),
+                    'pmra':  row.get('delve_pmra', np.nan),
+                    'pmdec': row.get('delve_pmdec', np.nan),
+                    'delve_pmra':              row.get('delve_pmra', np.nan),
+                    'delve_pmdec':             row.get('delve_pmdec', np.nan),
+                    'delve_pmra_error':        row.get('delve_pmra_error', np.nan),
+                    'delve_pmdec_error':       row.get('delve_pmdec_error', np.nan),
+                    'delve_pmra_pmdec_corr':   row.get('delve_pmra_pmdec_corr', 0.0),
+                    'delve_parallax':          row.get('delve_parallax', np.nan),
+                    'delve_parallax_error':    row.get('delve_parallax_error', np.nan),
+                    'delve_ra_error':          row.get('delve_ra_error', np.nan),
+                    'delve_dec_error':         row.get('delve_dec_error', np.nan),
+                    'gmag':  row.get('delve_rmag', np.nan),  # r ≈ G for red stars
+                })
+
+    if delve_only_rows:
+        delve_only_df = pd.DataFrame(delve_only_rows)
+        delve_only_df['Gaia_id']   = delve_only_df['delve_source_id'].apply(
+            lambda did: delve_id_to_gaia_id[int(did)])
+        delve_only_df['Gaia_time'] = 2016.0
+
+        # Ensure all Gaia columns exist (NaN for missing ones)
+        for col in gaia_catalog.columns:
+            if col not in delve_only_df.columns:
+                delve_only_df[col] = np.nan
+
+        gaia_catalog = pd.concat(
+            [gaia_catalog, delve_only_df[gaia_catalog.columns]],
+            ignore_index=True)
+
+        # Add DELVE-only detections to stars_per_image
+        n_delve_only_added = 0
+        for img_dir in img_dirs:
+            img_name = img_dir.name
+            if restrict_images is not None and img_name not in restrict_images:
+                continue
+            if img_name not in images:
+                continue
+
+            gaia_path = img_dir / "matched_gaia.csv"
+            gaia_hst_idx = set()
+            if gaia_path.exists():
+                gaia_match = pd.read_csv(gaia_path, usecols=['hst_index'])
+                gaia_hst_idx = set(gaia_match['hst_index'].tolist())
+
+            delve_only_stars = _build_delve_only_stars_df(
+                img_dir, img_name, gaia_hst_idx, delve_id_to_gaia_id, pos_err_floor)
+            if delve_only_stars is not None and len(delve_only_stars):
+                # Keep only sources that made it into gaia_catalog
+                valid_ids = set(gaia_catalog['Gaia_id'].values)
+                delve_only_stars = delve_only_stars[
+                    delve_only_stars['Gaia_id'].isin(valid_ids)].reset_index(drop=True)
+                if len(delve_only_stars):
+                    existing = stars_per_image[img_name]
+                    stars_per_image[img_name] = pd.concat(
+                        [existing, delve_only_stars], ignore_index=True)
+                    n_delve_only_added += len(delve_only_stars)
+
+        print(f"  DELVE-only: {len(delve_id_to_gaia_id)} unique sources, "
+              f"{n_delve_only_added} per-image detections added")
 
     # ── Write image summary CSV ───────────────────────────────────────────────
     if summary_rows:

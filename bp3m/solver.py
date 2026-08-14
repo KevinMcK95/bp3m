@@ -343,11 +343,41 @@ class BP3MSolver:
 
         self.C_survey_inv_dot_v = np.einsum('nij,nj->ni',self.C_survey_inv,self.v_survey)
 
-        # for i in range(self.n_stars):
-        #     try:
-        #         self.C_survey_inv[i] = np.linalg.inv(self.C_survey[i])
-        #     except np.linalg.LinAlgError:
-        #         self.C_survey_inv[i] = np.diag(1.0 / np.diag(self.C_survey[i] + 1e-30))
+        # ── Add DELVE PM/parallax precision ───────────────────────────────────
+        # For stars with DELVE PM errors in gaia_catalog, add the DELVE PM
+        # covariance inverse to C_survey_inv (information-form combination).
+        # This tightens the PM prior for Gaia+DELVE matched stars and provides
+        # a DELVE prior for DELVE-only stars (which have NaN Gaia PMs → gaia_2p).
+        if 'delve_pmra_error' in g.columns:
+            d_pmra_e  = _get('delve_pmra_error',      np.inf)
+            d_pmdec_e = _get('delve_pmdec_error',     np.inf)
+            d_corr    = _get('delve_pmra_pmdec_corr', 0.0)
+            d_pmra    = _get('delve_pmra',  0.0)
+            d_pmdec   = _get('delve_pmdec', 0.0)
+
+            has_delve_pm = (np.isfinite(d_pmra_e) & (d_pmra_e > 0) &
+                            np.isfinite(d_pmdec_e) & (d_pmdec_e > 0))
+            if has_delve_pm.any():
+                idx = np.where(has_delve_pm)[0]
+                s1  = d_pmra_e[idx];   s2  = d_pmdec_e[idx]
+                rho = np.clip(d_corr[idx], -0.9999, 0.9999)
+                det = s1**2 * s2**2 * (1 - rho**2)
+                inv11 =  s2**2 / det;  inv22 = s1**2 / det
+                inv12 = -rho * s1 * s2 / det
+                self.C_survey_inv[idx, 2, 2] += inv11
+                self.C_survey_inv[idx, 3, 3] += inv22
+                self.C_survey_inv[idx, 2, 3] += inv12
+                self.C_survey_inv[idx, 3, 2] += inv12
+                # Information-form RHS: C_delve_inv @ v_delve
+                self.C_survey_inv_dot_v[idx, 2] += inv11 * d_pmra[idx] + inv12 * d_pmdec[idx]
+                self.C_survey_inv_dot_v[idx, 3] += inv12 * d_pmra[idx] + inv22 * d_pmdec[idx]
+
+            # For gaia_2p stars with DELVE PM: update v_survey mean and disable
+            # the flat 100 mas/yr diffuse PM prior (done below in the diffuse block).
+            self._has_delve_pm = has_delve_pm   # stored for use in diffuse-prior block
+
+        else:
+            self._has_delve_pm = np.zeros(self.n_stars, dtype=bool)
 
         # ── Per-star astrometry prior (Michalik et al. 2015) ──────────────────
         # Gaia 5p/6p: zero precision (no diffuse prior — Gaia covariance suffices).
@@ -364,11 +394,14 @@ class BP3MSolver:
 
         # _C_VG_inv_per_star : (n_stars, 5) diagonal precision additions.
         # param order: (Δα*, Δδ, μα*, μδ, ϖ)
+        # Stars with DELVE PM have their PM prior supplied via C_survey_inv (above);
+        # the flat 100 mas/yr diffuse PM prior is disabled for them.
         self._C_VG_inv_per_star = np.zeros((self.n_stars, N_V), dtype=float)
         self._C_VG_inv_per_star[needs_diffuse, 0] = _SIGMA_POS**-2
         self._C_VG_inv_per_star[needs_diffuse, 1] = _SIGMA_POS**-2
-        self._C_VG_inv_per_star[needs_diffuse, 2] = _SIGMA_PM**-2
-        self._C_VG_inv_per_star[needs_diffuse, 3] = _SIGMA_PM**-2
+        needs_diffuse_pm = needs_diffuse & ~self._has_delve_pm
+        self._C_VG_inv_per_star[needs_diffuse_pm, 2] = _SIGMA_PM**-2
+        self._C_VG_inv_per_star[needs_diffuse_pm, 3] = _SIGMA_PM**-2
         finite_plx = needs_diffuse & np.isfinite(sigma_plx_prior)
         self._C_VG_inv_per_star[finite_plx, 4] = sigma_plx_prior[finite_plx]**-2
 
@@ -377,9 +410,17 @@ class BP3MSolver:
         self._sigma_diff_per_star = np.full((self.n_stars, N_V), 1e9, dtype=float)
         self._sigma_diff_per_star[needs_diffuse, 0] = 1e4
         self._sigma_diff_per_star[needs_diffuse, 1] = 1e4
-        self._sigma_diff_per_star[needs_diffuse, 2] = _SIGMA_PM
-        self._sigma_diff_per_star[needs_diffuse, 3] = _SIGMA_PM
-        self._sigma_diff_per_star[finite_plx,    4] = sigma_plx_prior[finite_plx]
+        self._sigma_diff_per_star[needs_diffuse_pm, 2] = _SIGMA_PM
+        self._sigma_diff_per_star[needs_diffuse_pm, 3] = _SIGMA_PM
+        # For DELVE-matched 2p stars, use DELVE PM error for outlier test
+        if self._has_delve_pm.any():
+            d_pmra_e_stored  = _get('delve_pmra_error',  np.inf)
+            d_pmdec_e_stored = _get('delve_pmdec_error', np.inf)
+            has_d2p = needs_diffuse & self._has_delve_pm
+            self._sigma_diff_per_star[has_d2p, 2] = d_pmra_e_stored[has_d2p]
+            self._sigma_diff_per_star[has_d2p, 3] = d_pmdec_e_stored[has_d2p]
+        finite_plx = needs_diffuse & np.isfinite(sigma_plx_prior)
+        self._sigma_diff_per_star[finite_plx, 4] = sigma_plx_prior[finite_plx]
 
     # ── Geometry precomputation ────────────────────────────────────────────────
 

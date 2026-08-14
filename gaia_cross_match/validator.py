@@ -449,7 +449,10 @@ def _load_gaia_phot(data_dir, target):
 # ---------------------------------------------------------------------------
 
 _DELVE_PHOT_COLS = ['delve_rmag', 'delve_gmag', 'delve_imag', 'delve_zmag',
-                    'delve_pmra', 'delve_pmdec']
+                    'delve_pmra', 'delve_pmdec',
+                    'delve_pmra_error', 'delve_pmdec_error', 'delve_pmra_pmdec_corr',
+                    'delve_parallax', 'delve_parallax_error',
+                    'delve_ra_error', 'delve_dec_error']
 _DELVE_SENTINEL_LO, _DELVE_SENTINEL_HI = -90.0, 50.0
 
 
@@ -649,6 +652,10 @@ def build_global_catalog(images, target, data_dir):
                 'n_delve_images':        len(g),
                 'delve_mtype':           g['delve_mtype'].mode().iloc[0]
                                          if 'delve_mtype' in g.columns and len(g['delve_mtype'].dropna()) else np.nan,
+                'delve_ra':              float(g['delve_ra_prop'].median())
+                                         if 'delve_ra_prop' in g.columns else np.nan,
+                'delve_dec':             float(g['delve_dec_prop'].median())
+                                         if 'delve_dec_prop' in g.columns else np.nan,
             }
             for col in _DELVE_PHOT_COLS:
                 if col in g.columns:
