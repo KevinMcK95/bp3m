@@ -348,15 +348,86 @@ class BP3MSolver:
         # covariance inverse to C_survey_inv (information-form combination).
         # This tightens the PM prior for Gaia+DELVE matched stars and provides
         # a DELVE prior for DELVE-only stars (which have NaN Gaia PMs → gaia_2p).
+        #
+        # Consistency gate: if Gaia and DELVE PMs differ by >3σ (chi2_2D>11.8),
+        # the match is suspect — trust Gaia and discard the DELVE prior.
         if 'delve_pmra_error' in g.columns:
             d_pmra_e  = _get('delve_pmra_error',      np.inf)
             d_pmdec_e = _get('delve_pmdec_error',     np.inf)
-            d_corr    = _get('delve_pmra_pmdec_corr', 0.0)
+            d_corr    = _get('delve_corr_pmra_pmdec', 0.0)
             d_pmra    = _get('delve_pmra',  0.0)
             d_pmdec   = _get('delve_pmdec', 0.0)
 
             has_delve_pm = (np.isfinite(d_pmra_e) & (d_pmra_e > 0) &
                             np.isfinite(d_pmdec_e) & (d_pmdec_e > 0))
+
+            # Consistency veto: 5D Gaia–DELVE comparison for Gaia 5p stars.
+            # χ²₅D = Δv^T (C_gaia + C_delve)^{-1} Δv;  threshold 17.7 = chi2.ppf(0.9973, 5)
+            # Δv = (Δα*, Δδ, Δμα*, Δμδ, Δϖ) in mas / mas/yr.
+            if has_delve_pm.any() and self.full_gaia_astrometry.any():
+                test_idx = has_delve_pm & self.full_gaia_astrometry
+                if test_idx.any():
+                    tidx = np.where(test_idx)[0]
+                    # DELVE sigmas in Gaia convention (ra,dec,pmra,pmdec,plx)
+                    d_sig = np.column_stack([
+                        _get('delve_ra_error',       np.inf)[tidx],
+                        _get('delve_dec_error',      np.inf)[tidx],
+                        d_pmra_e[tidx],
+                        d_pmdec_e[tidx],
+                        _get('delve_parallax_error', np.inf)[tidx],
+                    ])  # (m,5)
+                    # DELVE correlation matrix in Gaia convention.
+                    # DELVE convention (ra,dec,plx,pmra,pmdec) → Gaia (ra,dec,pmra,pmdec,plx):
+                    # (0,1)=ra_dec, (0,2)=ra_pmra, (0,3)=ra_pmdec, (0,4)=ra_plx
+                    # (1,2)=dec_pmra, (1,3)=dec_pmdec, (1,4)=dec_plx
+                    # (2,3)=pmra_pmdec, (2,4)=plx_pmra, (3,4)=plx_pmdec
+                    m = len(tidx)
+                    corr_d = np.zeros((m, 5, 5))
+                    for k in range(5):
+                        corr_d[:, k, k] = 1.0
+                    def _gc(col):
+                        return _get(col, 0.0)[tidx]
+                    corr_d[:, 0, 1] = corr_d[:, 1, 0] = _gc('delve_corr_ra_dec')
+                    corr_d[:, 0, 2] = corr_d[:, 2, 0] = _gc('delve_corr_ra_pmra')
+                    corr_d[:, 0, 3] = corr_d[:, 3, 0] = _gc('delve_corr_ra_pmdec')
+                    corr_d[:, 0, 4] = corr_d[:, 4, 0] = _gc('delve_corr_ra_plx')
+                    corr_d[:, 1, 2] = corr_d[:, 2, 1] = _gc('delve_corr_dec_pmra')
+                    corr_d[:, 1, 3] = corr_d[:, 3, 1] = _gc('delve_corr_dec_pmdec')
+                    corr_d[:, 1, 4] = corr_d[:, 4, 1] = _gc('delve_corr_dec_plx')
+                    corr_d[:, 2, 3] = corr_d[:, 3, 2] = _gc('delve_corr_pmra_pmdec')
+                    corr_d[:, 2, 4] = corr_d[:, 4, 2] = _gc('delve_corr_plx_pmra')
+                    corr_d[:, 3, 4] = corr_d[:, 4, 3] = _gc('delve_corr_plx_pmdec')
+                    C_delve = d_sig[:, :, None] * corr_d * d_sig[:, None, :]  # (m,5,5)
+                    # Δv in Gaia convention
+                    cos_dec = np.cos(np.radians(self.gaia_dec[tidx]))
+                    ra_delve  = _get('delve_ra_cat',  0.0)[tidx]
+                    dec_delve = _get('delve_dec_cat', 0.0)[tidx]
+                    delta_v = np.column_stack([
+                        (self.gaia_ra[tidx]  - ra_delve)  * cos_dec * 3.6e6,
+                        (self.gaia_dec[tidx] - dec_delve) * 3.6e6,
+                        _get('pmra',     0.0)[tidx] - d_pmra[tidx],
+                        _get('pmdec',    0.0)[tidx] - d_pmdec[tidx],
+                        _get('parallax', 0.0)[tidx] - _get('delve_parallax', 0.0)[tidx],
+                    ])  # (m,5)
+                    # Combined covariance; use C_survey (already in Gaia convention)
+                    C_comb = self.C_survey[test_idx] + C_delve  # (m,5,5)
+                    # Stars with complete finite 5D DELVE data → full chi2
+                    valid_5d = (np.isfinite(d_sig).all(axis=1) &
+                                (d_sig > 0).all(axis=1) &
+                                np.isfinite(delta_v).all(axis=1))
+                    chi2_5d = np.zeros(m)
+                    if valid_5d.any():
+                        Cv = C_comb[valid_5d]
+                        dv = delta_v[valid_5d]
+                        x = np.linalg.solve(Cv, dv)   # batch solve (m_v,5)
+                        chi2_5d[valid_5d] = np.einsum('ni,ni->n', dv, x)
+                    vetoed_5d = chi2_5d > 17.7   # 3σ equivalent, df=5
+                    n_vetoed = int(vetoed_5d.sum())
+                    if n_vetoed > 0:
+                        has_delve_pm[tidx[vetoed_5d]] = False
+                        print(f'  DELVE prior vetoed for {n_vetoed} stars '
+                              f'(Gaia/DELVE 5D discrepant >3σ; chi2_5d threshold 17.7)')
+
             if has_delve_pm.any():
                 idx = np.where(has_delve_pm)[0]
                 s1  = d_pmra_e[idx];   s2  = d_pmdec_e[idx]
@@ -376,8 +447,23 @@ class BP3MSolver:
             # the flat 100 mas/yr diffuse PM prior (done below in the diffuse block).
             self._has_delve_pm = has_delve_pm   # stored for use in diffuse-prior block
 
+            # Combined prior mean and covariance for the outlier test:
+            #   v_prior[i]  = C_prior[i] @ C_survey_inv_dot_v[i]
+            #   C_prior[i]  = inv(C_survey_inv[i])   (combined Gaia+DELVE)
+            # For stars without DELVE this is identical to (v_survey, C_survey).
+            self.v_prior = self.v_survey.copy()
+            self.C_prior = self.C_survey.copy()
+            if has_delve_pm.any():
+                idx_dp = np.where(has_delve_pm)[0]
+                C_prior_dp = np.linalg.inv(self.C_survey_inv[idx_dp])
+                self.C_prior[idx_dp] = C_prior_dp
+                self.v_prior[idx_dp] = np.einsum(
+                    'nij,nj->ni', C_prior_dp, self.C_survey_inv_dot_v[idx_dp])
+
         else:
             self._has_delve_pm = np.zeros(self.n_stars, dtype=bool)
+            self.v_prior = self.v_survey
+            self.C_prior = self.C_survey
 
         # ── Per-star astrometry prior (Michalik et al. 2015) ──────────────────
         # Gaia 5p/6p: zero precision (no diffuse prior — Gaia covariance suffices).
@@ -1763,10 +1849,15 @@ class BP3MSolver:
             p84 = float(np.percentile(values, 84))
             return float(max(p50 + k * max(p50 - p16, 1e-6), floor)), p16, p50, p84
 
-        # ── 1. Gaia prior chi2 test ───────────────────────────────────────────
-        # chi2 = (ã - v_s)^T (C_vT + C_survey)^{-1} (ã - v_s)
-        delta_gaia = v_hat - self.v_survey             # (n_stars, 5)
-        C_comb     = C_vT + self.C_survey              # (n_stars, 5, 5)
+        # ── 1. Combined prior chi2 test ───────────────────────────────────────
+        # chi2 = (ã - v_prior)^T (C_vT + C_prior)^{-1} (ã - v_prior)
+        # v_prior / C_prior are the combined Gaia+DELVE prior for DELVE-matched
+        # stars, and the Gaia-only prior for unmatched stars.  For DELVE-only
+        # stars (gaia_2p), v_prior uses the DELVE PM as the reference.
+        v_prior    = getattr(self, 'v_prior', self.v_survey)
+        C_prior    = getattr(self, 'C_prior', self.C_survey)
+        delta_gaia = v_hat - v_prior                   # (n_stars, 5)
+        C_comb     = C_vT + C_prior                    # (n_stars, 5, 5)
         C_comb_inv = np.linalg.inv(C_comb)
         chi2_gaia  = np.einsum('ni,nij,nj->n', delta_gaia, C_comb_inv, delta_gaia)
 

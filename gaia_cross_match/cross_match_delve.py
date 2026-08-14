@@ -458,11 +458,25 @@ def process_single_image_delve(
 
         pmra_error_d_in  = _col_in('pmra_error')
         pmdec_error_d_in = _col_in('pmdec_error')
-        pmra_pmdec_corr_d_in = _col_in('pmra_pmdec_corr', 0.0)
         parallax_d_in    = _col_in('parallax')
         parallax_error_d_in  = _col_in('parallax_error')
         ra_error_d_in    = _col_in('ra_error')
         dec_error_d_in   = _col_in('dec_error')
+        # Catalog positions at reference epoch (2016.0) — for Gaia-DELVE 5D comparison
+        ra_cat_d_in  = _col_in('ra')
+        dec_cat_d_in = _col_in('dec')
+        # All 10 DELVE correlation terms for the full 5×5 covariance
+        # DELVE convention: indices (ra=0, dec=1, plx=2, pmra=3, pmdec=4)
+        corr_ra_dec_d_in     = _col_in('ra_dec_corr',          0.0)
+        corr_ra_plx_d_in     = _col_in('ra_parallax_corr',     0.0)
+        corr_ra_pmra_d_in    = _col_in('ra_pmra_corr',         0.0)
+        corr_ra_pmdec_d_in   = _col_in('ra_pmdec_corr',        0.0)
+        corr_dec_plx_d_in    = _col_in('dec_parallax_corr',    0.0)
+        corr_dec_pmra_d_in   = _col_in('dec_pmra_corr',        0.0)
+        corr_dec_pmdec_d_in  = _col_in('dec_pmdec_corr',       0.0)
+        corr_plx_pmra_d_in   = _col_in('parallax_pmra_corr',   0.0)
+        corr_plx_pmdec_d_in  = _col_in('parallax_pmdec_corr',  0.0)
+        corr_pmra_pmdec_d_in = _col_in('pmra_pmdec_corr',      0.0)
 
         # Build the in-field population DataFrame for diagnostic plot backgrounds
         delve_field_df = pd.DataFrame({
@@ -689,15 +703,28 @@ def process_single_image_delve(
         output['delve_gmag']        = gmag_d_in[fm['g_idx'].values]
         output['delve_imag']        = imag_d_in[fm['g_idx'].values]
         output['delve_zmag']        = zmag_d_in[fm['g_idx'].values]
-        output['delve_pmra']             = pmra_d_in[fm['g_idx'].values]
-        output['delve_pmdec']            = pmdec_d_in[fm['g_idx'].values]
-        output['delve_pmra_error']       = pmra_error_d_in[fm['g_idx'].values]
-        output['delve_pmdec_error']      = pmdec_error_d_in[fm['g_idx'].values]
-        output['delve_pmra_pmdec_corr']  = pmra_pmdec_corr_d_in[fm['g_idx'].values]
-        output['delve_parallax']         = parallax_d_in[fm['g_idx'].values]
-        output['delve_parallax_error']   = parallax_error_d_in[fm['g_idx'].values]
-        output['delve_ra_error']         = ra_error_d_in[fm['g_idx'].values]
-        output['delve_dec_error']        = dec_error_d_in[fm['g_idx'].values]
+        output['delve_pmra']               = pmra_d_in[fm['g_idx'].values]
+        output['delve_pmdec']              = pmdec_d_in[fm['g_idx'].values]
+        output['delve_pmra_error']         = pmra_error_d_in[fm['g_idx'].values]
+        output['delve_pmdec_error']        = pmdec_error_d_in[fm['g_idx'].values]
+        output['delve_parallax']           = parallax_d_in[fm['g_idx'].values]
+        output['delve_parallax_error']     = parallax_error_d_in[fm['g_idx'].values]
+        output['delve_ra_error']           = ra_error_d_in[fm['g_idx'].values]
+        output['delve_dec_error']          = dec_error_d_in[fm['g_idx'].values]
+        # Catalog position at 2016.0 (same reference epoch as Gaia DR3)
+        output['delve_ra_cat']             = ra_cat_d_in[fm['g_idx'].values]
+        output['delve_dec_cat']            = dec_cat_d_in[fm['g_idx'].values]
+        # Full 5×5 DELVE correlation terms for the Gaia-DELVE consistency test
+        output['delve_corr_ra_dec']        = corr_ra_dec_d_in[fm['g_idx'].values]
+        output['delve_corr_ra_plx']        = corr_ra_plx_d_in[fm['g_idx'].values]
+        output['delve_corr_ra_pmra']       = corr_ra_pmra_d_in[fm['g_idx'].values]
+        output['delve_corr_ra_pmdec']      = corr_ra_pmdec_d_in[fm['g_idx'].values]
+        output['delve_corr_dec_plx']       = corr_dec_plx_d_in[fm['g_idx'].values]
+        output['delve_corr_dec_pmra']      = corr_dec_pmra_d_in[fm['g_idx'].values]
+        output['delve_corr_dec_pmdec']     = corr_dec_pmdec_d_in[fm['g_idx'].values]
+        output['delve_corr_plx_pmra']      = corr_plx_pmra_d_in[fm['g_idx'].values]
+        output['delve_corr_plx_pmdec']     = corr_plx_pmdec_d_in[fm['g_idx'].values]
+        output['delve_corr_pmra_pmdec']    = corr_pmra_pmdec_d_in[fm['g_idx'].values]
         if 'mtype' in delve_df.columns:
             output['delve_mtype']   = delve_df['mtype'].values[dlv_global_idx]
         if 'healpix_pixel' in delve_df.columns:

@@ -817,9 +817,14 @@ def load_image_data_flc(data_root, field_name: str,
     # solver can tighten the PM prior for Gaia+DELVE matched stars.
     _DELVE_PRIOR_COLS = [
         'delve_pmra', 'delve_pmdec',
-        'delve_pmra_error', 'delve_pmdec_error', 'delve_pmra_pmdec_corr',
+        'delve_pmra_error', 'delve_pmdec_error',
         'delve_parallax', 'delve_parallax_error',
         'delve_ra_error', 'delve_dec_error',
+        'delve_ra_cat', 'delve_dec_cat',
+        'delve_corr_ra_dec', 'delve_corr_ra_plx', 'delve_corr_ra_pmra',
+        'delve_corr_ra_pmdec', 'delve_corr_dec_plx', 'delve_corr_dec_pmra',
+        'delve_corr_dec_pmdec', 'delve_corr_plx_pmra', 'delve_corr_plx_pmdec',
+        'delve_corr_pmra_pmdec',
     ]
     if xm is not None:
         xm_gaia = xm[xm['gaia_source_id'].notna()].copy()
@@ -880,11 +885,22 @@ def load_image_data_flc(data_root, field_name: str,
                     'delve_pmdec':             row.get('delve_pmdec', np.nan),
                     'delve_pmra_error':        row.get('delve_pmra_error', np.nan),
                     'delve_pmdec_error':       row.get('delve_pmdec_error', np.nan),
-                    'delve_pmra_pmdec_corr':   row.get('delve_pmra_pmdec_corr', 0.0),
                     'delve_parallax':          row.get('delve_parallax', np.nan),
                     'delve_parallax_error':    row.get('delve_parallax_error', np.nan),
                     'delve_ra_error':          row.get('delve_ra_error', np.nan),
                     'delve_dec_error':         row.get('delve_dec_error', np.nan),
+                    'delve_ra_cat':            row.get('delve_ra_cat', np.nan),
+                    'delve_dec_cat':           row.get('delve_dec_cat', np.nan),
+                    'delve_corr_ra_dec':       row.get('delve_corr_ra_dec', 0.0),
+                    'delve_corr_ra_plx':       row.get('delve_corr_ra_plx', 0.0),
+                    'delve_corr_ra_pmra':      row.get('delve_corr_ra_pmra', 0.0),
+                    'delve_corr_ra_pmdec':     row.get('delve_corr_ra_pmdec', 0.0),
+                    'delve_corr_dec_plx':      row.get('delve_corr_dec_plx', 0.0),
+                    'delve_corr_dec_pmra':     row.get('delve_corr_dec_pmra', 0.0),
+                    'delve_corr_dec_pmdec':    row.get('delve_corr_dec_pmdec', 0.0),
+                    'delve_corr_plx_pmra':     row.get('delve_corr_plx_pmra', 0.0),
+                    'delve_corr_plx_pmdec':    row.get('delve_corr_plx_pmdec', 0.0),
+                    'delve_corr_pmra_pmdec':   row.get('delve_corr_pmra_pmdec', 0.0),
                     'gmag':  row.get('delve_rmag', np.nan),  # r ≈ G for red stars
                 })
 

@@ -450,9 +450,14 @@ def _load_gaia_phot(data_dir, target):
 
 _DELVE_PHOT_COLS = ['delve_rmag', 'delve_gmag', 'delve_imag', 'delve_zmag',
                     'delve_pmra', 'delve_pmdec',
-                    'delve_pmra_error', 'delve_pmdec_error', 'delve_pmra_pmdec_corr',
+                    'delve_pmra_error', 'delve_pmdec_error',
                     'delve_parallax', 'delve_parallax_error',
-                    'delve_ra_error', 'delve_dec_error']
+                    'delve_ra_error', 'delve_dec_error',
+                    'delve_ra_cat', 'delve_dec_cat',
+                    'delve_corr_ra_dec', 'delve_corr_ra_plx', 'delve_corr_ra_pmra',
+                    'delve_corr_ra_pmdec', 'delve_corr_dec_plx', 'delve_corr_dec_pmra',
+                    'delve_corr_dec_pmdec', 'delve_corr_plx_pmra', 'delve_corr_plx_pmdec',
+                    'delve_corr_pmra_pmdec']
 _DELVE_SENTINEL_LO, _DELVE_SENTINEL_HI = -90.0, 50.0
 
 
