@@ -298,9 +298,16 @@ def make_plots(solver, images, gaia_catalog,
         ax_unc_improve.scatter(gmag[_gaia_delve_nq],
                                sig_pm_gaia[_gaia_delve_nq]/sig_pm_bp3m[_gaia_delve_nq],
                                s=6, alpha=0.6, color='steelblue', label='Gaia+DELVE', zorder=3)
-    ax_unc_improve.set_xlabel("Gaia G [mag]")
+    # DELVE-only: improvement = DELVE prior sigma / BP3M sigma
+    _do_conv = _delve_only & bp3m_converged & np.isfinite(_d_sig_pm) & (_d_sig_pm > 0)
+    if _do_conv.any():
+        _delve_improve = _d_sig_pm[_do_conv] / sig_pm_bp3m[_do_conv]
+        ax_unc_improve.scatter(gmag[_do_conv], _delve_improve,
+                               s=10, alpha=0.7, color='darkorange', marker='^',
+                               label='DELVE only', zorder=4)
+    ax_unc_improve.set_xlabel("G [mag]")
     ax_unc_improve.set_ylabel(r"PM Improvement Factor")
-    ax_unc_improve.set_title(r"PM uncertainty Improvement vs magnitude compared to Gaia-alone")
+    ax_unc_improve.set_title(r"PM uncertainty Improvement vs magnitude compared to prior (Gaia or DELVE)")
     ax_unc_improve.set_xlim(xlim)
     ax_unc_improve.axhline(1.0,c='k',lw=2,ls='--',zorder=-1e10)
     ax_unc_improve.legend(fontsize=7)

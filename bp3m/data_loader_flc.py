@@ -422,7 +422,7 @@ def _build_delve_only_stars_df(
         "xy_hst_corr":     corr,
         "q_hst":           cat_qfit[hst_idx],
         "mag":             cat_mag[hst_idx],
-        "use_for_alignment": ok_sat,
+        "use_for_alignment": np.zeros(len(gaia_ids), dtype=bool),
         "use_for_fit":       ok_sat,
     })
 
