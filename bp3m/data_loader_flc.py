@@ -356,6 +356,7 @@ def _build_delve_only_stars_df(
     gaia_hst_indices: set,
     delve_id_to_gaia_id: dict,
     pos_err_floor: float = _MIN_POS_ERR_PX,
+    delve_use_for_align: bool = False,
 ) -> pd.DataFrame | None:
     """
     Build a stars_df for DELVE-only detections (hst_index not in matched_gaia.csv).
@@ -422,7 +423,7 @@ def _build_delve_only_stars_df(
         "xy_hst_corr":     corr,
         "q_hst":           cat_qfit[hst_idx],
         "mag":             cat_mag[hst_idx],
-        "use_for_alignment": np.zeros(len(gaia_ids), dtype=bool),
+        "use_for_alignment": ok_sat if delve_use_for_align else np.zeros(len(gaia_ids), dtype=bool),
         "use_for_fit":       ok_sat,
     })
 
@@ -553,7 +554,8 @@ def load_image_data_flc(data_root, field_name: str,
                         pos_err_floor: float = _MIN_POS_ERR_PX,
                         restrict_images: "set[str] | frozenset[str] | None" = None,
                         gaia_csv: "str | Path | list | None" = None,
-                        use_delve: bool = False):
+                        use_delve: bool = False,
+                        delve_use_for_align: bool = False):
     """
     Load BP3M inputs from the new FLC-based pipeline layout.
 
@@ -957,7 +959,8 @@ def load_image_data_flc(data_root, field_name: str,
                 gaia_hst_idx = set(gaia_match['hst_index'].tolist())
 
             delve_only_stars = _build_delve_only_stars_df(
-                img_dir, img_name, gaia_hst_idx, delve_id_to_gaia_id, pos_err_floor)
+                img_dir, img_name, gaia_hst_idx, delve_id_to_gaia_id, pos_err_floor,
+                delve_use_for_align=delve_use_for_align)
             if delve_only_stars is not None and len(delve_only_stars):
                 # Keep only sources that made it into gaia_catalog
                 valid_ids = set(gaia_catalog['Gaia_id'].values)

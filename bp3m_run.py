@@ -86,10 +86,17 @@ def _parse_args():
                           'applied uniformly to all pointings)')
 
     # ── DELVE ─────────────────────────────────────────────────────────────────
-    dlv = p.add_argument_group('DELVE options (optional; omit --delve_dir to skip all DELVE steps)')
-    dlv.add_argument('--delve_dir', type=str, default=None,
-                     help='Path to the directory containing DELVE PM_hp*.fits tile files. '
+    _DEFAULT_DELVE_DIR = '/bootes_raid6/users/kmckinnon/bp3m/DELVE_ProperMotion/PMCatalog'
+    dlv = p.add_argument_group('DELVE options (optional)')
+    dlv.add_argument('--use_delve', action='store_true',
+                     help='Incorporate DELVE proper-motion priors into the fit. '
                           'If not given, all DELVE steps are silently skipped.')
+    dlv.add_argument('--delve_dir', type=str, default=_DEFAULT_DELVE_DIR,
+                     help=f'Path to the directory containing DELVE PM_hp*.fits tile files. '
+                          f'Default: {_DEFAULT_DELVE_DIR}')
+    dlv.add_argument('--delve_use_for_align', action='store_true',
+                     help='Allow DELVE-only sources to contribute to image alignment '
+                          '(off by default; may be useful when DELVE astrometry improves).')
     dlv.add_argument('--force_redownload_delve', action='store_true',
                      help='Regenerate the DELVE CSV even if a cached one already exists.')
     dlv.add_argument('--skip_delve_crossmatch', action='store_true',
@@ -717,7 +724,7 @@ def main():
 
     # ── Step 1c: Download DELVE catalogue (one query per pointing) ──────────
     delve_csv_path: "Path | None" = None
-    if args.delve_dir and not args.skip_download:
+    if args.use_delve and not args.skip_download:
         from bp3m.pipeline.download_delve import download_delve as _dl_delve
         print("\n" + "─"*50)
         print("Step 1c: DELVE proper-motion catalogue")
@@ -742,7 +749,7 @@ def main():
                 delve_csv_path = _delve_csvs[0]
         else:
             print("  No DELVE tiles found for this field — DELVE steps disabled.")
-    elif args.delve_dir:
+    elif args.use_delve:
         # skip_download path: find any existing DELVE CSV
         _delve_dir_out = output_dir / field / "DELVE"
         _delve_csvs = sorted(_delve_dir_out.glob("*_delve.csv")) if _delve_dir_out.exists() else []
@@ -1208,7 +1215,8 @@ def main():
                         bp3m_dir=_indv_root / _img,
                         gaia_csv=gaia_csv_path,
                         qso_anchors_csv=_qso_anchors_csv if _qso_exists(_qso_anchors_csv) else None,
-                        use_delve=bool(args.delve_dir),
+                        use_delve=args.use_delve,
+                        delve_use_for_align=args.delve_use_for_align,
                     )
                     _n_ok += 1
                 except Exception as _exc:
@@ -1264,7 +1272,8 @@ def main():
                 qso_anchors_csv=_qso_anchors_csv if _qso_exists(_qso_anchors_csv) else None,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
                 gaia_csv=gaia_csv_path,
-                use_delve=bool(args.delve_dir),
+                use_delve=args.use_delve,
+                delve_use_for_align=args.delve_use_for_align,
             )
             # ── Step 5b: Compare synthetic results to truth ────────────────────
             print("\n" + "=" * 55)
@@ -1328,7 +1337,8 @@ def main():
                 gaia_epoch_obs=_gaia_epoch_obs_for_solver,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
                 gaia_csv=gaia_csv_path,
-                use_delve=bool(args.delve_dir),
+                use_delve=args.use_delve,
+                delve_use_for_align=args.delve_use_for_align,
             )
 
     # Save the command only on successful completion so interrupted runs
