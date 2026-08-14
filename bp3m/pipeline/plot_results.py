@@ -96,8 +96,10 @@ def make_plots(solver, images, gaia_catalog,
 
     # Full marginal covariance = r-propagation + conditional, with prior fallback.
     from bp3m.pipeline.run_alignment import _apply_prior_fallback
+    _failed_prior = ~getattr(solver, 'ok_star', np.ones(solver.n_stars, bool))
     v_cov_full, v_mean = _apply_prior_fallback(
-        v_cov + C_vT, v_mean, solver.C_prior, solver.v_prior)
+        v_cov + C_vT, v_mean, solver.C_prior, solver.v_prior,
+        failed_prior_test=_failed_prior)
 
     # ── Member mask and free (diffuse-prior) data ─────────────────────────────
     is_member = None
@@ -185,8 +187,14 @@ def make_plots(solver, images, gaia_catalog,
     hst_has_xmatch = hst_only & np.isfinite(_pmra_xmatch) & np.isfinite(_pmdec_xmatch)
 
     # ── DELVE source categorisation ───────────────────────────────────────────
-    # has_delve_pm: Gaia-matched star that also has a full DELVE PM covariance.
-    # DELVE-only: negative Gaia_id (synthetic row, no Gaia 5p astrometry).
+    # _delve_only:  negative Gaia_id = synthetic row with no real Gaia data.
+    # has_delve_pm: any star with a real Gaia ID (5p or 2p) that also has a
+    #               full DELVE PM covariance.
+    # _gaia_delve_nq: all real-Gaia+DELVE sources (5p and 2p) for PM panels.
+    # _gaia5p_delve_nq: 5p-Gaia+DELVE only — used for improvement ratios vs
+    #               Gaia 5p prior (2p prior is ~100 mas/yr diffuse; ratio would
+    #               be huge and dominate the improvement-factor y-axis).
+    # _gaia_only_nq: 5p Gaia without DELVE.
     def _gc_col(col):
         if col in _gc.columns:
             return pd.to_numeric(_gc[col], errors='coerce').to_numpy(float)
@@ -195,12 +203,14 @@ def make_plots(solver, images, gaia_catalog,
     _d_pmdec_err = _gc_col("delve_pmdec_error")
     _d_pmra_val  = _gc_col("delve_pmra")
     _d_pmdec_val = _gc_col("delve_pmdec")
+    _has_real_gaia = (_gaia_ids > 0)          # any real Gaia ID (5p or 2p)
+    _delve_only    = (_gaia_ids < 0)          # synthetic rows only
     has_delve_pm = (np.isfinite(_d_pmra_err) & (_d_pmra_err > 0) &
                     np.isfinite(_d_pmdec_err) & (_d_pmdec_err > 0) &
-                    has_gaia)
-    _delve_only  = hst_only  # negative Gaia_id ↔ DELVE-only source
-    _gaia_delve_nq = _gaia_not_qso & has_delve_pm
-    _gaia_only_nq  = _gaia_not_qso & ~has_delve_pm
+                    _has_real_gaia)            # Gaia (5p or 2p) + DELVE PM
+    _gaia_delve_nq   = _has_real_gaia & _not_qso & has_delve_pm   # all Gaia+DELVE
+    _gaia5p_delve_nq = _gaia_not_qso & has_delve_pm               # 5p Gaia+DELVE
+    _gaia_only_nq    = _gaia_not_qso & ~has_delve_pm              # 5p Gaia only
 
     for ax, gaia_pm, bp3m_pm_g, sig_g, sig_b_g, d_pm, d_sig, comp in zip(
             [ax_pmra, ax_pmdec],
@@ -258,7 +268,7 @@ def make_plots(solver, images, gaia_catalog,
         _style_ax(ax)
 
     _bp3m_gaia_conv = bp3m_converged & has_gaia
-    _bp3m_hst_conv  = bp3m_converged & hst_only
+    _bp3m_hst_conv  = bp3m_converged & _delve_only   # true DELVE-only (negative Gaia_id)
     _bp3m_gaia_conv_nq = _bp3m_gaia_conv & _not_qso
     gm_nq = gmag[_gaia_not_qso]
     ax_unc.scatter(gm_nq, sig_pm_gaia[_gaia_not_qso],
@@ -295,17 +305,19 @@ def make_plots(solver, images, gaia_catalog,
 
     ax_unc_improve.scatter(gmag[_gaia_only_nq], sig_pm_gaia[_gaia_only_nq]/sig_pm_bp3m[_gaia_only_nq],
                    s=6, alpha=0.6, color='grey', label='Gaia only', zorder=2)
-    if _gaia_delve_nq.any():
-        ax_unc_improve.scatter(gmag[_gaia_delve_nq],
-                               sig_pm_gaia[_gaia_delve_nq]/sig_pm_bp3m[_gaia_delve_nq],
+    # 5p Gaia+DELVE improvement vs Gaia 5p prior (2p prior ~100 mas/yr would dominate axis)
+    if _gaia5p_delve_nq.any():
+        ax_unc_improve.scatter(gmag[_gaia5p_delve_nq],
+                               sig_pm_gaia[_gaia5p_delve_nq]/sig_pm_bp3m[_gaia5p_delve_nq],
                                s=6, alpha=0.6, color='steelblue', label='Gaia+DELVE', zorder=3)
-    # DELVE-only: improvement = DELVE prior sigma / BP3M sigma
-    _do_conv = _delve_only & bp3m_converged & np.isfinite(_d_sig_pm) & (_d_sig_pm > 0)
+    # DELVE-anchored: true DELVE-only + Gaia 2p+DELVE — improvement vs DELVE prior sigma
+    _gaia2p_delve = _has_real_gaia & ~has_gaia & has_delve_pm  # 2p Gaia + DELVE
+    _do_conv = (_delve_only | _gaia2p_delve) & bp3m_converged & np.isfinite(_d_sig_pm) & (_d_sig_pm > 0)
     if _do_conv.any():
         _delve_improve = _d_sig_pm[_do_conv] / sig_pm_bp3m[_do_conv]
         ax_unc_improve.scatter(gmag[_do_conv], _delve_improve,
                                s=10, alpha=0.7, color='darkorange', marker='^',
-                               label='DELVE only', zorder=4)
+                               label='DELVE-anchored', zorder=4)
     ax_unc_improve.set_xlabel("G [mag]")
     ax_unc_improve.set_ylabel(r"PM Improvement Factor")
     ax_unc_improve.set_title(r"PM uncertainty Improvement vs magnitude compared to prior (Gaia or DELVE)")

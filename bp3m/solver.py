@@ -260,6 +260,7 @@ class BP3MSolver:
         self.gaia_time  = Time(g["Gaia_time"].fillna(2016.0).to_numpy(float),format='jyear',scale='tcb')
         self.gaia_yr  = self.gaia_time.jyear
         self.sigma_from_gaia_prior  = np.zeros(len(self.gaia_g)).astype(float)
+        self.ok_star = np.ones(len(self.gaia_g), dtype=bool)
 
         # Survey astrometry vector: v_s,i = (0, 0, pmra, pmdec, parallax)
         # (Δα*, Δδ) = 0 since Gaia position IS the reference; updates captured in v_T,i
@@ -1800,6 +1801,10 @@ class BP3MSolver:
 
         # Final v_hat = a_arr (Δr = 0 at the last converged r_hat)
         v_hat = a_arr.copy()
+
+        # Store final ok_star so _save_results/_make_plots can apply prior fallback
+        # to stars that failed the Gaia-prior chi2 test (Gaia-incompatible).
+        self.ok_star = ok_star_prev.copy()
 
         return r_hat, C_r, v_hat, C_vT, a_arr, K_img, z_weights_out
 

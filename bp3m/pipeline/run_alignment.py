@@ -409,14 +409,17 @@ def run_alignment(  # noqa: C901
 
 # ── Prior fallback ───────────────────────────────────────────────────────────
 
-def _apply_prior_fallback(v_cov_full, v_mean, C_prior_arr, v_prior_arr):
+def _apply_prior_fallback(v_cov_full, v_mean, C_prior_arr, v_prior_arr,
+                          failed_prior_test=None):
     """Return (v_cov_full, v_mean) with prior fallback applied in-place on copies.
 
-    For each star where the marginalised posterior is less informative than the
-    prior — either in the full 5D sense or in the PM 2×2 subspace — replace
-    both the covariance and the mean with the prior values.  The PM block check
-    catches the common case where C_extra (image-transformation propagation)
-    degrades PM precision even though position precision improved.
+    Stars get their posterior replaced with the prior when any of:
+      1. Full 5D determinant: posterior less informative than prior.
+      2. PM 2×2 block determinant: posterior PM less informative (catches cases
+         where position improvement masks PM degradation from C_extra).
+      3. failed_prior_test: star failed the Gaia-prior chi2 test (Gaia-
+         incompatible) in the final iteration — the posterior mean is
+         inconsistent with the prior regardless of covariance size.
     """
     v_cov_full = v_cov_full.copy()
     v_mean     = v_mean.copy()
@@ -431,8 +434,11 @@ def _apply_prior_fallback(v_cov_full, v_mean, C_prior_arr, v_prior_arr):
     sign_pm_prior, logdet_pm_prior = np.linalg.slogdet(C_prior_arr[:, 2:4, 2:4])
     use_prior_pm = ((sign_pm_post > 0) & (sign_pm_prior > 0) &
                     (logdet_pm_post > logdet_pm_prior))
-
     use_prior |= use_prior_pm
+
+    # Stars that failed the Gaia-prior chi2 test — posterior inconsistent with prior
+    if failed_prior_test is not None:
+        use_prior |= failed_prior_test
 
     if use_prior.any():
         v_cov_full[use_prior] = C_prior_arr[use_prior]
@@ -491,8 +497,10 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
                   run_config: dict | None = None):
     import pandas as pd
 
+    _failed_prior = ~getattr(solver, 'ok_star', np.ones(solver.n_stars, bool))
     v_cov_full, v_mean = _apply_prior_fallback(
-        v_cov + C_vT, v_mean, solver.C_prior, solver.v_prior)
+        v_cov + C_vT, v_mean, solver.C_prior, solver.v_prior,
+        failed_prior_test=_failed_prior)
 
     # 1. Image transformation parameters
     rows = []
