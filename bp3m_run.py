@@ -1328,6 +1328,7 @@ def main():
                 gaia_epoch_obs=_gaia_epoch_obs_for_solver,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
                 gaia_csv=gaia_csv_path,
+                use_delve=bool(args.delve_dir),
             )
 
     # Save the command only on successful completion so interrupted runs
