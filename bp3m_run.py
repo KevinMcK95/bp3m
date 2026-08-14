@@ -85,6 +85,18 @@ def _parse_args():
                      help='Search box height (degrees, overrides --search_radius; '
                           'applied uniformly to all pointings)')
 
+    # ── DELVE ─────────────────────────────────────────────────────────────────
+    dlv = p.add_argument_group('DELVE options (optional; omit --delve_dir to skip all DELVE steps)')
+    dlv.add_argument('--delve_dir', type=str, default=None,
+                     help='Path to the directory containing DELVE PM_hp*.fits tile files. '
+                          'If not given, all DELVE steps are silently skipped.')
+    dlv.add_argument('--force_redownload_delve', action='store_true',
+                     help='Regenerate the DELVE CSV even if a cached one already exists.')
+    dlv.add_argument('--skip_delve_crossmatch', action='store_true',
+                     help='Skip DELVE cross-matching (use existing matched_delve.csv).')
+    dlv.add_argument('--force_rematch_delve', action='store_true',
+                     help='Re-run DELVE cross-matching even if matched_delve.csv already exists.')
+
     # ── Gaia ──────────────────────────────────────────────────────────────────
     g = p.add_argument_group('Gaia options')
     g.add_argument('--min_gmag', type=float, default=0.0,
@@ -703,6 +715,40 @@ def main():
             return len(v) > 0
         return v.exists()
 
+    # ── Step 1c: Download DELVE catalogue (one query per pointing) ──────────
+    delve_csv_path: "Path | None" = None
+    if args.delve_dir and not args.skip_download:
+        from bp3m.pipeline.download_delve import download_delve as _dl_delve
+        print("\n" + "─"*50)
+        print("Step 1c: DELVE proper-motion catalogue")
+        print("─"*50)
+        _delve_frames = []
+        for _pi, (_ra_i, _dec_i, _sw_i, _sh_i) in enumerate(args.pointings):
+            _ddf = _dl_delve(
+                ra=_ra_i, dec=_dec_i,
+                search_width=_sw_i, search_height=_sh_i,
+                output_dir=output_dir, field_name=field,
+                delve_dir=args.delve_dir,
+                force_redownload=args.force_redownload_delve,
+            )
+            if _ddf is not None:
+                _delve_frames.append(_ddf)
+        if _delve_frames:
+            # point downstream steps at the first (or only) DELVE CSV
+            from bp3m.pipeline.download_delve import _cache_stem as _dlve_stem
+            _delve_dir_out = output_dir / field / "DELVE"
+            _delve_csvs = sorted(_delve_dir_out.glob("*_delve.csv"))
+            if _delve_csvs:
+                delve_csv_path = _delve_csvs[0]
+        else:
+            print("  No DELVE tiles found for this field — DELVE steps disabled.")
+    elif args.delve_dir:
+        # skip_download path: find any existing DELVE CSV
+        _delve_dir_out = output_dir / field / "DELVE"
+        _delve_csvs = sorted(_delve_dir_out.glob("*_delve.csv")) if _delve_dir_out.exists() else []
+        if _delve_csvs:
+            delve_csv_path = _delve_csvs[0]
+
     # ── Step 2: Download HST ─────────────────────────────────────────────────
     if not args.skip_download:
         from bp3m.pipeline.download_hst import download_hst_images
@@ -943,6 +989,30 @@ def main():
         print("Step 4: Cross-image validation (forced)")
         print("─"*50)
         _validate_catalog_if_needed(field, output_dir, force=True)
+
+    # ── Step 4c: DELVE cross-matching (optional) ─────────────────────────────
+    if delve_csv_path is not None and not args.skip_delve_crossmatch:
+        from bp3m.pipeline.cross_match_delve import run_cross_match_delve
+        run_cross_match_delve(
+            output_dir=output_dir, field_name=field,
+            delve_csv_path=delve_csv_path,
+            telescope=args.telescope,
+            im_type=args.hst_im_type,
+            n_processes=args.n_processes,
+            hst_pix_floor=args.cross_match_pix_floor,
+            min_matches=args.min_matches,
+            max_mag_diff=args.max_mag_diff,
+            scale_sweep=args.scale_sweep,
+            discovery_max_offset=args.discovery_max_offset,
+            use_resid_floor=args.auto_resid_floor,
+            force_rematch=args.force_rematch_delve,
+            restrict_to_obsids=_restrict,
+            lib_dir=Path(args.lib_dir) if args.lib_dir else None,
+            prior_sigma_rot_deg=args.prior_sigma_rot_deg,
+            prior_sigma_scale=args.prior_sigma_scale,
+            prior_sigma_skew=args.prior_sigma_skew,
+            init_resid_max=args.xmatch_init_resid_max,
+        )
 
     # ── Step 4b: Gaia DR4 epoch astrometry (optional) ────────────────────────
     _gaia_epoch_obs_for_solver: dict | None = None

@@ -445,6 +445,78 @@ def _load_gaia_phot(data_dir, target):
 
 
 # ---------------------------------------------------------------------------
+# DELVE photometry enrichment
+# ---------------------------------------------------------------------------
+
+_DELVE_PHOT_COLS = ['delve_rmag', 'delve_gmag', 'delve_imag', 'delve_zmag',
+                    'delve_pmra', 'delve_pmdec']
+_DELVE_SENTINEL_LO, _DELVE_SENTINEL_HI = -90.0, 50.0
+
+
+def _mask_delve_sentinels(df):
+    """Replace DELVE photometric sentinel values (−99 / +99) with NaN in-place."""
+    for col in _DELVE_PHOT_COLS:
+        if col.endswith('mag') and col in df.columns:
+            bad = (df[col] < _DELVE_SENTINEL_LO) | (df[col] > _DELVE_SENTINEL_HI)
+            df.loc[bad, col] = np.nan
+    return df
+
+
+def _collect_delve_info(images):
+    """
+    Read matched_delve.csv + source_quality.csv per image and partition into:
+
+    - gaia_linked : rows where hst_index appears in source_quality.csv (has Gaia ID)
+    - delve_only  : rows where hst_index has no Gaia match
+
+    Returns (gaia_linked_df, delve_only_df).  Either may be empty.
+    """
+    gaia_linked, delve_only = [], []
+
+    for name, d in images.items():
+        delve_path = os.path.join(d['image_dir'], 'matched_delve.csv')
+        if not os.path.exists(delve_path):
+            continue
+
+        delve = _mask_delve_sentinels(pd.read_csv(delve_path))
+        delve['image_name']    = name
+        delve['filter_camera'] = d['filter_camera']
+
+        sq_path = os.path.join(d['image_dir'], 'source_quality.csv')
+        if os.path.exists(sq_path):
+            sq = pd.read_csv(sq_path, usecols=['hst_index', 'gaia_source_id'])
+            sq['gaia_source_id'] = sq['gaia_source_id'].astype(np.int64)
+            linked = delve.merge(sq, on='hst_index', how='inner')
+            gaia_linked.append(linked)
+            only = delve[~delve['hst_index'].isin(sq['hst_index'])].copy()
+        else:
+            only = delve.copy()
+
+        if len(only):
+            delve_only.append(only)
+
+    gl = pd.concat(gaia_linked, ignore_index=True) if gaia_linked else pd.DataFrame()
+    do = pd.concat(delve_only,  ignore_index=True) if delve_only  else pd.DataFrame()
+    return gl, do
+
+
+def _agg_delve_for_gaia_source(g):
+    """Aggregate DELVE columns across multiple images for one gaia_source_id."""
+    row = {'n_delve_images': len(g)}
+    for col in ['delve_source_id']:
+        if col in g.columns:
+            row[col] = g[col].iloc[0]
+    for col in _DELVE_PHOT_COLS:
+        if col in g.columns:
+            vals = g[col].dropna()
+            row[col] = float(vals.median()) if len(vals) else np.nan
+    if 'delve_mtype' in g.columns:
+        modes = g['delve_mtype'].dropna().mode()
+        row['delve_mtype'] = modes.iloc[0] if len(modes) else np.nan
+    return pd.Series(row)
+
+
+# ---------------------------------------------------------------------------
 # Global target-level catalog
 # ---------------------------------------------------------------------------
 
@@ -516,7 +588,7 @@ def build_global_catalog(images, target, data_dir):
 
     catalog = (all_data
                .groupby(['gaia_source_id', 'filter_camera'])
-               .apply(agg_group)
+               .apply(agg_group, include_groups=False)
                .reset_index())
 
     # Enrich with Gaia photometry (BP/RP mags + errors, excess factor, RUWE).
@@ -534,6 +606,64 @@ def build_global_catalog(images, target, data_dir):
             catalog['gaia_source_id'] = catalog['gaia_source_id'].astype(np.int64)
             catalog = catalog.merge(phot_df, on='gaia_source_id', how='left')
 
+    # ── DELVE enrichment ──────────────────────────────────────────────────────
+    gaia_linked, delve_only = _collect_delve_info(images)
+
+    # 1. For Gaia-matched sources: add median DELVE photometry and IDs.
+    if len(gaia_linked):
+        delve_agg = (gaia_linked
+                     .groupby('gaia_source_id', sort=False)
+                     .apply(_agg_delve_for_gaia_source, include_groups=False)
+                     .reset_index())
+        delve_agg['gaia_source_id'] = delve_agg['gaia_source_id'].astype(np.int64)
+        catalog = catalog.merge(delve_agg, on='gaia_source_id', how='left')
+        catalog['has_delve_match'] = catalog['n_delve_images'].notna()
+        n_enriched = int(catalog['has_delve_match'].sum())
+        print(f'  DELVE: enriched {n_enriched} Gaia-matched sources with DELVE photometry')
+    else:
+        catalog['has_delve_match'] = False
+
+    # 2. DELVE-only sources: one row per (delve_source_id, filter_camera).
+    if len(delve_only) and 'delve_source_id' in delve_only.columns:
+        def _agg_delve_only(g):
+            # NOTE: filter_camera and delve_source_id are groupby keys —
+            # pandas 3.x excludes them from g; restored via reset_index() below.
+            row = {
+                'gaia_source_id':        np.nan,
+                'n_images':              len(g),
+                'image_list':            ','.join(g['image_name'].tolist()),
+                'hst_index_list':        ','.join(g['hst_index'].astype(str).tolist()),
+                'mag_norm_wmean':        float(g['hst_mag_st_gdc'].median())
+                                         if 'hst_mag_st_gdc' in g.columns else np.nan,
+                'mag_norm_werr':         np.nan,
+                'mag_norm_mad':          np.nan,
+                'n_consistent':          len(g),
+                'n_trustworthy':         len(g),
+                'all_trustworthy':       True,
+                'any_trustworthy':       True,
+                'has_gaia_pms':          False,
+                'gaia_gmag':             np.nan,
+                'median_residual_sigma': float(g['residual_sigma'].median())
+                                         if 'residual_sigma' in g.columns else np.nan,
+                'has_delve_match':       True,
+                'n_delve_images':        len(g),
+                'delve_mtype':           g['delve_mtype'].mode().iloc[0]
+                                         if 'delve_mtype' in g.columns and len(g['delve_mtype'].dropna()) else np.nan,
+            }
+            for col in _DELVE_PHOT_COLS:
+                if col in g.columns:
+                    vals = g[col].dropna()
+                    row[col] = float(vals.median()) if len(vals) else np.nan
+            return pd.Series(row)
+
+        # reset_index() restores delve_source_id and filter_camera from the groupby keys
+        delve_only_cat = (delve_only
+                          .groupby(['delve_source_id', 'filter_camera'], sort=False)
+                          .apply(_agg_delve_only, include_groups=False)
+                          .reset_index())
+        catalog = pd.concat([catalog, delve_only_cat], ignore_index=True)
+        print(f'  DELVE: added {len(delve_only_cat)} DELVE-only source rows')
+
     out = os.path.join(data_dir, target, 'cross_match_catalog.csv')
     catalog.to_csv(out, index=False)
     return out
@@ -542,6 +672,102 @@ def build_global_catalog(images, target, data_dir):
 # ---------------------------------------------------------------------------
 # Photometry CMD / colour-colour plots
 # ---------------------------------------------------------------------------
+
+def _plot_delve_photometry(cat, wide, data_dir, target, n_filters):
+    """
+    Produce DELVE-based CMD and colour-colour plots saved alongside the Gaia ones.
+
+    plots_validate_delve_cmds.png  — HST mag vs DELVE g−r colour per filter
+    plots_validate_delve_cc.png    — DELVE g−r vs r−i colour-colour
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    # Work from the per-(source, filter_camera) catalog, keeping best row per
+    # (source, filter) so the wide pivot works cleanly.
+    def _src_key(row):
+        if pd.notna(row.get('gaia_source_id')):
+            return f"g_{int(row['gaia_source_id'])}"
+        return f"d_{row.get('delve_source_id', 'NA')}"
+
+    cat = cat.copy()
+    cat['_src_key'] = cat.apply(_src_key, axis=1)
+    cat['_filter']  = cat['filter_camera'].str.split('/').str[0]
+
+    # Per-source DELVE photometry (constant across filters — take first non-null).
+    delve_src = (cat.drop_duplicates(subset='_src_key')
+                 [['_src_key'] + [c for c in ['delve_rmag', 'delve_gmag', 'delve_imag', 'delve_zmag']
+                                  if c in cat.columns]])
+
+    # Wide HST magnitudes (one col per filter).
+    cat_best = (cat.sort_values('n_trustworthy', ascending=False)
+                   .drop_duplicates(subset=['_src_key', '_filter']))
+    wide_d = (cat_best
+              .pivot_table(index='_src_key', columns='_filter',
+                           values='mag_norm_wmean', aggfunc='first')
+              .reset_index())
+    wide_d.columns.name = None
+    hst_fcols = [c for c in wide_d.columns if c != '_src_key']
+    wide_d = wide_d.rename(columns={c: f'hst_{c}' for c in hst_fcols})
+    wide_d = wide_d.merge(delve_src, on='_src_key', how='left')
+
+    # Compute DELVE colours; mask sentinels.
+    def _safe(col):
+        if col not in wide_d.columns:
+            return None
+        v = wide_d[col].copy()
+        v[(v < _DELVE_SENTINEL_LO) | (v > _DELVE_SENTINEL_HI)] = np.nan
+        return v
+
+    r = _safe('delve_rmag'); g = _safe('delve_gmag')
+    ri = _safe('delve_imag'); z = _safe('delve_zmag')
+
+    has_gr = g is not None and r is not None
+    has_ri = ri is not None and r is not None
+    gr = g - r if has_gr else None
+    rmi = r - ri if has_ri else None
+
+    # ── CMDs: one panel per HST filter ──────────────────────────────────────
+    hst_filters = sorted(hst_fcols)
+    n = len(hst_filters)
+    if n and has_gr:
+        ncols = min(4, n); nrows = int(np.ceil(n / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows),
+                                 squeeze=False)
+        fig.suptitle(f'{target}  —  DELVE CMDs ({n_filters} HST filters)', fontsize=14)
+        for idx, filt in enumerate(hst_filters):
+            ax = axes[idx // ncols][idx % ncols]
+            hcol = f'hst_{filt}'
+            if hcol not in wide_d.columns:
+                ax.set_visible(False); continue
+            ok = np.isfinite(wide_d[hcol].values) & np.isfinite(gr.values)
+            ax.scatter(gr[ok], wide_d[hcol][ok], s=2, alpha=0.4, color='steelblue')
+            ax.invert_yaxis()
+            ax.set_xlabel('g − r  (DELVE DES)', fontsize=9)
+            ax.set_ylabel(f'HST {filt}', fontsize=9)
+            ax.set_title(filt, fontsize=10)
+        for idx in range(n, nrows * ncols):
+            axes[idx // ncols][idx % ncols].set_visible(False)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        out = os.path.join(data_dir, target, 'plots_validate_delve_cmds.png')
+        plt.savefig(out, dpi=150); plt.close()
+        print(f'  DELVE CMDs: {out}')
+
+    # ── Colour-colour: g−r vs r−i (no HST axis needed) ───────────────────────
+    if has_gr and has_ri:
+        ok = np.isfinite(gr.values) & np.isfinite(rmi.values)
+        if ok.sum() > 10:
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.scatter(gr[ok], rmi[ok], s=3, alpha=0.4, color='steelblue')
+            ax.set_xlabel('g − r  (DELVE DES)', fontsize=11)
+            ax.set_ylabel('r − i  (DELVE DES)', fontsize=11)
+            ax.set_title(f'{target}  —  DELVE colour-colour  (n={ok.sum():,})', fontsize=12)
+            plt.tight_layout()
+            out = os.path.join(data_dir, target, 'plots_validate_delve_cc.png')
+            plt.savefig(out, dpi=150); plt.close()
+            print(f'  DELVE colour-colour: {out}')
+
 
 def plot_photometry_catalog(data_dir, target):
     """
@@ -629,6 +855,12 @@ def plot_photometry_catalog(data_dir, target):
         print(f'  Colour-colour: {out_cc}')
     except Exception as e:
         print(f'  Warning: plots_validate_cc.png failed: {e}')
+
+    # ── DELVE CMD + colour-colour ─────────────────────────────────────────────
+    delve_cols = ['delve_rmag', 'delve_gmag', 'delve_imag', 'delve_zmag']
+    has_delve = any(c in cat.columns for c in delve_cols)
+    if has_delve:
+        _plot_delve_photometry(cat, wide, data_dir, target, n_filters)
 
 
 # ---------------------------------------------------------------------------
