@@ -209,13 +209,14 @@ def make_plots(solver, images, gaia_catalog,
             [_d_pmra_val,   _d_pmdec_val],
             [_d_pmra_err,   _d_pmdec_err],
             [r"$\mu_{\alpha*}$",    r"$\mu_\delta$"]):
-        # Gaia-only stars (grey)
-        if _gaia_only_nq.any():
-            ax.errorbar(gaia_pm[_gaia_only_nq], bp3m_pm_g[_gaia_only_nq],
-                        xerr=sig_g[_gaia_only_nq], yerr=sig_b_g[_gaia_only_nq],
-                        fmt='o', ms=3, lw=0.5, alpha=0.5, color='grey',
-                        label='Gaia only', zorder=2)
-        # Gaia+DELVE stars (steelblue)
+        # DELVE-only stars (background, zorder=2)
+        _do_pm = _delve_only & np.isfinite(d_pm) & np.isfinite(d_sig) & (d_sig > 0)
+        if _do_pm.any():
+            ax.errorbar(d_pm[_do_pm], bp3m_pm_g[_do_pm],
+                        xerr=d_sig[_do_pm], yerr=sig_b_g[_do_pm],
+                        fmt='^', ms=4, lw=0.5, alpha=0.6, color='darkorange',
+                        label='DELVE only', zorder=2)
+        # Gaia+DELVE stars (middle, zorder=3)
         if _gaia_delve_nq.any():
             ax.errorbar(gaia_pm[_gaia_delve_nq], bp3m_pm_g[_gaia_delve_nq],
                         xerr=sig_g[_gaia_delve_nq], yerr=sig_b_g[_gaia_delve_nq],
@@ -228,13 +229,12 @@ def make_plots(solver, images, gaia_catalog,
                             xerr=d_sig[_dm], yerr=sig_b_g[_dm],
                             fmt='D', ms=4, lw=0.5, alpha=0.5, color='dodgerblue',
                             label='DELVE PM (for Gaia+DELVE)', zorder=3)
-        # DELVE-only stars (orange triangles, x=DELVE PM)
-        _do_pm = _delve_only & np.isfinite(d_pm) & np.isfinite(d_sig) & (d_sig > 0)
-        if _do_pm.any():
-            ax.errorbar(d_pm[_do_pm], bp3m_pm_g[_do_pm],
-                        xerr=d_sig[_do_pm], yerr=sig_b_g[_do_pm],
-                        fmt='^', ms=4, lw=0.5, alpha=0.6, color='darkorange',
-                        label='DELVE only', zorder=3)
+        # Gaia-only stars (foreground, zorder=4)
+        if _gaia_only_nq.any():
+            ax.errorbar(gaia_pm[_gaia_only_nq], bp3m_pm_g[_gaia_only_nq],
+                        xerr=sig_g[_gaia_only_nq], yerr=sig_b_g[_gaia_only_nq],
+                        fmt='o', ms=3, lw=0.5, alpha=0.5, color='grey',
+                        label='Gaia only', zorder=4)
 
         # Axis limits from Gaia-prior stars only (DELVE-only can blow up the axes)
         gaia_x = np.concatenate([
