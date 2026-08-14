@@ -94,8 +94,10 @@ def make_plots(solver, images, gaia_catalog,
     resid_plot_dir = Path(plot_dir) / RESID_PLOT_DIR_NAME
     resid_plot_dir.mkdir(parents=True, exist_ok=True)
 
-    # Full marginal covariance = r-propagation + conditional
-    v_cov_full = v_cov + C_vT   # (n_stars, 5, 5)
+    # Full marginal covariance = r-propagation + conditional, with prior fallback.
+    from bp3m.pipeline.run_alignment import _apply_prior_fallback
+    v_cov_full, v_mean = _apply_prior_fallback(
+        v_cov + C_vT, v_mean, solver.C_prior, solver.v_prior)
 
     # ── Member mask and free (diffuse-prior) data ─────────────────────────────
     is_member = None
@@ -185,14 +187,14 @@ def make_plots(solver, images, gaia_catalog,
     # ── DELVE source categorisation ───────────────────────────────────────────
     # has_delve_pm: Gaia-matched star that also has a full DELVE PM covariance.
     # DELVE-only: negative Gaia_id (synthetic row, no Gaia 5p astrometry).
-    _d_pmra_err  = pd.to_numeric(_gc.get("delve_pmra_error",  pd.Series(dtype=float)),
-                                 errors='coerce').to_numpy(float)
-    _d_pmdec_err = pd.to_numeric(_gc.get("delve_pmdec_error", pd.Series(dtype=float)),
-                                 errors='coerce').to_numpy(float)
-    _d_pmra_val  = pd.to_numeric(_gc.get("delve_pmra",  pd.Series(dtype=float)),
-                                 errors='coerce').to_numpy(float)
-    _d_pmdec_val = pd.to_numeric(_gc.get("delve_pmdec", pd.Series(dtype=float)),
-                                 errors='coerce').to_numpy(float)
+    def _gc_col(col):
+        if col in _gc.columns:
+            return pd.to_numeric(_gc[col], errors='coerce').to_numpy(float)
+        return np.full(len(_gc), np.nan)
+    _d_pmra_err  = _gc_col("delve_pmra_error")
+    _d_pmdec_err = _gc_col("delve_pmdec_error")
+    _d_pmra_val  = _gc_col("delve_pmra")
+    _d_pmdec_val = _gc_col("delve_pmdec")
     has_delve_pm = (np.isfinite(_d_pmra_err) & (_d_pmra_err > 0) &
                     np.isfinite(_d_pmdec_err) & (_d_pmdec_err > 0) &
                     has_gaia)
@@ -274,7 +276,7 @@ def make_plots(solver, images, gaia_catalog,
     if (_bp3m_gaia_conv_nq & ~has_delve_pm).any():
         ax_unc.scatter(gmag[_bp3m_gaia_conv_nq & ~has_delve_pm],
                        sig_pm_bp3m[_bp3m_gaia_conv_nq & ~has_delve_pm],
-                       s=6, alpha=0.7, color='grey', label='BP3M Gaia only', zorder=3)
+                       s=6, alpha=0.85, color='mediumseagreen', label='BP3M Gaia only', zorder=3)
     if (_bp3m_gaia_conv_nq & has_delve_pm).any():
         ax_unc.scatter(gmag[_bp3m_gaia_conv_nq & has_delve_pm],
                        sig_pm_bp3m[_bp3m_gaia_conv_nq & has_delve_pm],

@@ -407,6 +407,40 @@ def run_alignment(  # noqa: C901
     return output_bp3m
 
 
+# ── Prior fallback ───────────────────────────────────────────────────────────
+
+def _apply_prior_fallback(v_cov_full, v_mean, C_prior_arr, v_prior_arr):
+    """Return (v_cov_full, v_mean) with prior fallback applied in-place on copies.
+
+    For each star where the marginalised posterior is less informative than the
+    prior — either in the full 5D sense or in the PM 2×2 subspace — replace
+    both the covariance and the mean with the prior values.  The PM block check
+    catches the common case where C_extra (image-transformation propagation)
+    degrades PM precision even though position precision improved.
+    """
+    v_cov_full = v_cov_full.copy()
+    v_mean     = v_mean.copy()
+
+    # Full 5D determinant check
+    sign_post,  logdet_post  = np.linalg.slogdet(v_cov_full)
+    sign_prior, logdet_prior = np.linalg.slogdet(C_prior_arr)
+    use_prior = (sign_post > 0) & (sign_prior > 0) & (logdet_post > logdet_prior)
+
+    # PM 2×2 block check (catches degradation hidden by position improvement)
+    sign_pm_post,  logdet_pm_post  = np.linalg.slogdet(v_cov_full[:, 2:4, 2:4])
+    sign_pm_prior, logdet_pm_prior = np.linalg.slogdet(C_prior_arr[:, 2:4, 2:4])
+    use_prior_pm = ((sign_pm_post > 0) & (sign_pm_prior > 0) &
+                    (logdet_pm_post > logdet_pm_prior))
+
+    use_prior |= use_prior_pm
+
+    if use_prior.any():
+        v_cov_full[use_prior] = C_prior_arr[use_prior]
+        v_mean[use_prior]     = v_prior_arr[use_prior]
+
+    return v_cov_full, v_mean
+
+
 # ── Internal: write result CSVs and npy ─────────────────────────────────────
 
 def compute_chi2_per_star(solver, r_hat, v_hat, image_names, use_key='use_for_astrom'):
@@ -457,26 +491,8 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
                   run_config: dict | None = None):
     import pandas as pd
 
-    v_cov_full = v_cov + C_vT
-
-    # Clamp: marginalised posterior uncertainty never exceeds the prior.
-    # C_extra (the marginalisation term) can occasionally push PM/parallax
-    # uncertainty above the prior for stars in few images.  For each
-    # astrometric parameter k, scale the k-th row/col of v_cov_full by
-    # sqrt(prior_var / post_var) wherever post_var > prior_var.  This
-    # preserves correlations (rho is unchanged) and keeps the matrix PSD.
-    C_prior_arr = solver.C_prior  # (n_stars, 5, 5)
-    v_cov_full = v_cov_full.copy()
-    for k in range(5):            # ra, dec, pmra, pmdec, parallax
-        prior_var = C_prior_arr[:, k, k]
-        post_var  = v_cov_full[:, k, k]
-        worse = (post_var > prior_var) & (post_var > 0)
-        if not worse.any():
-            continue
-        scale = np.ones(len(worse))
-        scale[worse] = np.sqrt(prior_var[worse] / post_var[worse])
-        v_cov_full[:, k, :] *= scale[:, None]
-        v_cov_full[:, :, k] *= scale[:, None]
+    v_cov_full, v_mean = _apply_prior_fallback(
+        v_cov + C_vT, v_mean, solver.C_prior, solver.v_prior)
 
     # 1. Image transformation parameters
     rows = []
