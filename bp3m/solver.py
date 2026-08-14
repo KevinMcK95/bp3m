@@ -419,7 +419,8 @@ class BP3MSolver:
                     if valid_5d.any():
                         Cv = C_comb[valid_5d]
                         dv = delta_v[valid_5d]
-                        x = np.linalg.solve(Cv, dv)   # batch solve (m_v,5)
+                        # np.linalg.solve requires b as (...,M,K) not (...,M)
+                        x = np.linalg.solve(Cv, dv[:, :, None]).squeeze(-1)  # (m_v,5)
                         chi2_5d[valid_5d] = np.einsum('ni,ni->n', dv, x)
                     vetoed_5d = chi2_5d > 17.7   # 3σ equivalent, df=5
                     n_vetoed = int(vetoed_5d.sum())
