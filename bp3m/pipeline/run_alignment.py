@@ -71,6 +71,7 @@ def run_alignment(  # noqa: C901
     exclude_2p_from_alignment: bool = False,
     gaia_csv: "Path | list | None" = None,
     verbose_tests: bool = False,
+    use_delve: bool = False,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -150,7 +151,7 @@ def run_alignment(  # noqa: C901
     imgs, stars_per_image, gaia_catalog = load_image_data_flc(
         data_root, field_name, pos_err_floor=pos_err_floor,
         restrict_images=set(images) if images is not None else None,
-        gaia_csv=gaia_csv)
+        gaia_csv=gaia_csv, use_delve=use_delve)
     if imgs is None or len(imgs) == 0:
         raise RuntimeError(
             f"No usable images found for '{field_name}'. "

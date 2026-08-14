@@ -1208,6 +1208,7 @@ def main():
                         bp3m_dir=_indv_root / _img,
                         gaia_csv=gaia_csv_path,
                         qso_anchors_csv=_qso_anchors_csv if _qso_exists(_qso_anchors_csv) else None,
+                        use_delve=bool(args.delve_dir),
                     )
                     _n_ok += 1
                 except Exception as _exc:
@@ -1263,6 +1264,7 @@ def main():
                 qso_anchors_csv=_qso_anchors_csv if _qso_exists(_qso_anchors_csv) else None,
                 exclude_2p_from_alignment=args.exclude_2p_from_alignment,
                 gaia_csv=gaia_csv_path,
+                use_delve=bool(args.delve_dir),
             )
             # ── Step 5b: Compare synthetic results to truth ────────────────────
             print("\n" + "=" * 55)

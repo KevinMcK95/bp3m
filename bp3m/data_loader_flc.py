@@ -552,7 +552,8 @@ def build_index_maps(stars_per_image, gaia_catalog):
 def load_image_data_flc(data_root, field_name: str,
                         pos_err_floor: float = _MIN_POS_ERR_PX,
                         restrict_images: "set[str] | frozenset[str] | None" = None,
-                        gaia_csv: "str | Path | list | None" = None):
+                        gaia_csv: "str | Path | list | None" = None,
+                        use_delve: bool = False):
     """
     Load BP3M inputs from the new FLC-based pipeline layout.
 
@@ -812,6 +813,15 @@ def load_image_data_flc(data_root, field_name: str,
         .reset_index(drop=True)
     )
 
+    # DELVE-only sources have synthetic negative Gaia IDs.  Exclude them when
+    # DELVE is not requested so the Gaia-only analysis is unaffected.
+    if not use_delve and 'Gaia_id' in gaia_catalog.columns:
+        n_before = len(gaia_catalog)
+        gaia_catalog = gaia_catalog[gaia_catalog['Gaia_id'] >= 0].reset_index(drop=True)
+        n_removed = n_before - len(gaia_catalog)
+        if n_removed > 0:
+            print(f"  DELVE-only sources excluded (no --delve_dir): {n_removed} rows removed")
+
     # ── DELVE prior enrichment ─────────────────────────────────────────────────
     # Merge per-source DELVE PM covariance columns onto gaia_catalog so the
     # solver can tighten the PM prior for Gaia+DELVE matched stars.
@@ -826,7 +836,7 @@ def load_image_data_flc(data_root, field_name: str,
         'delve_corr_dec_pmdec', 'delve_corr_plx_pmra', 'delve_corr_plx_pmdec',
         'delve_corr_pmra_pmdec',
     ]
-    if xm is not None:
+    if xm is not None and use_delve:
         xm_gaia = xm[xm['gaia_source_id'].notna()].copy()
         avail = [c for c in _DELVE_PRIOR_COLS if c in xm_gaia.columns]
         if avail:
@@ -859,7 +869,7 @@ def load_image_data_flc(data_root, field_name: str,
     delve_only_rows: list[dict] = []    # one entry per unique delve_source_id
     delve_id_to_gaia_id: dict[int, int] = {}
 
-    for img_dir in img_dirs:
+    for img_dir in (img_dirs if use_delve else []):
         img_name = img_dir.name
         if restrict_images is not None and img_name not in restrict_images:
             continue
