@@ -236,17 +236,16 @@ def make_plots(solver, images, gaia_catalog,
                         fmt='^', ms=4, lw=0.5, alpha=0.6, color='darkorange',
                         label='DELVE only', zorder=3)
 
-        all_x = np.concatenate([
+        # Axis limits from Gaia-prior stars only (DELVE-only can blow up the axes)
+        gaia_x = np.concatenate([
             gaia_pm[_gaia_not_qso],
             d_pm[_gaia_delve_nq][np.isfinite(d_pm[_gaia_delve_nq])],
-            d_pm[_do_pm] if _do_pm.any() else np.array([]),
         ])
-        all_y = np.concatenate([
+        gaia_y = np.concatenate([
             bp3m_pm_g[_gaia_not_qso],
             bp3m_pm_g[_gaia_delve_nq],
-            bp3m_pm_g[_do_pm] if _do_pm.any() else np.array([]),
         ])
-        lim = _padded_lim(all_x, all_y)
+        lim = _padded_lim(gaia_x, gaia_y)
         ax.plot(lim, lim, 'k--', lw=1, zorder=4)
         ax.set_xlim(lim); ax.set_ylim(lim)
         ax.set_xlabel(f"{comp} prior [mas/yr]")
