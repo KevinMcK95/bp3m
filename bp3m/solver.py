@@ -494,11 +494,18 @@ class BP3MSolver:
                     # Gaia 2p survivors: add full DELVE 5×5 precision.
                     # C_survey_inv already has the Gaia 2p position 2×2 block;
                     # adding full C_delve_inv gives a well-defined 5×5 information matrix.
+                    # For 2p stars where any DELVE sigma is invalid (NaN/≤0), we cannot
+                    # form a full-rank 5×5 — revert has_delve_pm so the diffuse prior kicks in.
                     if surv_2p.any():
                         idx2 = surv_idx[surv_2p]
                         C_delve_2p = surv_C_delve[surv_2p]     # (n2, 5, 5)
                         has5d = (np.isfinite(surv_d_sig[surv_2p]).all(axis=1) &
                                  (surv_d_sig[surv_2p] > 0).all(axis=1))
+                        # Stars without a full valid 5×5 cannot get the DELVE prior and
+                        # also cannot use the diffuse PM prior (already disabled via
+                        # has_delve_pm). Revert them so they get the diffuse prior instead.
+                        if (~has5d).any():
+                            has_delve_pm[idx2[~has5d]] = False
                         if has5d.any():
                             C_delve_inv_2p = np.linalg.inv(C_delve_2p[has5d])  # (n5d, 5, 5)
                             idx2_5d = idx2[has5d]
