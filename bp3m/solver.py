@@ -1255,7 +1255,18 @@ class BP3MSolver:
             H_rr[lo_cs:lo_cs+nr, hi_cs:hi_cs+nr] -= C_cp
 
         # ── Invert H_vv → C_vT ────────────────────────────────────────────────
-        C_vT    = np.linalg.inv(H_vv)
+        try:
+            C_vT = np.linalg.inv(H_vv)
+        except np.linalg.LinAlgError:
+            for i in range(self.n_stars):
+                try:
+                    np.linalg.inv(H_vv[i])
+                except np.linalg.LinAlgError:
+                    print(f"  [DIAG] singular H_vv star idx={i} "
+                          f"gaia_2p={self.gaia_2p[i]} full5={self.full_gaia_astrometry[i]} "
+                          f"has_delve={self._has_delve_pm[i]} "
+                          f"H_diag={np.diag(H_vv[i])}")
+            raise
         a_align = np.einsum('nij,nj->ni', C_vT, h_align)  # for Schur complement rhs
         a       = np.einsum('nij,nj->ni', C_vT, h_all)    # returned stellar posteriors
 
