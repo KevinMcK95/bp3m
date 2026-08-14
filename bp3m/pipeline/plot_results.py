@@ -829,8 +829,8 @@ def make_plots(solver, images, gaia_catalog,
         if _d_blue not in _gc.columns or _d_red not in _gc.columns:
             continue
         _sentinel_lo, _sentinel_hi = -90.0, 50.0
-        _vb = pd.to_numeric(_gc[_d_blue], errors='coerce').to_numpy(float)
-        _vr = pd.to_numeric(_gc[_d_red],  errors='coerce').to_numpy(float)
+        _vb = pd.to_numeric(_gc[_d_blue], errors='coerce').to_numpy(float).copy()
+        _vr = pd.to_numeric(_gc[_d_red],  errors='coerce').to_numpy(float).copy()
         _vb[(_vb < _sentinel_lo) | (_vb > _sentinel_hi)] = np.nan
         _vr[(_vr < _sentinel_lo) | (_vr > _sentinel_hi)] = np.nan
         _d_color = _vb - _vr
