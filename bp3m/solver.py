@@ -454,8 +454,12 @@ class BP3MSolver:
             # For stars without DELVE this is identical to (v_survey, C_survey).
             self.v_prior = self.v_survey.copy()
             self.C_prior = self.C_survey.copy()
-            if has_delve_pm.any():
-                idx_dp = np.where(has_delve_pm)[0]
+            # Only invert C_survey_inv for full 5D stars (gaia_5p/6p + DELVE).
+            # For gaia_2p DELVE-only stars, C_survey_inv has zero rows/cols in
+            # the parallax dimension → singular.  Their C_prior stays as C_survey.
+            has_delve_pm_5d = has_delve_pm & self.full_gaia_astrometry
+            if has_delve_pm_5d.any():
+                idx_dp = np.where(has_delve_pm_5d)[0]
                 C_prior_dp = np.linalg.inv(self.C_survey_inv[idx_dp])
                 self.C_prior[idx_dp] = C_prior_dp
                 self.v_prior[idx_dp] = np.einsum(
