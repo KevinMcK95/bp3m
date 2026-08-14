@@ -205,9 +205,14 @@ def make_plots(solver, images, gaia_catalog,
     _d_pmdec_val = _gc_col("delve_pmdec")
     _has_real_gaia = (_gaia_ids > 0)          # any real Gaia ID (5p or 2p)
     _delve_only    = (_gaia_ids < 0)          # synthetic rows only
-    has_delve_pm = (np.isfinite(_d_pmra_err) & (_d_pmra_err > 0) &
-                    np.isfinite(_d_pmdec_err) & (_d_pmdec_err > 0) &
-                    _has_real_gaia)            # Gaia (5p or 2p) + DELVE PM
+    # Use solver._has_delve_pm (the post-veto truth) rather than raw catalog column
+    # presence.  Gaia 2p+DELVE stars whose DELVE was vetoed by the solver have
+    # C_prior = diffuse prior (1000 mas/yr), not the DELVE prior, so they must not
+    # appear in the DELVE-anchored improvement group.
+    has_delve_pm = getattr(solver, '_has_delve_pm',
+                           (np.isfinite(_d_pmra_err) & (_d_pmra_err > 0) &
+                            np.isfinite(_d_pmdec_err) & (_d_pmdec_err > 0) &
+                            _has_real_gaia))
     _gaia_delve_nq   = _has_real_gaia & _not_qso & has_delve_pm   # all Gaia+DELVE
     _gaia5p_delve_nq = _gaia_not_qso & has_delve_pm               # 5p Gaia+DELVE
     _gaia_only_nq    = _gaia_not_qso & ~has_delve_pm              # 5p Gaia only
