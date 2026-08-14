@@ -459,6 +459,25 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
 
     v_cov_full = v_cov + C_vT
 
+    # Clamp: marginalised posterior uncertainty never exceeds the prior.
+    # C_extra (the marginalisation term) can occasionally push PM/parallax
+    # uncertainty above the prior for stars in few images.  For each
+    # astrometric parameter k, scale the k-th row/col of v_cov_full by
+    # sqrt(prior_var / post_var) wherever post_var > prior_var.  This
+    # preserves correlations (rho is unchanged) and keeps the matrix PSD.
+    C_prior_arr = solver.C_prior  # (n_stars, 5, 5)
+    v_cov_full = v_cov_full.copy()
+    for k in range(5):            # ra, dec, pmra, pmdec, parallax
+        prior_var = C_prior_arr[:, k, k]
+        post_var  = v_cov_full[:, k, k]
+        worse = (post_var > prior_var) & (post_var > 0)
+        if not worse.any():
+            continue
+        scale = np.ones(len(worse))
+        scale[worse] = np.sqrt(prior_var[worse] / post_var[worse])
+        v_cov_full[:, k, :] *= scale[:, None]
+        v_cov_full[:, :, k] *= scale[:, None]
+
     # 1. Image transformation parameters
     rows = []
     for j, img in enumerate(image_names):
