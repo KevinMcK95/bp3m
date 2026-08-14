@@ -837,6 +837,8 @@ def load_image_data_flc(data_root, field_name: str,
         'delve_corr_ra_pmdec', 'delve_corr_dec_plx', 'delve_corr_dec_pmra',
         'delve_corr_dec_pmdec', 'delve_corr_plx_pmra', 'delve_corr_plx_pmdec',
         'delve_corr_pmra_pmdec',
+        # Photometry — carried through to gaia_cat so sky CMD plots can use DELVE colours
+        'delve_gmag', 'delve_rmag', 'delve_imag', 'delve_zmag',
     ]
     if xm is not None and use_delve:
         xm_gaia = xm[xm['gaia_source_id'].notna()].copy()
