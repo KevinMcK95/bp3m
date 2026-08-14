@@ -472,11 +472,11 @@ class BP3MSolver:
                     if surv_full5.any():
                         idx5 = surv_idx[surv_full5]
                         C_delve_5p = surv_C_delve[surv_full5]     # (n5, 5, 5)
-                        has5d_5p = (np.isfinite(surv_d_sig[surv_full5]).all(axis=1) &
+                        delve_full_5d_5p = (np.isfinite(surv_d_sig[surv_full5]).all(axis=1) &
                                     (surv_d_sig[surv_full5] > 0).all(axis=1))
-                        if has5d_5p.any():
-                            C_delve_inv_5p = np.linalg.inv(C_delve_5p[has5d_5p])
-                            idx5_5d = idx5[has5d_5p]
+                        if delve_full_5d_5p.any():
+                            C_delve_inv_5p = np.linalg.inv(C_delve_5p[delve_full_5d_5p])
+                            idx5_5d = idx5[delve_full_5d_5p]
                             self.C_survey_inv[idx5_5d] += C_delve_inv_5p
                             cos_d5 = np.cos(np.radians(self.gaia_dec[idx5_5d]))
                             v_delve_5p = np.column_stack([
@@ -499,16 +499,16 @@ class BP3MSolver:
                     if surv_2p.any():
                         idx2 = surv_idx[surv_2p]
                         C_delve_2p = surv_C_delve[surv_2p]     # (n2, 5, 5)
-                        has5d = (np.isfinite(surv_d_sig[surv_2p]).all(axis=1) &
-                                 (surv_d_sig[surv_2p] > 0).all(axis=1))
+                        delve_full_5d_2p = (np.isfinite(surv_d_sig[surv_2p]).all(axis=1) &
+                                            (surv_d_sig[surv_2p] > 0).all(axis=1))
                         # Stars without a full valid 5×5 cannot get the DELVE prior and
                         # also cannot use the diffuse PM prior (already disabled via
                         # has_delve_pm). Revert them so they get the diffuse prior instead.
-                        if (~has5d).any():
-                            has_delve_pm[idx2[~has5d]] = False
-                        if has5d.any():
-                            C_delve_inv_2p = np.linalg.inv(C_delve_2p[has5d])  # (n5d, 5, 5)
-                            idx2_5d = idx2[has5d]
+                        if (~delve_full_5d_2p).any():
+                            has_delve_pm[idx2[~delve_full_5d_2p]] = False
+                        if delve_full_5d_2p.any():
+                            C_delve_inv_2p = np.linalg.inv(C_delve_2p[delve_full_5d_2p])
+                            idx2_5d = idx2[delve_full_5d_2p]
                             self.C_survey_inv[idx2_5d] += C_delve_inv_2p
                             # v_delve in solver convention: positions as deviations from
                             # the Gaia catalog position in mas (= 0 when DELVE == Gaia);
@@ -1255,18 +1255,7 @@ class BP3MSolver:
             H_rr[lo_cs:lo_cs+nr, hi_cs:hi_cs+nr] -= C_cp
 
         # ── Invert H_vv → C_vT ────────────────────────────────────────────────
-        try:
-            C_vT = np.linalg.inv(H_vv)
-        except np.linalg.LinAlgError:
-            for i in range(self.n_stars):
-                try:
-                    np.linalg.inv(H_vv[i])
-                except np.linalg.LinAlgError:
-                    print(f"  [DIAG] singular H_vv star idx={i} "
-                          f"gaia_2p={self.gaia_2p[i]} full5={self.full_gaia_astrometry[i]} "
-                          f"has_delve={self._has_delve_pm[i]} "
-                          f"H_diag={np.diag(H_vv[i])}")
-            raise
+        C_vT    = np.linalg.inv(H_vv)
         a_align = np.einsum('nij,nj->ni', C_vT, h_align)  # for Schur complement rhs
         a       = np.einsum('nij,nj->ni', C_vT, h_all)    # returned stellar posteriors
 

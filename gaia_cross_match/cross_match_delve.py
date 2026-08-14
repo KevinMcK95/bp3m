@@ -734,6 +734,31 @@ def process_single_image_delve(
         output['residual_y']        = fm['dy'].values
         output['residual_sigma']    = fm['sigma'].values
 
+        # Nullify DELVE astrometric data for entries without a complete, valid
+        # 5×5 covariance (any sigma NaN or ≤ 0).  Photometry columns are kept.
+        _sig_cols = ['delve_ra_error', 'delve_dec_error', 'delve_pmra_error',
+                     'delve_pmdec_error', 'delve_parallax_error']
+        _astrom_cols = [
+            'delve_pmra', 'delve_pmdec', 'delve_pmra_error', 'delve_pmdec_error',
+            'delve_parallax', 'delve_parallax_error',
+            'delve_ra_error', 'delve_dec_error',
+            'delve_ra_cat', 'delve_dec_cat',
+            'delve_corr_ra_dec', 'delve_corr_ra_plx', 'delve_corr_ra_pmra',
+            'delve_corr_ra_pmdec', 'delve_corr_dec_plx', 'delve_corr_dec_pmra',
+            'delve_corr_dec_pmdec', 'delve_corr_plx_pmra', 'delve_corr_plx_pmdec',
+            'delve_corr_pmra_pmdec',
+        ]
+        _valid_5d = np.ones(len(output), dtype=bool)
+        for _c in _sig_cols:
+            if _c in output.colnames:
+                _sig = output[_c].data.astype(float)
+                _valid_5d &= np.isfinite(_sig) & (_sig > 0)
+        _n_bad = int((~_valid_5d).sum())
+        if _n_bad > 0:
+            for _c in _astrom_cols:
+                if _c in output.colnames:
+                    output[_c][~_valid_5d] = np.nan
+
         out_csv = os.path.join(hst['root'], 'matched_delve.csv')
         output.write(out_csv, format='ascii.csv', overwrite=True)
 

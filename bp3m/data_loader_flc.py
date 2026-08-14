@@ -837,6 +837,18 @@ def load_image_data_flc(data_root, field_name: str,
                         .rename(columns={'_gid': 'Gaia_id'}))
             xm_prior['Gaia_id'] = xm_prior['Gaia_id'].astype(np.int64)
             gaia_catalog = gaia_catalog.merge(xm_prior, on='Gaia_id', how='left')
+            # Nullify astrometric columns for entries with incomplete 5×5 covariance
+            # (handles cached matched_delve.csv that predates the cross-match filter).
+            _sig_cols_gc = ['delve_ra_error', 'delve_dec_error', 'delve_pmra_error',
+                            'delve_pmdec_error', 'delve_parallax_error']
+            _present = [c for c in _sig_cols_gc if c in gaia_catalog.columns]
+            if _present:
+                _valid = np.ones(len(gaia_catalog), dtype=bool)
+                for _c in _present:
+                    _s = pd.to_numeric(gaia_catalog[_c], errors='coerce')
+                    _valid &= _s.notna() & (_s > 0)
+                _astrom_null = [c for c in _DELVE_PRIOR_COLS if c in gaia_catalog.columns]
+                gaia_catalog.loc[~_valid, _astrom_null] = np.nan
             n_delve_pm = int(gaia_catalog.get('delve_pmra_error', pd.Series(dtype=float)).notna().sum())
             print(f"  DELVE priors merged: {n_delve_pm} Gaia sources with DELVE PM covariance")
 
