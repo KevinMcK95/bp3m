@@ -820,6 +820,28 @@ def make_plots(solver, images, gaia_catalog,
                           plot_dir, is_member=_is_mem_sky,
                           fname='sky_cmd_pm_diffuse_prior.png')
 
+    # ── DELVE sky CMD plots (one per available DELVE colour) ─────────────────
+    _DELVE_COLORS = [
+        ('delve_gmag', 'delve_rmag', 'DELVE g − r (mag)', 'DELVE r (mag)', 'sky_cmd_pm_delve_gr.png'),
+        ('delve_rmag', 'delve_imag', 'DELVE r − i (mag)', 'DELVE i (mag)', 'sky_cmd_pm_delve_ri.png'),
+    ]
+    for _d_blue, _d_red, _clabel, _mlabel, _fname in _DELVE_COLORS:
+        if _d_blue not in _gc.columns or _d_red not in _gc.columns:
+            continue
+        _sentinel_lo, _sentinel_hi = -90.0, 50.0
+        _vb = pd.to_numeric(_gc[_d_blue], errors='coerce').to_numpy(float)
+        _vr = pd.to_numeric(_gc[_d_red],  errors='coerce').to_numpy(float)
+        _vb[(_vb < _sentinel_lo) | (_vb > _sentinel_hi)] = np.nan
+        _vr[(_vr < _sentinel_lo) | (_vr > _sentinel_hi)] = np.nan
+        _d_color = _vb - _vr
+        _d_mag   = _vr
+        _ok_d = ok & np.isfinite(_d_color) & np.isfinite(_d_mag)
+        if _ok_d.sum() < 5:
+            continue
+        _plot_sky_and_cmd(ra, dec, _d_mag, _d_color, pm_size, pm_unc, _ok_d,
+                          plot_dir, is_member=_is_mem_sky, fname=_fname,
+                          color_label=_clabel, mag_label=_mlabel)
+
     # ── Figure: HST XY residuals + BP3M proper motions on detector ───────────
     if not plot_residuals:
         print(f"  All plots saved to {plot_dir}/")
@@ -1077,7 +1099,8 @@ def _style_ax(ax):
 
 
 def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
-                      is_member=None, fname='sky_cmd_pm.png'):
+                      is_member=None, fname='sky_cmd_pm.png',
+                      color_label="Gaia BP − RP (mag)", mag_label="Gaia G (mag)"):
     """Three panels: sky map coloured by |PM|, CMD coloured by |PM|, CMD coloured by σ_PM."""
     from matplotlib.colors import LogNorm
 
@@ -1117,8 +1140,8 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
                       norm=norm_pm, cmap=cmap_pm, zorder=2,
                       linewidths=0, rasterized=True)
     plt.colorbar(sc, ax=ax, label="|PM| (mas/yr)")
-    ax.set_xlabel("Gaia BP − RP (mag)")
-    ax.set_ylabel("Gaia G (mag)")
+    ax.set_xlabel(color_label)
+    ax.set_ylabel(mag_label)
     ax.set_title("CMD  (colour = |PM|)")
     ax.invert_yaxis()
     _style_ax(ax)
@@ -1130,8 +1153,8 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
                       norm=norm_unc, cmap=cmap_unc, zorder=2,
                       linewidths=0, rasterized=True)
     plt.colorbar(sc, ax=ax, label="σ_PM (mas/yr)")
-    ax.set_xlabel("Gaia BP − RP (mag)")
-    ax.set_ylabel("Gaia G (mag)")
+    ax.set_xlabel(color_label)
+    ax.set_ylabel(mag_label)
     ax.set_title("CMD  (colour = σ_PM)")
     ax.invert_yaxis()
     _style_ax(ax)

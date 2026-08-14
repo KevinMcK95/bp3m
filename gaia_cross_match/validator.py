@@ -687,17 +687,18 @@ def build_global_catalog(images, target, data_dir):
 
 def _plot_delve_photometry(cat, wide, data_dir, target, n_filters):
     """
-    Produce DELVE-based CMD and colour-colour plots saved alongside the Gaia ones.
+    Produce DELVE+HST pairwise CMD and colour-colour plots using the same
+    approach as the Gaia plots: all pairwise (HST+DELVE) CMDs and all
+    colour-colour triplets.
 
-    plots_validate_delve_cmds.png  — HST mag vs DELVE g−r colour per filter
-    plots_validate_delve_cc.png    — DELVE g−r vs r−i colour-colour
+    DELVE g/r/i/z are added as DELVEg/DELVEr/DELVEi/DELVEz bands alongside
+    the HST filters so _plot_cmds and _plot_color_color handle the pairwise
+    logic automatically.
+
+    plots_validate_delve_cmds.png  — all pairwise HST+DELVE CMDs
+    plots_validate_delve_cc.png    — all triplet colour-colour panels
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    # Work from the per-(source, filter_camera) catalog, keeping best row per
-    # (source, filter) so the wide pivot works cleanly.
+    # Build per-source key covering both Gaia and DELVE-only rows.
     def _src_key(row):
         if pd.notna(row.get('gaia_source_id')):
             return f"g_{int(row['gaia_source_id'])}"
@@ -707,12 +708,15 @@ def _plot_delve_photometry(cat, wide, data_dir, target, n_filters):
     cat['_src_key'] = cat.apply(_src_key, axis=1)
     cat['_filter']  = cat['filter_camera'].str.split('/').str[0]
 
-    # Per-source DELVE photometry (constant across filters — take first non-null).
+    # Per-source DELVE photometry (constant across filter rows — take first).
+    delve_phot_cols = [c for c in ['delve_gmag', 'delve_rmag', 'delve_imag', 'delve_zmag']
+                       if c in cat.columns]
+    if not delve_phot_cols:
+        return
     delve_src = (cat.drop_duplicates(subset='_src_key')
-                 [['_src_key'] + [c for c in ['delve_rmag', 'delve_gmag', 'delve_imag', 'delve_zmag']
-                                  if c in cat.columns]])
+                 [['_src_key'] + delve_phot_cols])
 
-    # Wide HST magnitudes (one col per filter).
+    # Wide HST magnitudes: one mag_wmean_{FILTER} col per HST filter.
     cat_best = (cat.sort_values('n_trustworthy', ascending=False)
                    .drop_duplicates(subset=['_src_key', '_filter']))
     wide_d = (cat_best
@@ -721,64 +725,56 @@ def _plot_delve_photometry(cat, wide, data_dir, target, n_filters):
               .reset_index())
     wide_d.columns.name = None
     hst_fcols = [c for c in wide_d.columns if c != '_src_key']
-    wide_d = wide_d.rename(columns={c: f'hst_{c}' for c in hst_fcols})
+    wide_d = wide_d.rename(columns={c: f'mag_wmean_{c}' for c in hst_fcols})
     wide_d = wide_d.merge(delve_src, on='_src_key', how='left')
 
-    # Compute DELVE colours; mask sentinels.
-    def _safe(col):
-        if col not in wide_d.columns:
-            return None
-        v = wide_d[col].copy()
+    # Map DELVE photometry columns → mag_wmean_DELVEg/r/i/z (masking sentinels).
+    # The DELVEg/r/i/z band labels are registered in _plot_cmds/_plot_color_color's
+    # _WL dict so they sort correctly relative to HST filters.
+    _BAND_MAP = [
+        ('delve_gmag', 'DELVEg'),
+        ('delve_rmag', 'DELVEr'),
+        ('delve_imag', 'DELVEi'),
+        ('delve_zmag', 'DELVEz'),
+    ]
+    added_bands = []
+    for delve_col, band_label in _BAND_MAP:
+        if delve_col not in wide_d.columns:
+            continue
+        v = pd.to_numeric(wide_d[delve_col], errors='coerce').copy()
         v[(v < _DELVE_SENTINEL_LO) | (v > _DELVE_SENTINEL_HI)] = np.nan
-        return v
+        wide_d[f'mag_wmean_{band_label}'] = v
+        added_bands.append(band_label)
+    wide_d = wide_d.drop(columns=delve_phot_cols, errors='ignore')
 
-    r = _safe('delve_rmag'); g = _safe('delve_gmag')
-    ri = _safe('delve_imag'); z = _safe('delve_zmag')
+    if not added_bands:
+        return
+    n_delve_ok = sum(wide_d[f'mag_wmean_{b}'].notna().sum() > 0 for b in added_bands)
+    if n_delve_ok == 0:
+        return
 
-    has_gr = g is not None and r is not None
-    has_ri = ri is not None and r is not None
-    gr = g - r if has_gr else None
-    rmi = r - ri if has_ri else None
+    try:
+        from bp3m.pipeline.hst_catalog_crossmatch import _plot_cmds, _plot_color_color
+    except ImportError:
+        print('  _plot_delve_photometry: bp3m not importable, skipping')
+        return
 
-    # ── CMDs: one panel per HST filter ──────────────────────────────────────
-    hst_filters = sorted(hst_fcols)
-    n = len(hst_filters)
-    if n and has_gr:
-        ncols = min(4, n); nrows = int(np.ceil(n / ncols))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows),
-                                 squeeze=False)
-        fig.suptitle(f'{target}  —  DELVE CMDs ({n_filters} HST filters)', fontsize=14)
-        for idx, filt in enumerate(hst_filters):
-            ax = axes[idx // ncols][idx % ncols]
-            hcol = f'hst_{filt}'
-            if hcol not in wide_d.columns:
-                ax.set_visible(False); continue
-            ok = np.isfinite(wide_d[hcol].values) & np.isfinite(gr.values)
-            ax.scatter(gr[ok], wide_d[hcol][ok], s=2, alpha=0.4, color='steelblue')
-            ax.invert_yaxis()
-            ax.set_xlabel('g − r  (DELVE DES)', fontsize=9)
-            ax.set_ylabel(f'HST {filt}', fontsize=9)
-            ax.set_title(filt, fontsize=10)
-        for idx in range(n, nrows * ncols):
-            axes[idx // ncols][idx % ncols].set_visible(False)
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        out = os.path.join(data_dir, target, 'plots_validate_delve_cmds.png')
-        plt.savefig(out, dpi=150); plt.close()
-        print(f'  DELVE CMDs: {out}')
+    n_all = len(hst_fcols) + len(added_bands)
+    out_cmds = os.path.join(data_dir, target, 'plots_validate_delve_cmds.png')
+    try:
+        _plot_cmds(wide_d, None, out_cmds,
+                   title=f'{target}  —  DELVE+HST CMDs ({n_all} bands)')
+        print(f'  DELVE CMDs: {out_cmds}')
+    except Exception as e:
+        print(f'  Warning: plots_validate_delve_cmds.png failed: {e}')
 
-    # ── Colour-colour: g−r vs r−i (no HST axis needed) ───────────────────────
-    if has_gr and has_ri:
-        ok = np.isfinite(gr.values) & np.isfinite(rmi.values)
-        if ok.sum() > 10:
-            fig, ax = plt.subplots(figsize=(6, 5))
-            ax.scatter(gr[ok], rmi[ok], s=3, alpha=0.4, color='steelblue')
-            ax.set_xlabel('g − r  (DELVE DES)', fontsize=11)
-            ax.set_ylabel('r − i  (DELVE DES)', fontsize=11)
-            ax.set_title(f'{target}  —  DELVE colour-colour  (n={ok.sum():,})', fontsize=12)
-            plt.tight_layout()
-            out = os.path.join(data_dir, target, 'plots_validate_delve_cc.png')
-            plt.savefig(out, dpi=150); plt.close()
-            print(f'  DELVE colour-colour: {out}')
+    out_cc = os.path.join(data_dir, target, 'plots_validate_delve_cc.png')
+    try:
+        _plot_color_color(wide_d, None, out_cc,
+                          title=f'{target}  —  DELVE+HST colour-colour ({n_all} bands)')
+        print(f'  DELVE colour-colour: {out_cc}')
+    except Exception as e:
+        print(f'  Warning: plots_validate_delve_cc.png failed: {e}')
 
 
 def plot_photometry_catalog(data_dir, target):

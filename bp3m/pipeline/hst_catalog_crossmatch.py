@@ -4855,6 +4855,7 @@ def _plot_cmds(combined_df: pd.DataFrame, gaia_df: Optional[pd.DataFrame],
         'F555W': 531, 'F606W': 592, 'F600LP': 747, 'F625W': 626,
         'F775W': 764, 'F814W': 803, 'F850LP': 918,
         'G': 673,   # Gaia G effective wavelength
+        'DELVEg': 473, 'DELVEr': 642, 'DELVEi': 784, 'DELVEz': 926,
     }
 
     def _wl(band: str) -> float:
@@ -5088,6 +5089,7 @@ def _plot_color_color(combined_df: pd.DataFrame, gaia_df: Optional[pd.DataFrame]
         'F555W': 531, 'F606W': 592, 'F600LP': 747, 'F625W': 626,
         'F775W': 764, 'F814W': 803, 'F850LP': 918,
         'G': 673,
+        'DELVEg': 473, 'DELVEr': 642, 'DELVEi': 784, 'DELVEz': 926,
     }
 
     def _wl(band: str) -> float:
