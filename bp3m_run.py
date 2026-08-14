@@ -1021,6 +1021,24 @@ def main():
             init_resid_max=args.xmatch_init_resid_max,
         )
 
+        # Auto-validate: cross_match_catalog.csv must be regenerated after DELVE
+        # crossmatch so it includes DELVE PM columns (used by the solver for
+        # Gaia+DELVE PM priors and correct trustworthiness counts).  This is
+        # needed when switching from a Gaia-only run to --use_delve without
+        # --force_validate.
+        import pandas as _pd_tmp
+        from bp3m.pipeline.cross_match import _validate_catalog_if_needed
+        _cat_path = Path(output_dir) / field / "cross_match_catalog.csv"
+        _needs_delve_validate = not _cat_path.exists()
+        if not _needs_delve_validate:
+            _hdr = _pd_tmp.read_csv(_cat_path, nrows=0)
+            if 'delve_pmra' not in _hdr.columns:
+                print("  cross_match_catalog.csv lacks DELVE columns — "
+                      "re-validating to merge DELVE data...")
+                _needs_delve_validate = True
+        if _needs_delve_validate:
+            _validate_catalog_if_needed(field, output_dir, force=True)
+
     # ── Step 4b: Gaia DR4 epoch astrometry (optional) ────────────────────────
     _gaia_epoch_obs_for_solver: dict | None = None
 

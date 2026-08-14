@@ -184,11 +184,16 @@ def run_alignment(  # noqa: C901
 
     if bp3m_min_stars > 0:
         before = len(image_names)
-        image_names = [n for n in image_names if len(stars_per_image[n]) >= bp3m_min_stars]
+        # Count alignment-eligible stars only (use_for_alignment=True, excluding
+        # DELVE-only rows which have negative Gaia_id and aren't used for alignment).
+        image_names = [
+            n for n in image_names
+            if int(stars_per_image[n]["use_for_alignment"].sum()) >= bp3m_min_stars
+        ]
         dropped = before - len(image_names)
         if dropped:
             print(f"  --bp3m_min_stars {bp3m_min_stars}: dropped {dropped} image(s) "
-                  f"with fewer than {bp3m_min_stars} Gaia stars")
+                  f"with fewer than {bp3m_min_stars} alignment stars")
 
     if not image_names:
         raise RuntimeError("No images remain after filtering.")
