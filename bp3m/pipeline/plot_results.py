@@ -821,6 +821,10 @@ def make_plots(solver, images, gaia_catalog,
                           fname='sky_cmd_pm_diffuse_prior.png')
 
     # ── DELVE sky CMD plots (one per available DELVE colour) ─────────────────
+    # Use bp3m_converged & finite pm only — do NOT require finite Gaia G,
+    # because DELVE-only stars (negative Gaia_id) have gmag=NaN and would
+    # be excluded entirely if we reused the Gaia `ok` mask.
+    _ok_delve_base = bp3m_converged & np.isfinite(pm_size)
     _DELVE_COLORS = [
         ('delve_gmag', 'delve_rmag', 'DELVE g − r (mag)', 'DELVE r (mag)', 'sky_cmd_pm_delve_gr.png'),
         ('delve_rmag', 'delve_imag', 'DELVE r − i (mag)', 'DELVE i (mag)', 'sky_cmd_pm_delve_ri.png'),
@@ -835,7 +839,7 @@ def make_plots(solver, images, gaia_catalog,
         _vr[(_vr < _sentinel_lo) | (_vr > _sentinel_hi)] = np.nan
         _d_color = _vb - _vr
         _d_mag   = _vr
-        _ok_d = ok & np.isfinite(_d_color) & np.isfinite(_d_mag)
+        _ok_d = _ok_delve_base & np.isfinite(_d_color) & np.isfinite(_d_mag)
         if _ok_d.sum() < 5:
             continue
         _plot_sky_and_cmd(ra, dec, _d_mag, _d_color, pm_size, pm_unc, _ok_d,
