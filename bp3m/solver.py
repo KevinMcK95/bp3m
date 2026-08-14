@@ -761,8 +761,11 @@ class BP3MSolver:
                 "r_prior"        : r_prior,           # (N_R,) prior mean — from WCS header only
                 "r_init"         : r_init,            # (N_R,) initial iterate — from transformation.csv when available
                 "C_r_prior_inv"  : C_r_prior_inv,     # (N_R, N_R)
-                "use_for_fit"    : good_for_fitting,  # (n,) boolean — used for alignment (and astrometry)
-                "use_for_astrom" : good_for_fitting.copy(),  # (n,) boolean — used for astrometry only
+                "use_for_fit"    : good_for_fitting,  # (n,) boolean — used for alignment
+                # use_for_astrom: alignment stars PLUS sources excluded from alignment
+                # (e.g. DELVE-only stars) whose HST positions still constrain their
+                # own v_hat via h_all (astrometry-only path in _solve_one_pass).
+                "use_for_astrom" : good_for_fitting | df['use_for_fit'].to_numpy(bool),
                 "use_for_fit_max": ok_init.copy(),    # hard ceiling: only blocks 100px+ outliers
                 # Frozen snapshot of initially-trusted stars (use_for_alignment=True,
                 # q_hst>0, gaia_trustworthy, initial residual ≤ 100px).  Used as the
@@ -1176,10 +1179,7 @@ class BP3MSolver:
                                       d["use_for_fit"]))
             else:
                 use_align  = d["use_for_fit"]
-                if getattr(self, '_use_two_tier', False):
-                    use_astrom = d.get("use_for_astrom", use_align)
-                else:
-                    use_astrom = use_align
+                use_astrom = d.get("use_for_astrom", use_align)
 
             # When exclude_2p_from_alignment is set, 2p stars do not contribute
             # to the image transformation equations (H_rr, h_r).
