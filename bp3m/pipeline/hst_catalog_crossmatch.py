@@ -4557,7 +4557,9 @@ def run_hst_crossmatch(
                    title=f'{field_name} — all sources (cycle {cycle_id})')
         print(f"  cmds_all{_cy}.png written")
     except Exception as _e:
+        import traceback as _tb
         print(f"  Warning: cmds_all{_cy}.png failed: {_e}")
+        _tb.print_exc()
 
     try:
         _plot_color_color(combined_df, gaia_df=None,
@@ -4565,7 +4567,9 @@ def run_hst_crossmatch(
                           title=f'{field_name} — all sources (cycle {cycle_id})')
         print(f"  cc_all{_cy}.png written")
     except Exception as _e:
+        import traceback as _tb
         print(f"  Warning: cc_all{_cy}.png failed: {_e}")
+        _tb.print_exc()
 
     if gaia_df is not None and 'gaia_source_id' in combined_df.columns:
         try:
@@ -4629,7 +4633,9 @@ def run_hst_crossmatch(
                        title=f'{field_name} v2 — all sources (cycle {cycle_id})')
             print(f"  cmds_v2_all{_cy}.png written")
         except Exception as _e:
+            import traceback as _tb
             print(f"  Warning: cmds_v2_all{_cy}.png failed: {_e}")
+            _tb.print_exc()
 
         try:
             _plot_color_color(combined_v2_df, gaia_df=None,
@@ -4637,7 +4643,9 @@ def run_hst_crossmatch(
                               title=f'{field_name} v2 — all sources (cycle {cycle_id})')
             print(f"  cc_v2_all{_cy}.png written")
         except Exception as _e:
+            import traceback as _tb
             print(f"  Warning: cc_v2_all{_cy}.png failed: {_e}")
+            _tb.print_exc()
 
         if gaia_df is not None and 'gaia_source_id' in _good_pm_v2.columns:
             try:
