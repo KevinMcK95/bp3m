@@ -927,6 +927,10 @@ def load_image_data_flc(data_root, field_name: str,
                     'delve_corr_plx_pmra':     row.get('delve_corr_plx_pmra', 0.0),
                     'delve_corr_plx_pmdec':    row.get('delve_corr_plx_pmdec', 0.0),
                     'delve_corr_pmra_pmdec':   row.get('delve_corr_pmra_pmdec', 0.0),
+                    'delve_gmag': row.get('delve_gmag', np.nan),
+                    'delve_rmag': row.get('delve_rmag', np.nan),
+                    'delve_imag': row.get('delve_imag', np.nan),
+                    'delve_zmag': row.get('delve_zmag', np.nan),
                     'gmag':  row.get('delve_rmag', np.nan),  # r ≈ G for red stars
                 })
 
