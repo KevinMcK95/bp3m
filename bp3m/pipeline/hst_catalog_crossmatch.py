@@ -4562,10 +4562,14 @@ def run_hst_crossmatch(
         _tb.print_exc()
 
     try:
+        _cc_all_path = output_dir / f'cc_all{_cy}.png'
         _plot_color_color(combined_df, gaia_df=None,
-                          output_path=output_dir / f'cc_all{_cy}.png',
+                          output_path=_cc_all_path,
                           title=f'{field_name} — all sources (cycle {cycle_id})')
-        print(f"  cc_all{_cy}.png written")
+        if _cc_all_path.exists():
+            print(f"  cc_all{_cy}.png written")
+        else:
+            print(f"  cc_all{_cy}.png skipped (fewer than 3 filters)")
     except Exception as _e:
         import traceback as _tb
         print(f"  Warning: cc_all{_cy}.png failed: {_e}")
@@ -4638,10 +4642,14 @@ def run_hst_crossmatch(
             _tb.print_exc()
 
         try:
+            _cc_v2_all_path = output_dir / f'cc_v2_all{_cy}.png'
             _plot_color_color(combined_v2_df, gaia_df=None,
-                              output_path=output_dir / f'cc_v2_all{_cy}.png',
+                              output_path=_cc_v2_all_path,
                               title=f'{field_name} v2 — all sources (cycle {cycle_id})')
-            print(f"  cc_v2_all{_cy}.png written")
+            if _cc_v2_all_path.exists():
+                print(f"  cc_v2_all{_cy}.png written")
+            else:
+                print(f"  cc_v2_all{_cy}.png skipped (fewer than 3 filters)")
         except Exception as _e:
             import traceback as _tb
             print(f"  Warning: cc_v2_all{_cy}.png failed: {_e}")
