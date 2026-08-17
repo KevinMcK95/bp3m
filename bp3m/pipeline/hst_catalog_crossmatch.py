@@ -4551,6 +4551,22 @@ def run_hst_crossmatch(
     except Exception as _e:
         print(f"  Warning: cmds{_cy}.png failed: {_e}")
 
+    try:
+        _plot_cmds(combined_df, gaia_df=None,
+                   output_path=output_dir / f'cmds_all{_cy}.png',
+                   title=f'{field_name} — all sources (cycle {cycle_id})')
+        print(f"  cmds_all{_cy}.png written")
+    except Exception as _e:
+        print(f"  Warning: cmds_all{_cy}.png failed: {_e}")
+
+    try:
+        _plot_color_color(combined_df, gaia_df=None,
+                          output_path=output_dir / f'cc_all{_cy}.png',
+                          title=f'{field_name} — all sources (cycle {cycle_id})')
+        print(f"  cc_all{_cy}.png written")
+    except Exception as _e:
+        print(f"  Warning: cc_all{_cy}.png failed: {_e}")
+
     if gaia_df is not None and 'gaia_source_id' in combined_df.columns:
         try:
             _plot_gaia_comparison(good_pm_df, gaia_df,
@@ -4606,6 +4622,22 @@ def run_hst_crossmatch(
             print(f"  cmds_v2{_cy}.png written")
         except Exception as _e:
             print(f"  Warning: cmds_v2{_cy}.png failed: {_e}")
+
+        try:
+            _plot_cmds(combined_v2_df, gaia_df=None,
+                       output_path=output_dir / f'cmds_v2_all{_cy}.png',
+                       title=f'{field_name} v2 — all sources (cycle {cycle_id})')
+            print(f"  cmds_v2_all{_cy}.png written")
+        except Exception as _e:
+            print(f"  Warning: cmds_v2_all{_cy}.png failed: {_e}")
+
+        try:
+            _plot_color_color(combined_v2_df, gaia_df=None,
+                              output_path=output_dir / f'cc_v2_all{_cy}.png',
+                              title=f'{field_name} v2 — all sources (cycle {cycle_id})')
+            print(f"  cc_v2_all{_cy}.png written")
+        except Exception as _e:
+            print(f"  Warning: cc_v2_all{_cy}.png failed: {_e}")
 
         if gaia_df is not None and 'gaia_source_id' in _good_pm_v2.columns:
             try:
