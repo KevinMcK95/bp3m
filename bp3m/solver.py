@@ -2416,7 +2416,8 @@ class BP3MSolver:
                         & (sigma_resid > sigma_min))
 
             if diag_rows is not None:
-                is_gaia_2p = self.gaia_2p[sidx] if hasattr(self, 'gaia_2p') else np.zeros(len(sidx), dtype=bool)
+                _gaia_2p_arr = np.asarray(self.gaia_2p) if hasattr(self, 'gaia_2p') else None
+                is_gaia_2p = _gaia_2p_arr[sidx] if _gaia_2p_arr is not None else np.zeros(len(sidx), dtype=bool)
                 for k in range(len(use)):
                     if use[k] and not already_excl[k]:
                         diag_rows.append({
