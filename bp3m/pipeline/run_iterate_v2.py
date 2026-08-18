@@ -84,6 +84,8 @@ def main():
                         help="Cook's D threshold for test-4 influence clipping")
     parser.add_argument('--influence_sigma_min', type=float, default=2.0,
                         help='Minimum sigma_resid for test-4 (default 2.0)')
+    parser.add_argument('--diag_influence_path', type=str, default=None,
+                        help='If set, write per-detection Cook\'s D diagnostics to this CSV path')
     parser.add_argument('--soft_weights', action='store_true',
                         help='Use Student-t IRLS soft weights instead of hard tests 1-4')
     parser.add_argument('--student_t_nu', type=float, default=50.0,
@@ -177,6 +179,7 @@ def main():
         use_influence_clip   = not args.no_influence_clip,
         influence_d_thresh   = args.influence_d_thresh,
         influence_sigma_min  = args.influence_sigma_min,
+        diag_influence_path  = args.diag_influence_path,
         use_soft_weights              = args.soft_weights,
         student_t_nu                  = args.student_t_nu,
         exclude_2p_from_alignment     = args.exclude_2p_from_alignment,

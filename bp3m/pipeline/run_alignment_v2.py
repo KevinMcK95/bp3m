@@ -647,6 +647,7 @@ def run_alignment_v2(
     influence_d_thresh: float = 1.0,   # auto-scaled by V1/V2 C_r ratio at runtime
     influence_sigma_min: float = 2.0,
     influence_raw_cooks_d: bool = False,
+    diag_influence_path=None,
     verbose_tests: bool = False,
     hst_pm_sigma_diffuse: float = 100.0,
     bp3m_dir: Path | None = None,
@@ -1373,6 +1374,7 @@ def run_alignment_v2(
         influence_raw_cooks_d=influence_raw_cooks_d,
         verbose_tests=verbose_tests,
         use_two_tier=True,         # enables use_for_astrom tracking
+        diag_influence_path=diag_influence_path,
         per_iter_callback=callback,
         use_soft_weights=use_soft_weights,
         student_t_nu=student_t_nu,

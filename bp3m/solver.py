@@ -1385,7 +1385,8 @@ class BP3MSolver:
             student_t_nu: float = 50.0,
             z_tol: float = 1.0,
             z_init: dict | None = None,
-            no_align_prior: bool = False):
+            no_align_prior: bool = False,
+            diag_influence_path=None):
         """
         Iterative BP3M fit with outlier rejection.
 
@@ -1748,11 +1749,22 @@ class BP3MSolver:
                 n_inf_new = 0
                 _t4_flagged_info = []
                 if use_influence_clip and it_outer >= min_outer and _n_consec_stable < 2:
+                    _diag_rows = [] if diag_influence_path is not None else None
                     n_inf_new, _t4_flagged_info = self._apply_influence_clip(
                         r_hat, C_r, a_arr,
                         cooks_d_thresh=influence_d_thresh,
                         sigma_min=influence_sigma_min,
-                        raw_cooks_d=influence_raw_cooks_d)
+                        raw_cooks_d=influence_raw_cooks_d,
+                        diag_rows=_diag_rows,
+                        it_outer=it_outer + 1)
+                    if diag_influence_path is not None and _diag_rows:
+                        import csv, os
+                        _write_header = not os.path.exists(diag_influence_path)
+                        with open(diag_influence_path, 'a', newline='') as _f:
+                            _w = csv.DictWriter(_f, fieldnames=list(_diag_rows[0].keys()))
+                            if _write_header:
+                                _w.writeheader()
+                            _w.writerows(_diag_rows)
                     n_total_changed += n_inf_new
 
                 print(f"\n  Outer iter {it_outer+1}: "
@@ -2303,7 +2315,7 @@ class BP3MSolver:
 
     def _apply_influence_clip(self, r_hat, C_r, a_arr,
                                cooks_d_thresh=1.0, sigma_min=5.0,
-                               raw_cooks_d=False):
+                               raw_cooks_d=False, diag_rows=None, it_outer=None):
         """
         Test-4: influence-based clipping with ratchet semantics.
 
@@ -2402,6 +2414,22 @@ class BP3MSolver:
                         & ~already_excl
                         & (test_d > cooks_d_thresh)
                         & (sigma_resid > sigma_min))
+
+            if diag_rows is not None:
+                is_gaia_2p = self.gaia_2p[sidx] if hasattr(self, 'gaia_2p') else np.zeros(len(sidx), dtype=bool)
+                for k in range(len(use)):
+                    if use[k] and not already_excl[k]:
+                        diag_rows.append({
+                            'it_outer': it_outer,
+                            'img': img,
+                            'sidx': int(sidx[k]),
+                            'gaia_2p': bool(is_gaia_2p[k]),
+                            'cooks_d': float(cooks_d[k]),
+                            'leverage': float(leverage[k]),
+                            'test_d': float(test_d[k]),
+                            'sigma_resid': float(sigma_resid[k]),
+                            'flagged': bool(new_flag[k]),
+                        })
 
             if new_flag.any():
                 # Guard: never drop below 4 stars per image
