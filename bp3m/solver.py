@@ -53,7 +53,7 @@ from .instrument_config import (
     SIGMA_PAIR_POINTING as _SIGMA_PAIR_POINTING,
 )
 
-N_R = 8     # r_j dimensions for poly_order=1 (backward-compat constant)
+N_R = 6     # r_j dimensions for poly_order=1 (a,b,c,d,Δα0,Δδ0)
 N_V = 5     # v_T,i dimensions: (Δα*, Δδ, μα*, μδ, ϖ)
 
 # ── Global astrometry prior ────────────────────────────────────────────────────
@@ -198,10 +198,10 @@ class BP3MSolver:
         ----------
         poly_order : int, optional
             Polynomial order for the image transformation.
-              1 → linear (a,b,c,d,w,z,Δα0,Δδ0) — 8 parameters per image (default)
-              2 → adds degree-2 terms — 14 parameters per image
-              3 → adds degree-2 and degree-3 terms — 22 parameters per image
-            N_R(p) = 2 + (p+1)*(p+2)
+              1 → linear (a,b,c,d,Δα0,Δδ0) — 6 parameters per image (default)
+              2 → adds degree-2 terms — 12 parameters per image
+              3 → adds degree-2 and degree-3 terms — 20 parameters per image
+            N_R(p) = (p+1)*(p+2)
         prior_sigma_rot_deg, prior_sigma_scale, prior_sigma_skew, prior_sigma_pointing : float or None
             Override the plate prior widths from instrument_config.py.
             None uses the module-level defaults.
