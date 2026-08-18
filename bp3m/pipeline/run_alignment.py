@@ -57,8 +57,9 @@ def run_alignment(  # noqa: C901
     use_pair_prior: bool = False,
     inflate_alpha_max: float = 3.0,
     use_influence_clip: bool = True,
-    influence_d_thresh: float = 1.0,
-    influence_sigma_min: float = 2.0,
+    influence_k: float = 5.0,
+    influence_floor_sr: float | None = None,
+    influence_floor_sd: float = 3.0,
     influence_raw_cooks_d: bool = False,
     use_two_tier: bool = False,
     no_align_prior: bool = False,
@@ -98,8 +99,9 @@ def run_alignment(  # noqa: C901
     bp3m_dir         : override default bp3m location
     checkpoint_dir   : save/load fitting checkpoint here
     use_influence_clip  : enable test-4 Cook's D influence clipping
-    influence_d_thresh  : Cook's D threshold (default 1.0)
-    influence_sigma_min : minimum sigma_resid for influence flagging (default 2.0)
+    influence_k         : adaptive multiplier k for sigma_resid and scaled_D thresholds (default 5.0)
+    influence_floor_sr  : floor for sigma_resid threshold (None = theoretical chi(2) p99 ≈ 3.03)
+    influence_floor_sd  : floor for scaled_D threshold (default 3.0)
     influence_raw_cooks_d : use raw Cook's D instead of null-normalised scaled_D
     no_align_prior      : zero out the alignment (a,b,c,d,delta_ra0,delta_dec0) prior
 
@@ -339,8 +341,9 @@ def run_alignment(  # noqa: C901
         inflate_alpha_max=inflate_alpha_max,
         prefilter=not no_prefilter,
         use_influence_clip=use_influence_clip,
-        influence_d_thresh=influence_d_thresh,
-        influence_sigma_min=influence_sigma_min,
+        influence_k=influence_k,
+        influence_floor_sr=influence_floor_sr,
+        influence_floor_sd=influence_floor_sd,
         influence_raw_cooks_d=influence_raw_cooks_d,
         verbose_tests=verbose_tests,
         use_two_tier=use_two_tier,

@@ -1377,7 +1377,10 @@ class BP3MSolver:
             inflate_from_iter=3, inflate_alpha_max=3.0, min_outer_iters=None,
             hst_fit_sigma_mult=0.5,
             prefilter=True, chi2_threshold=None, alpha_scale_chi2=False,
-            use_influence_clip=True, influence_d_thresh=1.0, influence_sigma_min=5.0,
+            use_influence_clip=True,
+            influence_k: float = 5.0,
+            influence_floor_sr: float | None = None,
+            influence_floor_sd: float = 3.0,
             influence_raw_cooks_d=False,
             verbose_tests=False,
             use_two_tier=False, per_iter_callback=None,
@@ -1470,24 +1473,22 @@ class BP3MSolver:
             formal errors are slightly underestimated.
         use_influence_clip : bool, default True
             If True, apply test-4 influence-based clipping after the EM
-            converges (tests 1-3).  Flags detections where Cook's D >
-            influence_d_thresh AND sigma_resid > influence_sigma_min.
-            Cook's D captures moderate-residual, high-leverage detections that
-            pass the sigma threshold but disproportionately pull r_hat.
-            Uses ratchet semantics: flagged pairs are permanently excluded
-            (never re-admitted by tests 1-3), guaranteeing monotonic convergence
-            of n_inf_new toward 0.
-        influence_d_thresh : float, default 2.0
-            Threshold on the null-normalised Cook's D (scaled_D = D*N_R/leverage).
-            Under the null E[scaled_D] = 1 regardless of image density, so
-            scaled_D > d_thresh means the detection is d_thresh times more
-            influential than expected for a well-fitting star.
-        influence_sigma_min : float, default 5.0
-            Minimum sigma_resid for a detection to be flagged by test-4.
-            Prevents removing well-fit high-leverage stars (low residual, high
-            leverage is NOT a problem — it means the star is a good anchor).
-            Raised to 5.0 (from the prior 2.0) to avoid over-clipping stars
-            from long-baseline images where genuine Cook's D is naturally high.
+            converges (tests 1-3).  Flags detections where sigma_resid >
+            thresh_sr AND scaled_D > thresh_sd, where both thresholds are
+            set adaptively from the eligible-detection distribution using
+            p50 + k*(p50-p16), clamped to theoretical null floors.
+            Uses ratchet semantics: flagged pairs are permanently excluded.
+        influence_k : float, default 5.0
+            Adaptive multiplier k for both sigma_resid and scaled_D thresholds.
+            thresh = max(p50 + k*(p50-p16), floor).  Matches the k=5.0 used
+            by tests 1-3 (_adapt_thresh).
+        influence_floor_sr : float or None, default None
+            Floor for the sigma_resid threshold.  None uses the theoretical
+            chi(2) 99th percentile: sqrt(chi2(2).ppf(0.99)) ≈ 3.03.
+        influence_floor_sd : float, default 3.0
+            Floor for the scaled_D threshold.  Empirically calibrated from
+            clean converged solutions; approximately the 99th percentile of
+            the scaled_D null distribution.
         influence_raw_cooks_d : bool, default False
             If True, compare raw Cook's D against the threshold instead of the
             null-normalised scaled_D = D*N_R/leverage.  Raw D is biased against
@@ -1748,15 +1749,19 @@ class BP3MSolver:
                 # and trigger a cascade.
                 n_inf_new = 0
                 _t4_flagged_info = []
+                _t4_thresh_sr = _t4_thresh_sd = float('nan')
                 if use_influence_clip and it_outer >= min_outer and _n_consec_stable < 2:
                     _diag_rows = [] if diag_influence_path is not None else None
-                    n_inf_new, _t4_flagged_info = self._apply_influence_clip(
-                        r_hat, C_r, a_arr,
-                        cooks_d_thresh=influence_d_thresh,
-                        sigma_min=influence_sigma_min,
-                        raw_cooks_d=influence_raw_cooks_d,
-                        diag_rows=_diag_rows,
-                        it_outer=it_outer + 1)
+                    n_inf_new, _t4_flagged_info, _t4_thresh_sr, _t4_thresh_sd = \
+                        self._apply_influence_clip(
+                            r_hat, C_r, a_arr,
+                            k_sigma_resid=influence_k,
+                            k_scaled_d=influence_k,
+                            floor_sigma_resid=influence_floor_sr,
+                            floor_scaled_d=influence_floor_sd,
+                            raw_cooks_d=influence_raw_cooks_d,
+                            diag_rows=_diag_rows,
+                            it_outer=it_outer + 1)
                     if diag_influence_path is not None and _diag_rows:
                         import csv, os
                         _write_header = not os.path.exists(diag_influence_path)
@@ -1767,10 +1772,16 @@ class BP3MSolver:
                             _w.writerows(_diag_rows)
                     n_total_changed += n_inf_new
 
+                _t4_str = ""
+                if use_influence_clip:
+                    _t4_str = f", {n_inf_new} test-4 changes"
+                    if it_outer >= min_outer and _n_consec_stable < 2:
+                        _t4_str += (f"  [thresh_sr={_t4_thresh_sr:.2f}"
+                                    f"  thresh_sd={_t4_thresh_sd:.2f}]")
                 print(f"\n  Outer iter {it_outer+1}: "
                       f"{n_global_changed} test-1/2 changes, "
                       f"{n_use_changed} test-3 changes"
-                      + (f", {n_inf_new} test-4 changes" if use_influence_clip else "")
+                      + _t4_str
                       + f"  ({n_total_changed} total)")
                 for img, n_use, n_tot, alpha_applied, alpha_raw, n_astrom_only in clip_info:
                     tags = []
@@ -2314,62 +2325,72 @@ class BP3MSolver:
               f"  (2p frac={(nu_2p/(nu_2p+nu_5p)):.2f})" if (nu_2p+nu_5p) else "")
 
     def _apply_influence_clip(self, r_hat, C_r, a_arr,
-                               cooks_d_thresh=1.0, sigma_min=5.0,
+                               k_sigma_resid=5.0, k_scaled_d=5.0,
+                               floor_sigma_resid=None, floor_scaled_d=3.0,
                                raw_cooks_d=False, diag_rows=None, it_outer=None):
         """
         Test-4: influence-based clipping with ratchet semantics.
 
-        Flags star-image pairs where scaled_D > cooks_d_thresh AND
-        sigma_resid > sigma_min that are not already influence-excluded.
+        Flags star-image pairs where sigma_resid > thresh_sr AND
+        scaled_D > thresh_sd that are not already influence-excluded.
+        Both thresholds are set adaptively from the observed distribution of
+        eligible detections using the same p50 + k*(p50-p16) scheme as
+        tests 1-3, clamped to theoretical null floors:
+
+            thresh_sr = max(p50_sr + k*(p50_sr - p16_sr), floor_sigma_resid)
+            thresh_sd = max(p50_sd + k*(p50_sd - p16_sd), floor_scaled_d)
+
+        sigma_resid is the Mahalanobis position residual sqrt(r^T Cs^{-1} r).
+        Under the null it follows chi(2), so the theoretical floor is
+        sqrt(chi2(2).ppf(0.99)) ≈ 3.03.
+
+        scaled_D = D * N_R / leverage normalises Cook's D so E[scaled_D] = 1
+        regardless of image density.  The theoretical null distribution of
+        scaled_D is not analytically clean; floor_scaled_d=3.0 is an
+        empirically calibrated default.
+
+        Thresholds are computed globally across all eligible detections (two-
+        pass: compute statistics, then apply flags) so that a single outlier
+        image does not bias the per-image thresholds.
+
         Newly flagged pairs are added to ``_img_data[img]["influence_excl"]``,
         a persistent boolean mask that _update_use_for_fit respects as a hard
         ceiling — flagged pairs are never re-admitted by tests 1-3.
-
-        The ratchet guarantees monotonic convergence: the influence_excl set
-        only grows, so the count of *new* flags must eventually reach zero.
-
-        Cook's D_k = (X_k^T Cs_k^{-1} resid_k)^T C_r_j (X_k^T Cs_k^{-1} resid_k) / N_R
-
-        Under the null, E[D_k] = leverage_k / N_R, where
-        leverage_k = tr(Cs_k^{-1} X_k C_r_j X_k^T).
-
-        Raw D_k is biased against sparse images: with few stars per image,
-        leverage_k is large so E[D_k] >> 1 even for well-fitting stars.
-        We therefore compare the null-normalised statistic:
-
-            scaled_D_k = D_k * N_R / leverage_k
-
-        Under the null E[scaled_D_k] = 1 regardless of image density, so
-        the threshold cooks_d_thresh has the same meaning for dense and sparse
-        images.  Combined with sigma_resid > sigma_min, this targets
-        detections whose influence is cooks_d_thresh times larger than
-        expected for a well-fitting star.
 
         Returns
         -------
         n_new : int
             Number of detections *newly* added to influence_excl.
         flagged_info : list of (img, sidx_flagged)
-            Per-image list of star indices (into self.*) that were newly flagged,
-            for use in caller-side diagnostics (star-type breakdown etc.).
+            Per-image list of star indices (into self.*) that were newly flagged.
+        thresh_sr, thresh_sd : float
+            Thresholds actually used (for logging).
         """
+        from scipy.stats import chi2 as chi2_dist
+
         nr = self.N_R
-        n_new = 0
-        flagged_info = []
+
+        # Theoretical floor for sigma_resid: sqrt(chi2(2).ppf(0.99))
+        if floor_sigma_resid is None:
+            floor_sigma_resid = float(np.sqrt(chi2_dist.ppf(0.99, df=2)))
+
+        # ── Pass 1: compute statistics per image, collect eligible values ─────
+        per_img = {}   # img -> (use, already_excl, sidx, sigma_resid, test_d, cooks_d, leverage)
+        all_sr  = []
+        all_sd  = []
 
         for j_idx, img in enumerate(self.image_names):
             d = self._img_data.get(img)
             if d is None:
                 continue
             use = np.asarray(d["use_for_fit"], dtype=bool)
-            n   = len(use)
             if use.sum() < 4:
                 continue
 
-            # Initialise influence_excl on first call
             if "influence_excl" not in d:
-                d["influence_excl"] = np.zeros(n, dtype=bool)
+                d["influence_excl"] = np.zeros(len(use), dtype=bool)
             already_excl = d["influence_excl"]
+            eligible = use & ~already_excl
 
             cs    = j_idx * nr
             r_j   = r_hat[cs:cs + nr]
@@ -2394,26 +2415,45 @@ class BP3MSolver:
             delta_r = XtCsR @ C_r_j
             cooks_d = np.sum(XtCsR * delta_r, axis=1) / nr
 
-            # Leverage: tr(Cs_inv_k @ X_k @ C_r_j @ X_k^T)  — (n,) scalar per star
-            XCrX     = np.einsum('nik,kl,njl->nij', X_mat, C_r_j, X_mat)  # (n,2,2)
-            leverage = np.einsum('nij,nji->n', Cs_inv, XCrX)               # (n,)
+            XCrX     = np.einsum('nik,kl,njl->nij', X_mat, C_r_j, X_mat)
+            leverage = np.einsum('nij,nji->n', Cs_inv, XCrX)
 
-            # Cook's D statistic to compare against threshold.
-            # Default: null-normalised scaled_D = D * N_R / leverage so that
-            # E[scaled_D] = 1 regardless of image density.
-            # raw_cooks_d=True: use raw D (biased against sparse images but
-            # matches the pre-normalisation behaviour for testing).
             if raw_cooks_d:
                 test_d = cooks_d
             else:
                 safe_lev = np.where(leverage > 1e-12, leverage, np.inf)
                 test_d   = cooks_d * nr / safe_lev
 
-            # Only consider pairs currently in use and not already excluded
+            per_img[img] = (use, already_excl, eligible, sidx, sigma_resid, test_d, cooks_d, leverage)
+
+            if eligible.any():
+                all_sr.extend(sigma_resid[eligible].tolist())
+                all_sd.extend(test_d[eligible].tolist())
+
+        # ── Adaptive thresholds from eligible population ───────────────────────
+        def _adapt(values, k, floor):
+            arr = np.array(values)
+            if len(arr) < 10:
+                return float(floor)
+            p16 = float(np.percentile(arr, 16))
+            p50 = float(np.median(arr))
+            return float(max(p50 + k * max(p50 - p16, 1e-6), floor))
+
+        thresh_sr = _adapt(all_sr, k_sigma_resid, floor_sigma_resid)
+        thresh_sd = _adapt(all_sd, k_scaled_d,    floor_scaled_d)
+
+        # ── Pass 2: apply flagging ─────────────────────────────────────────────
+        n_new = 0
+        flagged_info = []
+
+        for img, (use, already_excl, eligible, sidx,
+                  sigma_resid, test_d, cooks_d, leverage) in per_img.items():
+            d = self._img_data[img]
+
             new_flag = (use
                         & ~already_excl
-                        & (test_d > cooks_d_thresh)
-                        & (sigma_resid > sigma_min))
+                        & (sigma_resid > thresh_sr)
+                        & (test_d > thresh_sd))
 
             if diag_rows is not None:
                 _gaia_2p_arr = np.asarray(self.gaia_2p) if hasattr(self, 'gaia_2p') else None
@@ -2429,18 +2469,19 @@ class BP3MSolver:
                             'leverage': float(leverage[k]),
                             'test_d': float(test_d[k]),
                             'sigma_resid': float(sigma_resid[k]),
+                            'thresh_sr': thresh_sr,
+                            'thresh_sd': thresh_sd,
                             'flagged': bool(new_flag[k]),
                         })
 
             if new_flag.any():
-                # Guard: never drop below 4 stars per image
                 if (use & ~new_flag).sum() >= 4:
                     d["influence_excl"] = already_excl | new_flag
                     d["use_for_fit"]    = use & ~new_flag
                     n_new += int(new_flag.sum())
                     flagged_info.append((img, sidx[new_flag]))
 
-        return n_new, flagged_info
+        return n_new, flagged_info, thresh_sr, thresh_sd
 
     def compute_analytic_posteriors(self, r_hat, C_r, a_arr, K_img, C_vT):
         """Compute exactly marginalised per-star posteriors analytically.

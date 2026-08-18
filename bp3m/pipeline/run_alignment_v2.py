@@ -644,8 +644,9 @@ def run_alignment_v2(
     use_pair_prior: bool = False,
     inflate_alpha_max: float = 3.0,
     use_influence_clip: bool = True,
-    influence_d_thresh: float = 1.0,   # auto-scaled by V1/V2 C_r ratio at runtime
-    influence_sigma_min: float = 2.0,
+    influence_k: float = 5.0,
+    influence_floor_sr: float | None = None,
+    influence_floor_sd: float = 3.0,
     influence_raw_cooks_d: bool = False,
     diag_influence_path=None,
     verbose_tests: bool = False,
@@ -676,8 +677,9 @@ def run_alignment_v2(
     hst_max_per_image : per-image cap on HST-only source count
     outlier_sigma   : residual threshold (pixels) for soft-flagging HST-only dets
     use_influence_clip : enable test-4 Cook's D influence clipping
-    influence_d_thresh : Cook's D threshold
-    influence_sigma_min : minimum sigma_resid for influence flagging
+    influence_k        : adaptive multiplier k for sigma_resid and scaled_D thresholds (default 5.0)
+    influence_floor_sr : floor for sigma_resid threshold (None = theoretical chi(2) p99 ≈ 3.03)
+    influence_floor_sd : floor for scaled_D threshold (default 3.0)
     influence_raw_cooks_d : use raw Cook's D instead of null-normalised scaled_D
     verbose_tests : print per-iter breakdown of flagged dets by Gaia type (2p vs 5p/6p) and chip
     bp3m_dir      : override default bp3m location
@@ -781,31 +783,6 @@ def run_alignment_v2(
                 usecols=lambda c: c in _load_cols,
                 dtype={'Gaia_id': np.int64},
             )
-        # Load V1 C_r to estimate typical transformation uncertainty scale.
-        # V2 starts from V1's converged solution so its C_r is smaller than V1's
-        # early-iteration C_r.  We scale influence_d_thresh so that the effective
-        # absolute-shift threshold is the same as in V1.
-        _v1_cr_path = v1_bp3m_dir / "C_r.npy"
-        _v1_cr_scale: float = 1.0
-        if _v1_cr_path.exists() and influence_d_thresh == 3.0:
-            # Only auto-scale if the user hasn't overridden d_thresh manually
-            # (default 3.0 means "auto-scale from V1 C_r").
-            try:
-                _v1_cr = np.load(_v1_cr_path)
-                _n_r_per = _v1_cr.shape[0] // max(len(v1_abcd), 1)
-                # Typical Δα0 uncertainty = median sqrt(C_r[4,4])
-                _cr_dra0_vals = []
-                for _j in range(len(v1_abcd)):
-                    _cs = _j * _n_r_per
-                    _cr_j = _v1_cr[_cs:_cs+_n_r_per, _cs:_cs+_n_r_per]
-                    if _cr_j.shape[0] > 4:
-                        _cr_dra0_vals.append(float(np.sqrt(max(_cr_j[4, 4], 0.0))))
-                if _cr_dra0_vals:
-                    _v1_cr_scale = float(np.median(_cr_dra0_vals))
-                    print(f"  V1 C_r scale (median σ_Δα0): {_v1_cr_scale:.4e} mas  "
-                          f"→ influence_d_thresh auto-scaled to {_v1_cr_scale / 1e-3:.1f}×1e-3")
-            except Exception as _exc:
-                print(f"  Warning: could not load V1 C_r for d_thresh scaling: {_exc}")
     else:
         print(f"  Note: no v1 BP3M results found at {v1_xform_path}; "
               "using transformation.csv initialization.")
@@ -1256,51 +1233,6 @@ def run_alignment_v2(
                 traceback.print_exc()
             print()
 
-    # ── Scale influence_d_thresh by V1/V2 C_r ratio ──────────────────────────
-    # Cook's D = (X^T Cs^{-1} resid)^T C_r (X^T Cs^{-1} resid) / N_R.
-    # V1 starts from a rough transformation (large C_r); V2 starts from the
-    # converged V1 solution (small C_r).  The same D_thresh therefore removes
-    # different detections: V1 rarely exceeds D>1 because C_r is large, while
-    # V2 can exceed D>1 for perfectly fine detections.
-    # Fix: scale D_thresh so that the ABSOLUTE shift threshold (in pixels) is
-    # the same as V1's, i.e.  D_thresh_V2 = D_thresh × (C_r_V1 / C_r_V2).
-    _infl_d_thresh_scaled = influence_d_thresh
-    if v1_abcd and n_iter > 0:
-        v1_cr_path = data_root / field_name / "BP3M_results" / "C_r.npy"
-        if v1_cr_path.exists():
-            try:
-                _v1_cr = np.load(v1_cr_path)
-                _nr    = solver.N_R
-                _n_img = len(image_names)
-                # Median σ_Δα0 (sqrt of C_r[4,4] per image) as scale indicator
-                _v1_sigma_dra0 = float(np.median([
-                    np.sqrt(max(_v1_cr[j*_nr+4, j*_nr+4], 0.0))
-                    for j in range(min(_n_img, _v1_cr.shape[0] // _nr))
-                ]))
-                # One solve pass at V1 init to get current C_r
-                _r_init_for_cr = np.concatenate([
-                    solver._img_data[img]["r_init"] for img in image_names])
-                _, _C_r_v2, _, _, _ = solver._solve_one_pass(_r_init_for_cr)
-                _v2_sigma_dra0 = float(np.median([
-                    np.sqrt(max(_C_r_v2[j*_nr+4, j*_nr+4], 0.0))
-                    for j in range(_n_img)
-                ]))
-                if _v2_sigma_dra0 > 0 and _v1_sigma_dra0 > 0:
-                    # D = (X Cs^{-1} resid)^T C_r (X Cs^{-1} resid) / N_R.
-                    # Larger C_r → larger D for the same physical resid.
-                    # To apply the same physical shift threshold as V1 (D_thresh_V1 × σ_Δα0_V1),
-                    # V2 needs D_thresh_V2 = D_thresh_V1 × (σ_Δα0_V2 / σ_Δα0_V1).
-                    _cr_ratio = _v2_sigma_dra0 / _v1_sigma_dra0
-                    _infl_d_thresh_scaled = influence_d_thresh * _cr_ratio
-                    print(f"  Influence clipping: σ_Δα0(V1)={_v1_sigma_dra0:.4e}  "
-                          f"σ_Δα0(V2)={_v2_sigma_dra0:.4e}  "
-                          f"C_r ratio(V2/V1)={_cr_ratio:.2f}  "
-                          f"→ influence_d_thresh={_infl_d_thresh_scaled:.2f} "
-                          f"(base={influence_d_thresh:.1f})")
-            except Exception as _exc:
-                print(f"  Warning: C_r ratio scaling failed ({_exc}); "
-                      f"using influence_d_thresh={influence_d_thresh}")
-
     # ── Enable HST-only sources for n_iter=0 ─────────────────────────────────
     # When n_iter=0, Phase 2 outer iterations never run, so the V2AlignmentCallback
     # transition (which sets use_for_astrom=True and seeds v_survey PM) never fires.
@@ -1369,8 +1301,9 @@ def run_alignment_v2(
         hst_fit_sigma_mult=0.5,    # HST-only must have tighter residuals to stay in alignment
         prefilter=_run_solver_prefilter,
         use_influence_clip=use_influence_clip,
-        influence_d_thresh=_infl_d_thresh_scaled,
-        influence_sigma_min=influence_sigma_min,
+        influence_k=influence_k,
+        influence_floor_sr=influence_floor_sr,
+        influence_floor_sd=influence_floor_sd,
         influence_raw_cooks_d=influence_raw_cooks_d,
         verbose_tests=verbose_tests,
         use_two_tier=True,         # enables use_for_astrom tracking

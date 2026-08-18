@@ -80,10 +80,13 @@ def main():
                         help='Skip BP3M Phase-0 pre-filter pass')
     parser.add_argument('--no_influence_clip', action='store_true',
                         help="Disable test-4 Cook's D influence clipping")
-    parser.add_argument('--influence_d_thresh', type=float, default=1.0,
-                        help="Cook's D threshold for test-4 influence clipping")
-    parser.add_argument('--influence_sigma_min', type=float, default=2.0,
-                        help='Minimum sigma_resid for test-4 (default 2.0)')
+    parser.add_argument('--influence_k', type=float, default=5.0,
+                        help='Adaptive multiplier k for test-4 sigma_resid and scaled_D thresholds '
+                             '(thresh = max(p50 + k*(p50-p16), floor); default 5.0)')
+    parser.add_argument('--influence_floor_sr', type=float, default=None,
+                        help='Floor for sigma_resid threshold (default: theoretical chi(2) p99 ≈ 3.03)')
+    parser.add_argument('--influence_floor_sd', type=float, default=3.0,
+                        help='Floor for scaled_D threshold (default 3.0)')
     parser.add_argument('--diag_influence_path', type=str, default=None,
                         help='If set, write per-detection Cook\'s D diagnostics to this CSV path')
     parser.add_argument('--soft_weights', action='store_true',
@@ -177,8 +180,9 @@ def main():
         hst_pm_sigma_diffuse = args.hst_pm_sigma_diffuse,
         det_chi2_threshold   = args.det_chi2_threshold,
         use_influence_clip   = not args.no_influence_clip,
-        influence_d_thresh   = args.influence_d_thresh,
-        influence_sigma_min  = args.influence_sigma_min,
+        influence_k          = args.influence_k,
+        influence_floor_sr   = args.influence_floor_sr,
+        influence_floor_sd   = args.influence_floor_sd,
         diag_influence_path  = args.diag_influence_path,
         use_soft_weights              = args.soft_weights,
         student_t_nu                  = args.student_t_nu,
