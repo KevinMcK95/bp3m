@@ -287,11 +287,13 @@ def _parse_args():
     bp.add_argument('--inflate_alpha_max', type=float, default=3.0,
                     help='Per-iteration cap on the alpha error-inflation multiplier (default 3.0; '
                          'pre-2026-08-05 default was 10.0)')
-    bp.add_argument('--influence_d_thresh', type=float, default=2.0,
-                    help="Cook's D threshold for influence clipping (default 1.0)")
-    bp.add_argument('--influence_sigma_min', type=float, default=5.0,
-                    help='Minimum sigma_resid for influence clipping (default 2.0; '
-                         'prevents removing well-fit high-leverage anchors)')
+    bp.add_argument('--influence_k', type=float, default=5.0,
+                    help='Adaptive multiplier k for test-4 sigma_resid and scaled_D thresholds '
+                         '(thresh = max(p50 + k*(p50-p16), floor); default 5.0)')
+    bp.add_argument('--influence_floor_sr', type=float, default=None,
+                    help='Floor for sigma_resid threshold (default: theoretical chi(2) p99 ≈ 3.03)')
+    bp.add_argument('--influence_floor_sd', type=float, default=3.0,
+                    help='Floor for scaled_D threshold (default 3.0)')
     bp.add_argument('--influence_raw_cooks_d', action='store_true',
                     help='Use raw Cook\'s D instead of null-normalised scaled_D=D*N_R/leverage. '
                          'Raw D is biased against sparse images but matches pre-normalisation behaviour.')
@@ -1221,8 +1223,9 @@ def main():
                         prior_sigma_skew=args.prior_sigma_skew,
                         prior_sigma_pointing=args.prior_sigma_pointing,
                         inflate_alpha_max=args.inflate_alpha_max,
-                        influence_d_thresh=args.influence_d_thresh,
-                        influence_sigma_min=args.influence_sigma_min,
+                        influence_k=args.influence_k,
+                        influence_floor_sr=args.influence_floor_sr,
+                        influence_floor_sd=args.influence_floor_sd,
                         influence_raw_cooks_d=args.influence_raw_cooks_d,
                         verbose_tests=args.verbose_tests,
                         use_two_tier=args.two_tier,
@@ -1277,8 +1280,9 @@ def main():
                 prior_sigma_skew=args.prior_sigma_skew,
                 prior_sigma_pointing=args.prior_sigma_pointing,
                 inflate_alpha_max=args.inflate_alpha_max,
-                influence_d_thresh=args.influence_d_thresh,
-                influence_sigma_min=args.influence_sigma_min,
+                influence_k=args.influence_k,
+                influence_floor_sr=args.influence_floor_sr,
+                influence_floor_sd=args.influence_floor_sd,
                 influence_raw_cooks_d=args.influence_raw_cooks_d,
                 verbose_tests=args.verbose_tests,
                 use_two_tier=args.two_tier,
@@ -1341,8 +1345,9 @@ def main():
                 prior_sigma_skew=args.prior_sigma_skew,
                 prior_sigma_pointing=args.prior_sigma_pointing,
                 inflate_alpha_max=args.inflate_alpha_max,
-                influence_d_thresh=args.influence_d_thresh,
-                influence_sigma_min=args.influence_sigma_min,
+                influence_k=args.influence_k,
+                influence_floor_sr=args.influence_floor_sr,
+                influence_floor_sd=args.influence_floor_sd,
                 influence_raw_cooks_d=args.influence_raw_cooks_d,
                 verbose_tests=args.verbose_tests,
                 use_two_tier=args.two_tier,
