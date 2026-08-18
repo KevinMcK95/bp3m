@@ -644,8 +644,8 @@ def run_alignment_v2(
     use_pair_prior: bool = False,
     inflate_alpha_max: float = 3.0,
     use_influence_clip: bool = True,
-    influence_d_thresh: float = 2.0,   # auto-scaled by V1/V2 C_r ratio at runtime
-    influence_sigma_min: float = 5.0,
+    influence_d_thresh: float = 1.0,   # auto-scaled by V1/V2 C_r ratio at runtime
+    influence_sigma_min: float = 2.0,
     influence_raw_cooks_d: bool = False,
     verbose_tests: bool = False,
     hst_pm_sigma_diffuse: float = 100.0,
