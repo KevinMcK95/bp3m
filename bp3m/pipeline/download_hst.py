@@ -374,7 +374,7 @@ def search_mast(
             return filt_name in available_combos[inst_name]
 
         if 'instrument_name' in obs_df.columns and 'filters' in obs_df.columns:
-            mask_obs = obs_df.apply(_combo_ok, axis=1)
+            mask_obs = obs_df.apply(_combo_ok, axis=1).astype(bool)
             dropped = obs_df[~mask_obs]
             if not dropped.empty:
                 dropped_combos = sorted(set(
