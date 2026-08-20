@@ -1297,10 +1297,12 @@ def plot_delve_footprint(
     if obs_df is not None and len(obs_df) > 0:
         _guard_ra_lo = _guard_ra_hi = _guard_dec_lo = _guard_dec_hi = None
         if _boxes is not None:
+            _cen_ra   = (_boxes[0][0] if len(_boxes) == 1
+                         else sum(b[0] for b in _boxes) / len(_boxes))
+            _cen_dec  = (_boxes[0][1] if len(_boxes) == 1
+                         else sum(b[1] for b in _boxes) / len(_boxes))
             _span_ra  = max(b[0]+b[2]/2 for b in _boxes) - min(b[0]-b[2]/2 for b in _boxes)
             _span_dec = max(b[1]+b[3]/2 for b in _boxes) - min(b[1]-b[3]/2 for b in _boxes)
-            _cen_ra   = sum(b[0] for b in _boxes) / len(_boxes)
-            _cen_dec  = sum(b[1] for b in _boxes) / len(_boxes)
             _guard_ra_lo  = _cen_ra  - _span_ra  * 1.5
             _guard_ra_hi  = _cen_ra  + _span_ra  * 1.5
             _guard_dec_lo = _cen_dec - _span_dec * 1.5
@@ -1308,23 +1310,28 @@ def plot_delve_footprint(
 
         for _, row in obs_df.iterrows():
             filt  = str(row.get('filters', '')).strip().upper()
+            fid   = int(row.get('field_id', 0))
             color = _FILTER_COLORS.get(filt, _DEFAULT_COLOR)
             polys = _parse_polygons(str(row.get('s_region', '')))
+            if not polys:
+                continue
+            cx = np.mean(polys[0][:, 0])
+            cy = np.mean(polys[0][:, 1])
+            if (_guard_ra_lo is not None and
+                    not (_guard_ra_lo <= cx <= _guard_ra_hi
+                         and _guard_dec_lo <= cy <= _guard_dec_hi)):
+                continue
             for verts in polys:
-                if len(verts) < 3:
-                    continue
-                cra  = verts[:, 0].mean()
-                cdec = verts[:, 1].mean()
-                if (_guard_ra_lo is not None and
-                        not (_guard_ra_lo <= cra <= _guard_ra_hi
-                             and _guard_dec_lo <= cdec <= _guard_dec_hi)):
-                    continue
                 patch = plt.Polygon(verts, closed=True,
-                                    edgecolor=color, facecolor=color,
-                                    alpha=0.25, lw=1.0, zorder=3)
+                                    facecolor='none', edgecolor=color,
+                                    lw=1.5, zorder=3)
                 ax.add_patch(patch)
-                if filt not in filter_patches:
-                    filter_patches[filt] = mpatches.Patch(color=color, label=filt, alpha=0.6)
+            ax.text(cx, cy, str(fid), ha='center', va='center',
+                    fontsize=7, fontweight='bold', color=color, zorder=4,
+                    bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.6))
+            if filt not in filter_patches:
+                filter_patches[filt] = mpatches.Patch(
+                    facecolor='none', edgecolor=color, lw=1.5, label=filt)
 
     # ── Axis limits: same logic as plot_footprints (driven by HST footprints) ─
     pad_factor = 0.08
