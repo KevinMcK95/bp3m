@@ -804,6 +804,7 @@ def main():
             skip_mast_download=args.skip_mast_download,
             n_processes=args.n_processes,
             extra_pointings=_extra_pt,
+            delve_csv_path=delve_csv_path,
         )
 
     # Read manifest of selected obsids written by step 2 (persists across runs)

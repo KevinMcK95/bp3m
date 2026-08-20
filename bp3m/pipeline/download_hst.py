@@ -417,6 +417,7 @@ def download_hst_images(
     mast_refresh_days: int | None = 30,
     skip_mast_download: bool = False,
     extra_pointings: "list[tuple[float, float, float, float]] | None" = None,
+    delve_csv_path: 'str | Path | None' = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Search MAST for images of a field and download them.
@@ -648,6 +649,22 @@ def download_hst_images(
                         search_boxes=_search_boxes)
     except Exception as _e:
         print(f"  WARNING: footprint plot failed — {_e}")
+
+    if delve_csv_path is not None and Path(delve_csv_path).exists():
+        _delve_png = Path(output_dir) / field_name / "DELVE" / f"{field_name}_footprints.png"
+        try:
+            plot_delve_footprint(
+                delve_csv=delve_csv_path,
+                obs_df=obs_df,
+                save_path=_delve_png,
+                field_name=field_name,
+                ra=ra, dec=dec,
+                search_width=search_width,
+                search_height=search_height,
+                search_boxes=_search_boxes,
+            )
+        except Exception as _e:
+            print(f"  WARNING: DELVE footprint plot failed — {_e}")
 
     # Select which observations to download
     if field_ids == 'all':
@@ -1214,6 +1231,161 @@ def plot_footprints(
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Footprint plot saved: {save_path}")
+
+
+def plot_delve_footprint(
+    delve_csv: 'str | Path',
+    obs_df: pd.DataFrame,
+    save_path: 'str | Path',
+    field_name: str = '',
+    ra: float | None = None,
+    dec: float | None = None,
+    search_width: float | None = None,
+    search_height: float | None = None,
+    search_boxes: 'list[tuple[float,float,float,float]] | None' = None,
+) -> None:
+    """
+    Plot DELVE sources coloured by magnitude with HST footprints overlaid.
+
+    Axis limits are derived from the HST footprints in obs_df using the same
+    logic as plot_footprints, so the zoom level matches the HST field of view.
+    Saves a PNG to save_path (in the DELVE subdirectory).
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.collections import PatchCollection
+
+    delve_df = pd.read_csv(delve_csv)
+
+    # Pick best available magnitude column (prefer r, then g, i, z)
+    mag_col = next((c for c in ('r_mag', 'g_mag', 'i_mag', 'z_mag')
+                    if c in delve_df.columns and delve_df[c].notna().any()), None)
+    filter_label = mag_col.split('_')[0].upper() if mag_col else ''
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+
+    # ── DELVE sources coloured by magnitude ──────────────────────────────────
+    if mag_col:
+        mag = delve_df[mag_col].values
+        sc = ax.scatter(delve_df['ra'].values, delve_df['dec'].values,
+                        c=mag, cmap='plasma_r', vmin=17, vmax=24,
+                        s=2, alpha=0.5, rasterized=True, zorder=1)
+        cbar = plt.colorbar(sc, ax=ax, fraction=0.03, pad=0.01)
+        cbar.set_label(f'{filter_label}-band mag', fontsize=9)
+    else:
+        ax.scatter(delve_df['ra'].values, delve_df['dec'].values,
+                   s=2, alpha=0.5, color='steelblue', rasterized=True, zorder=1)
+
+    # ── Normalise search boxes ────────────────────────────────────────────────
+    _boxes: 'list[tuple[float,float,float,float]] | None' = None
+    if search_boxes is not None and len(search_boxes) > 0:
+        _boxes = list(search_boxes)
+    elif ra is not None and dec is not None and search_width and search_height:
+        _boxes = [(ra, dec, search_width, search_height)]
+
+    if _boxes is not None:
+        for _bi, (_bra, _bdec, _bsw, _bsh) in enumerate(_boxes):
+            _rect_ra  = [_bra - _bsw/2, _bra + _bsw/2,
+                         _bra + _bsw/2, _bra - _bsw/2, _bra - _bsw/2]
+            _rect_dec = [_bdec - _bsh/2, _bdec - _bsh/2,
+                         _bdec + _bsh/2, _bdec + _bsh/2, _bdec - _bsh/2]
+            ax.plot(_rect_ra, _rect_dec, 'k--', lw=1.0, alpha=0.6, zorder=2,
+                    label='Search box' if _bi == 0 else None)
+
+    # ── HST footprints overlaid for reference ─────────────────────────────────
+    filter_patches: dict[str, mpatches.Patch] = {}
+    if obs_df is not None and len(obs_df) > 0:
+        _guard_ra_lo = _guard_ra_hi = _guard_dec_lo = _guard_dec_hi = None
+        if _boxes is not None:
+            _span_ra  = max(b[0]+b[2]/2 for b in _boxes) - min(b[0]-b[2]/2 for b in _boxes)
+            _span_dec = max(b[1]+b[3]/2 for b in _boxes) - min(b[1]-b[3]/2 for b in _boxes)
+            _cen_ra   = sum(b[0] for b in _boxes) / len(_boxes)
+            _cen_dec  = sum(b[1] for b in _boxes) / len(_boxes)
+            _guard_ra_lo  = _cen_ra  - _span_ra  * 1.5
+            _guard_ra_hi  = _cen_ra  + _span_ra  * 1.5
+            _guard_dec_lo = _cen_dec - _span_dec * 1.5
+            _guard_dec_hi = _cen_dec + _span_dec * 1.5
+
+        for _, row in obs_df.iterrows():
+            filt  = str(row.get('filters', '')).strip().upper()
+            color = _FILTER_COLORS.get(filt, _DEFAULT_COLOR)
+            polys = _parse_polygons(str(row.get('s_region', '')))
+            for verts in polys:
+                if len(verts) < 3:
+                    continue
+                cra  = verts[:, 0].mean()
+                cdec = verts[:, 1].mean()
+                if (_guard_ra_lo is not None and
+                        not (_guard_ra_lo <= cra <= _guard_ra_hi
+                             and _guard_dec_lo <= cdec <= _guard_dec_hi)):
+                    continue
+                patch = plt.Polygon(verts, closed=True,
+                                    edgecolor=color, facecolor=color,
+                                    alpha=0.25, lw=1.0, zorder=3)
+                ax.add_patch(patch)
+                if filt not in filter_patches:
+                    filter_patches[filt] = mpatches.Patch(color=color, label=filt, alpha=0.6)
+
+    # ── Axis limits: same logic as plot_footprints (driven by HST footprints) ─
+    pad_factor = 0.08
+    if _boxes is not None:
+        cut_ra_lo  = min(b[0] - b[2]/2 for b in _boxes)
+        cut_ra_hi  = max(b[0] + b[2]/2 for b in _boxes)
+        cut_dec_lo = min(b[1] - b[3]/2 for b in _boxes)
+        cut_dec_hi = max(b[1] + b[3]/2 for b in _boxes)
+
+        all_ra, all_dec = [], []
+        if obs_df is not None:
+            for _, row in obs_df.iterrows():
+                bbox = _footprint_bbox(str(row.get('s_region', '')))
+                if not bbox:
+                    continue
+                cra  = (bbox[0] + bbox[1]) / 2
+                cdec = (bbox[2] + bbox[3]) / 2
+                if cut_ra_lo <= cra <= cut_ra_hi and cut_dec_lo <= cdec <= cut_dec_hi:
+                    all_ra  += [bbox[0], bbox[1]]
+                    all_dec += [bbox[2], bbox[3]]
+
+        if all_ra:
+            span_ra  = max(all_ra)  - min(all_ra)
+            span_dec = max(all_dec) - min(all_dec)
+            ra_lo  = max(cut_ra_lo,  min(all_ra)  - span_ra  * pad_factor)
+            ra_hi  = min(cut_ra_hi,  max(all_ra)  + span_ra  * pad_factor)
+            dec_lo = max(cut_dec_lo, min(all_dec) - span_dec * pad_factor)
+            dec_hi = min(cut_dec_hi, max(all_dec) + span_dec * pad_factor)
+        else:
+            ra_lo, ra_hi   = cut_ra_lo, cut_ra_hi
+            dec_lo, dec_hi = cut_dec_lo, cut_dec_hi
+        center_dec = (dec_lo + dec_hi) / 2
+    else:
+        margin = 0.05
+        ra_lo  = delve_df['ra'].min()  - margin
+        ra_hi  = delve_df['ra'].max()  + margin
+        dec_lo = delve_df['dec'].min() - margin
+        dec_hi = delve_df['dec'].max() + margin
+        center_dec = (dec_lo + dec_hi) / 2
+
+    ax.set_xlim(ra_hi, ra_lo)   # RA right-to-left
+    ax.set_ylim(dec_lo, dec_hi)
+    ax.set_aspect(1.0 / np.cos(np.deg2rad(center_dec)), adjustable='box')
+
+    # ── Legend, labels ────────────────────────────────────────────────────────
+    legend_handles = list(filter_patches.values())
+    if legend_handles:
+        ax.legend(handles=legend_handles, title='HST filter',
+                  fontsize=8, title_fontsize=8, loc='best', framealpha=0.8)
+
+    ax.set_xlabel('R.A. (deg)')
+    ax.set_ylabel('Dec. (deg)')
+    n_delve = len(delve_df)
+    title = (f'{field_name} — DELVE sources ({n_delve:,}) + HST footprints'
+             if field_name else f'DELVE sources ({n_delve:,})')
+    ax.set_title(title, fontsize=12)
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  DELVE footprint plot saved: {save_path}")
 
 
 def _parse_polygons(s_region: str) -> list[np.ndarray]:
