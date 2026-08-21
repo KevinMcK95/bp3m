@@ -503,7 +503,7 @@ def download_gaia(
     n_total = len(args)
     area = search_width * search_height * abs(np.cos(np.deg2rad(dec)))
     print(f"  Total query bins: {n_total}  (full area {area:.4f} deg²)")
-    args = [(*a[:6], i+1, n_total, a[8]) for i, a in enumerate(args)]
+    args = [(*a[:6], i+1, n_total, a[8], a[9]) for i, a in enumerate(args)]
 
     if n_total > 1 and n_processes > 1:
         workers = min(n_total, 20, n_processes * 2)
