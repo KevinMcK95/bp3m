@@ -177,18 +177,31 @@ def _mag_bins(min_mag, max_mag, area):
         log10(1.0), log10(1.0 + max_mag - min_mag), num=int(n))
 
 
-def _dec_strips(dec, height, max_strip_deg):
-    """Split a dec range into strips of at most max_strip_deg height.
+def _sky_patches(ra, dec, width, height, patch_size_deg):
+    """Split a sky region into approximately square patches.
 
-    Returns list of (strip_center_dec, strip_height) tuples that together
-    cover [dec - height/2, dec + height/2] with no gaps or overlaps.
+    Each patch is patch_size_deg on a side in sky coordinates:
+      - dec height  = patch_size_deg
+      - RA width    = patch_size_deg / cos(strip_dec)  [degrees of RA]
+
+    Returns list of (patch_ra, patch_dec, patch_width, patch_height).
     """
-    n_strips = max(1, int(np.ceil(height / max_strip_deg)))
-    edges = np.linspace(dec - height / 2, dec + height / 2, n_strips + 1)
-    return [
-        (0.5 * (edges[i] + edges[i + 1]), float(edges[i + 1] - edges[i]))
-        for i in range(n_strips)
-    ]
+    n_dec = max(1, int(np.ceil(height / patch_size_deg)))
+    dec_edges = np.linspace(dec - height / 2, dec + height / 2, n_dec + 1)
+
+    patches = []
+    for i in range(n_dec):
+        s_dec    = 0.5 * (dec_edges[i] + dec_edges[i + 1])
+        s_height = float(dec_edges[i + 1] - dec_edges[i])
+        ra_patch = patch_size_deg / max(np.cos(np.deg2rad(s_dec)), 0.017)
+        n_ra     = max(1, int(np.ceil(width / ra_patch)))
+        ra_edges = np.linspace(ra - width / 2, ra + width / 2, n_ra + 1)
+        for j in range(n_ra):
+            s_ra    = 0.5 * (ra_edges[j] + ra_edges[j + 1])
+            s_width = float(ra_edges[j + 1] - ra_edges[j])
+            patches.append((s_ra, s_dec, s_width, s_height))
+
+    return patches
 
 
 _QUERY_TIMEOUT = 300   # seconds per attempt
@@ -433,37 +446,40 @@ def download_gaia(
     ind_dir = gaia_dir / "individual_queries"
     ind_dir.mkdir(exist_ok=True)
 
-    # Build the list of (strip_center_dec, strip_height) pairs.
+    # Build patch list: one patch covers the full field; more when splitting.
     if max_spatial_strip_deg is not None:
-        strips = _dec_strips(dec, search_height, max_spatial_strip_deg)
+        patches = _sky_patches(ra, dec, search_width, search_height,
+                               max_spatial_strip_deg)
     else:
-        strips = [(dec, search_height)]
+        patches = [(ra, dec, search_width, search_height)]
 
-    n_strips = len(strips)
-    if n_strips > 1:
-        print(f"  Dec strips: {n_strips}  "
-              f"(max {max_spatial_strip_deg:.2f} deg each)")
+    n_patches = len(patches)
+    if n_patches > 1:
+        print(f"  Sky patches: {n_patches}  "
+              f"(~{max_spatial_strip_deg:.2f} deg squares)")
 
-    # Build the full work list: one entry per (strip, mag-bin) combination.
+    # Build the full work list: one entry per (patch, mag-bin) combination.
     args = []
-    for s_idx, (s_dec, s_height) in enumerate(strips):
-        s_area = search_width * s_height * abs(np.cos(np.deg2rad(s_dec)))
-        s_bins = _mag_bins(min_gmag, _max_gmag, s_area)
-        s_query = _build_query(source_table, ra, s_dec, search_width, s_height)
-        if n_strips > 1:
-            # cache key encodes strip bounds so different strip sizes don't collide
-            s_lo = s_dec - s_height / 2
-            s_hi = s_dec + s_height / 2
-            cache_key = f"{field_name}_declo{s_lo:+.6f}_dechi{s_hi:+.6f}"
-            label = f"strip {s_idx+1}/{n_strips}"
+    for p_idx, (p_ra, p_dec, p_w, p_h) in enumerate(patches):
+        p_area = p_w * p_h * abs(np.cos(np.deg2rad(p_dec)))
+        p_bins = _mag_bins(min_gmag, _max_gmag, p_area)
+        p_query = _build_query(source_table, p_ra, p_dec, p_w, p_h)
+        if n_patches > 1:
+            # cache key encodes patch bounds so resizing patches invalidates cache
+            ra_lo  = p_ra  - p_w / 2;  ra_hi  = p_ra  + p_w / 2
+            dec_lo = p_dec - p_h / 2;  dec_hi = p_dec + p_h / 2
+            cache_key = (f"{field_name}"
+                         f"_ralo{ra_lo:+.5f}_rahi{ra_hi:+.5f}"
+                         f"_declo{dec_lo:+.5f}_dechi{dec_hi:+.5f}")
+            label = f"patch {p_idx+1}/{n_patches}"
         else:
             cache_key = field_name
             label = ""
-        for b_idx in range(len(s_bins) - 1):
-            args.append((s_query, s_bins[b_idx+1], s_bins[b_idx],
+        for b_idx in range(len(p_bins) - 1):
+            args.append((p_query, p_bins[b_idx+1], p_bins[b_idx],
                          ind_dir, cache_key, label, None, None, query_timeout))
 
-    # Renumber bins for display now that total count is known.
+    # Renumber for display now that total count is known.
     n_total = len(args)
     area = search_width * search_height * abs(np.cos(np.deg2rad(dec)))
     print(f"  Total query bins: {n_total}  (full area {area:.4f} deg²)")
