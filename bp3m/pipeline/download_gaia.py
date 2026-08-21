@@ -544,11 +544,6 @@ def download_gaia(
     df.to_csv(out_path, index=False)
     meta_path.write_text(json.dumps(current_meta, indent=2))
 
-    # Individual bin files are now redundant — the merged CSV is the source of truth
-    for f in ind_dir.glob("*.csv"):
-        f.unlink()
-    ind_dir.rmdir()
-
     n_clean = df['clean_label'].sum()
     print(f"  Stars after quality filter: {n_clean} / {len(df)}")
     print(f"  Saved: {out_path}")
