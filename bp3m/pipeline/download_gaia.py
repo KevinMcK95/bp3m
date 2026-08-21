@@ -177,6 +177,20 @@ def _mag_bins(min_mag, max_mag, area):
         log10(1.0), log10(1.0 + max_mag - min_mag), num=int(n))
 
 
+def _dec_strips(dec, height, max_strip_deg):
+    """Split a dec range into strips of at most max_strip_deg height.
+
+    Returns list of (strip_center_dec, strip_height) tuples that together
+    cover [dec - height/2, dec + height/2] with no gaps or overlaps.
+    """
+    n_strips = max(1, int(np.ceil(height / max_strip_deg)))
+    edges = np.linspace(dec - height / 2, dec + height / 2, n_strips + 1)
+    return [
+        (0.5 * (edges[i] + edges[i + 1]), float(edges[i + 1] - edges[i]))
+        for i in range(n_strips)
+    ]
+
+
 _QUERY_TIMEOUT = 300   # seconds per attempt
 _QUERY_RETRIES = 3
 
@@ -194,22 +208,23 @@ def _submit_gaia_async(full_q: str) -> pd.DataFrame:
 
 
 def _query_mag_bin(args):
-    """Worker: launch one Gaia TAP query for a magnitude slice."""
+    """Worker: launch one Gaia TAP query for a spatial+magnitude slice."""
     import concurrent.futures
     import time
 
-    query, min_g, max_g, ind_dir, field, n, n_total, timeout = args
+    query, min_g, max_g, ind_dir, cache_key, label, n, n_total, timeout = args
     full_q = (query +
               f" AND (phot_g_mean_mag > {min_g:.4f})"
               f" AND (phot_g_mean_mag <= {max_g:.4f})")
 
     cache_path = None
     if ind_dir is not None:
-        cache_path = Path(ind_dir) / f"{field}_G_{min_g:.4f}_{max_g:.4f}.csv"
+        cache_path = Path(ind_dir) / f"{cache_key}_G_{min_g:.4f}_{max_g:.4f}.csv"
         if cache_path.exists():
             return pd.read_csv(cache_path)
 
-    print(f"  Bin {n}/{n_total}: querying G {min_g:.2f}–{max_g:.2f} ...", flush=True)
+    print(f"  Bin {n}/{n_total}: querying {label} G {min_g:.2f}–{max_g:.2f} ...",
+          flush=True)
     print(f"  ADQL: {full_q}", flush=True)
     last_exc = None
     for attempt in range(_QUERY_RETRIES):
@@ -219,7 +234,8 @@ def _query_mag_bin(args):
                 result = future.result(timeout=timeout)
             if cache_path is not None:
                 result.to_csv(cache_path, index=False)
-            print(f"  Bin {n}/{n_total}: {len(result)} stars  (G {min_g:.2f}–{max_g:.2f})")
+            print(f"  Bin {n}/{n_total}: {len(result)} stars  "
+                  f"({label} G {min_g:.2f}–{max_g:.2f})")
             return result
         except concurrent.futures.TimeoutError:
             last_exc = TimeoutError(
@@ -238,7 +254,7 @@ def _query_mag_bin(args):
                       f"retrying in {wait}s ...", flush=True)
                 time.sleep(wait)
     raise RuntimeError(
-        f"Gaia query for bin {n}/{n_total} (G {min_g:.2f}–{max_g:.2f}) "
+        f"Gaia query for bin {n}/{n_total} ({label} G {min_g:.2f}–{max_g:.2f}) "
         f"failed after {_QUERY_RETRIES} attempts: {last_exc}"
     ) from last_exc
 
@@ -330,6 +346,7 @@ def download_gaia(
     query_timeout: int = 300,
     force_redownload: bool = False,
     quiet: bool = False,
+    max_spatial_strip_deg: float | None = None,
 ) -> pd.DataFrame:
     """
     Download and quality-filter Gaia stars in a rectangular sky region.
@@ -338,6 +355,11 @@ def download_gaia(
     encodes the query geometry and magnitude limits; a JSON sidecar records all
     parameters so cache validity can be checked on subsequent runs.  Pass
     ``force_redownload=True`` to re-query the archive regardless.
+
+    When ``max_spatial_strip_deg`` is set the dec range is subdivided into
+    strips of at most that height before querying, which avoids TAP timeouts
+    for dense or wide fields.  Each strip+magnitude-bin combination is cached
+    independently under ``individual_queries/``.
 
     Individual magnitude-bin query results are always cached under
     ``{gaia_dir}/individual_queries/`` to speed up re-runs.
@@ -411,19 +433,44 @@ def download_gaia(
     ind_dir = gaia_dir / "individual_queries"
     ind_dir.mkdir(exist_ok=True)
 
-    area  = search_width * search_height * abs(np.cos(np.deg2rad(dec)))
-    bins  = _mag_bins(min_gmag, _max_gmag, area)
-    n_bins = len(bins) - 1
+    # Build the list of (strip_center_dec, strip_height) pairs.
+    if max_spatial_strip_deg is not None:
+        strips = _dec_strips(dec, search_height, max_spatial_strip_deg)
+    else:
+        strips = [(dec, search_height)]
 
-    print(f"  Magnitude bins: {n_bins}  (area {area:.4f} deg²)")
+    n_strips = len(strips)
+    if n_strips > 1:
+        print(f"  Dec strips: {n_strips}  "
+              f"(max {max_spatial_strip_deg:.2f} deg each)")
 
-    args = [
-        (query, bins[i+1], bins[i], ind_dir, field_name, i+1, n_bins, query_timeout)
-        for i in range(n_bins)
-    ]
+    # Build the full work list: one entry per (strip, mag-bin) combination.
+    args = []
+    for s_idx, (s_dec, s_height) in enumerate(strips):
+        s_area = search_width * s_height * abs(np.cos(np.deg2rad(s_dec)))
+        s_bins = _mag_bins(min_gmag, _max_gmag, s_area)
+        s_query = _build_query(source_table, ra, s_dec, search_width, s_height)
+        if n_strips > 1:
+            # cache key encodes strip bounds so different strip sizes don't collide
+            s_lo = s_dec - s_height / 2
+            s_hi = s_dec + s_height / 2
+            cache_key = f"{field_name}_declo{s_lo:+.6f}_dechi{s_hi:+.6f}"
+            label = f"strip {s_idx+1}/{n_strips}"
+        else:
+            cache_key = field_name
+            label = ""
+        for b_idx in range(len(s_bins) - 1):
+            args.append((s_query, s_bins[b_idx+1], s_bins[b_idx],
+                         ind_dir, cache_key, label, None, None, query_timeout))
 
-    if n_bins > 1 and n_processes > 1:
-        workers = min(n_bins, 20, n_processes * 2)
+    # Renumber bins for display now that total count is known.
+    n_total = len(args)
+    area = search_width * search_height * abs(np.cos(np.deg2rad(dec)))
+    print(f"  Total query bins: {n_total}  (full area {area:.4f} deg²)")
+    args = [(*a[:6], i+1, n_total, a[8]) for i, a in enumerate(args)]
+
+    if n_total > 1 and n_processes > 1:
+        workers = min(n_total, 20, n_processes * 2)
         with Pool(workers) as pool:
             chunks = pool.map(_query_mag_bin, args)
     else:
