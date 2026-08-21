@@ -208,13 +208,31 @@ _QUERY_TIMEOUT = 300   # seconds per attempt
 _QUERY_RETRIES = 3
 
 
-def _submit_gaia_async(full_q: str) -> pd.DataFrame:
+def _make_gaia_client(gaia_tap_server: str | None):
+    """Return a Gaia TAP client for the given server URL.
+
+    Known servers:
+      ESA (default) : https://gea.esac.esa.int/   context: tap-server
+      ARI Heidelberg: https://gaia.ari.uni-heidelberg.de/  context: tap
+    """
+    from astroquery.gaia import Gaia, GaiaClass
+    if gaia_tap_server is None:
+        return Gaia
+    if 'ari.uni-heidelberg' in gaia_tap_server:
+        return GaiaClass(gaia_tap_server=gaia_tap_server,
+                         tap_server_context='tap',
+                         show_server_messages=False)
+    return GaiaClass(gaia_tap_server=gaia_tap_server,
+                     show_server_messages=False)
+
+
+def _submit_gaia_async(full_q: str, gaia_tap_server: str | None = None) -> pd.DataFrame:
     """Submit one Gaia TAP async job and return the result as a DataFrame."""
-    from astroquery.gaia import Gaia
-    job = Gaia.launch_job_async(full_q)
+    client = _make_gaia_client(gaia_tap_server)
+    job = client.launch_job_async(full_q)
     result = job.get_results().to_pandas()
     try:
-        Gaia.remove_jobs([job.jobid])
+        client.remove_jobs([job.jobid])
     except Exception:
         pass
     return result
@@ -225,7 +243,7 @@ def _query_mag_bin(args):
     import concurrent.futures
     import time
 
-    query, min_g, max_g, ind_dir, cache_key, label, n, n_total, timeout = args
+    query, min_g, max_g, ind_dir, cache_key, label, n, n_total, timeout, gaia_tap_server = args
     full_q = (query +
               f" AND (phot_g_mean_mag > {min_g:.4f})"
               f" AND (phot_g_mean_mag <= {max_g:.4f})")
@@ -243,7 +261,7 @@ def _query_mag_bin(args):
     for attempt in range(_QUERY_RETRIES):
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
-                future = exe.submit(_submit_gaia_async, full_q)
+                future = exe.submit(_submit_gaia_async, full_q, gaia_tap_server)
                 result = future.result(timeout=timeout)
             if cache_path is not None:
                 result.to_csv(cache_path, index=False)
@@ -360,6 +378,7 @@ def download_gaia(
     force_redownload: bool = False,
     quiet: bool = False,
     max_spatial_strip_deg: float | None = None,
+    gaia_tap_server: str | None = None,
 ) -> pd.DataFrame:
     """
     Download and quality-filter Gaia stars in a rectangular sky region.
@@ -477,7 +496,8 @@ def download_gaia(
             label = ""
         for b_idx in range(len(p_bins) - 1):
             args.append((p_query, p_bins[b_idx+1], p_bins[b_idx],
-                         ind_dir, cache_key, label, None, None, query_timeout))
+                         ind_dir, cache_key, label, None, None, query_timeout,
+                         gaia_tap_server))
 
     # Renumber for display now that total count is known.
     n_total = len(args)
