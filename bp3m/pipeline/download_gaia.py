@@ -544,6 +544,9 @@ def download_gaia(
     df.to_csv(out_path, index=False)
     meta_path.write_text(json.dumps(current_meta, indent=2))
 
+    import shutil as _shutil
+    _shutil.rmtree(ind_dir, ignore_errors=True)
+
     n_clean = df['clean_label'].sum()
     print(f"  Stars after quality filter: {n_clean} / {len(df)}")
     print(f"  Saved: {out_path}")
