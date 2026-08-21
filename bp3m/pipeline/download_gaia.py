@@ -554,10 +554,12 @@ def download_gaia(
 
     download_gaia_qso_candidates(ra, dec, search_width, search_height,
                                   output_dir, field_name,
-                                  force_redownload=force_redownload)
+                                  force_redownload=force_redownload,
+                                  gaia_tap_server=gaia_tap_server)
     download_gaia_galaxy_candidates(ra, dec, search_width, search_height,
                                      output_dir, field_name,
-                                     force_redownload=force_redownload)
+                                     force_redownload=force_redownload,
+                                     gaia_tap_server=gaia_tap_server)
     return df
 
 
@@ -569,6 +571,7 @@ def download_gaia_qso_candidates(
     output_dir: Path,
     field_name: str,
     force_redownload: bool = False,
+    gaia_tap_server: str | None = None,
 ) -> pd.DataFrame | None:
     """Download Gaia DR3 qso_candidates for the same sky region.
 
@@ -617,11 +620,18 @@ def download_gaia_qso_candidates(
 
     print(f"\n[Gaia] Downloading qso_candidates for {field_name}...")
     try:
-        from astroquery.gaia import Gaia
-        job = Gaia.launch_job_async(query)
+        client = _make_gaia_client(gaia_tap_server)
+        job = client.launch_job_async(query)
         result = job.get_results().to_pandas()
         try:
-            Gaia.remove_jobs([job.jobid])
+            import io as _io
+            _dev_null = _io.StringIO()
+            _orig_stdout, _orig_stderr = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = _dev_null
+            try:
+                client.remove_jobs([job.jobid])
+            finally:
+                sys.stdout, sys.stderr = _orig_stdout, _orig_stderr
         except Exception:
             pass
         result = _add_secular_aberration(result)
@@ -651,6 +661,7 @@ def download_gaia_galaxy_candidates(
     output_dir: Path,
     field_name: str,
     force_redownload: bool = False,
+    gaia_tap_server: str | None = None,
 ) -> "pd.DataFrame | None":
     """Download Gaia DR3 galaxy_candidates for the same sky region.
 
@@ -700,11 +711,18 @@ def download_gaia_galaxy_candidates(
 
     print(f"\n[Gaia] Downloading galaxy_candidates for {field_name}...")
     try:
-        from astroquery.gaia import Gaia
-        job = Gaia.launch_job_async(query)
+        client = _make_gaia_client(gaia_tap_server)
+        job = client.launch_job_async(query)
         result = job.get_results().to_pandas()
         try:
-            Gaia.remove_jobs([job.jobid])
+            import io as _io
+            _dev_null = _io.StringIO()
+            _orig_stdout, _orig_stderr = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = _dev_null
+            try:
+                client.remove_jobs([job.jobid])
+            finally:
+                sys.stdout, sys.stderr = _orig_stdout, _orig_stderr
         except Exception:
             pass
         result = _add_secular_aberration(result)
