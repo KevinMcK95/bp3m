@@ -208,22 +208,28 @@ _QUERY_TIMEOUT = 300   # seconds per attempt
 _QUERY_RETRIES = 3
 
 
-def _make_gaia_client(gaia_tap_server: str | None):
-    """Return a Gaia TAP client for the given server URL.
+# Full TAP service URLs for known Gaia mirrors.
+# GaiaClass wraps TapPlus and appends its own server_context, so for non-ESA
+# mirrors we bypass GaiaClass and use TapPlus directly with the complete URL.
+_GAIA_TAP_URLS = {
+    'https://gea.esac.esa.int/':              None,   # use default GaiaClass
+    'https://gaia.ari.uni-heidelberg.de/':    'https://gaia.ari.uni-heidelberg.de/tap',
+}
 
-    Known servers:
-      ESA (default) : https://gea.esac.esa.int/   context: tap-server
-      ARI Heidelberg: https://gaia.ari.uni-heidelberg.de/  context: tap
-    """
-    from astroquery.gaia import Gaia, GaiaClass
+
+def _make_gaia_client(gaia_tap_server: str | None):
+    """Return a Gaia TAP client for the given server URL."""
+    from astroquery.gaia import Gaia
     if gaia_tap_server is None:
         return Gaia
-    if 'ari.uni-heidelberg' in gaia_tap_server:
+    tap_url = _GAIA_TAP_URLS.get(gaia_tap_server)
+    if tap_url is None:
+        # Unrecognised URL — fall back to GaiaClass with the URL as-is
+        from astroquery.gaia import GaiaClass
         return GaiaClass(gaia_tap_server=gaia_tap_server,
-                         tap_server_context='tap',
                          show_server_messages=False)
-    return GaiaClass(gaia_tap_server=gaia_tap_server,
-                     show_server_messages=False)
+    from astroquery.utils.tap.core import TapPlus
+    return TapPlus(url=tap_url)
 
 
 def _submit_gaia_async(full_q: str, gaia_tap_server: str | None = None) -> pd.DataFrame:
