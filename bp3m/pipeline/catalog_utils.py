@@ -70,11 +70,14 @@ def clean_photometry(gmag, corrected_flux_excess_factor, sigma=3.0):
     def _sigma_C(g, s):
         return s * (0.0059898 + 8.817481e-12 * g**7.618399)
 
-    nodes = np.linspace(gmag.min() - 0.1, gmag.max() + 0.1, 100)
+    finite = np.isfinite(gmag) & np.isfinite(cfe)
+    nodes = np.linspace(np.nanmin(gmag) - 0.1, np.nanmax(gmag) + 0.1, 100)
     up   = list(zip(nodes, _sigma_C(nodes,  sigma)))
     down = list(zip(nodes[::-1], _sigma_C(nodes, -sigma)[::-1]))
     path = MPath(up + down, closed=True)
-    return path.contains_points(np.column_stack([gmag, cfe]))
+    result = np.zeros(len(gmag), dtype=bool)
+    result[finite] = path.contains_points(np.column_stack([gmag[finite], cfe[finite]]))
+    return result
 
 
 def apply_quality_flags(df, sigma_flux_excess=3.0, use_5p=False):
