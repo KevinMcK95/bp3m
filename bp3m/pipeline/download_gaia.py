@@ -238,7 +238,14 @@ def _submit_gaia_async(full_q: str, gaia_tap_server: str | None = None) -> pd.Da
     job = client.launch_job_async(full_q)
     result = job.get_results().to_pandas()
     try:
-        client.remove_jobs([job.jobid])
+        import io as _io
+        _dev_null = _io.StringIO()
+        _orig_stdout, _orig_stderr = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = _dev_null
+        try:
+            client.remove_jobs([job.jobid])
+        finally:
+            sys.stdout, sys.stderr = _orig_stdout, _orig_stderr
     except Exception:
         pass
     return result
