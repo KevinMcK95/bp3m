@@ -358,12 +358,19 @@ def _check_cache(csv_path: Path, meta_path: Path,
     except Exception as e:
         return False, [f"could not read sidecar: {e}"]
 
+    _FLOAT_KEYS = {"ra", "dec", "search_width", "search_height",
+                   "min_gmag", "max_gmag", "sigma_flux_excess"}
+    _FLOAT_TOL  = 1e-4  # 4th decimal place in degrees (~0.36 arcsec)
+
     diffs = []
     for key, cur_val in current_meta.items():
         if key == "adql":
             continue  # checked separately below (verbose)
         saved_val = saved.get(key, "<missing>")
-        if saved_val != cur_val:
+        if key in _FLOAT_KEYS and isinstance(saved_val, (int, float)):
+            if abs(float(saved_val) - float(cur_val)) > _FLOAT_TOL:
+                diffs.append(f"  {key}: saved={saved_val!r}  current={cur_val!r}")
+        elif saved_val != cur_val:
             diffs.append(f"  {key}: saved={saved_val!r}  current={cur_val!r}")
 
     if saved.get("adql") != current_meta["adql"]:
