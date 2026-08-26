@@ -1,0 +1,139 @@
+#!/usr/bin/env python
+"""
+Set up a new LSST field end to end: download, lay out, and optionally analyse.
+
+    python -m ground_to_gaia_xmatch.scripts.new_field \
+        --name Sculptor_dSph --ra 15.021 --dec -33.6815 --radius 0.75 --run
+
+Does, in order:
+  1. dp2.Source in the cone            -> table_dp2.<name>-data.tbl
+  2. dp2.VisitDetector over 2x the cone -> table_dp2.<name>-VisitDetector.tbl
+  3. Gaia over the same footprint      -> Gaia/<name>_ra..._gaia.csv
+  4. with --run: cross-match, per-image alignment, and diagnostics
+
+Needs an RSP token for steps 1-2 (see download_lsst).  Step 3 needs no
+credentials.
+
+The Gaia box is sized from the footprint the LSST data actually covers, not from
+the requested radius, so it always contains the detectors that came back.  Note
+download_gaia nests its output under a <field_name>/ subdirectory, which the
+adapter's non-recursive glob would miss — this script flattens it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+from pathlib import Path
+
+import numpy as np
+
+DEFAULT_ROOT = Path('/home/jupyter-kmckinnon/data_bootes/bp3m/Rubin/LSST')
+
+# Padding beyond the LSST footprint for the Gaia box, in degrees.  One LSST
+# detector is ~0.23 deg across, so half a detector plus slack.
+GAIA_PAD_DEG = 0.4
+
+
+def footprint(field_root: Path, name: str):
+    """(ra, dec, width, height) covering the downloaded visit-detector centres."""
+    from astropy.io import ascii as ascii_io
+    vd = ascii_io.read(field_root / f'table_dp2.{name}-VisitDetector.tbl',
+                       format='ipac').to_pandas()
+    ra0, dec0 = float(vd.ra.mean()), float(vd.dec.mean())
+    # Width in RA degrees: divide the great-circle span by cos(dec), since a
+    # search box in RA covers less sky at higher |dec|.
+    cd = max(np.cos(np.radians(dec0)), 1e-6)
+    w = (float(vd.ra.max() - vd.ra.min()) + 2 * GAIA_PAD_DEG / cd)
+    h = (float(vd.dec.max() - vd.dec.min()) + 2 * GAIA_PAD_DEG)
+    return ra0, dec0, w, h
+
+
+def fetch_gaia(field_root: Path, name: str, quiet=False):
+    """Gaia over the LSST footprint, flattened into <field_root>/Gaia/."""
+    from bp3m.pipeline.download_gaia import download_gaia
+    ra0, dec0, w, h = footprint(field_root, name)
+    gdir = field_root / 'Gaia'
+    gdir.mkdir(parents=True, exist_ok=True)
+    if list(gdir.glob('*_gaia.csv')):
+        if not quiet:
+            print('  Gaia catalogue already present')
+        return
+    if not quiet:
+        print(f'  Gaia: centre ({ra0:.4f}, {dec0:.4f}) box {w:.4f} x {h:.4f} deg')
+    download_gaia(ra=ra0, dec=dec0, search_width=w, search_height=h,
+                  output_dir=str(gdir), field_name=name,
+                  min_gmag=0.0, max_gmag=None, n_processes=4,
+                  query_timeout=600, quiet=quiet)
+    # download_gaia writes into <output_dir>/<field_name>/; flatten it so the
+    # adapter's non-recursive glob finds the file.
+    nested = gdir / name
+    if nested.is_dir():
+        for f in nested.iterdir():
+            shutil.move(str(f), str(gdir / f.name))
+        nested.rmdir()
+        if not quiet:
+            print(f'  flattened {nested.name}/ into Gaia/')
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__,
+                               formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--name', required=True, help='Field name, e.g. Sculptor_dSph')
+    p.add_argument('--ra', type=float, required=True)
+    p.add_argument('--dec', type=float, required=True)
+    p.add_argument('--radius', '--search-radius', '--search_radius',
+                   type=float, required=True, dest='radius',
+                   help='Source cone radius [deg]')
+    p.add_argument('--root', type=Path, default=DEFAULT_ROOT,
+                   help=f'Parent directory for fields (default {DEFAULT_ROOT})')
+    p.add_argument('--bands', nargs='+', default=None)
+    p.add_argument('--max-rows', type=int, default=None)
+    p.add_argument('--token-file', default=None)
+    p.add_argument('--vd-radius-factor', type=float, default=2.0)
+    p.add_argument('--skip-lsst', action='store_true')
+    p.add_argument('--skip-gaia', action='store_true')
+    p.add_argument('--run', action='store_true',
+                   help='Also run cross-match, alignment and diagnostics')
+    p.add_argument('--no-plots', action='store_true')
+    args = p.parse_args(argv)
+
+    field_root = args.root / args.name
+    field_root.mkdir(parents=True, exist_ok=True)
+    print(f'field root: {field_root}')
+
+    if not args.skip_lsst:
+        from ..download_lsst import download_lsst
+        print('[1/3] LSST DP2 source + visit-detector tables')
+        download_lsst(args.ra, args.dec, args.radius,
+                      field_root=field_root, field_name=args.name,
+                      bands=args.bands, max_rows=args.max_rows,
+                      token_file=args.token_file,
+                      vd_radius_factor=args.vd_radius_factor)
+
+    if not args.skip_gaia:
+        print('[2/3] Gaia catalogue over the LSST footprint')
+        fetch_gaia(field_root, args.name)
+
+    if not args.run:
+        print('\nready. analyse with:')
+        print(f'  python -m ground_to_gaia_xmatch.scripts.run_xmatch '
+              f'--instrument lsst --field-root {field_root}')
+        return
+
+    print('[3/3] cross-match + alignment + diagnostics')
+    from .. import xmatch
+    from ..align import driver
+    from ..discovery import magnitude_tiers
+    from ..instruments.lsst import LSSTInstrument
+    inst = LSSTInstrument(field_root)
+    xmatch.run(inst, field_root, source_tiers=magnitude_tiers,
+               make_plots=not args.no_plots)
+    driver.run_per_image(inst, field_root, make_plots=not args.no_plots,
+                         verbose=False)
+    from .diagnose_transforms import main as diag
+    diag(['--instrument', 'lsst', '--field-root', str(field_root)])
+
+
+if __name__ == '__main__':
+    main()
