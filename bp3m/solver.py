@@ -1425,6 +1425,7 @@ class BP3MSolver:
 
     def fit(self, n_iter=20, tol=1e-6, clip_sigma=4.5, inflate_hst_errors=False,
             inflate_from_iter=3, inflate_alpha_max=3.0, min_outer_iters=None,
+            mask_tol_frac=1e-3, mask_tol_iters=3,
             hst_fit_sigma_mult=0.5,
             prefilter=True, chi2_threshold=None, alpha_scale_chi2=False,
             use_influence_clip=True,
@@ -1764,6 +1765,9 @@ class BP3MSolver:
             print('\n Phase 2: EM-style outlier rejection')
 
             ok_star_prev = np.ones(self.n_stars, dtype=bool)
+            _n_tol_stable = 0
+            _n_det_tot = sum(d["n"] for d in self._img_data.values() if d)
+            _mask_tol = int(max(1, round(mask_tol_frac * _n_det_tot)))
             _n_consec_stable = 0  # consecutive iters with 0 tests-1/2/3 changes
 
             for it_outer in range(n_iter):
@@ -1855,13 +1859,34 @@ class BP3MSolver:
 
                 ok_star_prev = ok_star_new.copy()
 
-                # Convergence: tests 1-2 stable AND test-4 found nothing new.
-                # The ratchet guarantees n_inf_new → 0, so this always terminates.
-                if (n_global_changed == 0 and n_use_changed == 0
-                        and n_inf_new == 0
-                        and it_outer >= min_outer):
+                # Convergence: tests 1-2 and 4 must be EXACTLY stable; test 3
+                # is allowed a small tolerance.  With N detections and a
+                # threshold recomputed from the accepted set (and from alpha,
+                # which itself depends on that set), a few borderline detections
+                # flip forever.  Measured on Leo_I: tests 1-2 settle by iteration
+                # 4 and test 4 is always 0, but test 3 flickers 4-32 of ~11000
+                # detections for all 50 iterations.  Each flip moves
+                # Δα0/Δδ0 by ~residual/N_stars ~ 10 μas -- the tangent point is
+                # effectively the per-image residual mean, so it has 1/N leverage
+                # that a/b/c/d do not (those move ~1e-8, i.e. 1e5x less).  That
+                # shifts every residual and re-creates the flicker: a
+                # self-sustaining limit cycle, not a transient.  The jump
+                # plateaus (mean of last 10 / previous 10 = 1.02 over 50 iters)
+                # and tracks the flip count (Spearman +0.65).  Requiring exactly
+                # zero therefore never terminates on a large field.
+                _stable_124 = (n_global_changed == 0 and n_inf_new == 0)
+                if _stable_124 and n_use_changed == 0 and it_outer >= min_outer:
                     print(f"  Tests 1-4 stable — stopping.")
                     break
+                if _stable_124 and it_outer >= min_outer and n_use_changed <= _mask_tol:
+                    _n_tol_stable += 1
+                    if _n_tol_stable >= mask_tol_iters:
+                        print(f"  Tests 1-2/4 stable and test-3 flicker "
+                              f"{n_use_changed} <= {_mask_tol} for "
+                              f"{mask_tol_iters} iters — stopping.")
+                        break
+                else:
+                    _n_tol_stable = 0
 
                 r_hat, C_r, a_arr, K_img, C_vT = _inner_converge(
                     r_hat, f'outer {it_outer+1}')
@@ -1872,11 +1897,19 @@ class BP3MSolver:
                 print(f"  Stopped after {n_iter} outer iterations "
                       f"(star set did not fully stabilise)")
 
-            # The loop tests a_arr at the top and re-solves at the bottom, so on
-            # the exhaustion path the a_arr returned below was never tested.
-            # Re-run tests 1-2 on it so ok_star / sigma_from_gaia_prior /
-            # prior_fallback describe the solution actually being reported.
-            # No-op on the `break` path.  See _final_star_tests.
+            # Freeze the detection mask and solve once more.  Nothing below
+            # this point calls _update_use_for_fit, so this is a small
+            # well-posed problem and its result is a true fixed point of the
+            # frozen mask, rather than wherever the test-3 limit cycle happened
+            # to be when the loop stopped.
+            if n_iter > 0:
+                r_hat, C_r, a_arr, K_img, C_vT = _inner_converge(
+                    r_hat, 'final (mask frozen)')
+
+            # The loop tests a_arr at the top and re-solves at the bottom, so
+            # the a_arr reported below was never itself tested.  Re-run tests
+            # 1-2 on it so ok_star / sigma_from_gaia_prior / prior_fallback
+            # describe the solution actually being written out.
             ok_star_prev = self._final_star_tests(
                 a_arr, C_vT, ok_star_prev=ok_star_prev)
 

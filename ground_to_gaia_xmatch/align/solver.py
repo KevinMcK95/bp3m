@@ -1319,6 +1319,8 @@ class AlignmentSolver:
             min_outer_iters=None,
             prefilter=True, use_influence_clip=True,
             influence_k=5.0, floor_scaled_d=3.0,
+            adaptive_delta=0.1,
+            mask_tol_frac=1e-3, mask_tol_iters=3,
             verbose=True):
         """
         Phase 0/1/2 EM loop (mirrors bp3m.BP3MSolver.fit).
@@ -1379,6 +1381,9 @@ class AlignmentSolver:
                 print(f'\n Phase 2: EM outlier rejection{infl_str}')
             ok_star_prev = np.ones(self.n_stars, dtype=bool)
             _n_consec_stable = 0
+            _n_tol_stable = 0
+            _n_det_tot = sum(d['n'] for d in self._img_data.values() if d)
+            _mask_tol = int(max(1, round(mask_tol_frac * _n_det_tot)))
 
             for it_outer in range(n_iter):
                 clip_info, ok_star_new, n_use_chg = self._update_use_for_fit(
@@ -1387,7 +1392,8 @@ class AlignmentSolver:
                     inflate_errors=inflate_errors,
                     inflate_from_iter=inflate_from_iter,
                     inflate_alpha_max=inflate_alpha_max,
-                    alpha_scale_chi2=alpha_scale_chi2)
+                    alpha_scale_chi2=alpha_scale_chi2,
+                    adaptive_delta=adaptive_delta)
 
                 n_global_chg = int(np.sum(ok_star_prev != ok_star_new))
                 n_total_chg  = n_global_chg + n_use_chg
@@ -1426,12 +1432,35 @@ class AlignmentSolver:
 
                 ok_star_prev = ok_star_new.copy()
 
-                # Stop only once tests 1-4 are ALL stable AND min_outer is satisfied
-                if (n_global_chg == 0 and n_use_chg == 0
-                        and n_inf == 0 and it_outer >= min_outer):
+                # Stopping.  Tests 1-2 and 4 must be EXACTLY stable; test 3 is
+                # allowed a small tolerance.  With N detections and a threshold
+                # recomputed from the accepted set (and from alpha, which itself
+                # depends on that set), a few borderline detections flip
+                # forever.  Measured on Leo_I: tests 1-2 settle by iteration 4
+                # and test 4 is always 0, but test 3 flickers 4-32 of ~11000
+                # detections for all 50 iterations.  Each flip moves
+                # Dalpha0/Ddelta0 by ~residual/N_stars ~ 10 uas -- the tangent
+                # point is effectively the per-image residual mean, so it has
+                # 1/N leverage that a/b/c/d do not (they move ~1e-8, i.e. 1e5x
+                # less).  That shifts every residual and re-creates the flicker:
+                # a self-sustaining limit cycle, not a transient.  The jump
+                # plateaus (mean of last 10 / prev 10 = 1.02 over 50 iters) and
+                # correlates with the flip count (Spearman +0.65).
+                _stable_124 = (n_global_chg == 0 and n_inf == 0)
+                if _stable_124 and n_use_chg == 0 and it_outer >= min_outer:
                     if verbose:
                         print("  Tests 1–4 stable — stopping.")
                     break
+                if _stable_124 and it_outer >= min_outer and n_use_chg <= _mask_tol:
+                    _n_tol_stable += 1
+                    if _n_tol_stable >= mask_tol_iters:
+                        if verbose:
+                            print(f"  Tests 1-2/4 stable and test-3 flicker "
+                                  f"{n_use_chg} <= {_mask_tol} for "
+                                  f"{mask_tol_iters} iters — stopping.")
+                        break
+                else:
+                    _n_tol_stable = 0
 
                 r_hat, C_r, a_arr, K_img, C_vT = _inner_converge(r_hat, f'outer {it_outer+1}')
 
@@ -1443,6 +1472,28 @@ class AlignmentSolver:
                 if verbose:
                     print(f"  Stopped after {n_iter} outer iterations "
                           f"(star set did not fully stabilise)")
+
+            # ── Freeze the mask, then finalise ───────────────────────────────
+            # Two things are wrong with whatever state the loop leaves behind:
+            #   * the LAST action in the loop body is the tangent-point
+            #     re-linearisation, which calls _precompute_geometry and rebuilds
+            #     xi/eta -- so a_arr and C_vT are STALE with respect to the
+            #     geometry they are about to be reported against;
+            #   * on the exhaustion path the returned a_arr is one solve newer
+            #     than anything the tests saw.
+            # use_for_fit is frozen from here on (nothing below calls
+            # _update_use_for_fit), so these solves are a small well-posed
+            # problem: solve -> absorb the residual tangent-point offset ->
+            # solve again lands on a true fixed point of the frozen mask rather
+            # than an arbitrary point on the test-3 limit cycle.
+            r_hat, C_r, a_arr, K_img, C_vT = _inner_converge(
+                r_hat, 'final (mask frozen)')
+            _moved_f = self._relinearise_tangent_point(r_hat, a_arr)
+            r_hat, C_r, a_arr, K_img, C_vT = _inner_converge(
+                r_hat, 'final (re-centred)')
+            if verbose:
+                print(f"  Finalised with mask frozen "
+                      f"(last tangent-point absorb: {_moved_f:.5f} mas)")
 
             # ── Final star-level tests on the REPORTED a_arr ──────────────────
             # The loop tests a_arr at the top and re-solves at the bottom, so on
