@@ -307,7 +307,7 @@ class AlignmentSolver:
                 if gid in self.star_id_to_idx:
                     sidx_list.append(self.star_id_to_idx[gid])
                     row_list.append(i)
-            if len(sidx_list) < 6:
+            if len(sidx_list) < 3:   # 3 stars = 6 constraints = 6 params
                 self._img_data[img] = None
                 continue
 
@@ -605,8 +605,15 @@ class AlignmentSolver:
         for j_idx, img in enumerate(self.image_names):
             d  = self._img_data.get(img)
             cs = j_idx * nr
-            H_rr[cs:cs+nr, cs:cs+nr] += self._img_data[img]['C_r_prior_inv'] if d is not None else 0
-
+            # NOTE: the transformation prior is added ONCE, on the normal path
+            # below (see "H_rr += d['C_r_prior_inv']" after XCsX).  bp3m adds it
+            # here only inside its mutually-exclusive `if dropped:` branch; a
+            # copy of that add at the top of this loop double-counted the prior
+            # for every image, making it sqrt(2) too tight.  That is invisible
+            # in star-rich fields (the prior term is negligible next to XCsX)
+            # but dominates Gaia-sparse ones like COSMOS, where an image has
+            # only 2-3 alignment stars and its transform is prior-driven: the
+            # over-stiff prior forces WCS error into the stellar PMs instead.
             if d is None:
                 K_img[img] = None
                 continue
@@ -863,25 +870,78 @@ class AlignmentSolver:
         p84 = float(np.percentile(values, 84))
         return float(max(p50 + k*max(p50-p16, 1e-6), floor)), p16, p50, p84
 
-    def _update_use_for_fit(self, r_hat, v_hat, C_r, C_vT, clip_sigma,
-                            chi2_pval=0.95, iteration=0,
-                            adaptive_k=5.0, adaptive_delta=0.1,
-                            ok_star_prev=None,
-                            skip_star_tests=False,
-                            chi2_threshold=None,
-                            inflate_errors=True,
-                            inflate_from_iter=3,
-                            inflate_alpha_max=3.0,
-                            alpha_scale_chi2=False):
-        """
-        Three-test outlier rejection + alpha inflation mirroring bp3m._update_use_for_fit.
+    # Option-5 health gate + backstop ceiling on the adaptive thresholds.
+    #
+    # _adapt_thresh returns p50 + k*(p50-p16), floored but previously UNCAPPED,
+    # so a globally-inconsistent population defines its own "normal" and no star
+    # looks like an outlier: COSMOS multi-band drove the df=5 threshold to 327
+    # while stars sat 10-67 sigma from their Gaia priors.
+    #
+    # The gate encodes *why* adaptivity is licensed.  Adapting upward is
+    # justified when the quoted uncertainties are mis-scaled -- but the alpha
+    # inflation already measures and divides out exactly that scale factor.  A
+    # centre still far above the theoretical median therefore means the MODEL is
+    # wrong (e.g. uncorrected DCR), not the error model, and adapting to it is
+    # unjustified rather than merely generous.  So when p50 exceeds
+    # gate_mult * median(chi2_df), stop adapting and fall back to the floor.
+    #
+    # Calibration (418 bp3m v1 HST fields + LSST/Fornax, measured):
+    #   healthy p50 is always BELOW theory -- HST 1.94, LSST i-band 1.87,
+    #   Fornax 0.11, vs theory 4.35 (df=5).  No HST field exceeds p50=13.93.
+    #   gate_mult=3.0 (13.05 at df=5) gates ~1/418 HST fields.
+    #   ceiling_mult=6.0 (90.5 at df=5) is above the HST max adaptive of 83.6,
+    #   so it binds in 0/418 -- a pure backstop for the in-between regime.
+    GATE_MULT_DEFAULT    = 3.0
+    CEILING_MULT_DEFAULT = 6.0
 
-        Test 1: Gaia prior chi2  (star-level, global)
-        Test 2: Diffuse prior chi2 (star-level, global)
-        Test 3: Per-image position residual chi2 (image-level)
-        Alpha:  Inflate C_src when median chi2 > expected (starting at inflate_from_iter)
+    @staticmethod
+    def _gate_thresh(thresh, p50, df, floor,
+                     gate_mult=GATE_MULT_DEFAULT,
+                     ceiling_mult=CEILING_MULT_DEFAULT):
         """
-        observed = self.gaia_n_obs_used > 0
+        Apply the health gate and backstop ceiling to one adaptive threshold.
+
+        Returns (thresh, gated, capped).  `gated` means the population was judged
+        inconsistent and the threshold was pulled back to the floor; `capped`
+        means only the backstop ceiling bound.  p50 may be NaN (fewer than 10
+        reference points), in which case nothing is applied.
+        """
+        if not np.isfinite(p50):
+            return float(thresh), False, False
+        if gate_mult is not None and p50 > gate_mult * float(chi2_dist.median(df=df)):
+            return float(floor), True, False
+        if ceiling_mult is not None:
+            ceil = ceiling_mult * float(floor)
+            if thresh > ceil:
+                return float(ceil), False, True
+        return float(thresh), False, False
+
+    def _star_level_tests(self, v_hat, C_vT, adaptive_k=5.0, adaptive_delta=0.1,
+                          ok_star_prev=None, chi2_pval=0.95, observed=None,
+                          thresh_gate_mult=GATE_MULT_DEFAULT,
+                          thresh_ceiling_mult=CEILING_MULT_DEFAULT):
+        """
+        Tests 1 and 2 — the star-level (global) rejection tests.
+
+        Test 1: Gaia-prior chi2, chi2_g = dv^T (C_vT + C_prior)^-1 dv, against an
+                adaptive threshold p50 + k*(p50-p16) floored at chi2(0.99).
+        Test 2: diffuse-prior chi2 against a fixed threshold.
+
+        Split out of _update_use_for_fit so the same code can be re-run on the
+        FINAL a_arr after the EM loop.  These two tests are pure functions of the
+        stellar solution and the priors — they touch no per-image mask, no alpha,
+        and nothing the fit consumes — so re-running them cannot feed back into
+        the solve.  (Test 3 and alpha are deliberately NOT here: re-running those
+        on a final a_arr would move the masks out of step with the solve that
+        produced it.)
+
+        Sets self.sigma_from_gaia_prior as a side effect, since that column must
+        always describe whichever solution the caller is about to report.
+
+        Returns (ok_star, ok_gaia, ok_diffuse, chi2_g, diag).
+        """
+        if observed is None:
+            observed = self.gaia_n_obs_used > 0
 
         floor_5 = float(chi2_dist.ppf(0.99, df=5))
         floor_2 = float(chi2_dist.ppf(0.99, df=2))
@@ -898,6 +958,10 @@ class AlignmentSolver:
             chi2_g[obs_5p], adaptive_k, chi2_dist.ppf(chi2_pval, df=5), floor=floor_5)
         th2, p16_2, p50_2, p84_2 = self._adapt_thresh(
             chi2_g[obs_2p], adaptive_k, chi2_dist.ppf(chi2_pval, df=2), floor=floor_2)
+        th5, gated_5, capped_5 = self._gate_thresh(
+            th5, p50_5, 5, floor_5, thresh_gate_mult, thresh_ceiling_mult)
+        th2, gated_2, capped_2 = self._gate_thresh(
+            th2, p50_2, 2, floor_2, thresh_gate_mult, thresh_ceiling_mult)
 
         ok_gaia_admit = np.where(self.gaia_2p, chi2_g < th2, chi2_g < th5)
 
@@ -908,6 +972,13 @@ class AlignmentSolver:
             th2_out, *_ = self._adapt_thresh(
                 chi2_g[obs_2p], adaptive_k+adaptive_delta,
                 chi2_dist.ppf(chi2_pval, df=2), floor=floor_2)
+            # Gate the expulsion thresholds with the SAME p50, so the hysteresis
+            # dead-band collapses to the floor together with admission rather
+            # than leaving a one-sided ratchet.
+            th5_out, *_g = self._gate_thresh(
+                th5_out, p50_5, 5, floor_5, thresh_gate_mult, thresh_ceiling_mult)
+            th2_out, *_g = self._gate_thresh(
+                th2_out, p50_2, 2, floor_2, thresh_gate_mult, thresh_ceiling_mult)
             ok_gaia_retain = np.where(self.gaia_2p, chi2_g < th2_out, chi2_g < th5_out)
             ok_gaia = np.where(ok_star_prev, ok_gaia_retain, ok_gaia_admit)
         else:
@@ -921,6 +992,49 @@ class AlignmentSolver:
 
         ok_star = ok_gaia & ok_diffuse
         self.sigma_from_gaia_prior[:] = np.sqrt(np.maximum(chi2_g, 0.))
+
+        diag = dict(th5=th5, th2=th2, th5_out=th5_out, thresh_diff=thresh_diff,
+                    gated_5=gated_5, gated_2=gated_2,
+                    capped_5=capped_5, capped_2=capped_2,
+                    p16_5=p16_5, p50_5=p50_5, p84_5=p84_5,
+                    p16_2=p16_2, p50_2=p50_2, p84_2=p84_2,
+                    obs_5p=obs_5p, obs_2p=obs_2p, observed=observed)
+        return ok_star, ok_gaia, ok_diffuse, chi2_g, diag
+
+    def _update_use_for_fit(self, r_hat, v_hat, C_r, C_vT, clip_sigma,
+                            chi2_pval=0.95, iteration=0,
+                            adaptive_k=5.0, adaptive_delta=0.1,
+                            ok_star_prev=None,
+                            skip_star_tests=False,
+                            chi2_threshold=None,
+                            inflate_errors=True,
+                            inflate_from_iter=3,
+                            inflate_alpha_max=3.0,
+                            alpha_scale_chi2=False,
+                            thresh_gate_mult=GATE_MULT_DEFAULT,
+                            thresh_ceiling_mult=CEILING_MULT_DEFAULT):
+        """
+        Three-test outlier rejection + alpha inflation mirroring bp3m._update_use_for_fit.
+
+        Test 1: Gaia prior chi2  (star-level, global)
+        Test 2: Diffuse prior chi2 (star-level, global)
+        Test 3: Per-image position residual chi2 (image-level)
+        Alpha:  Inflate C_src when median chi2 > expected (starting at inflate_from_iter)
+        """
+        observed = self.gaia_n_obs_used > 0
+
+        # Test 3 below still needs the df=2 chi2 floor.
+        floor_2 = float(chi2_dist.ppf(0.99, df=2))
+
+        ok_star, ok_gaia, ok_diffuse, chi2_g, _d = self._star_level_tests(
+            v_hat, C_vT, adaptive_k=adaptive_k, adaptive_delta=adaptive_delta,
+            ok_star_prev=ok_star_prev, chi2_pval=chi2_pval, observed=observed,
+            thresh_gate_mult=thresh_gate_mult,
+            thresh_ceiling_mult=thresh_ceiling_mult)
+        th5, th2, th5_out, thresh_diff = _d['th5'], _d['th2'], _d['th5_out'], _d['thresh_diff']
+        p16_5, p50_5, p84_5 = _d['p16_5'], _d['p50_5'], _d['p84_5']
+        p16_2, p50_2, p84_2 = _d['p16_2'], _d['p50_2'], _d['p84_2']
+        obs_5p, obs_2p = _d['obs_5p'], _d['obs_2p']
 
         if skip_star_tests:
             ok_star = np.ones(self.n_stars, dtype=bool)
@@ -936,8 +1050,18 @@ class AlignmentSolver:
             print(f"    thresh  5p+6p:{th5:.2f}{hyst} {_pct_str(p16_5,p50_5,p84_5,int(obs_5p.sum()))}  "
                   f"df=2:{th2:.2f} {_pct_str(p16_2,p50_2,p84_2,int(obs_2p.sum()))}  "
                   f"diffuse:{thresh_diff:.1f}")
+            _gs = []
+            if _d.get('gated_5'):  _gs.append('5p GATED->floor')
+            if _d.get('gated_2'):  _gs.append('2p GATED->floor')
+            if _d.get('capped_5'): _gs.append('5p capped')
+            if _d.get('capped_2'): _gs.append('2p capped')
             print(f"    chi2 outliers (of {n_obs} observed): "
-                  f"{n_fail_gaia} Gaia-incompatible, {n_fail_diff} diffuse")
+                  f"{n_fail_gaia} Gaia-incompatible, {n_fail_diff} diffuse"
+                  + (f"   [{'; '.join(_gs)}]" if _gs else ""))
+            if _d.get('gated_5') or _d.get('gated_2'):
+                print(f"    WARNING population inconsistent with its own errors "
+                      f"(p50={_d['p50_5']:.2f} > {thresh_gate_mult}x theory) — "
+                      f"adaptive threshold refused, using floor")
 
         # ── Test 3: Per-image position chi2 + alpha inflation ────────────────
         # Use HST-only chi2 (no C_r, no C_vT) for the threshold test —
@@ -948,6 +1072,7 @@ class AlignmentSolver:
         self.gaia_n_obs_used[:] = 0
         info = []
         n_use_changed = 0
+        n_thresh_gated = 0
 
         for img, rd in resid_hst.items():
             sidx   = rd['sidx']
@@ -989,11 +1114,32 @@ class AlignmentSolver:
                 thresh_admit = float(chi2_threshold)
                 thresh_expel = thresh_admit * (1.0 + adaptive_delta / adaptive_k)
             else:
-                thresh_admit, *_ = self._adapt_thresh(
+                thresh_admit, _p16_3, _p50_3, _ = self._adapt_thresh(
                     sig_sq_eff[ok_ref], adaptive_k, chi2_dist.ppf(chi2_pval, df=2), floor=floor_2)
                 thresh_expel, *_ = self._adapt_thresh(
                     sig_sq_eff[ok_ref], adaptive_k+adaptive_delta,
                     chi2_dist.ppf(chi2_pval, df=2), floor=floor_2)
+                # Alpha carve-out.  sig_sq_eff is already divided by alpha^2, so
+                # after a successful inflation its centre should sit near the
+                # theoretical median and the gate is meaningful.  But alpha is
+                # capped at inflate_alpha_max: once it saturates, the true
+                # required inflation is larger than what was applied and the
+                # residual centre is LEGITIMATELY high by up to (needed/cap)^2.
+                # Gating there would reject exactly the images that most need
+                # inflation, so the gate is skipped for saturated images and only
+                # the backstop ceiling is kept.
+                _am = self._img_data[img].get('alpha_max', np.nan)
+                _aa = self._img_data[img].get('alpha_applied', 1.0)
+                _alpha_sat = bool(np.isfinite(_am) and _aa >= _am - 1e-9)
+                _gm = None if _alpha_sat else thresh_gate_mult
+                thresh_admit, _g3, _c3 = self._gate_thresh(
+                    thresh_admit, _p50_3, 2, floor_2, _gm, thresh_ceiling_mult)
+                thresh_expel, *_ = self._gate_thresh(
+                    thresh_expel, _p50_3, 2, floor_2, _gm, thresh_ceiling_mult)
+                if _g3:
+                    n_thresh_gated += 1
+                self._img_data[img]['thresh_gated'] = bool(_g3)
+                self._img_data[img]['alpha_saturated_at_test3'] = _alpha_sat
 
             ok_resid_admit = sig_sq_eff < thresh_admit
             if adaptive_delta > 0:
@@ -1277,7 +1423,31 @@ class AlignmentSolver:
                     print(f"    tangent point re-linearised (max |d| = {_moved:.3f} mas)")
             else:
                 if verbose:
-                    print(f"  Stopped after {n_iter} outer iterations.")
+                    print(f"  Stopped after {n_iter} outer iterations "
+                          f"(star set did not fully stabilise)")
+
+            # ── Final star-level tests on the REPORTED a_arr ──────────────────
+            # The loop tests a_arr at the top and re-solves at the bottom, so on
+            # the exhaustion path the returned a_arr is one solve NEWER than the
+            # last thing tested.  When the EM oscillates instead of converging
+            # (LSST multi-band joints do: DCR makes the residuals irreconcilable),
+            # the two land on opposite half-cycles, and ok_star /
+            # sigma_from_gaia_prior / prior_fallback end up describing a solution
+            # that is not the one written out — Gaia-incompatible stars sail
+            # through with chi2_g ~ 0 while their reported PM is hundreds of
+            # sigma off.  Re-run tests 1-2 on the final a_arr so those three
+            # always describe the astrometry actually being reported.  Masks and
+            # alpha are deliberately left alone (see _star_level_tests).
+            # On the `break` path this is a no-op: a_arr was not re-solved, so it
+            # recomputes the same numbers.
+            ok_star_prev, _, _, _chi2_g_fin, _dfin = self._star_level_tests(
+                a_arr, C_vT, ok_star_prev=ok_star_prev)
+            if verbose:
+                _obs = _dfin['observed']
+                _nf  = int((~ok_star_prev & _obs).sum())
+                print(f"  Final star tests on reported solution: {_nf}/{int(_obs.sum())} "
+                      f"flagged (thresh 5p={_dfin['th5']:.2f}, "
+                      f"max chi2={np.nanmax(_chi2_g_fin[_obs]) if _obs.any() else float('nan'):.2f})")
 
         v_hat = a_arr.copy()
         self.ok_star = ok_star_prev.copy() if clip_sigma is not None else np.ones(self.n_stars, bool)

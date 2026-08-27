@@ -171,6 +171,56 @@ def _make_pair_coupling_inv(meta_hi, poly_order=1,
     return C_pair_inv
 
 
+# ── Option-5 health gate + backstop ceiling on the adaptive thresholds ───────
+#
+# _adapt_thresh returns p50 + k*(p50-p16), floored but otherwise UNCAPPED, so a
+# globally-inconsistent population defines its own "normal" and no star looks
+# like an outlier.  Measured failure: an LSST multi-band joint drove the df=5
+# threshold to 327 while stars sat 10-67 sigma from their Gaia priors, and none
+# of their detections were ever dropped.
+#
+# The gate encodes *why* adaptivity is licensed.  Adapting upward is justified
+# when the quoted uncertainties are mis-scaled -- but the alpha inflation already
+# measures and divides out exactly that scale factor.  A centre still far above
+# the theoretical median therefore means the MODEL is wrong (uncorrected DCR,
+# distortion, ...) rather than the error model, and adapting to it is unjustified
+# rather than merely generous.  So when p50 > gate_mult * median(chi2_df), stop
+# adapting and fall back to the floor.
+#
+# Calibration, measured over 418 bp3m v1 HST fields (chi2_gaia reconstructed from
+# C_vT.npy + the Gaia prior columns) plus LSST/Fornax:
+#   healthy p50 is always BELOW theory: HST 1.94, LSST i-band 1.87, Fornax 0.11,
+#   against a theoretical median of 4.35 (df=5).  Upward adaptivity has never
+#   been needed to protect a healthy field.  No HST field exceeds p50 = 13.93.
+#   GATE_MULT=3.0    -> gate at 13.05 (df=5); gates ~1/418 HST fields.
+#   CEILING_MULT=6.0 -> 90.5 (df=5); HST max adaptive is 83.6, so 0/418 bind.
+THRESH_GATE_MULT_DEFAULT    = 3.0
+THRESH_CEILING_MULT_DEFAULT = 6.0
+
+
+def _gate_thresh(thresh, p50, df, floor,
+                 gate_mult=THRESH_GATE_MULT_DEFAULT,
+                 ceiling_mult=THRESH_CEILING_MULT_DEFAULT):
+    """
+    Apply the health gate and backstop ceiling to one adaptive threshold.
+
+    Returns (thresh, gated, capped).  `gated` means the population was judged
+    inconsistent with its own uncertainties and the threshold was pulled back to
+    the floor; `capped` means only the backstop ceiling bound.  A NaN p50 (fewer
+    than 10 reference points) applies nothing.
+    """
+    from scipy.stats import chi2 as _c2
+    if not np.isfinite(p50):
+        return float(thresh), False, False
+    if gate_mult is not None and p50 > gate_mult * float(_c2.median(df=df)):
+        return float(floor), True, False
+    if ceiling_mult is not None:
+        ceil = ceiling_mult * float(floor)
+        if thresh > ceil:
+            return float(ceil), False, True
+    return float(thresh), False, False
+
+
 class BP3MSolver:
     """
     Simultaneous HST-Gaia astrometric alignment and stellar PM/parallax update.
@@ -1822,6 +1872,14 @@ class BP3MSolver:
                 print(f"  Stopped after {n_iter} outer iterations "
                       f"(star set did not fully stabilise)")
 
+            # The loop tests a_arr at the top and re-solves at the bottom, so on
+            # the exhaustion path the a_arr returned below was never tested.
+            # Re-run tests 1-2 on it so ok_star / sigma_from_gaia_prior /
+            # prior_fallback describe the solution actually being reported.
+            # No-op on the `break` path.  See _final_star_tests.
+            ok_star_prev = self._final_star_tests(
+                a_arr, C_vT, ok_star_prev=ok_star_prev)
+
         # Final v_hat = a_arr (Δr = 0 at the last converged r_hat)
         v_hat = a_arr.copy()
 
@@ -1898,6 +1956,110 @@ class BP3MSolver:
 
         return z_dict, n_det_total, n_eff_total
 
+    def _final_star_tests(self, v_hat, C_vT, ok_star_prev=None,
+                          adaptive_k=5.0, adaptive_delta=0.1, chi2_pval=0.95,
+                          verbose=True):
+        """
+        Re-run tests 1 and 2 on the FINAL a_arr, after the EM loop has ended.
+
+        Why this exists
+        ---------------
+        The EM loop tests a_arr at the TOP of each iteration and re-solves at the
+        BOTTOM.  On the `break` path that is harmless (a_arr was not re-solved, so
+        the tested and returned solutions are the same object).  On the exhaustion
+        path — `for ... else: "Stopped after N outer iterations"` — the returned
+        a_arr is one solve NEWER than anything that was tested.
+
+        If the EM has converged, one extra solve moves nothing and the distinction
+        is academic.  If it is still OSCILLATING, the tested and returned states
+        can be opposite half-cycles, and then ok_star / sigma_from_gaia_prior /
+        prior_fallback describe a solution that is not the one written out:
+        Gaia-incompatible stars pass with chi2_gaia ~ 0 while their reported PM is
+        hundreds of sigma from the prior, and no detection is ever dropped because
+        the drop decision was taken against the other half-cycle.
+
+        Only tests 1 and 2 are re-run.  They are pure functions of (v_hat, C_vT,
+        priors) and feed nothing back into the fit.  Test 3 and the alpha
+        inflation are deliberately NOT re-run: they mutate use_for_fit and C_hst,
+        which would put the masks out of step with the solve that produced v_hat.
+
+        NOTE: the chi2/threshold logic below is duplicated from tests 1-2 inside
+        _update_use_for_fit rather than shared, to keep this fix from touching
+        that hot path.  If the thresholds there change, change them here too.
+
+        Returns ok_star for the reported solution; also refreshes
+        self.sigma_from_gaia_prior.
+        """
+        from scipy.stats import chi2 as chi2_dist
+
+        observed = self.gaia_n_hst_used > 0
+        floor_5  = float(chi2_dist.ppf(0.99, df=5))
+        floor_2  = float(chi2_dist.ppf(0.99, df=2))
+
+        def _adapt_thresh(values, k, fallback, floor=0.0):
+            if len(values) < 10:
+                return float(max(fallback, floor))
+            p16 = float(np.percentile(values, 16))
+            p50 = float(np.median(values))
+            return float(max(p50 + k * max(p50 - p16, 1e-6), floor))
+
+        # ── Test 1: combined-prior chi2 ──────────────────────────────────────
+        v_prior    = getattr(self, 'v_prior', self.v_survey)
+        C_prior    = getattr(self, 'C_prior', self.C_survey)
+        delta_gaia = v_hat - v_prior
+        chi2_gaia  = np.einsum('ni,nij,nj->n', delta_gaia,
+                               np.linalg.inv(C_vT + C_prior), delta_gaia)
+
+        obs_5p = observed & ~self.gaia_2p
+        obs_2p = observed & self.gaia_2p
+        th5 = _adapt_thresh(chi2_gaia[obs_5p], adaptive_k,
+                            chi2_dist.ppf(chi2_pval, df=5), floor=floor_5)
+        th2 = _adapt_thresh(chi2_gaia[obs_2p], adaptive_k,
+                            chi2_dist.ppf(chi2_pval, df=2), floor=floor_2)
+        # Same gate as in _update_use_for_fit, so the final pass can never be
+        # more permissive than the in-loop tests were.
+        _p50_5 = (float(np.median(chi2_gaia[obs_5p]))
+                  if int(obs_5p.sum()) >= 10 else float('nan'))
+        _p50_2 = (float(np.median(chi2_gaia[obs_2p]))
+                  if int(obs_2p.sum()) >= 10 else float('nan'))
+        th5, _gt5, _ = _gate_thresh(th5, _p50_5, 5, floor_5)
+        th2, _gt2, _ = _gate_thresh(th2, _p50_2, 2, floor_2)
+        ok_gaia_admit = np.where(self.gaia_2p, chi2_gaia < th2, chi2_gaia < th5)
+
+        if ok_star_prev is not None and adaptive_delta > 0:
+            th5_o = _adapt_thresh(chi2_gaia[obs_5p], adaptive_k + adaptive_delta,
+                                  chi2_dist.ppf(chi2_pval, df=5), floor=floor_5)
+            th2_o = _adapt_thresh(chi2_gaia[obs_2p], adaptive_k + adaptive_delta,
+                                  chi2_dist.ppf(chi2_pval, df=2), floor=floor_2)
+            ok_gaia_retain = np.where(self.gaia_2p,
+                                      chi2_gaia < th2_o, chi2_gaia < th5_o)
+            ok_gaia = np.where(ok_star_prev, ok_gaia_retain, ok_gaia_admit)
+        else:
+            ok_gaia = ok_gaia_admit
+
+        # ── Test 2: diffuse prior (fixed threshold) ──────────────────────────
+        chi2_diff   = np.sum((v_hat / self._sigma_diff_per_star)**2, axis=1)
+        thresh_diff = float(chi2_dist.ppf(chi2_dist.cdf(4.0, df=1), df=5))
+        ok_diffuse  = chi2_diff < thresh_diff
+
+        ok_star = ok_gaia & ok_diffuse
+        self.sigma_from_gaia_prior[:] = np.sqrt(np.maximum(chi2_gaia, 0.))
+
+        if verbose:
+            n_obs = int(observed.sum())
+            n_fg  = int((~ok_gaia & observed).sum())
+            n_fd  = int((~ok_diffuse & ok_gaia & observed).sum())
+            mx    = float(np.nanmax(chi2_gaia[observed])) if n_obs else float('nan')
+            print(f"  Final tests 1-2 on the REPORTED solution "
+                  f"(of {n_obs} observed): {n_fg} Gaia-incompatible, "
+                  f"{n_fd} diffuse  [thresh 5p={th5:.2f}, max chi2={mx:.2f}]")
+            if ok_star_prev is not None:
+                n_new = int((ok_star_prev & ~ok_star & observed).sum())
+                if n_new:
+                    print(f"    {n_new} star(s) newly rejected — the returned a_arr "
+                          f"had not been tested (EM did not converge)")
+        return ok_star
+
     def _update_use_for_fit(self, r_hat, v_hat, C_r, C_vT, clip_sigma,
                             chi2_pval=0.95, iteration=0,
                             adaptive_k=5.0, adaptive_delta=0.1,
@@ -1906,7 +2068,9 @@ class BP3MSolver:
                             inflate_from_iter=3, inflate_alpha_max=3.0,
                             hst_fit_sigma_mult=0.5,
                             skip_star_tests=False,
-                            chi2_threshold=None, alpha_scale_chi2=False):
+                            chi2_threshold=None, alpha_scale_chi2=False,
+                            thresh_gate_mult=THRESH_GATE_MULT_DEFAULT,
+                            thresh_ceiling_mult=THRESH_CEILING_MULT_DEFAULT):
         """
         Update use_for_fit via two star-level chi2 tests plus per-image
         residual clipping.
@@ -1981,6 +2145,14 @@ class BP3MSolver:
             chi2_gaia[obs_5p], adaptive_k, chi2_dist.ppf(chi2_pval, df=5), floor=floor_5)
         thresh_gaia_2, p16_2, p50_2, p84_2 = _adapt_thresh(
             chi2_gaia[obs_2p], adaptive_k, chi2_dist.ppf(chi2_pval, df=2), floor=floor_2)
+        thresh_gaia_5, _gated_5, _capped_5 = _gate_thresh(
+            thresh_gaia_5, p50_5, 5, floor_5, thresh_gate_mult, thresh_ceiling_mult)
+        thresh_gaia_2, _gated_2, _capped_2 = _gate_thresh(
+            thresh_gaia_2, p50_2, 2, floor_2, thresh_gate_mult, thresh_ceiling_mult)
+        if (_gated_5 or _gated_2) and not skip_star_tests:
+            print(f"    WARNING population inconsistent with its own errors "
+                  f"(p50={p50_5:.2f} > {thresh_gate_mult}x theory) — adaptive "
+                  f"threshold refused, using floor {floor_5:.2f}")
         # Admission: a star must clear thresh_gaia to be (re-)included.
         ok_gaia_admit = np.where(self.gaia_2p,
                                  chi2_gaia < thresh_gaia_2,
@@ -1997,6 +2169,13 @@ class BP3MSolver:
             thresh_out_2, _, _, _ = _adapt_thresh(chi2_gaia[obs_2p],
                                          adaptive_k + adaptive_delta,
                                          chi2_dist.ppf(chi2_pval, df=2), floor=floor_2)
+            # Gate the expulsion thresholds with the SAME p50, so the hysteresis
+            # dead-band collapses to the floor together with admission rather
+            # than leaving a one-sided ratchet.
+            thresh_out_5, _, _ = _gate_thresh(thresh_out_5, p50_5, 5, floor_5,
+                                              thresh_gate_mult, thresh_ceiling_mult)
+            thresh_out_2, _, _ = _gate_thresh(thresh_out_2, p50_2, 2, floor_2,
+                                              thresh_gate_mult, thresh_ceiling_mult)
             ok_gaia_retain = np.where(self.gaia_2p,
                                       chi2_gaia < thresh_out_2,
                                       chi2_gaia < thresh_out_5)
@@ -2125,7 +2304,7 @@ class BP3MSolver:
                 thresh_admit = float(chi2_threshold)
                 thresh_expel = thresh_admit * (1.0 + adaptive_delta / adaptive_k)
             else:
-                thresh_admit, _, _, _ = _adapt_thresh(sig_sq_eff[ok_thresh_ref],
+                thresh_admit, _, _p50_3, _ = _adapt_thresh(sig_sq_eff[ok_thresh_ref],
                                              adaptive_k,
                                              chi2_dist.ppf(chi2_pval, df=2),
                                              floor=floor_2)
@@ -2133,6 +2312,22 @@ class BP3MSolver:
                                              adaptive_k + adaptive_delta,
                                              chi2_dist.ppf(chi2_pval, df=2),
                                              floor=floor_2)
+                # Alpha carve-out.  sig_sq_eff is already divided by alpha^2, so
+                # after a successful inflation its centre sits near the
+                # theoretical median and the gate is meaningful.  But alpha is
+                # capped at inflate_alpha_max: once it saturates the required
+                # inflation exceeds what was applied and the residual centre is
+                # LEGITIMATELY high.  Gating there would reject exactly the
+                # images that most need inflation, so for saturated images the
+                # gate is skipped and only the backstop ceiling is kept.
+                _aa = self._img_data[img].get("alpha_applied", 1.0)
+                _alpha_sat = bool(_aa >= inflate_alpha_max - 1e-9)
+                _gm3 = None if _alpha_sat else thresh_gate_mult
+                thresh_admit, _g3, _ = _gate_thresh(
+                    thresh_admit, _p50_3, 2, floor_2, _gm3, thresh_ceiling_mult)
+                thresh_expel, _, _ = _gate_thresh(
+                    thresh_expel, _p50_3, 2, floor_2, _gm3, thresh_ceiling_mult)
+                self._img_data[img]["thresh_gated"] = bool(_g3)
 
             ok_resid_admit = sig_sq_eff < thresh_admit
 
