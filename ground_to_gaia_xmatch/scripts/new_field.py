@@ -105,6 +105,17 @@ def main(argv=None):
     p.add_argument('--skip-gaia', action='store_true')
     p.add_argument('--run', action='store_true',
                    help='Also run cross-match, alignment and diagnostics')
+    p.add_argument('--align-mode', '--align_mode', dest='align_mode',
+                   default='per-image',
+                   choices=['per-image', 'joint', 'both', 'none'],
+                   help="With --run, which alignment to do (default per-image). "
+                        "'joint' skips the per-image solves entirely and fits all "
+                        "images together -- much faster on large fields, since "
+                        "the joint solve reads the cross-match output directly "
+                        "and never needs the per-image results.  'none' stops "
+                        "after the cross-match.")
+    p.add_argument('--joint-label', default='all',
+                   help='Output label for the joint fit (align/joint_<label>/)')
     p.add_argument('--no-plots', action='store_true')
     p.add_argument('--force', action='store_true',
                    help='Reprocess images that already have complete output. '
@@ -144,10 +155,23 @@ def main(argv=None):
     inst = LSSTInstrument(field_root)
     xmatch.run(inst, field_root, source_tiers=magnitude_tiers,
                make_plots=not args.no_plots, force=args.force)
-    driver.run_per_image(inst, field_root, make_plots=not args.no_plots,
-                         verbose=False, force=args.force)
-    from .diagnose_transforms import main as diag
-    diag(['--instrument', 'lsst', '--field-root', str(field_root)])
+
+    mode = args.align_mode
+    if mode in ('per-image', 'both'):
+        driver.run_per_image(inst, field_root, make_plots=not args.no_plots,
+                             verbose=False, force=args.force)
+    if mode in ('joint', 'both'):
+        driver.run_joint(inst, field_root, label=args.joint_label,
+                         make_plots=not args.no_plots, force=args.force)
+
+    # diagnose_transforms reads the PER-IMAGE align output, so it only has
+    # something to say when those solves ran.
+    if mode in ('per-image', 'both'):
+        from .diagnose_transforms import main as diag
+        diag(['--instrument', 'lsst', '--field-root', str(field_root)])
+    elif mode == 'joint':
+        print('  (skipping transform diagnostics: they read the per-image '
+              'output, which --align-mode joint does not produce)')
 
 
 if __name__ == '__main__':
