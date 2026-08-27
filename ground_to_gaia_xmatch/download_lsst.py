@@ -28,7 +28,17 @@ Written as IPAC tables under `field_root`, with the names the adapter globs:
 
 Queries are async (TAP job), so results larger than the sync row cap come back
 in full — the 50,000-row exports from the portal are a UI limit, not the true
-source count.
+source count.  That cuts both ways: a deep-drilling field is genuinely huge.
+COSMOS in a 0.25 deg cone returns 4.7 MILLION sources over 717 visits.
+
+Format
+------
+IPAC is fixed-width text, so astropy must scan every row to size the columns;
+at millions of rows the write takes longer than the query and produces a
+multi-GB file.  Above FITS_THRESHOLD rows the tables are written as FITS binary
+tables instead, which the LSST adapter reads transparently.  FITS rather than
+Parquet because astropy writes it natively with no extra dependency.  Smaller
+fields stay IPAC so hand-exported portal files remain interchangeable.
 """
 
 from __future__ import annotations
@@ -43,10 +53,23 @@ TAP_URL = 'https://data.lsst.cloud/api/tap'
 SOURCE_TABLE = 'dp2.Source'
 VISIT_DETECTOR_TABLE = 'dp2.VisitDetector'
 
-# The visit-detector cone is widened relative to the source cone: a detector
-# whose CENTRE lies outside the source cone can still contribute sources inside
-# it, and an image with no WCS metadata row is silently skipped by the adapter.
-VD_RADIUS_FACTOR = 2.0
+# The visit-detector cone must be widened relative to the source cone, because
+# VisitDetector rows are indexed by detector CENTRE: a detector centred well
+# outside the source cone still contributes sources inside it, and an image with
+# no metadata row is silently skipped by the adapter.
+#
+# The margin is ADDITIVE, not multiplicative.  An LSST detector is ~0.23 deg
+# across, so its centre can sit up to half a diagonal (~0.16 deg) from any
+# source it contributes.  A multiplicative factor fails badly for small cones:
+# at r=0.05 a 2x rule gives 0.1 deg and misses 77% of contributing detectors
+# (measured on COSMOS), while at r=0.25 the same rule happens to be wide enough.
+DETECTOR_HALF_DIAG_DEG = 0.17
+VD_RADIUS_FACTOR = 2.0          # retained as a floor for large cones
+
+# Above this many rows, write a FITS binary table rather than IPAC.  IPAC's
+# fixed-width text writer must scan every row to size the columns and balloons
+# on wide tables; COSMOS (4.7M rows x 40 cols) never finished writing.
+FITS_THRESHOLD = 200_000
 
 SOURCE_COLUMNS = [
     'x', 'y', 'xErr', 'yErr', 'ra', 'dec', 'raErr', 'decErr', 'ra_dec_Cov',
@@ -157,6 +180,27 @@ def run_async(service, adql: str, poll: float = 10.0, timeout: float = 3600.0,
     return job.fetch_result().to_table()
 
 
+def _write_table(t, path: Path, quiet: bool = False) -> Path:
+    """
+    Write an astropy table, choosing the format by size.
+
+    Returns the path actually written, which may have a .parquet suffix.
+    """
+    if len(t) > FITS_THRESHOLD:
+        fp = path.with_suffix('.fits')
+        if not quiet:
+            print(f'  {len(t)} rows > {FITS_THRESHOLD} — writing FITS '
+                  f'({fp.name}); IPAC would take longer than the query',
+                  flush=True)
+        # Object/str columns need an explicit width for FITS; astropy handles
+        # this, but bytes-vs-str round-tripping is the usual failure, so the
+        # adapter decodes on read.
+        t.write(fp, format='fits', overwrite=True)
+        return fp
+    t.write(path, format='ipac', overwrite=True)
+    return path
+
+
 # ── driver ───────────────────────────────────────────────────────────────────
 
 def download_lsst(ra: float, dec: float, radius: float,
@@ -199,12 +243,15 @@ def download_lsst(ra: float, dec: float, radius: float,
               f'{len(set(src["detector"]))} detectors, '
               f'bands {sorted(set(str(b) for b in src["band"]))}', flush=True)
 
-    vd_radius = radius * vd_radius_factor
+    # Whichever is larger: the additive detector margin (correct for small
+    # cones) or the legacy multiplicative floor (already generous for large).
+    vd_radius = max(radius + DETECTOR_HALF_DIAG_DEG, radius * vd_radius_factor)
     q_vd = visit_detector_adql(ra, dec, vd_radius, table=vd_table,
                                mjd_range=mjd_range)
     if not quiet:
-        print(f'  querying {vd_table}: cone r={vd_radius} deg '
-              f'({vd_radius_factor}x the source cone)', flush=True)
+        print(f'  querying {vd_table}: cone r={vd_radius:.3f} deg '
+              f'(source cone + {DETECTOR_HALF_DIAG_DEG} deg detector margin)',
+              flush=True)
     vd = run_async(svc, q_vd, quiet=quiet)
     if not quiet:
         print(f'  -> {len(vd)} visit-detector rows', flush=True)
@@ -217,14 +264,16 @@ def download_lsst(ra: float, dec: float, radius: float,
     if missing:
         print(f'  WARNING: {len(missing)} of {len(want)} (visit, detector) pairs '
               f'with sources have NO metadata row and will be skipped by the '
-              f'adapter. Widen vd_radius_factor (currently {vd_radius_factor}).')
+              f'adapter. Increase DETECTOR_HALF_DIAG_DEG (currently '
+              f'{DETECTOR_HALF_DIAG_DEG}) — the metadata cone was '
+              f'{vd_radius:.3f} deg.')
         for v, d in sorted(missing)[:10]:
             print(f'    visit {v} detector {d}')
     elif not quiet:
         print(f'  all {len(want)} (visit, detector) pairs have metadata')
 
-    src.write(src_path, format='ipac', overwrite=True)
-    vd.write(vd_path, format='ipac', overwrite=True)
+    src_path = _write_table(src, src_path, quiet=quiet)
+    vd_path = _write_table(vd, vd_path, quiet=quiet)
     (field_root / f'table_dp2.{field_name}-query.json').write_text(json.dumps(
         {'ra': ra, 'dec': dec, 'radius_deg': radius, 'bands': bands,
          'source_table': source_table, 'visit_detector_table': vd_table,
@@ -238,5 +287,5 @@ def download_lsst(ra: float, dec: float, radius: float,
 
 __all__ = ['download_lsst', 'source_adql', 'visit_detector_adql', 'tap_service',
            'read_token', 'run_async', 'TAP_URL', 'SOURCE_TABLE',
-           'VISIT_DETECTOR_TABLE', 'VD_RADIUS_FACTOR',
+           'VISIT_DETECTOR_TABLE', 'VD_RADIUS_FACTOR', 'DETECTOR_HALF_DIAG_DEG',
            'SOURCE_COLUMNS', 'VISIT_DETECTOR_COLUMNS']

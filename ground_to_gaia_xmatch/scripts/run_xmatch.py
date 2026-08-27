@@ -39,6 +39,11 @@ def main(argv=None):
                    help='Restrict to these exposure ids (visit / expnum)')
     p.add_argument('--detector', type=int, nargs='+', default=None,
                    help='Restrict to these detector ids (detector / ext)')
+    p.add_argument('--force', action='store_true',
+                   help='Reprocess images that already have complete output. '
+                        'By default a directory carrying a .complete sentinel is '
+                        'skipped, so reruns and radius changes resume instead of '
+                        'redoing finished work.')
     p.add_argument('--no-plots', action='store_true',
                    help='Skip diagnostic figures (use for bulk reduction)')
     args = p.parse_args(argv)
@@ -46,7 +51,7 @@ def main(argv=None):
     inst, tiers = build_instrument(args.instrument, args.field_root,
                                    exposures=args.exposure,
                                    detectors=args.detector)
-    xmatch.run(inst, args.field_root, source_tiers=tiers,
+    xmatch.run(inst, args.field_root, source_tiers=tiers, force=args.force,
                make_plots=not args.no_plots)
 
 

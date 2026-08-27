@@ -105,7 +105,7 @@ def write_image_result(field_root: Path, result: dict, log_text: str = '') -> Pa
 
 
 def run(inst: Instrument, field_root: Path, source_tiers=magnitude_tiers,
-        make_plots=True) -> pd.DataFrame:
+        make_plots=True, force=False) -> pd.DataFrame:
     """
     Cross-match every image in the dataset.
 
@@ -116,7 +116,19 @@ def run(inst: Instrument, field_root: Path, source_tiers=magnitude_tiers,
     print(f'[{_ts()}] Processing {len(images)} images\n', flush=True)
 
     summary, per_exposure = [], {}
+    n_skipped_done = 0
     for i, meta in enumerate(images, 1):
+        # Resume: a directory is only "complete" once its sentinel exists, which
+        # is written after every output file.  The sentinel carries the summary
+        # row, so skipping still produces a complete summary table.
+        out_dir = layout.xmatch_root(field_root) / meta.rel_dir()
+        if not force and layout.is_complete(out_dir):
+            row = layout.read_complete(out_dir)
+            summary.append(row or {'image_id': meta.image_id, 'status': 'ok',
+                                   **meta.key})
+            n_skipped_done += 1
+            continue
+
         print(f'[{_ts()}] [{i:3d}/{len(images)}] {meta.image_id} ...', flush=True)
         t0 = time.time()
 
@@ -139,8 +151,12 @@ def run(inst: Instrument, field_root: Path, source_tiers=magnitude_tiers,
             out.mkdir(parents=True, exist_ok=True)
             (out / layout.LOG_TXT).write_text(log_text)
             print(f'  -> SKIPPED ({dt:.1f}s)\n', flush=True)
-            summary.append({'image_id': meta.image_id, 'status': 'skipped',
-                            **meta.key})
+            row = {'image_id': meta.image_id, 'status': 'skipped', **meta.key}
+            summary.append(row)
+            # Mark complete: "too few sources to match" is a property of the
+            # data, not a transient failure, so a rerun would reach the same
+            # verdict.  --force still redoes it.
+            layout.mark_complete(out, row)
             continue
 
         write_image_result(field_root, result, log_text)
@@ -167,6 +183,7 @@ def run(inst: Instrument, field_root: Path, source_tiers=magnitude_tiers,
             'mjd': meta.mjd, 'ra0': meta.ra0, 'dec0': meta.dec0,
             **meta.key,
         })
+        layout.mark_complete(out_dir, summary[-1])
         per_exposure.setdefault(meta.exposure_id, []).append(result)
 
     # Exposure-level roll-ups.

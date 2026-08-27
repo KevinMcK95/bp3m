@@ -48,6 +48,8 @@ XMATCH_DIR = 'xmatch'
 ALIGN_DIR = 'align'
 PLOTS_DIR = 'plots'
 
+COMPLETE_SENTINEL = '.complete'
+
 MATCHED_CSV = 'matched_gaia.csv'
 TRANSFORM_CSV = 'transformation.csv'
 LOG_TXT = 'processing_log.txt'
@@ -139,3 +141,35 @@ __all__ = [
     'ALL_MATCHED_CSV', 'ALL_TRANSFORM_CSV', 'SUMMARY_CSV',
     'STELLAR_CSV', 'IMAGE_TRANSFORM_CSV',
 ]
+
+
+# ── Completion sentinels (resume support) ────────────────────────────────────
+# Written LAST and via atomic rename, so a job killed part-way through writing
+# its outputs never leaves a directory that *looks* finished.  The payload is the
+# stage's summary row, so a resumed run can rebuild its summary table without
+# redoing the work.  Same idea as bulk.SENTINEL, but per output directory rather
+# than per exposure, so xmatch and align can both use it.
+
+def sentinel(out_dir) -> Path:
+    return Path(out_dir) / COMPLETE_SENTINEL
+
+
+def is_complete(out_dir) -> bool:
+    return sentinel(out_dir).is_file()
+
+
+def mark_complete(out_dir, payload: dict | None = None) -> None:
+    import json
+    d = Path(out_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / (COMPLETE_SENTINEL + '.tmp')
+    tmp.write_text(json.dumps(payload or {}, default=str))
+    tmp.replace(sentinel(d))
+
+
+def read_complete(out_dir) -> dict:
+    import json
+    try:
+        return json.loads(sentinel(out_dir).read_text())
+    except Exception:
+        return {}

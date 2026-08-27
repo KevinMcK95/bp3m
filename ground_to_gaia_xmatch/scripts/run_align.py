@@ -53,6 +53,11 @@ def main(argv=None):
     p.add_argument('--exclude-2p-from-alignment', action='store_true',
                    help='Gaia 2p stars get astrometry but do not constrain the '
                         'image transformation (bp3m exclude_2p_from_alignment)')
+    p.add_argument('--force', action='store_true',
+                   help='Re-solve images that already have complete output. '
+                        'By default a directory carrying a .complete sentinel is '
+                        'reused, so an interrupted or extended run resumes '
+                        'instead of redoing finished work.')
     p.add_argument('--quiet', action='store_true')
     args = p.parse_args(argv)
 
@@ -65,9 +70,9 @@ def main(argv=None):
               make_plots=not args.no_plots, verbose=not args.quiet)
 
     if args.mode == 'joint':
-        driver.run_joint(inst, args.field_root, label=args.label, **kw)
+        driver.run_joint(inst, args.field_root, force=args.force, label=args.label, **kw)
     else:
-        driver.run_per_image(inst, args.field_root, **kw)
+        driver.run_per_image(inst, args.field_root, force=args.force, **kw)
 
 
 if __name__ == '__main__':

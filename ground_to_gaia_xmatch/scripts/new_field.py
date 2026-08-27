@@ -65,15 +65,25 @@ def fetch_gaia(field_root: Path, name: str, quiet=False):
                   output_dir=str(gdir), field_name=name,
                   min_gmag=0.0, max_gmag=None, n_processes=4,
                   query_timeout=600, quiet=quiet)
-    # download_gaia writes into <output_dir>/<field_name>/; flatten it so the
-    # adapter's non-recursive glob finds the file.
-    nested = gdir / name
-    if nested.is_dir():
-        for f in nested.iterdir():
-            shutil.move(str(f), str(gdir / f.name))
-        nested.rmdir()
-        if not quiet:
-            print(f'  flattened {nested.name}/ into Gaia/')
+    # download_gaia nests its output, and by more than one level: the observed
+    # layout is <output_dir>/<field_name>/Gaia/<files>.  Flatten whatever depth
+    # it used, because the adapter's glob is non-recursive.
+    moved = 0
+    for f in sorted(gdir.rglob('*')):
+        if f.is_file() and f.parent != gdir:
+            dest = gdir / f.name
+            if not dest.exists():
+                shutil.move(str(f), str(dest))
+                moved += 1
+    # Remove the now-empty nest, deepest first.
+    for d in sorted((d for d in gdir.rglob('*') if d.is_dir()),
+                    key=lambda x: -len(x.parts)):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    if moved and not quiet:
+        print(f'  flattened {moved} file(s) into Gaia/')
 
 
 def main(argv=None):
@@ -96,6 +106,11 @@ def main(argv=None):
     p.add_argument('--run', action='store_true',
                    help='Also run cross-match, alignment and diagnostics')
     p.add_argument('--no-plots', action='store_true')
+    p.add_argument('--force', action='store_true',
+                   help='Reprocess images that already have complete output. '
+                        'By default a directory carrying a .complete sentinel is '
+                        'skipped, so reruns and radius changes resume instead of '
+                        'redoing finished work.')
     args = p.parse_args(argv)
 
     field_root = args.root / args.name
@@ -128,9 +143,9 @@ def main(argv=None):
     from ..instruments.lsst import LSSTInstrument
     inst = LSSTInstrument(field_root)
     xmatch.run(inst, field_root, source_tiers=magnitude_tiers,
-               make_plots=not args.no_plots)
+               make_plots=not args.no_plots, force=args.force)
     driver.run_per_image(inst, field_root, make_plots=not args.no_plots,
-                         verbose=False)
+                         verbose=False, force=args.force)
     from .diagnose_transforms import main as diag
     diag(['--instrument', 'lsst', '--field-root', str(field_root)])
 

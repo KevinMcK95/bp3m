@@ -29,7 +29,13 @@ from ..instruments.base import ImageMeta
 from ..match_table import read_transformation
 from .solver import N_R, AlignmentSolver
 
-MIN_STARS = 6
+# Minimum matched stars for an image to enter the alignment.  Each star
+# contributes TWO measurements (xi and eta), so 3 stars give 6 constraints,
+# exactly determining the 6 affine parameters (a, b, c, d, dRA0, dDec0).
+# A previous value of 6 was wrong: it confused the parameter count with the
+# star count and needlessly discarded images with 3-5 stars, which matters in
+# Gaia-sparse fields (COSMOS lost ~38% of images this way).
+MIN_STARS = 3
 
 # Parameter rows that carry image identity rather than a number.  They collide
 # with identity columns on the wide frame and must be dropped explicitly — CFHT
@@ -171,31 +177,50 @@ def solve(records: Sequence[dict], gaia_df: pd.DataFrame, out_dir: Path,
     if len(records) > 1:
         print(f'  [{label}] TOTAL {total_used}/{total_n} star-image pairs, '
               f'{len(gaia_sub)} distinct stars')
+    # Sentinel last, after save_results and the plots, so an interrupted solve is
+    # never mistaken for a finished one on the next run.
+    layout.mark_complete(out_dir, {'label': label, 'n_images': len(records),
+                                   'n_stars': len(gaia_sub),
+                                   'n_used': total_used, 'n_total': total_n})
     return out_dir
 
 
-def run_per_image(inst, field_root: Path, **kw):
+def run_per_image(inst, field_root: Path, force=False, **kw):
     """One independent solve per image."""
     field_root = Path(field_root)
     out_dirs = []
+    n_reused = 0
     images = list(inst.iter_images())
     for i, meta in enumerate(images, 1):
+        out_dir = layout.align_root(field_root) / meta.rel_dir()
+        if not force and layout.is_complete(out_dir):
+            out_dirs.append(out_dir)
+            n_reused += 1
+            continue
         print(f'[{i:3d}/{len(images)}] {meta.image_id}', flush=True)
         rec = load_image_record(field_root, meta)
         if rec is None:
             continue
-        out = solve([rec], _gaia(inst, meta),
-                    layout.align_root(field_root) / meta.rel_dir(),
-                    meta.image_id, **kw)
+        out = solve([rec], _gaia(inst, meta), out_dir, meta.image_id, **kw)
         if out:
             out_dirs.append(out)
+    if n_reused:
+        print(f'  reused {n_reused} already-complete image(s) '
+              f'(--force to redo)')
     print(f'\nDone: {len(out_dirs)}/{len(images)} images solved')
     return out_dirs
 
 
-def run_joint(inst, field_root: Path, label='all', **kw):
+def run_joint(inst, field_root: Path, label='all', force=False, **kw):
     """One solve across every image, sharing stars between them."""
     field_root = Path(field_root)
+    joint_dir = layout.joint_align_dir(field_root, label)
+    if not force and layout.is_complete(joint_dir):
+        info = layout.read_complete(joint_dir)
+        print(f'Joint solve already complete for label {label!r} '
+              f'({info.get("n_images", "?")} images, {info.get("n_stars", "?")} '
+              f'stars) — reusing.  Use --force to redo.')
+        return joint_dir
     records, gaia_parts = [], []
     for meta in inst.iter_images():
         rec = load_image_record(field_root, meta)
@@ -218,8 +243,7 @@ def run_joint(inst, field_root: Path, label='all', **kw):
           f'{len(ids)} distinct stars '
           f'({n_pairs / max(len(ids), 1):.2f} observations per star)')
 
-    return solve(records, gaia_df,
-                 layout.joint_align_dir(field_root, label), f'joint_{label}', **kw)
+    return solve(records, gaia_df, joint_dir, f'joint_{label}', **kw)
 
 
 def _gaia(inst, meta=None) -> pd.DataFrame:

@@ -16,8 +16,13 @@ Unit and column notes specific to this dataset
 * `raErr` is already a great-circle error: median(raErr)/median(decErr) = 1.00
   across detectors, not the 1/cos(dec) = 1.21 a raw RA-angle error would give.
   No cos(dec) factor is applied.
-* `extendedness_flag` is a STRING column ('false'/'true'), not a boolean.
-  `bool('false')` is True, so it must be compared to the literal string.
+* `extendedness_flag` arrives in three different guises and MUST be parsed
+  defensively.  A portal IPAC export gives the lowercase strings
+  'false'/'true'; a TAP download gives a real numpy bool; and a TAP result
+  written back out through astropy's IPAC writer gives CAPITALISED 'False'/
+  'True' (it renders the bool with str()).  A literal `== 'false'` test matches
+  nothing in the last two cases, silently classifying every source as extended
+  and destroying the star/galaxy separation.  Use _to_bool().
 * Fluxes are nJy; magnitude uses the AB zero point of 31.4.
 """
 
@@ -79,23 +84,56 @@ class LSSTInstrument:
     # ── table loading (cached) ───────────────────────────────────────────────
 
     def _find(self, suffix: str) -> Path:
-        hits = sorted(self.field_root.glob(f'table_dp2.*-{suffix}.tbl'))
-        if not hits:
-            raise FileNotFoundError(
-                f'No table_dp2.*-{suffix}.tbl under {self.field_root}')
-        return hits[0]
+        """Locate a table, preferring FITS (written for large fields)."""
+        for ext in ('.fits', '.tbl'):
+            hits = sorted(self.field_root.glob(f'table_dp2.*-{suffix}{ext}'))
+            if hits:
+                return hits[0]
+        raise FileNotFoundError(
+            f'No table_dp2.*-{suffix}.(fits|tbl) under {self.field_root}')
+
+    @staticmethod
+    def _to_bool(col) -> np.ndarray:
+        """
+        Interpret a flag column that may be bool, 'true'/'false', or
+        'True'/'False' depending on how the table reached us.
+
+        Anything unrecognised is treated as False rather than guessed at, so a
+        new representation shows up as "no flags set" rather than as silently
+        inverted classifications.
+        """
+        a = np.asarray(col)
+        if a.dtype == bool:
+            return a
+        if np.issubdtype(a.dtype, np.number):
+            return a.astype(bool)
+        s = np.char.lower(np.char.strip(a.astype(str)))
+        return np.isin(s, ('true', 't', '1', 'yes'))
+
+    @staticmethod
+    def _read(path: Path) -> pd.DataFrame:
+        if path.suffix == '.fits':
+            from astropy.table import Table
+            df = Table.read(path).to_pandas()
+            # FITS stores strings as bytes; decode so comparisons like
+            # extendedness_flag == 'false' behave as they do for IPAC.
+            for c in df.columns:
+                if df[c].dtype == object and len(df) and isinstance(
+                        df[c].iloc[0], (bytes, bytearray)):
+                    df[c] = df[c].str.decode('utf-8')
+            return df
+        return ascii_io.read(path, format='ipac').to_pandas()
 
     @property
     def sources(self) -> pd.DataFrame:
         if self._sources is None:
-            self._sources = ascii_io.read(self._find('data'), format='ipac').to_pandas()
+            self._sources = self._read(self._find('data'))
         return self._sources
 
     @property
     def visit_detector(self) -> pd.DataFrame:
         if self._meta is None:
-            self._meta = ascii_io.read(self._find('VisitDetector'),
-                                       format='ipac').to_pandas()
+            self._meta = self._read(self._find('VisitDetector'))
         return self._meta
 
     def gaia_catalog(self, meta=None) -> pd.DataFrame:
@@ -172,8 +210,10 @@ class LSSTInstrument:
         mag = -2.5 * np.log10(safe) + AB_ZP
         magerr = np.clip(1.0857 * np.abs(flux_err) / safe, 0.01, 1.0)
 
-        # String column: bool('false') is True, so compare to the literal.
-        is_star = (sub['extendedness_flag'].values == 'false')
+        # extendedness_flag TRUE means extended, so a star is the negation.
+        # Parsed via _to_bool because the representation varies by source; see
+        # the module docstring.
+        is_star = ~self._to_bool(sub['extendedness_flag'].values)
 
         cat = SourceCatalog(
             xi=xi, eta=eta, C_src=C_src,
