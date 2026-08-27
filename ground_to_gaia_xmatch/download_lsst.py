@@ -201,6 +201,24 @@ def _write_table(t, path: Path, quiet: bool = False) -> Path:
     return path
 
 
+def existing_table(field_root: Path, field_name: str, kind: str) -> Path | None:
+    """
+    Path to an already-downloaded table, whichever format it was written in.
+
+    _write_table picks the format by size — IPAC (.tbl) below FITS_THRESHOLD rows
+    and FITS (.fits) above it — so the download cache cannot check a single fixed
+    name.  It previously checked only '<...>-data.tbl', which meant every field
+    over FITS_THRESHOLD sources (i.e. most real fields: Eridanus_II has 754699)
+    re-downloaded on every run while reporting nothing amiss.  Extension order
+    matches the adapter's _find, so reader and cache agree on which file wins.
+    """
+    for ext in ('.fits', '.tbl'):
+        p = Path(field_root) / f'table_dp2.{field_name}-{kind}{ext}'
+        if p.exists():
+            return p
+    return None
+
+
 # ── driver ───────────────────────────────────────────────────────────────────
 
 def download_lsst(ra: float, dec: float, radius: float,
@@ -218,14 +236,17 @@ def download_lsst(ra: float, dec: float, radius: float,
     """
     field_root = Path(field_root)
     field_root.mkdir(parents=True, exist_ok=True)
+    # Base names; _write_table may swap .tbl -> .fits when the table is large.
     src_path = field_root / f'table_dp2.{field_name}-data.tbl'
     vd_path = field_root / f'table_dp2.{field_name}-VisitDetector.tbl'
 
-    if src_path.exists() and vd_path.exists() and not force:
+    src_have = existing_table(field_root, field_name, 'data')
+    vd_have = existing_table(field_root, field_name, 'VisitDetector')
+    if src_have is not None and vd_have is not None and not force:
         if not quiet:
             print(f'  already present (use force=True to redownload):\n'
-                  f'    {src_path.name}\n    {vd_path.name}')
-        return src_path, vd_path
+                  f'    {src_have.name}\n    {vd_have.name}')
+        return src_have, vd_have
 
     svc = tap_service(read_token(token_file))
 
@@ -285,7 +306,8 @@ def download_lsst(ra: float, dec: float, radius: float,
     return src_path, vd_path
 
 
-__all__ = ['download_lsst', 'source_adql', 'visit_detector_adql', 'tap_service',
+__all__ = [
+    'existing_table','download_lsst', 'source_adql', 'visit_detector_adql', 'tap_service',
            'read_token', 'run_async', 'TAP_URL', 'SOURCE_TABLE',
            'VISIT_DETECTOR_TABLE', 'VD_RADIUS_FACTOR', 'DETECTOR_HALF_DIAG_DEG',
            'SOURCE_COLUMNS', 'VISIT_DETECTOR_COLUMNS']
