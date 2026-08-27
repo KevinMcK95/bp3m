@@ -561,10 +561,20 @@ class AlignmentSolver:
 
         # Rebuild geometry at the updated tangent points, preserving the
         # detection masks that the outlier tests have established.
+        # influence_excl MUST be in this list.  _precompute_geometry below
+        # rebuilds _img_data from scratch, so any key not carried across is
+        # silently reset -- and test 4 relies on influence_excl being a ratchet
+        # (`influence_excl = already_excl | new_flag`).  Dropping it re-armed the
+        # same detections every outer iteration, so n_inf never reached 0 and the
+        # loop could never satisfy its convergence test: the Fornax joints sat at
+        # an exactly-repeating `0 test-1/2, 4 test-3, 4 test-4` for iterations
+        # 15-20 and burned all 20 iterations.  bp3m is unaffected because its
+        # _update_geometry edits in place instead of rebuilding.
         keep = {img: {k: d[k] for k in
                       ('use_for_fit', 'use_for_fit_max', 'use_for_align_init',
                        'use_for_astrom', 'alpha_applied', 'alpha_raw',
-                       'alpha_max', 'n_alpha_ref')
+                       'alpha_max', 'n_alpha_ref', 'influence_excl',
+                       'thresh_gated', 'alpha_saturated_at_test3')
                       if k in d}
                 for img, d in self._img_data.items() if d is not None}
         self._precompute_geometry(verbose=False)
