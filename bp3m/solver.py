@@ -2107,6 +2107,20 @@ class BP3MSolver:
 
         observed = self.gaia_n_hst_used > 0   # stars used in previous iteration
 
+        # The gate's premise is that alpha has ALREADY divided the error-model
+        # scale out of the residuals, so any remaining excess is model error.
+        # That premise does not hold everywhere:
+        #   * Phase 0 (skip_star_tests) runs off ONE un-converged solve with no
+        #     alpha at all, so a huge p50 is entirely legitimate.  Gating there
+        #     collapsed the pre-filter to 53/15261 detections on Leo_I.
+        #   * Before inflate_from_iter, or with inflate_errors=False, alpha has
+        #     never been applied, so excess may well be pure error mis-scaling.
+        # Outside those regimes the adaptive threshold must stay free.
+        _gate_on = (not skip_star_tests) and bool(inflate_errors) \
+                   and int(iteration) >= int(inflate_from_iter)
+        _gm = thresh_gate_mult    if _gate_on else None
+        _cm = thresh_ceiling_mult if _gate_on else None
+
         # Theoretical chi2 floors: adaptive thresholds may not drop below the
         # q=0.99 expected value for the relevant distribution.  This prevents
         # runaway exclusion when the empirical chi2 distribution narrows
@@ -2146,9 +2160,9 @@ class BP3MSolver:
         thresh_gaia_2, p16_2, p50_2, p84_2 = _adapt_thresh(
             chi2_gaia[obs_2p], adaptive_k, chi2_dist.ppf(chi2_pval, df=2), floor=floor_2)
         thresh_gaia_5, _gated_5, _capped_5 = _gate_thresh(
-            thresh_gaia_5, p50_5, 5, floor_5, thresh_gate_mult, thresh_ceiling_mult)
+            thresh_gaia_5, p50_5, 5, floor_5, _gm, _cm)
         thresh_gaia_2, _gated_2, _capped_2 = _gate_thresh(
-            thresh_gaia_2, p50_2, 2, floor_2, thresh_gate_mult, thresh_ceiling_mult)
+            thresh_gaia_2, p50_2, 2, floor_2, _gm, _cm)
         if (_gated_5 or _gated_2) and not skip_star_tests:
             print(f"    WARNING population inconsistent with its own errors "
                   f"(p50={p50_5:.2f} > {thresh_gate_mult}x theory) — adaptive "
@@ -2172,10 +2186,8 @@ class BP3MSolver:
             # Gate the expulsion thresholds with the SAME p50, so the hysteresis
             # dead-band collapses to the floor together with admission rather
             # than leaving a one-sided ratchet.
-            thresh_out_5, _, _ = _gate_thresh(thresh_out_5, p50_5, 5, floor_5,
-                                              thresh_gate_mult, thresh_ceiling_mult)
-            thresh_out_2, _, _ = _gate_thresh(thresh_out_2, p50_2, 2, floor_2,
-                                              thresh_gate_mult, thresh_ceiling_mult)
+            thresh_out_5, _, _ = _gate_thresh(thresh_out_5, p50_5, 5, floor_5, _gm, _cm)
+            thresh_out_2, _, _ = _gate_thresh(thresh_out_2, p50_2, 2, floor_2, _gm, _cm)
             ok_gaia_retain = np.where(self.gaia_2p,
                                       chi2_gaia < thresh_out_2,
                                       chi2_gaia < thresh_out_5)
@@ -2322,11 +2334,11 @@ class BP3MSolver:
                 # gate is skipped and only the backstop ceiling is kept.
                 _aa = self._img_data[img].get("alpha_applied", 1.0)
                 _alpha_sat = bool(_aa >= inflate_alpha_max - 1e-9)
-                _gm3 = None if _alpha_sat else thresh_gate_mult
+                _gm3 = None if _alpha_sat else _gm
                 thresh_admit, _g3, _ = _gate_thresh(
-                    thresh_admit, _p50_3, 2, floor_2, _gm3, thresh_ceiling_mult)
+                    thresh_admit, _p50_3, 2, floor_2, _gm3, _cm)
                 thresh_expel, _, _ = _gate_thresh(
-                    thresh_expel, _p50_3, 2, floor_2, _gm3, thresh_ceiling_mult)
+                    thresh_expel, _p50_3, 2, floor_2, _gm3, _cm)
                 self._img_data[img]["thresh_gated"] = bool(_g3)
 
             ok_resid_admit = sig_sq_eff < thresh_admit

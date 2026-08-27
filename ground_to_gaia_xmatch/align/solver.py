@@ -919,7 +919,8 @@ class AlignmentSolver:
     def _star_level_tests(self, v_hat, C_vT, adaptive_k=5.0, adaptive_delta=0.1,
                           ok_star_prev=None, chi2_pval=0.95, observed=None,
                           thresh_gate_mult=GATE_MULT_DEFAULT,
-                          thresh_ceiling_mult=CEILING_MULT_DEFAULT):
+                          thresh_ceiling_mult=CEILING_MULT_DEFAULT,
+                          gate_active=True):
         """
         Tests 1 and 2 — the star-level (global) rejection tests.
 
@@ -942,6 +943,11 @@ class AlignmentSolver:
         """
         if observed is None:
             observed = self.gaia_n_obs_used > 0
+        # See the gate note in _update_use_for_fit: the gate is only meaningful
+        # once alpha has removed the error-model scale.  gate_active=False makes
+        # both the gate and the ceiling no-ops.
+        if not gate_active:
+            thresh_gate_mult = thresh_ceiling_mult = None
 
         floor_5 = float(chi2_dist.ppf(0.99, df=5))
         floor_2 = float(chi2_dist.ppf(0.99, df=2))
@@ -1026,11 +1032,23 @@ class AlignmentSolver:
         # Test 3 below still needs the df=2 chi2 floor.
         floor_2 = float(chi2_dist.ppf(0.99, df=2))
 
+        # The gate's premise is that alpha has ALREADY divided the error-model
+        # scale out of the residuals, so remaining excess is model error.  That
+        # premise fails in Phase 0 (one un-converged solve, no alpha) and before
+        # inflate_from_iter (alpha not yet applied) — gating there rejects almost
+        # everything (Leo_I pre-filter collapsed to 53/15261).  Leave the
+        # adaptive threshold free in those regimes.
+        _gate_on = (not skip_star_tests) and bool(inflate_errors) \
+                   and int(iteration) >= int(inflate_from_iter)
+        _gm = thresh_gate_mult    if _gate_on else None
+        _cm = thresh_ceiling_mult if _gate_on else None
+
         ok_star, ok_gaia, ok_diffuse, chi2_g, _d = self._star_level_tests(
             v_hat, C_vT, adaptive_k=adaptive_k, adaptive_delta=adaptive_delta,
             ok_star_prev=ok_star_prev, chi2_pval=chi2_pval, observed=observed,
             thresh_gate_mult=thresh_gate_mult,
-            thresh_ceiling_mult=thresh_ceiling_mult)
+            thresh_ceiling_mult=thresh_ceiling_mult,
+            gate_active=_gate_on)
         th5, th2, th5_out, thresh_diff = _d['th5'], _d['th2'], _d['th5_out'], _d['thresh_diff']
         p16_5, p50_5, p84_5 = _d['p16_5'], _d['p50_5'], _d['p84_5']
         p16_2, p50_2, p84_2 = _d['p16_2'], _d['p50_2'], _d['p84_2']
@@ -1131,11 +1149,11 @@ class AlignmentSolver:
                 _am = self._img_data[img].get('alpha_max', np.nan)
                 _aa = self._img_data[img].get('alpha_applied', 1.0)
                 _alpha_sat = bool(np.isfinite(_am) and _aa >= _am - 1e-9)
-                _gm = None if _alpha_sat else thresh_gate_mult
+                _gm3 = None if _alpha_sat else _gm
                 thresh_admit, _g3, _c3 = self._gate_thresh(
-                    thresh_admit, _p50_3, 2, floor_2, _gm, thresh_ceiling_mult)
+                    thresh_admit, _p50_3, 2, floor_2, _gm3, _cm)
                 thresh_expel, *_ = self._gate_thresh(
-                    thresh_expel, _p50_3, 2, floor_2, _gm, thresh_ceiling_mult)
+                    thresh_expel, _p50_3, 2, floor_2, _gm3, _cm)
                 if _g3:
                     n_thresh_gated += 1
                 self._img_data[img]['thresh_gated'] = bool(_g3)
