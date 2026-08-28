@@ -194,6 +194,50 @@ def solve(records: Sequence[dict], gaia_df: pd.DataFrame, out_dir: Path,
     return out_dir
 
 
+def field_centre(field_root: Path, metas) -> tuple[float, float]:
+    """
+    Cone centre for radius selection: the download's own centre when the
+    provenance file is there, else the median image centre.
+    """
+    import json, glob
+    for j in sorted(glob.glob(str(Path(field_root) / 'table_dp2.*-query.json'))):
+        try:
+            d = json.loads(Path(j).read_text())
+            return float(d['ra']), float(d['dec'])
+        except Exception:
+            pass
+    ra = np.median([m.ra0 for m in metas])
+    dec = np.median([m.dec0 for m in metas])
+    return float(ra), float(dec)
+
+
+def select_images(field_root: Path, metas, select_radius=None,
+                  select_center=None, verbose=True):
+    """
+    Keep images whose detector centre lies within select_radius of the centre.
+
+    A field is downloaded and cross-matched once at a generous radius; a smaller
+    analysis region is then a SELECTION over that existing output, not a new
+    download.  Re-downloading a sub-cone into a second directory would re-match
+    the very same central images -- pure duplication.
+    """
+    metas = list(metas)
+    if not select_radius:
+        return metas
+    ra0, dec0 = select_center if select_center else field_centre(field_root, metas)
+    cd = np.cos(np.radians(dec0))
+    keep = []
+    for m in metas:
+        dra = (m.ra0 - ra0) * cd
+        sep = float(np.hypot(dra, m.dec0 - dec0))
+        if sep <= select_radius:
+            keep.append(m)
+    if verbose:
+        print(f'  region select: {len(keep)}/{len(metas)} images within '
+              f'{select_radius} deg of ({ra0:.4f}, {dec0:+.4f})')
+    return keep
+
+
 def run_per_image(inst, field_root: Path, force=False, **kw):
     """One independent solve per image."""
     field_root = Path(field_root)
@@ -220,7 +264,8 @@ def run_per_image(inst, field_root: Path, force=False, **kw):
     return out_dirs
 
 
-def run_joint(inst, field_root: Path, label='all', force=False, **kw):
+def run_joint(inst, field_root: Path, label='all', force=False,
+              select_radius=None, select_center=None, **kw):
     """One solve across every image, sharing stars between them."""
     field_root = Path(field_root)
     joint_dir = layout.joint_align_dir(field_root, label)
@@ -231,7 +276,8 @@ def run_joint(inst, field_root: Path, label='all', force=False, **kw):
               f'stars) — reusing.  Use --force to redo.')
         return joint_dir
     records, gaia_parts = [], []
-    for meta in inst.iter_images():
+    for meta in select_images(field_root, inst.iter_images(),
+                              select_radius, select_center):
         rec = load_image_record(field_root, meta)
         if rec is not None:
             records.append(rec)

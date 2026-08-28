@@ -53,6 +53,16 @@ def main(argv=None):
     p.add_argument('--exclude-2p-from-alignment', action='store_true',
                    help='Gaia 2p stars get astrometry but do not constrain the '
                         'image transformation (bp3m exclude_2p_from_alignment)')
+    p.add_argument('--select-radius', '--select_radius', dest='select_radius',
+                   type=float, default=None,
+                   help='Restrict the fit to images whose detector centre lies '
+                        'within this many degrees of the field centre.  Operates '
+                        'on the EXISTING cross-match, so shrinking the analysis '
+                        'region costs nothing and needs no new download.')
+    p.add_argument('--select-center', '--select_center', dest='select_center',
+                   type=float, nargs=2, default=None, metavar=('RA', 'DEC'),
+                   help='Centre for --select-radius (default: the cone centre '
+                        'recorded in table_dp2.*-query.json)')
     p.add_argument('--force', action='store_true',
                    help='Re-solve images that already have complete output. '
                         'By default a directory carrying a .complete sentinel is '
@@ -70,7 +80,10 @@ def main(argv=None):
               make_plots=not args.no_plots, verbose=not args.quiet)
 
     if args.mode == 'joint':
-        driver.run_joint(inst, args.field_root, force=args.force, label=args.label, **kw)
+        driver.run_joint(inst, args.field_root, force=args.force, label=args.label,
+                         select_radius=args.select_radius,
+                         select_center=tuple(args.select_center)
+                         if args.select_center else None, **kw)
     else:
         driver.run_per_image(inst, args.field_root, force=args.force, **kw)
 
