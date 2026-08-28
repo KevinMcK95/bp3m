@@ -114,6 +114,14 @@ def load_image_record(field_root: Path, meta: ImageMeta, use_delve: bool = False
     d = layout.xmatch_root(field_root) / meta.rel_dir()
     mfile, tfile = d / layout.MATCHED_CSV, d / layout.TRANSFORM_CSV
     if not mfile.exists() or not tfile.exists():
+        # An image the cross-match already judged unusable carries a sentinel
+        # recording status='skipped'.  That verdict is a property of the data and
+        # will not change, so say nothing per-image -- M49 printed 509 identical
+        # lines on every run, Virgo_III 442.  The caller reports one summary.
+        # A MISSING sentinel is different: the image was never attempted, which
+        # is worth flagging.
+        if layout.read_complete(d).get('status') == 'skipped':
+            return 'skipped'
         print(f'  [{meta.image_id}] missing cross-match output — skip')
         return None
 
@@ -300,7 +308,7 @@ def run_per_image(inst, field_root: Path, force=False, use_delve=False,
             continue
         print(f'[{i:3d}/{len(images)}] {meta.image_id}', flush=True)
         rec = load_image_record(field_root, meta, use_delve, delve_use_for_align)
-        if rec is None:
+        if rec == 'skipped' or rec is None:
             continue
         out = solve([rec], _gaia(inst, meta, field_root, use_delve,
                                  delve_use_for_align, [meta]),
@@ -327,9 +335,13 @@ def run_joint(inst, field_root: Path, label='all', force=False,
               f'stars) — reusing.  Use --force to redo.')
         return joint_dir
     records, gaia_parts, used_metas = [], [], []
+    n_prefiltered = 0
     for meta in select_images(field_root, inst.iter_images(),
                               select_radius, select_center):
         rec = load_image_record(field_root, meta, use_delve, delve_use_for_align)
+        if rec == 'skipped':
+            n_prefiltered += 1
+            continue
         if rec is not None:
             records.append(rec)
             used_metas.append(meta)
@@ -339,6 +351,9 @@ def run_joint(inst, field_root: Path, label='all', force=False,
             # rows on a Reticulum_II joint.  The merge is a whole-field
             # operation, so it happens once, below.
             gaia_parts.append(_gaia(inst, meta))
+    if n_prefiltered:
+        print(f'  {n_prefiltered} image(s) skipped at cross-match time '
+              f'(too few sources/Gaia) — not retried')
     if not records:
         print('No usable images — nothing to solve.')
         return None

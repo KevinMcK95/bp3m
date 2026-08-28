@@ -386,8 +386,15 @@ def merge_delve(gaia_df: pd.DataFrame, field_root, metas,
             if 'src_index' in mg.columns:
                 gaia_by_src = dict(zip(mg['src_index'].astype(int),
                                        mg['gaia_source_id'].astype('int64')))
-        _idcol = 'delve_source_id' if 'delve_source_id' in mdv.columns \
-            else 'gaia_source_id'
+        _idcol = next((c for c in ('delve_source_id', 'gaia_source_id')
+                       if c in mdv.columns), None)
+        if _idcol is None:
+            # A matched_delve.csv with no id column cannot be joined to anything.
+            # Warn and skip rather than raising KeyError, which previously took
+            # down an entire field's fit over a handful of malformed files.
+            print(f'  WARNING {pdv} has no delve_source_id/gaia_source_id '
+                  f'column — skipping (re-run the DELVE cross-match for it)')
+            continue
         for src_i, dv_id in zip(mdv['src_index'].astype(int),
                                 mdv[_idcol].astype('int64')):
             if dv_id not in dsrc.index:
