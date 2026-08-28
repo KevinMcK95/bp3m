@@ -292,6 +292,15 @@ def to_bp3m_schema(matched: pd.DataFrame, delve_df: pd.DataFrame) -> pd.DataFram
     out = matched.copy()
     out['hst_index'] = out['src_index']
     out['delve_source_id'] = out['gaia_source_id'].astype('int64')
+    # Drop gaia_source_id.  Our MATCH_COLUMNS names the reference id
+    # gaia_source_id whatever the reference catalogue is, so on the DELVE pass it
+    # holds a DELVE id -- which is both misleading and actively breaking:
+    # validator._collect_delve_info does delve.merge(sq, on='hst_index') where sq
+    # also carries gaia_source_id, so pandas suffixes both to _x/_y, the plain
+    # column disappears, and the following groupby('gaia_source_id') raises
+    # KeyError.  bp3m's matched_delve.csv has no gaia_source_id at all; the id
+    # lives in delve_source_id, and the Gaia association is made by the merge.
+    out = out.drop(columns=['gaia_source_id'])
     # bp3m names the ground magnitude columns after HST; the validator computes
     # cross-image zero-points from hst_mag_st_gdc, which for us is the image's
     # own calibrated magnitude.
@@ -377,8 +386,10 @@ def merge_delve(gaia_df: pd.DataFrame, field_root, metas,
             if 'src_index' in mg.columns:
                 gaia_by_src = dict(zip(mg['src_index'].astype(int),
                                        mg['gaia_source_id'].astype('int64')))
+        _idcol = 'delve_source_id' if 'delve_source_id' in mdv.columns \
+            else 'gaia_source_id'
         for src_i, dv_id in zip(mdv['src_index'].astype(int),
-                                mdv['gaia_source_id'].astype('int64')):
+                                mdv[_idcol].astype('int64')):
             if dv_id not in dsrc.index:
                 continue
             row = dsrc.loc[dv_id]
