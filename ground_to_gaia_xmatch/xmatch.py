@@ -128,7 +128,17 @@ def run(inst: Instrument, field_root: Path, source_tiers=magnitude_tiers,
         # is written after every output file.  The sentinel carries the summary
         # row, so skipping still produces a complete summary table.
         out_dir = layout.xmatch_root(field_root) / meta.rel_dir()
-        if not force and layout.is_complete(out_dir):
+        # An image completed by an earlier Gaia-only run carries a sentinel, so
+        # a plain resume would skip it and it would never get its DELVE pass.
+        # Completion therefore also requires matched_delve.csv whenever DELVE is
+        # requested.  (Images legitimately skipped for too few sources have no
+        # matched_gaia.csv either, and are re-attempted cheaply.)
+        _delve_done = True
+        if delve_df is not None:
+            from .delve import MATCHED_DELVE_CSV
+            _delve_done = ((out_dir / MATCHED_DELVE_CSV).exists()
+                           or not (out_dir / layout.MATCHED_CSV).exists())
+        if not force and _delve_done and layout.is_complete(out_dir):
             row = layout.read_complete(out_dir)
             summary.append(row or {'image_id': meta.image_id, 'status': 'ok',
                                    **meta.key})
@@ -182,8 +192,10 @@ def run(inst: Instrument, field_root: Path, source_tiers=magnitude_tiers,
                 dres = None
                 print(f'  DELVE cross-match failed: {type(exc).__name__}: {exc}')
             if dres is not None:
+                from .delve import to_bp3m_schema
                 out_d = layout.xmatch_root(field_root) / meta.rel_dir()
-                dres['matched'].to_csv(out_d / MATCHED_DELVE_CSV, index=False)
+                to_bp3m_schema(dres['matched'], delve_df).to_csv(
+                    out_d / MATCHED_DELVE_CSV, index=False)
                 print(f"  DELVE: {dres['params']['n_matches']} matches")
             else:
                 print('  DELVE: no solution for this image')

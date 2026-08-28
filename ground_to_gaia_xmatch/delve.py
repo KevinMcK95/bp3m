@@ -245,6 +245,53 @@ def build_delve_field(delve_df: pd.DataFrame, meta, xi_src=None, eta_src=None,
     )
 
 
+def to_bp3m_schema(matched: pd.DataFrame, delve_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add the columns bp3m's matched_delve.csv carries, so the file is consumable
+    by gaia_cross_match.validator without translation.
+
+    The validator's ``_collect_delve_info`` reads matched_delve.csv straight off
+    disk and joins ``source_quality.csv`` on ``hst_index`` to split DELVE
+    detections into Gaia-linked and DELVE-only.  It also reads
+    ``delve_source_id`` and the ``_DELVE_PHOT_COLS`` block.  None of those exist
+    in our MATCH_COLUMNS schema, so they are added here rather than the file
+    being left in a private format only this package understands.
+
+    Our own columns are kept alongside, so the file serves both consumers.
+    """
+    out = matched.copy()
+    out['hst_index'] = out['src_index']
+    out['delve_source_id'] = out['gaia_source_id'].astype('int64')
+    # bp3m names the ground magnitude columns after HST; the validator computes
+    # cross-image zero-points from hst_mag_st_gdc, which for us is the image's
+    # own calibrated magnitude.
+    if 'src_mag' in out.columns:
+        out['hst_mag_st_gdc'] = out['src_mag']
+        out['hst_mag_gdc'] = out['src_mag']
+    if 'src_magerr' in out.columns:
+        out['hst_mag_err_gdc'] = out['src_magerr']
+    if 'src_is_star' in out.columns:
+        out['hst_is_star'] = out['src_is_star']
+
+    src = delve_df.set_index('source_id')
+    idx = out['delve_source_id'].to_numpy()
+    keep = np.isin(idx, src.index.to_numpy())
+    for scol, pcol in _SRC_TO_PRIOR.items():
+        if scol not in src.columns:
+            continue
+        vals = np.full(len(out), np.nan, dtype=float)
+        if keep.any():
+            vals[keep] = pd.to_numeric(
+                src[scol].reindex(idx[keep]).to_numpy(), errors='coerce')
+        out[pcol] = vals
+    if 'mtype' in src.columns:
+        m = np.full(len(out), None, dtype=object)
+        if keep.any():
+            m[keep] = src['mtype'].reindex(idx[keep]).to_numpy()
+        out['delve_mtype'] = m
+    return out
+
+
 def _valid_prior(df: pd.DataFrame) -> np.ndarray:
     """Rows whose full 5x5 DELVE covariance is usable."""
     ok = np.ones(len(df), dtype=bool)
