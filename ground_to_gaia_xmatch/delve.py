@@ -187,11 +187,26 @@ def load_delve(field_root, quiet: bool = False) -> pd.DataFrame | None:
     if df is None or not len(df):
         return None
     df['source_id'] = df['source_id'].astype('int64')
+
+    # load_delve_data filters the +/-99 sentinel on r_mag ONLY (it is the
+    # matching magnitude), so a source with a good r_mag but g_mag = 99 survives
+    # as a legitimate row -- correct, since its astrometry is fine and it is a
+    # usable PM prior -- but its COLOUR is then 99 - 19 = 80 mag.  bp3m never
+    # shows that because it masks the sentinels at every point of use
+    # (validator._mask_delve_sentinels, and inline in plot_results before
+    # building a DELVE colour).  Masking once here is equivalent and harder to
+    # forget: the row is kept, only the unusable magnitudes become NaN.
+    _SENTINEL_LO, _SENTINEL_HI = -90.0, 50.0
+    for c in ('r_mag', 'g_mag', 'i_mag', 'z_mag'):
+        if c in df.columns:
+            v = pd.to_numeric(df[c], errors='coerce')
+            df[c] = v.mask((v < _SENTINEL_LO) | (v > _SENTINEL_HI))
     if 'gmag' not in df.columns:
         df['gmag'] = pd.to_numeric(df['r_mag'], errors='coerce')
-    if 'bp_rp' not in df.columns and {'g_mag', 'i_mag'} <= set(df.columns):
-        df['bp_rp'] = (pd.to_numeric(df['g_mag'], errors='coerce')
-                       - pd.to_numeric(df['i_mag'], errors='coerce'))
+    # NOTE: no bp_rp is synthesised here.  build_delve_field reads it for the
+    # cross-match CMD panel, where a DES colour is correct and the axis is
+    # labelled DELVE; but writing it into the survey catalogue would leak a DES
+    # colour onto the Gaia CMD's "BP - RP" axis.  merge_delve leaves it NaN.
     _DELVE_CACHE[key] = df
     return df
 
@@ -249,7 +264,12 @@ def build_delve_field(delve_df: pd.DataFrame, meta, xi_src=None, eta_src=None,
         extra={
             'source_id': delve_df['source_id'].to_numpy(dtype=np.int64)[keep],
             'ra_prop': ra_prop[keep], 'dec_prop': dec_prop[keep],
-            'pmra': col('pmra'), 'pmdec': col('pmdec'), 'bp_rp': col('bp_rp'),
+            'pmra': col('pmra'), 'pmdec': col('pmdec'),
+            # DES g-i as the colour for the DELVE diagnostic figure's CMD panel,
+            # computed here rather than stored on the catalogue: on THIS figure
+            # the axis is labelled DELVE, so a DES colour is correct, whereas a
+            # bp_rp column on the survey catalogue would leak onto the Gaia CMD.
+            'bp_rp': (col('g_mag') - col('i_mag')),
             'index': np.where(keep)[0],
         },
     )
@@ -414,10 +434,18 @@ def merge_delve(gaia_df: pd.DataFrame, field_root, metas,
             r['source_id'] = -int(dv_id)
             if 'gaia_source_id' in out.columns:
                 r['gaia_source_id'] = -int(dv_id)
+            # gmag <- DELVE r, exactly as bp3m does
+            # ("'gmag': row.get('delve_rmag'), # r ~ G for red stars"), because
+            # some panels gate on finite gmag.
+            #
+            # bp_rp is deliberately LEFT NaN: bp3m does not set it on a synthetic
+            # row, and filling it with a DELVE colour puts DES g-i on an axis
+            # labelled "Gaia BP - RP", silently mixing photometric systems in the
+            # Gaia CMD.  DELVE colours belong on the separate DELVE CMDs
+            # (sky_cmd_pm_delve_*), which carry their own axis labels.
             for c, v in (('ra', src.get('ra')), ('dec', src.get('dec')),
                          ('ref_epoch', src.get('ref_epoch', 2016.0)),
-                         ('gmag', src.get('gmag', src.get('r_mag'))),
-                         ('bp_rp', src.get('bp_rp'))):
+                         ('gmag', src.get('r_mag'))):
                 if c in out.columns:
                     r[c] = v
             r['delve_only'] = True

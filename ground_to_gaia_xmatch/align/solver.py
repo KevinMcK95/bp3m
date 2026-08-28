@@ -2065,18 +2065,60 @@ class AlignmentSolver:
             ax.legend(fontsize=7, loc='upper left')
             _style_ax(ax)
 
-        # Uncertainty vs magnitude panel
-        _xmatch_gaia_conv = xm_converged & has_gaia
+        # Uncertainty vs magnitude panel.
+        # Populations follow bp3m plot_results.make_plots exactly, including
+        # marker, colour and zorder, so the two are directly comparable:
+        #   Gaia prior       #444444        DELVE prior      dodgerblue  D
+        #   Gaia only        mediumseagreen Gaia+DELVE       steelblue
+        #   Gaia 2p          mediumpurple s DELVE only       darkorange  ^
+        # DELVE-only stars are identified by a NEGATIVE source id, which is how
+        # bp3m finds them (`_delve_only = (_gaia_ids < 0)`), and Gaia+DELVE by
+        # solver._has_delve_pm -- the POST-VETO mask, not the raw catalogue
+        # column, so a star whose DELVE prior was vetoed correctly plots as
+        # Gaia-only.
+        _sid = self.gaia_df['gaia_source_id'].to_numpy() \
+            if 'gaia_source_id' in self.gaia_df.columns else np.ones(self.n_stars)
+        _delve_only = np.asarray(_sid, dtype=np.int64) < 0
+        _has_dpm = np.asarray(getattr(self, '_has_delve_pm',
+                                      np.zeros(self.n_stars, bool)), dtype=bool)
+
         ax_unc.scatter(gmag[_gaia_nq], sig_pm_gaia[_gaia_nq],
                        s=6, alpha=0.7, color='#444444', label='Gaia prior', zorder=2)
-        if _xmatch_gaia_conv.any():
-            ax_unc.scatter(gmag[_xmatch_gaia_conv], sig_pm_xm[_xmatch_gaia_conv],
-                           s=6, alpha=0.85, color='mediumseagreen', label='xmatch', zorder=3)
-        _xmatch_2p_conv = xm_converged & (~has_gaia)
+
+        # The DELVE prior's own PM uncertainty, for comparison with the fit
+        _d_sig = None
+        if 'delve_pmra_error' in self.gaia_df.columns:
+            _dra = pd.to_numeric(self.gaia_df['delve_pmra_error'],
+                                 errors='coerce').to_numpy(float)
+            _dde = pd.to_numeric(self.gaia_df.get('delve_pmdec_error'),
+                                 errors='coerce').to_numpy(float)
+            _d_sig = np.sqrt(np.maximum(_dra, 0) * np.maximum(_dde, 0))
+            _m = np.isfinite(_d_sig) & (_d_sig > 0)
+            if _m.any():
+                ax_unc.scatter(gmag[_m], _d_sig[_m], s=6, alpha=0.6,
+                               color='dodgerblue', marker='D',
+                               label='DELVE prior', zorder=2)
+
+        _xmatch_gaia_conv = xm_converged & has_gaia
+        _gonly = _xmatch_gaia_conv & ~_has_dpm & ~_delve_only
+        _gdlv  = _xmatch_gaia_conv & _has_dpm & ~_delve_only
+        if _gonly.any():
+            ax_unc.scatter(gmag[_gonly], sig_pm_xm[_gonly], s=6, alpha=0.85,
+                           color='mediumseagreen', label='xmatch Gaia only',
+                           zorder=3)
+        if _gdlv.any():
+            ax_unc.scatter(gmag[_gdlv], sig_pm_xm[_gdlv], s=6, alpha=0.7,
+                           color='steelblue', label='xmatch Gaia+DELVE', zorder=3)
+        _xmatch_2p_conv = xm_converged & (~has_gaia) & ~_delve_only
         if _xmatch_2p_conv.any():
             ax_unc.scatter(gmag[_xmatch_2p_conv], sig_pm_xm[_xmatch_2p_conv],
                            s=8, alpha=0.8, color='mediumpurple', marker='s',
                            label='xmatch Gaia 2p', zorder=4)
+        _dlv_conv = xm_converged & _delve_only
+        if _dlv_conv.any():
+            ax_unc.scatter(gmag[_dlv_conv], sig_pm_xm[_dlv_conv],
+                           s=10, alpha=0.8, color='darkorange', marker='^',
+                           label='xmatch DELVE only', zorder=4)
         ax_unc.set_xlabel('G [mag]')
         ax_unc.set_ylabel(r'$(\det\,C_{\mu})^{1/4}$ [mas/yr]')
         ax_unc.set_title(r'Geometric-mean PM uncertainty $(\det\,C_{\mu})^{1/4}$ vs magnitude')
@@ -2362,6 +2404,42 @@ class AlignmentSolver:
         is_2p = self.gaia_2p   # same basis as has_gaia above (astrometric_params_solved)
         _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
                                is_member=is_2p)  # mark 2p stars
+
+        # ── DELVE sky/CMD figures, one per available DELVE colour ─────────────
+        # Separate figures rather than DELVE photometry on the Gaia axes: DES
+        # griz and Gaia G/BP/RP are different systems, so a DES colour drawn on
+        # an axis labelled "Gaia BP - RP" would be meaningless.  bp3m emits
+        # sky_cmd_pm_delve_gr.png and sky_cmd_pm_delve_ri.png with their own
+        # labels; this mirrors that, including the +/-99 sentinel masking and the
+        # deliberately Gaia-free mask.
+        _gc = self.gaia_df if hasattr(self, 'gaia_df') else getattr(self, 'gaia_cat', None)
+        if _gc is not None:
+            # NOTE the mask does NOT require finite Gaia G.  DELVE-only stars
+            # (negative source_id) have no Gaia magnitude, and reusing the Gaia
+            # `ok` mask would drop exactly the faint population these figures
+            # exist to show.
+            _ok_delve_base = xm_converged & np.isfinite(pm_size)
+            _DELVE_COLORS = [
+                ('delve_gmag', 'delve_rmag', 'DELVE g − r (mag)', 'DELVE r (mag)',
+                 'sky_cmd_pm_delve_gr.png'),
+                ('delve_rmag', 'delve_imag', 'DELVE r − i (mag)', 'DELVE i (mag)',
+                 'sky_cmd_pm_delve_ri.png'),
+            ]
+            for _blue, _red, _clab, _mlab, _fn in _DELVE_COLORS:
+                if _blue not in _gc.columns or _red not in _gc.columns:
+                    continue
+                _vb = pd.to_numeric(_gc[_blue], errors='coerce').to_numpy(float).copy()
+                _vr = pd.to_numeric(_gc[_red],  errors='coerce').to_numpy(float).copy()
+                # DELVE's missing-photometry sentinels, same bounds as bp3m
+                for _v in (_vb, _vr):
+                    _v[(_v < -90.0) | (_v > 50.0)] = np.nan
+                _ok_d = _ok_delve_base & np.isfinite(_vb - _vr) & np.isfinite(_vr)
+                if _ok_d.sum() < 5:
+                    continue
+                print(f"    DELVE sky/CMD: {int(_ok_d.sum())} stars -> {_fn}")
+                _plot_sky_and_cmd(ra, dec, _vr, _vb - _vr, pm_size, pm_unc,
+                                  _ok_d, plot_dir, is_member=is_2p, fname=_fn,
+                                  color_label=_clab, mag_label=_mlab)
 
         # ── Figure 5: per-image residual maps (3×2) ───────────────────────────
         if not plot_residuals:
