@@ -47,6 +47,10 @@ def main(argv=None):
     p.add_argument('--delve-dir', '--delve_dir', dest='delve_dir', default=None,
                    help='Directory of DELVE PM_hp*.fits tiles '
                         '(default: the bp3m DELVE_ProperMotion/PMCatalog path)')
+    p.add_argument('--no-validate', dest='validate', action='store_false',
+                   help='Skip the cross-image validation that normally follows '
+                        'the cross-match (bp3m runs it via '
+                        '_validate_catalog_if_needed)')
     p.add_argument('--force', action='store_true',
                    help='Reprocess images that already have complete output. '
                         'By default a directory carrying a .complete sentinel is '
@@ -70,6 +74,13 @@ def main(argv=None):
     xmatch.run(inst, args.field_root, source_tiers=tiers, force=args.force,
                delve_df=delve_df,
                make_plots=not args.no_plots)
+
+    # bp3m runs its validator immediately after cross-matching
+    # (cross_match._validate_catalog_if_needed), because the is_trustworthy flag
+    # and cross_match_catalog.csv it produces are what downstream steps key on.
+    if args.validate:
+        from ..validate import validate_field
+        validate_field(args.field_root)
 
 
 if __name__ == '__main__':

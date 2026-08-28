@@ -143,6 +143,9 @@ def main(argv=None):
     p.add_argument('--joint-label', default='all',
                    help='Output label for the joint fit (align/joint_<label>/)')
     p.add_argument('--no-plots', action='store_true')
+    p.add_argument('--no-validate', dest='validate', action='store_false',
+                   help='Skip the cross-image validation that normally follows '
+                        'the cross-match')
     p.add_argument('--force', action='store_true',
                    help='Reprocess images that already have complete output. '
                         'By default a directory carrying a .complete sentinel is '
@@ -194,6 +197,10 @@ def main(argv=None):
     xmatch.run(inst, field_root, source_tiers=magnitude_tiers,
                make_plots=not args.no_plots, force=args.force,
                delve_df=delve_df)
+
+    if args.validate:
+        from ..validate import validate_field
+        validate_field(field_root)
 
     mode = args.align_mode
     if mode in ('per-image', 'both'):
