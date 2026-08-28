@@ -39,6 +39,14 @@ def main(argv=None):
                    help='Restrict to these exposure ids (visit / expnum)')
     p.add_argument('--detector', type=int, nargs='+', default=None,
                    help='Restrict to these detector ids (detector / ext)')
+    p.add_argument('--use-delve', '--use_delve', dest='use_delve',
+                   action='store_true',
+                   help='Also cross-match each image against DELVE and write '
+                        'matched_delve.csv, so DELVE PM priors and DELVE-only '
+                        'stars are available to the fit (bp3m --use_delve).')
+    p.add_argument('--delve-dir', '--delve_dir', dest='delve_dir', default=None,
+                   help='Directory of DELVE PM_hp*.fits tiles '
+                        '(default: the bp3m DELVE_ProperMotion/PMCatalog path)')
     p.add_argument('--force', action='store_true',
                    help='Reprocess images that already have complete output. '
                         'By default a directory carrying a .complete sentinel is '
@@ -51,7 +59,16 @@ def main(argv=None):
     inst, tiers = build_instrument(args.instrument, args.field_root,
                                    exposures=args.exposure,
                                    detectors=args.detector)
+    delve_df = None
+    if args.use_delve:
+        from ..delve import DEFAULT_DELVE_DIR, fetch_delve, load_delve
+        fetch_delve(args.field_root, args.field_root.name,
+                    delve_dir=args.delve_dir or DEFAULT_DELVE_DIR)
+        delve_df = load_delve(args.field_root)
+        if delve_df is None:
+            print('  no DELVE coverage for this field — continuing Gaia-only')
     xmatch.run(inst, args.field_root, source_tiers=tiers, force=args.force,
+               delve_df=delve_df,
                make_plots=not args.no_plots)
 
 

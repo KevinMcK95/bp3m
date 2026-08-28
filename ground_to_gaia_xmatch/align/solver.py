@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.collections import LineCollection
 
-from ..geometry import gnomonic as _gnomonic_mas
+from ..geometry import DEG2MAS, gnomonic as _gnomonic_mas
 from bp3m.astro_utils import (
     n_r_from_poly_order, build_X_matrix, compute_poly_jacobian,
     plane_project_tangent_derivs,
@@ -248,7 +248,13 @@ class AlignmentSolver:
             self.C_survey_inv[~fga, :2, :2] = np.linalg.inv(C[~fga, :2, :2])
         self.C_survey_inv_dot_v = np.einsum('nij,nj->ni', self.C_survey_inv, self.v_survey)
 
+        # ── DELVE priors (information-form combination with Gaia) ─────────────
+        self._add_delve_priors(g, _get)
+
         # ── Diffuse prior for 2p stars (Michalik et al. 2015 for parallax) ───
+        # A 2p star with a surviving DELVE prior must NOT also get the flat
+        # 100 mas/yr diffuse PM prior — DELVE supplies real PM information, and
+        # stacking the diffuse prior on top would dilute it.
         needs_diffuse = self.gaia_2p.copy()
         # Stored so the alpha estimator (and anything else needing "does this
         # star have an informative position prior?") can use one definition.
@@ -267,8 +273,9 @@ class AlignmentSolver:
         self._C_VG_inv = np.zeros((self.n_stars, N_V), dtype=float)
         self._C_VG_inv[needs_diffuse, 0] = _SIGMA_POS**-2
         self._C_VG_inv[needs_diffuse, 1] = _SIGMA_POS**-2
-        self._C_VG_inv[needs_diffuse, 2] = _SIGMA_PM**-2
-        self._C_VG_inv[needs_diffuse, 3] = _SIGMA_PM**-2
+        needs_diffuse_pm = needs_diffuse & ~self._has_delve_pm
+        self._C_VG_inv[needs_diffuse_pm, 2] = _SIGMA_PM**-2
+        self._C_VG_inv[needs_diffuse_pm, 3] = _SIGMA_PM**-2
         fin_plx = needs_diffuse & np.isfinite(sigma_plx_prior)
         self._C_VG_inv[fin_plx, 4] = sigma_plx_prior[fin_plx]**-2
 
@@ -276,9 +283,160 @@ class AlignmentSolver:
         self._sigma_diff_per_star = np.full((self.n_stars, N_V), 1e9)
         self._sigma_diff_per_star[needs_diffuse, 0] = 1e4
         self._sigma_diff_per_star[needs_diffuse, 1] = 1e4
-        self._sigma_diff_per_star[needs_diffuse, 2] = _SIGMA_PM
-        self._sigma_diff_per_star[needs_diffuse, 3] = _SIGMA_PM
+        self._sigma_diff_per_star[needs_diffuse_pm, 2] = _SIGMA_PM
+        self._sigma_diff_per_star[needs_diffuse_pm, 3] = _SIGMA_PM
+        # A DELVE-matched 2p star's diffuse-prior chi2 test uses the DELVE PM
+        # error, not the 100 mas/yr flat width, or the test could never fire.
+        if self._has_delve_pm.any():
+            _h2 = needs_diffuse & self._has_delve_pm
+            self._sigma_diff_per_star[_h2, 2] = _get('delve_pmra_error', np.inf)[_h2]
+            self._sigma_diff_per_star[_h2, 3] = _get('delve_pmdec_error', np.inf)[_h2]
         self._sigma_diff_per_star[fin_plx, 4] = sigma_plx_prior[fin_plx]
+
+    # ── DELVE priors ─────────────────────────────────────────────────────────
+
+    # Consistency-veto thresholds: chi2.ppf(0.9973, df) — a 3-sigma equivalent.
+    _DELVE_VETO_5D = 17.7   # df=5, Gaia 5p/6p vs DELVE on all five parameters
+    _DELVE_VETO_2D = 11.8   # df=2, Gaia 2p vs DELVE on position only
+
+    def _add_delve_priors(self, g, _get):
+        """
+        Fold DELVE PM/parallax precision into the survey prior (bp3m parity).
+
+        Information-form combination: C_survey_inv += C_delve_inv, and
+        C_survey_inv_dot_v += C_delve_inv @ v_delve.  Adding precisions is what
+        makes the two catalogues combine correctly whether Gaia contributes a
+        full 5x5 (5p/6p) or only a 2x2 position block (2p) — in the latter case
+        Gaia's 2x2 plus DELVE's full 5x5 is what makes the star's 5x5
+        information matrix well-defined at all.
+
+        Before combining, each DELVE prior faces a consistency veto, because a
+        wrong cross-match or a bad DECam fit would otherwise inject a confident
+        wrong prior:
+          * Gaia 5p/6p — full 5D chi2 of (Gaia - DELVE) against C_gaia + C_delve;
+          * Gaia 2p    — 2D position chi2 only, since 2p has no PM or parallax
+                         to compare against.
+
+        v_delve expresses position as an OFFSET from the Gaia catalogue position
+        in mas (zero when the two agree), matching v_survey's convention where
+        the position components are zero by construction.
+
+        Caveat carried over from bp3m: DELVE used Gaia DR3 as its astrometric
+        reference frame, so the two are not strictly independent.  Treating them
+        as independent is a deliberate, minor approximation.
+
+        Sets self._has_delve_pm and, for stars with a surviving prior, replaces
+        v_prior / C_prior with the combined values.
+        """
+        self._has_delve_pm = np.zeros(self.n_stars, dtype=bool)
+        if 'delve_pmra_error' not in getattr(g, 'columns', []):
+            return
+
+        d_pmra_e  = _get('delve_pmra_error',  np.inf)
+        d_pmdec_e = _get('delve_pmdec_error', np.inf)
+        d_pmra    = _get('delve_pmra',  0.0)
+        d_pmdec   = _get('delve_pmdec', 0.0)
+        d_plx     = _get('delve_parallax', 0.0)
+        d_ra      = _get('delve_ra_cat',  np.nan)
+        d_dec     = _get('delve_dec_cat', np.nan)
+
+        has_d = (np.isfinite(d_pmra_e) & (d_pmra_e > 0)
+                 & np.isfinite(d_pmdec_e) & (d_pmdec_e > 0))
+        if not has_d.any():
+            return
+        idx = np.where(has_d)[0]
+
+        # DELVE 5x5 in the solver's parameter order (dRA*, dDec, pmra, pmdec, plx).
+        d_sig = np.column_stack([
+            _get('delve_ra_error',       np.inf)[idx],
+            _get('delve_dec_error',      np.inf)[idx],
+            d_pmra_e[idx], d_pmdec_e[idx],
+            _get('delve_parallax_error', np.inf)[idx],
+        ])
+        corr = np.zeros((len(idx), N_V, N_V))
+        for k in range(N_V):
+            corr[:, k, k] = 1.0
+        for i, j, name in [(0, 1, 'delve_corr_ra_dec'), (0, 2, 'delve_corr_ra_pmra'),
+                           (0, 3, 'delve_corr_ra_pmdec'), (0, 4, 'delve_corr_ra_plx'),
+                           (1, 2, 'delve_corr_dec_pmra'), (1, 3, 'delve_corr_dec_pmdec'),
+                           (1, 4, 'delve_corr_dec_plx'), (2, 3, 'delve_corr_pmra_pmdec'),
+                           (2, 4, 'delve_corr_plx_pmra'), (3, 4, 'delve_corr_plx_pmdec')]:
+            corr[:, i, j] = corr[:, j, i] = _get(name, 0.0)[idx]
+        C_d = d_sig[:, :, None] * corr * d_sig[:, None, :]
+        full5 = np.isfinite(d_sig).all(axis=1) & (d_sig > 0).all(axis=1)
+
+        cosd = np.cos(np.radians(self.gaia_dec))
+        dpos = np.column_stack([
+            (self.gaia_ra[idx] - d_ra[idx]) * cosd[idx] * DEG2MAS,
+            (self.gaia_dec[idx] - d_dec[idx]) * DEG2MAS,
+        ])
+
+        # ── veto: Gaia 5p/6p, full 5D ────────────────────────────────────────
+        is5 = self.full_gaia_astrometry[idx]
+        if is5.any():
+            t5 = idx[is5]
+            dv5 = np.column_stack([
+                dpos[is5, 0], dpos[is5, 1],
+                _get('pmra', 0.0)[t5] - d_pmra[t5],
+                _get('pmdec', 0.0)[t5] - d_pmdec[t5],
+                _get('parallax', 0.0)[t5] - d_plx[t5],
+            ])
+            chi2 = np.zeros(len(t5))
+            ok = full5[is5] & np.isfinite(dv5).all(axis=1)
+            if ok.any():
+                Cc = self.C_survey[t5] + C_d[is5]
+                x = np.linalg.solve(Cc[ok], dv5[ok, :, None]).squeeze(-1)
+                chi2[ok] = np.einsum('ni,ni->n', dv5[ok], x)
+            bad = chi2 > self._DELVE_VETO_5D
+            if bad.any():
+                has_d[t5[bad]] = False
+                print(f'  DELVE prior vetoed for {int(bad.sum())} Gaia-5p star(s) '
+                      f'(5D discrepant >3sigma; chi2 > {self._DELVE_VETO_5D})')
+
+        # ── veto: Gaia 2p, position only ─────────────────────────────────────
+        is2 = ~self.full_gaia_astrometry[idx] & full5 & has_d[idx]
+        if is2.any():
+            t2 = idx[is2]
+            chi2 = np.zeros(len(t2))
+            ok = np.isfinite(dpos[is2]).all(axis=1)
+            if ok.any():
+                Cp = self.C_survey[t2][:, :2, :2] + C_d[is2][:, :2, :2]
+                x = np.linalg.solve(Cp[ok], dpos[is2][ok, :, None]).squeeze(-1)
+                chi2[ok] = np.einsum('ni,ni->n', dpos[is2][ok], x)
+            bad = chi2 > self._DELVE_VETO_2D
+            if bad.any():
+                has_d[t2[bad]] = False
+                print(f'  DELVE prior vetoed for {int(bad.sum())} Gaia-2p star(s) '
+                      f'(position offset >3sigma; chi2 > {self._DELVE_VETO_2D})')
+
+        # ── combine the survivors ────────────────────────────────────────────
+        surv = has_d[idx] & full5
+        # A 2p star whose DELVE 5x5 is incomplete can use neither the DELVE prior
+        # nor (had we left has_d set) the diffuse one.  Clear it so the diffuse
+        # prior takes over rather than leaving it with no PM prior at all.
+        has_d[idx[~full5]] = False
+        if surv.any():
+            gi = idx[surv]
+            C_inv_d = np.linalg.inv(C_d[surv])
+            self.C_survey_inv[gi] += C_inv_d
+            v_d = np.column_stack([
+                (d_ra[gi] - self.gaia_ra[gi]) * cosd[gi] * DEG2MAS,
+                (d_dec[gi] - self.gaia_dec[gi]) * DEG2MAS,
+                d_pmra[gi], d_pmdec[gi], d_plx[gi],
+            ])
+            self.C_survey_inv_dot_v[gi] += np.einsum('nij,nj->ni', C_inv_d, v_d)
+            # v_prior / C_prior must describe the COMBINED prior, since every
+            # downstream test (test 1 especially) measures against them.
+            C_pri = np.linalg.inv(self.C_survey_inv[gi])
+            self.C_prior = self.C_prior.copy()
+            self.v_prior = np.asarray(self.v_prior).copy()
+            self.C_prior[gi] = C_pri
+            self.v_prior[gi] = np.einsum('nij,nj->ni', C_pri,
+                                         self.C_survey_inv_dot_v[gi])
+            n5 = int(self.full_gaia_astrometry[gi].sum())
+            print(f'  DELVE priors combined for {len(gi)} star(s) '
+                  f'({n5} Gaia 5p/6p, {len(gi) - n5} Gaia 2p)')
+        self._has_delve_pm = has_d
 
     # ── Geometry precomputation ──────────────────────────────────────────────
 

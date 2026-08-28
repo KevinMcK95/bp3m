@@ -63,6 +63,16 @@ def main(argv=None):
                    type=float, nargs=2, default=None, metavar=('RA', 'DEC'),
                    help='Centre for --select-radius (default: the cone centre '
                         'recorded in table_dp2.*-query.json)')
+    p.add_argument('--use-delve', '--use_delve', dest='use_delve',
+                   action='store_true',
+                   help='Fold DELVE proper-motion priors into the fit and admit '
+                        'DELVE-only stars, as bp3m --use_delve does.  Requires '
+                        'matched_delve.csv from a cross-match run with '
+                        '--use-delve.')
+    p.add_argument('--delve-use-for-align', '--delve_use_for_align',
+                   dest='delve_use_for_align', action='store_true',
+                   help='Let DELVE-only sources help calibrate image transforms '
+                        '(off by default; they inform their own astrometry only).')
     p.add_argument('--force', action='store_true',
                    help='Re-solve images that already have complete output. '
                         'By default a directory carrying a .complete sentinel is '
@@ -83,9 +93,13 @@ def main(argv=None):
         driver.run_joint(inst, args.field_root, force=args.force, label=args.label,
                          select_radius=args.select_radius,
                          select_center=tuple(args.select_center)
-                         if args.select_center else None, **kw)
+                         if args.select_center else None,
+                         use_delve=args.use_delve,
+                         delve_use_for_align=args.delve_use_for_align, **kw)
     else:
-        driver.run_per_image(inst, args.field_root, force=args.force, **kw)
+        driver.run_per_image(inst, args.field_root, force=args.force,
+                             use_delve=args.use_delve,
+                             delve_use_for_align=args.delve_use_for_align, **kw)
 
 
 if __name__ == '__main__':

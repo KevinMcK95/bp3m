@@ -238,7 +238,8 @@ def select_images(field_root: Path, metas, select_radius=None,
     return keep
 
 
-def run_per_image(inst, field_root: Path, force=False, **kw):
+def run_per_image(inst, field_root: Path, force=False, use_delve=False,
+                  delve_use_for_align=False, **kw):
     """One independent solve per image."""
     field_root = Path(field_root)
     out_dirs = []
@@ -254,7 +255,9 @@ def run_per_image(inst, field_root: Path, force=False, **kw):
         rec = load_image_record(field_root, meta)
         if rec is None:
             continue
-        out = solve([rec], _gaia(inst, meta), out_dir, meta.image_id, **kw)
+        out = solve([rec], _gaia(inst, meta, field_root, use_delve,
+                                 delve_use_for_align, [meta]),
+                    out_dir, meta.image_id, **kw)
         if out:
             out_dirs.append(out)
     if n_reused:
@@ -265,7 +268,8 @@ def run_per_image(inst, field_root: Path, force=False, **kw):
 
 
 def run_joint(inst, field_root: Path, label='all', force=False,
-              select_radius=None, select_center=None, **kw):
+              select_radius=None, select_center=None,
+              use_delve=False, delve_use_for_align=False, **kw):
     """One solve across every image, sharing stars between them."""
     field_root = Path(field_root)
     joint_dir = layout.joint_align_dir(field_root, label)
@@ -281,7 +285,8 @@ def run_joint(inst, field_root: Path, label='all', force=False,
         rec = load_image_record(field_root, meta)
         if rec is not None:
             records.append(rec)
-            gaia_parts.append(_gaia(inst, meta))
+            gaia_parts.append(_gaia(inst, meta, field_root, use_delve,
+                                    delve_use_for_align, [meta]))
     if not records:
         print('No usable images — nothing to solve.')
         return None
@@ -301,9 +306,18 @@ def run_joint(inst, field_root: Path, label='all', force=False,
     return solve(records, gaia_df, joint_dir, f'joint_{label}', **kw)
 
 
-def _gaia(inst, meta=None) -> pd.DataFrame:
-    """Gaia catalogue with the id column named and typed as the solver expects."""
+def _gaia(inst, meta=None, field_root=None, use_delve=False,
+          delve_use_for_align=False, metas=None) -> pd.DataFrame:
+    """
+    Survey prior catalogue, with the id column named and typed as the solver
+    expects.  With use_delve, DELVE priors are merged in and DELVE-only stars
+    appended, so the solver sees one combined catalogue (see delve.merge_delve).
+    """
     g = inst.gaia_catalog(meta)
+    if use_delve and field_root is not None:
+        from ..delve import merge_delve
+        g = merge_delve(g, field_root, list(metas or []),
+                        delve_use_for_align=delve_use_for_align)
     if 'gaia_source_id' not in g.columns:
         g = g.rename(columns={'source_id': 'gaia_source_id'})
     g['gaia_source_id'] = g['gaia_source_id'].astype('int64')

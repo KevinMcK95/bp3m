@@ -38,7 +38,8 @@ def _spread(v):
 
 
 def cross_match_image(inst: Instrument, meta: ImageMeta, gaia_df: pd.DataFrame,
-                      source_tiers=magnitude_tiers, verbose=True):
+                      source_tiers=magnitude_tiers, verbose=True,
+                      field_builder=None):
     """
     Cross-match a single image.
 
@@ -52,8 +53,13 @@ def cross_match_image(inst: Instrument, meta: ImageMeta, gaia_df: pd.DataFrame,
     print(f'  Catalog: {len(cat)} sources, {int(cat.is_star.sum())} stars '
           f'({100*cat.is_star.mean():.1f}%)')
 
-    gaia = build_gaia_field(gaia_df, meta, cat.xi, cat.eta,
-                            margin=cfg.disc_max + 500.0)
+    # field_builder lets a non-Gaia reference catalogue supply its own
+    # propagation and covariance.  DELVE must: its errors carry systematic
+    # floors added by _construct_delve_cov, and the Gaia routine indexes
+    # Gaia-only columns it does not have.
+    _build = field_builder or build_gaia_field
+    gaia = _build(gaia_df, meta, cat.xi, cat.eta,
+                  margin=cfg.disc_max + 500.0)
     if len(gaia) < cfg.min_matches:
         print(f'  Too few Gaia in footprint: {len(gaia)}')
         return None
@@ -105,7 +111,7 @@ def write_image_result(field_root: Path, result: dict, log_text: str = '') -> Pa
 
 
 def run(inst: Instrument, field_root: Path, source_tiers=magnitude_tiers,
-        make_plots=True, force=False) -> pd.DataFrame:
+        make_plots=True, force=False, delve_df=None) -> pd.DataFrame:
     """
     Cross-match every image in the dataset.
 
@@ -160,6 +166,28 @@ def run(inst: Instrument, field_root: Path, source_tiers=magnitude_tiers,
             continue
 
         write_image_result(field_root, result, log_text)
+
+        # Second pass against DELVE.  Same cross_match_image, same discovery /
+        # refinement / one-to-one machinery -- DELVE's catalogue is written with
+        # Gaia column names precisely so this works unchanged.  Written beside
+        # matched_gaia.csv and joined later on src_index (see delve.merge_delve).
+        if delve_df is not None:
+            from .delve import MATCHED_DELVE_CSV
+            try:
+                from .delve import build_delve_field
+                dres = cross_match_image(inst, meta, delve_df, source_tiers,
+                                         verbose=False,
+                                         field_builder=build_delve_field)
+            except Exception as exc:
+                dres = None
+                print(f'  DELVE cross-match failed: {type(exc).__name__}: {exc}')
+            if dres is not None:
+                out_d = layout.xmatch_root(field_root) / meta.rel_dir()
+                dres['matched'].to_csv(out_d / MATCHED_DELVE_CSV, index=False)
+                print(f"  DELVE: {dres['params']['n_matches']} matches")
+            else:
+                print('  DELVE: no solution for this image')
+
         if make_plots:
             from .plots.xmatch_plots import make_xmatch_plots
             make_xmatch_plots(result, layout.plots_dir(

@@ -101,6 +101,17 @@ def main(argv=None):
     p.add_argument('--bands', nargs='+', default=None)
     p.add_argument('--max-rows', type=int, default=None)
     p.add_argument('--token-file', default=None)
+    p.add_argument('--use-delve', '--use_delve', dest='use_delve',
+                   action='store_true',
+                   help='Also cross-match each image against DELVE and write '
+                        'matched_delve.csv, so DELVE PM priors and DELVE-only '
+                        'stars are available to the fit (bp3m --use_delve).')
+    p.add_argument('--delve-dir', '--delve_dir', dest='delve_dir', default=None,
+                   help='Directory of DELVE PM_hp*.fits tiles '
+                        '(default: the bp3m DELVE_ProperMotion/PMCatalog path)')
+    p.add_argument('--delve-use-for-align', '--delve_use_for_align',
+                   dest='delve_use_for_align', action='store_true',
+                   help='Let DELVE-only sources help calibrate image transforms')
     p.add_argument('--force-download', '--force_download',
                    dest='force_download', action='store_true',
                    help='Re-query the LSST and Gaia catalogues even when tables '
@@ -170,16 +181,31 @@ def main(argv=None):
     from ..discovery import magnitude_tiers
     from ..instruments.lsst import LSSTInstrument
     inst = LSSTInstrument(field_root)
+    delve_df = None
+    if args.use_delve:
+        from ..delve import DEFAULT_DELVE_DIR, fetch_delve, load_delve
+        print('  DELVE: extracting catalogue over the field footprint')
+        fetch_delve(field_root, args.name,
+                    delve_dir=args.delve_dir or DEFAULT_DELVE_DIR,
+                    force=args.force_download)
+        delve_df = load_delve(field_root)
+        if delve_df is None:
+            print('  no DELVE coverage for this field — continuing Gaia-only')
     xmatch.run(inst, field_root, source_tiers=magnitude_tiers,
-               make_plots=not args.no_plots, force=args.force)
+               make_plots=not args.no_plots, force=args.force,
+               delve_df=delve_df)
 
     mode = args.align_mode
     if mode in ('per-image', 'both'):
         driver.run_per_image(inst, field_root, make_plots=not args.no_plots,
-                             verbose=False, force=args.force)
+                             verbose=False, force=args.force,
+                             use_delve=args.use_delve,
+                             delve_use_for_align=args.delve_use_for_align)
     if mode in ('joint', 'both'):
         driver.run_joint(inst, field_root, label=args.joint_label,
-                         make_plots=not args.no_plots, force=args.force)
+                         make_plots=not args.no_plots, force=args.force,
+                         use_delve=args.use_delve,
+                         delve_use_for_align=args.delve_use_for_align)
 
     # diagnose_transforms reads the PER-IMAGE align output, so it only has
     # something to say when those solves ran.
