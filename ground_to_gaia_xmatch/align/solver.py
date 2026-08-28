@@ -2066,8 +2066,12 @@ class AlignmentSolver:
             _style_ax(ax)
 
         # Uncertainty vs magnitude panel.
-        # Populations follow bp3m plot_results.make_plots exactly, including
-        # marker, colour and zorder, so the two are directly comparable:
+        # Populations follow bp3m plot_results.make_plots, EXCEPT the z-order:
+        # 5p (circles) is drawn above 2p (squares) everywhere the two share a
+        # panel.  2p proper motions scatter much more widely, and on top they
+        # bury the tight 5p cluster that the figure exists to show.  bp3m puts 2p
+        # above; this is a deliberate, requested divergence.  Order here:
+        # priors 2 < 2p 3 < 5p 4 < DELVE-only 5.
         #   Gaia prior       #444444        DELVE prior      dodgerblue  D
         #   Gaia only        mediumseagreen Gaia+DELVE       steelblue
         #   Gaia 2p          mediumpurple s DELVE only       darkorange  ^
@@ -2105,20 +2109,20 @@ class AlignmentSolver:
         if _gonly.any():
             ax_unc.scatter(gmag[_gonly], sig_pm_xm[_gonly], s=6, alpha=0.85,
                            color='mediumseagreen', label='xmatch Gaia only',
-                           zorder=3)
+                           zorder=4)
         if _gdlv.any():
             ax_unc.scatter(gmag[_gdlv], sig_pm_xm[_gdlv], s=6, alpha=0.7,
-                           color='steelblue', label='xmatch Gaia+DELVE', zorder=3)
+                           color='steelblue', label='xmatch Gaia+DELVE', zorder=4)
         _xmatch_2p_conv = xm_converged & (~has_gaia) & ~_delve_only
         if _xmatch_2p_conv.any():
             ax_unc.scatter(gmag[_xmatch_2p_conv], sig_pm_xm[_xmatch_2p_conv],
                            s=8, alpha=0.8, color='mediumpurple', marker='s',
-                           label='xmatch Gaia 2p', zorder=4)
+                           label='xmatch Gaia 2p', zorder=3)
         _dlv_conv = xm_converged & _delve_only
         if _dlv_conv.any():
             ax_unc.scatter(gmag[_dlv_conv], sig_pm_xm[_dlv_conv],
                            s=10, alpha=0.8, color='darkorange', marker='^',
-                           label='xmatch DELVE only', zorder=4)
+                           label='xmatch DELVE only', zorder=5)
         ax_unc.set_xlabel('G [mag]')
         ax_unc.set_ylabel(r'$(\det\,C_{\mu})^{1/4}$ [mas/yr]')
         ax_unc.set_title(r'Geometric-mean PM uncertainty $(\det\,C_{\mu})^{1/4}$ vs magnitude')
@@ -2209,7 +2213,7 @@ class AlignmentSolver:
             ax = axes[row, 1]
             if xm_5p_conv.any():
                 ax.scatter(xm_pmra_5p, xm_pmdec_5p, c=c_xmatch_5p, s=6,
-                          norm=norm_unc, cmap=cmap_unc, alpha=0.8, zorder=2,
+                          norm=norm_unc, cmap=cmap_unc, alpha=0.8, zorder=3,
                           label='Gaia 5p')
             if xm_2p_conv.any():
                 sc = ax.scatter(xm_pmra_2p, xm_pmdec_2p, c=c_xmatch_2p, s=8,
@@ -2266,7 +2270,7 @@ class AlignmentSolver:
             if xm_5p_conv.any():
                 _pm_error_bars(ax, xm_pmra_5p, xm_pmdec_5p, C_pm_xmatch_5p_h)
                 ax.scatter(xm_pmra_5p, xm_pmdec_5p, c=c_xmatch_5p, s=6,
-                          norm=norm_unc, cmap=cmap_unc, alpha=0.8, zorder=2,
+                          norm=norm_unc, cmap=cmap_unc, alpha=0.8, zorder=3,
                           label='Gaia 5p')
             if xm_2p_conv.any():
                 _pm_error_bars(ax, xm_pmra_2p, xm_pmdec_2p, C_pm_xmatch_2p_h)
@@ -2363,7 +2367,7 @@ class AlignmentSolver:
                 ax = axes[row, col]
                 if xm_5p_conv.any():
                     ax.scatter(pmra_5p, pmdec_5p, c=xi_5p if col == 0 else eta_5p, s=6,
-                              norm=norm_c, cmap='plasma', alpha=0.8, zorder=2, label='Gaia 5p')
+                              norm=norm_c, cmap='plasma', alpha=0.8, zorder=3, label='Gaia 5p')
                 if xm_2p_conv.any():
                     sc = ax.scatter(pmra_2p, pmdec_2p, c=xi_2p if col == 0 else eta_2p, s=8,
                                    marker='s', norm=norm_c, cmap='plasma', alpha=0.65,
@@ -2714,7 +2718,7 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
         if (~is_mem_sky).any():
             sc = ax.scatter(ra[ok_sky][~is_mem_sky], dec[ok_sky][~is_mem_sky],
                            c=pm_size[ok_sky][~is_mem_sky], s=6,
-                           norm=norm_pm, cmap='plasma', alpha=0.8, zorder=2,
+                           norm=norm_pm, cmap='plasma', alpha=0.8, zorder=3,
                            linewidths=0, rasterized=True, label='Gaia 5p/6p')
         if is_mem_sky.any():
             sc = ax.scatter(ra[ok_sky][is_mem_sky], dec[ok_sky][is_mem_sky],
@@ -2723,7 +2727,7 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
                            linewidths=0, rasterized=True, label='Gaia 2p')
     else:
         sc = ax.scatter(ra[ok_sky], dec[ok_sky], c=pm_size[ok_sky], s=6,
-                       norm=norm_pm, cmap='plasma', alpha=0.8, zorder=2,
+                       norm=norm_pm, cmap='plasma', alpha=0.8, zorder=3,
                        linewidths=0, rasterized=True)
     if sc is not None:
         plt.colorbar(sc, ax=ax, label='|PM| (mas/yr)')
@@ -2745,7 +2749,7 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
             if (~is_mem_cmd).any():
                 sc = ax.scatter(bp_rp[has_cmd][~is_mem_cmd], gmag[has_cmd][~is_mem_cmd],
                                c=pm_size[has_cmd][~is_mem_cmd], s=6,
-                               norm=norm_pm, cmap='plasma', alpha=0.8, zorder=2,
+                               norm=norm_pm, cmap='plasma', alpha=0.8, zorder=3,
                                linewidths=0, rasterized=True, label='Gaia 5p/6p')
             if is_mem_cmd.any():
                 sc = ax.scatter(bp_rp[has_cmd][is_mem_cmd], gmag[has_cmd][is_mem_cmd],
@@ -2754,7 +2758,7 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
                                linewidths=0, rasterized=True, label='Gaia 2p')
         else:
             sc = ax.scatter(bp_rp[has_cmd], gmag[has_cmd], c=pm_size[has_cmd], s=6,
-                           norm=norm_pm, cmap='plasma', alpha=0.8, zorder=2,
+                           norm=norm_pm, cmap='plasma', alpha=0.8, zorder=3,
                            linewidths=0, rasterized=True)
         if sc is not None:
             plt.colorbar(sc, ax=ax, label='|PM| (mas/yr)')
@@ -2775,7 +2779,7 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
             if (~is_mem_cmd).any():
                 sc = ax.scatter(bp_rp[has_cmd][~is_mem_cmd], gmag[has_cmd][~is_mem_cmd],
                                c=pm_unc[has_cmd][~is_mem_cmd], s=6,
-                               norm=norm_unc, cmap='viridis', alpha=0.8, zorder=2,
+                               norm=norm_unc, cmap='viridis', alpha=0.8, zorder=3,
                                linewidths=0, rasterized=True, label='Gaia 5p/6p')
             if is_mem_cmd.any():
                 sc = ax.scatter(bp_rp[has_cmd][is_mem_cmd], gmag[has_cmd][is_mem_cmd],
@@ -2784,7 +2788,7 @@ def _plot_sky_and_cmd(ra, dec, gmag, bp_rp, pm_size, pm_unc, ok, plot_dir,
                                linewidths=0, rasterized=True, label='Gaia 2p')
         else:
             sc = ax.scatter(bp_rp[has_cmd], gmag[has_cmd], c=pm_unc[has_cmd], s=6,
-                           norm=norm_unc, cmap='viridis', alpha=0.8, zorder=2,
+                           norm=norm_unc, cmap='viridis', alpha=0.8, zorder=3,
                            linewidths=0, rasterized=True)
         if sc is not None:
             plt.colorbar(sc, ax=ax, label='σ_PM (mas/yr)')
