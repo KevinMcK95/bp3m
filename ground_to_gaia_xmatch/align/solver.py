@@ -2343,6 +2343,17 @@ def _plot_chi2_distributions(solver, r_hat, v_hat, plot_dir):
     all_accepted = np.concatenate(list(per_img_chi2.values()))
     all_vals     = np.concatenate(list(per_img_all.values()))
 
+    # An image can end up with zero accepted detections (every one clipped, or
+    # too few matches to begin with).  np.percentile on an empty array raises
+    # IndexError, which previously aborted the whole run from inside a PLOT:
+    # M49's per-image pass died at image 660 of 5009 this way, losing the
+    # remaining 4349.  A diagnostic must never be able to kill the fit, so skip
+    # the figure instead.  Nothing about the plot itself changes when there IS
+    # data to draw.
+    if all_accepted.size == 0 or all_vals.size == 0:
+        print('    (skipping chi2 distribution plot: no accepted detections)')
+        return
+
     thresholds = {
         '0.99':   chi2_dist_mod.ppf(0.99,   df=2),
         '0.999':  chi2_dist_mod.ppf(0.999,  df=2),

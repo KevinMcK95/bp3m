@@ -158,7 +158,16 @@ def solve(records: Sequence[dict], gaia_df: pd.DataFrame, out_dir: Path,
     out_dir.mkdir(parents=True, exist_ok=True)
     solver.save_results(r_hat, C_r, v_hat, C_vT, v_mean, v_cov, out_dir)
     if make_plots:
-        solver.make_plots(r_hat, v_hat, v_mean, v_cov, C_vT, C_r, out_dir)
+        # A diagnostic must never be able to kill the fit.  M49's per-image pass
+        # died at image 660 of 5009 on an IndexError inside a chi2 histogram,
+        # discarding the remaining 4349 images' worth of work -- even though
+        # save_results above had already written valid output for each of them.
+        # Report loudly and carry on; the results are unaffected.
+        try:
+            solver.make_plots(r_hat, v_hat, v_mean, v_cov, C_vT, C_r, out_dir)
+        except Exception as exc:
+            print(f'  WARNING plots failed for {label}: '
+                  f'{type(exc).__name__}: {exc}  (results are still valid)')
 
     resid = solver.compute_residuals(r_hat, v_hat)
     total_used = total_n = 0

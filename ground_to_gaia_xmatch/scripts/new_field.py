@@ -49,7 +49,7 @@ def footprint(field_root: Path, name: str):
     return ra0, dec0, w, h
 
 
-def fetch_gaia(field_root: Path, name: str, quiet=False):
+def fetch_gaia(field_root: Path, name: str, quiet=False, query_timeout=600):
     """Gaia over the LSST footprint, flattened into <field_root>/Gaia/."""
     from bp3m.pipeline.download_gaia import download_gaia
     ra0, dec0, w, h = footprint(field_root, name)
@@ -64,7 +64,7 @@ def fetch_gaia(field_root: Path, name: str, quiet=False):
     download_gaia(ra=ra0, dec=dec0, search_width=w, search_height=h,
                   output_dir=str(gdir), field_name=name,
                   min_gmag=0.0, max_gmag=None, n_processes=4,
-                  query_timeout=600, quiet=quiet)
+                  query_timeout=query_timeout, quiet=quiet)
     # download_gaia nests its output, and by more than one level: the observed
     # layout is <output_dir>/<field_name>/Gaia/<files>.  Flatten whatever depth
     # it used, because the adapter's glob is non-recursive.
@@ -100,6 +100,11 @@ def main(argv=None):
     p.add_argument('--bands', nargs='+', default=None)
     p.add_argument('--max-rows', type=int, default=None)
     p.add_argument('--token-file', default=None)
+    p.add_argument('--gaia-timeout', type=int, default=600,
+                   help='Per-magnitude-bin Gaia TAP timeout in seconds '
+                        '(default 600).  Raise it for crowded low-latitude '
+                        'fields: Sagittarius dSph at l=5.6, b=-14 timed out on '
+                        'the G 17-19 bin at 600 s.')
     p.add_argument('--vd-radius-factor', type=float, default=2.0)
     p.add_argument('--skip-lsst', action='store_true')
     p.add_argument('--skip-gaia', action='store_true')
@@ -139,7 +144,7 @@ def main(argv=None):
 
     if not args.skip_gaia:
         print('[2/3] Gaia catalogue over the LSST footprint')
-        fetch_gaia(field_root, args.name)
+        fetch_gaia(field_root, args.name, query_timeout=args.gaia_timeout)
 
     if not args.run:
         print('\nready. analyse with:')
