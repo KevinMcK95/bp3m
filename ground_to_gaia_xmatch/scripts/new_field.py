@@ -49,15 +49,16 @@ def footprint(field_root: Path, name: str):
     return ra0, dec0, w, h
 
 
-def fetch_gaia(field_root: Path, name: str, quiet=False, query_timeout=600):
+def fetch_gaia(field_root: Path, name: str, quiet=False, query_timeout=600,
+               force=False):
     """Gaia over the LSST footprint, flattened into <field_root>/Gaia/."""
     from bp3m.pipeline.download_gaia import download_gaia
     ra0, dec0, w, h = footprint(field_root, name)
     gdir = field_root / 'Gaia'
     gdir.mkdir(parents=True, exist_ok=True)
-    if list(gdir.glob('*_gaia.csv')):
+    if list(gdir.glob('*_gaia.csv')) and not force:
         if not quiet:
-            print('  Gaia catalogue already present')
+            print('  Gaia catalogue already present (--force-download to refetch)')
         return
     if not quiet:
         print(f'  Gaia: centre ({ra0:.4f}, {dec0:.4f}) box {w:.4f} x {h:.4f} deg')
@@ -100,6 +101,15 @@ def main(argv=None):
     p.add_argument('--bands', nargs='+', default=None)
     p.add_argument('--max-rows', type=int, default=None)
     p.add_argument('--token-file', default=None)
+    p.add_argument('--force-download', '--force_download',
+                   dest='force_download', action='store_true',
+                   help='Re-query the LSST and Gaia catalogues even when tables '
+                        'are already present.  Needed when EXTENDING a field to a '
+                        'larger --search_radius, since the download cache checks '
+                        'only that files exist, not that they cover the request. '
+                        'Deliberately separate from --force so the cross-match '
+                        'can still resume: images already done are skipped and '
+                        'only the newly-covered ones are processed.')
     p.add_argument('--gaia-timeout', type=int, default=600,
                    help='Per-magnitude-bin Gaia TAP timeout in seconds '
                         '(default 600).  Raise it for crowded low-latitude '
@@ -140,11 +150,13 @@ def main(argv=None):
                       field_root=field_root, field_name=args.name,
                       bands=args.bands, max_rows=args.max_rows,
                       token_file=args.token_file,
-                      vd_radius_factor=args.vd_radius_factor)
+                      vd_radius_factor=args.vd_radius_factor,
+                      force=args.force_download)
 
     if not args.skip_gaia:
         print('[2/3] Gaia catalogue over the LSST footprint')
-        fetch_gaia(field_root, args.name, query_timeout=args.gaia_timeout)
+        fetch_gaia(field_root, args.name, query_timeout=args.gaia_timeout,
+                   force=args.force_download)
 
     if not args.run:
         print('\nready. analyse with:')
