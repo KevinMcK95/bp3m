@@ -154,6 +154,12 @@ def fetch_delve(field_root, name: str, delve_dir=DEFAULT_DELVE_DIR,
     return hits[0]
 
 
+# The DELVE catalogue is ~350k rows and takes seconds to parse.  Cached on the
+# resolved path so repeated calls across images are free, the same reason the
+# CFHT adapter caches its 848k-row detector table.
+_DELVE_CACHE: dict = {}
+
+
 def load_delve(field_root, quiet: bool = False) -> pd.DataFrame | None:
     """
     The DELVE catalogue for this field.
@@ -173,6 +179,9 @@ def load_delve(field_root, quiet: bool = False) -> pd.DataFrame | None:
     hits = sorted(delve_root(field_root).glob('*_delve.csv'))
     if not hits:
         return None
+    key = str(hits[0].resolve())
+    if key in _DELVE_CACHE:
+        return _DELVE_CACHE[key]
     from gaia_cross_match.cross_match_delve import load_delve_data
     df = load_delve_data(str(hits[0]))
     if df is None or not len(df):
@@ -183,6 +192,7 @@ def load_delve(field_root, quiet: bool = False) -> pd.DataFrame | None:
     if 'bp_rp' not in df.columns and {'g_mag', 'i_mag'} <= set(df.columns):
         df['bp_rp'] = (pd.to_numeric(df['g_mag'], errors='coerce')
                        - pd.to_numeric(df['i_mag'], errors='coerce'))
+    _DELVE_CACHE[key] = df
     return df
 
 
@@ -395,9 +405,15 @@ def merge_delve(gaia_df: pd.DataFrame, field_root, metas,
             # solver treats the star as needing a diffuse Gaia prior, exactly as
             # a Gaia 2p source is treated, while the delve_* block supplies the
             # real information.
-            r['source_id'] = int(dv_id)
+            # NEGATIVE synthetic id, exactly as bp3m does
+            # (delve_id_to_gaia_id[did] = -did): unique, int64-safe, and
+            # instantly distinguishable from a real Gaia source_id.  It MUST
+            # match the id driver._append_delve_only stamps on the detections,
+            # or the catalogue row and its observations never join and the star
+            # is dropped.
+            r['source_id'] = -int(dv_id)
             if 'gaia_source_id' in out.columns:
-                r['gaia_source_id'] = int(dv_id)
+                r['gaia_source_id'] = -int(dv_id)
             for c, v in (('ra', src.get('ra')), ('dec', src.get('dec')),
                          ('ref_epoch', src.get('ref_epoch', 2016.0)),
                          ('gmag', src.get('gmag', src.get('r_mag'))),

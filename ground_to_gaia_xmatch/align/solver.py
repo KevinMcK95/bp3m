@@ -641,6 +641,25 @@ class AlignmentSolver:
             if use_init.sum() < 4:
                 use_init = ok_init.copy()
 
+            # use_for_alignment gates whether a detection may CALIBRATE the
+            # transform, separately from whether it is fitted at all.  bp3m sets
+            # it False for DELVE-only detections (see
+            # data_loader_flc._build_delve_only_stars_df: use_for_alignment =
+            # ok_sat if delve_use_for_align else zeros, while use_for_fit stays
+            # True), because DELVE astrometry is not trusted to define an image
+            # frame -- but a DELVE-only star's ground positions still constrain
+            # its own PM through the astrometry-only path.  Without this the
+            # column would be silently ignored and DELVE-only stars would help
+            # set the transform they are being measured against.
+            if 'use_for_alignment' in sub.columns:
+                _ufa = sub['use_for_alignment'].to_numpy()
+                if _ufa.dtype == object:
+                    _ufa = np.isin(np.char.lower(_ufa.astype(str)),
+                                   ('true', 't', '1', 'yes'))
+                else:
+                    _ufa = _ufa.astype(bool)
+                use_init = use_init & _ufa
+
             n_rej_init = int(np.sum(~use_init))
             if n_rej_init > 0:
                 print(f"  {img}: {n_rej_init}/{n} rejected by initial residual screen")

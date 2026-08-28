@@ -61,7 +61,51 @@ def _as_float(params: dict, key: str, default: float) -> float:
     return f if np.isfinite(f) else float(default)
 
 
-def load_image_record(field_root: Path, meta: ImageMeta) -> dict | None:
+def _append_delve_only(matched: pd.DataFrame, d: Path, image_id: str,
+                       delve_use_for_align: bool) -> pd.DataFrame:
+    """
+    Add this image's DELVE-only detections to its matched table.
+
+    A DELVE-only detection is a ground source matched to DELVE but NOT to Gaia,
+    identified by src_index (bp3m uses the same key, hst_index).  Without these
+    rows the synthetic DELVE-only catalogue entries have zero observations, so
+    the solver drops them and the entire sub-Gaia-limit population is absent
+    from the fit -- which is exactly what happened before this existed.
+
+    Mirrors data_loader_flc._build_delve_only_stars_df: the detection keeps the
+    ground measurement (position and covariance, already in matched_delve.csv),
+    gets a synthetic NEGATIVE id (-delve_source_id, unique and int64-safe, as
+    bp3m does), and is marked use_for_alignment=False unless
+    --delve-use-for-align, so it informs its own astrometry without calibrating
+    the transform.
+    """
+    from ..delve import MATCHED_DELVE_CSV
+    dpath = d / MATCHED_DELVE_CSV
+    if not dpath.exists():
+        return matched
+    dv = pd.read_csv(dpath)
+    if 'src_index' not in dv.columns or 'delve_source_id' not in dv.columns:
+        return matched
+    claimed = set(matched['src_index'].astype(int)) if 'src_index' in matched.columns else set()
+    only = dv[~dv['src_index'].astype(int).isin(claimed)].copy()
+    if not len(only):
+        matched['use_for_alignment'] = True
+        return matched
+
+    only['gaia_source_id'] = -only['delve_source_id'].astype('int64')
+    # DELVE has a PM for every row, so these are not diffuse-prior 2p stars.
+    only['has_gaia_pms'] = True
+    only['use_for_alignment'] = bool(delve_use_for_align)
+    matched = matched.copy()
+    matched['use_for_alignment'] = True
+    keep = [c for c in matched.columns if c in only.columns]
+    out = pd.concat([matched, only[keep]], ignore_index=True)
+    out['gaia_source_id'] = out['gaia_source_id'].astype('int64')
+    return out
+
+
+def load_image_record(field_root: Path, meta: ImageMeta, use_delve: bool = False,
+                      delve_use_for_align: bool = False) -> dict | None:
     """
     Build one solver image record from this image's cross-match outputs.
 
@@ -77,6 +121,9 @@ def load_image_record(field_root: Path, meta: ImageMeta) -> dict | None:
     # Read the id column straight to int64: a float64 round-trip silently
     # corrupts Gaia source_ids above 2^53.
     matched['gaia_source_id'] = matched['gaia_source_id'].astype('int64')
+    if use_delve:
+        matched = _append_delve_only(matched, d, meta.image_id,
+                                     delve_use_for_align)
     if len(matched) < MIN_STARS:
         print(f'  [{meta.image_id}] only {len(matched)} matches — skip')
         return None
@@ -252,7 +299,7 @@ def run_per_image(inst, field_root: Path, force=False, use_delve=False,
             n_reused += 1
             continue
         print(f'[{i:3d}/{len(images)}] {meta.image_id}', flush=True)
-        rec = load_image_record(field_root, meta)
+        rec = load_image_record(field_root, meta, use_delve, delve_use_for_align)
         if rec is None:
             continue
         out = solve([rec], _gaia(inst, meta, field_root, use_delve,
@@ -279,14 +326,19 @@ def run_joint(inst, field_root: Path, label='all', force=False,
               f'({info.get("n_images", "?")} images, {info.get("n_stars", "?")} '
               f'stars) — reusing.  Use --force to redo.')
         return joint_dir
-    records, gaia_parts = [], []
+    records, gaia_parts, used_metas = [], [], []
     for meta in select_images(field_root, inst.iter_images(),
                               select_radius, select_center):
-        rec = load_image_record(field_root, meta)
+        rec = load_image_record(field_root, meta, use_delve, delve_use_for_align)
         if rec is not None:
             records.append(rec)
-            gaia_parts.append(_gaia(inst, meta, field_root, use_delve,
-                                    delve_use_for_align, [meta]))
+            used_metas.append(meta)
+            # Raw Gaia only here.  Merging DELVE per image would re-parse the
+            # ~350k-row catalogue once per image and build one full copy of the
+            # Gaia table per image before de-duplication -- 229 copies of 63k
+            # rows on a Reticulum_II joint.  The merge is a whole-field
+            # operation, so it happens once, below.
+            gaia_parts.append(_gaia(inst, meta))
     if not records:
         print('No usable images — nothing to solve.')
         return None
@@ -294,6 +346,13 @@ def run_joint(inst, field_root: Path, label='all', force=False,
     gaia_df = (pd.concat(gaia_parts, ignore_index=True)
                  .drop_duplicates('gaia_source_id')
                  .reset_index(drop=True))
+    if use_delve:
+        from ..delve import merge_delve
+        gaia_df = merge_delve(gaia_df, field_root, used_metas,
+                              delve_use_for_align=delve_use_for_align)
+        if 'gaia_source_id' not in gaia_df.columns:
+            gaia_df = gaia_df.rename(columns={'source_id': 'gaia_source_id'})
+        gaia_df['gaia_source_id'] = gaia_df['gaia_source_id'].astype('int64')
 
     n_pairs = sum(len(r['matched']) for r in records)
     ids = set()
