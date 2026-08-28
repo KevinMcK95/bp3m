@@ -21,16 +21,28 @@ import numpy as np
 import pandas as pd
 
 
-def make_xmatch_plots(result: dict, out_dir: Path) -> Path:
-    """Write the diagnostic figure set for one image."""
+def make_xmatch_plots(result: dict, out_dir: Path, ref: str = 'Gaia',
+                      suffix: str = '') -> Path:
+    """
+    Write the diagnostic figure set for one image.
+
+    `ref` names the reference catalogue in the axis labels and `suffix` is
+    appended to the filenames, so the DELVE cross-match produces
+    diagnostic_plots_delve.png / offset_histogram_delve.png from this same
+    function.  The panel layout, ordering and colours are untouched — bp3m's
+    _save_diagnostic_plots_delve states its layout "mirrors
+    save_diagnostic_plots() from cross_match.py exactly", and this figure is
+    already that verbatim port, so DELVE needs no second implementation.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    _diagnostic_plots(result, out_dir)
-    _offset_histogram(result, out_dir)
-    return out_dir / 'diagnostic_plots.png'
+    _diagnostic_plots(result, out_dir, ref=ref, suffix=suffix)
+    _offset_histogram(result, out_dir, ref=ref, suffix=suffix)
+    return out_dir / f'diagnostic_plots{suffix}.png'
 
 
-def _diagnostic_plots(result: dict, det_dir: Path) -> None:
+def _diagnostic_plots(result: dict, det_dir: Path, ref: str = 'Gaia',
+                      suffix: str = '') -> None:
     """5x2 diagnostic figure."""
     matched = result['matched']
     rejected = result['rejected']
@@ -46,7 +58,7 @@ def _diagnostic_plots(result: dict, det_dir: Path) -> None:
     m_nonstars = matched[~matched['src_is_star'].astype(bool)]
 
     fig, axes = plt.subplots(5, 2, figsize=(14, 24 / 4 * 5))
-    fig.suptitle(f"Match Diagnostics: {image_name}", fontsize=18)
+    fig.suptitle(f"{ref} Match Diagnostics: {image_name}", fontsize=18)
 
     # ── 0,0: Field Map (pixels) ──────────────────────────────────────────────
     ax = axes[0, 0]
@@ -74,7 +86,7 @@ def _diagnostic_plots(result: dict, det_dir: Path) -> None:
         ax.scatter(m_stars['gaia_pmra'], m_stars['gaia_pmdec'],
                    c='blue', alpha=0.6, s=10, label='Matched star')
     ax.set_xlabel('PMRA (mas/yr)'); ax.set_ylabel('PMDec (mas/yr)')
-    ax.set_title('Gaia Proper Motions'); ax.legend(fontsize=7)
+    ax.set_title(f'{ref} Proper Motions'); ax.legend(fontsize=7)
 
     # ── 1,0: Gaia CMD (G vs BP-RP) ───────────────────────────────────────────
     ax = axes[1, 0]
@@ -89,8 +101,8 @@ def _diagnostic_plots(result: dict, det_dir: Path) -> None:
             ax.scatter(m_stars['gaia_bprp'], m_stars['gaia_gmag'],
                        c='blue', alpha=0.6, s=10, label='Matched star')
         ax.invert_yaxis()
-        ax.set_xlabel('BP − RP (mag)'); ax.set_ylabel('Gaia G (mag)')
-        ax.set_title('Gaia Color-Magnitude Diagram'); ax.legend(fontsize=7)
+        ax.set_xlabel('BP − RP (mag)'); ax.set_ylabel(f'{ref} mag')
+        ax.set_title(f'{ref} Color-Magnitude Diagram'); ax.legend(fontsize=7)
 
     # ── 1,1: G vs G-instrumental (photometric calibration) ───────────────────
     ax = axes[1, 1]
@@ -105,8 +117,8 @@ def _diagnostic_plots(result: dict, det_dir: Path) -> None:
                        s=12 if col != 'red' else 5, label=lbl)
     ax.axvline(zp, color='black', ls='--', lw=1, label=f'ZP={zp:.3f}')
     ax.invert_yaxis()
-    ax.set_xlabel(f'G − {INST} (mag)'); ax.set_ylabel('Gaia G (mag)')
-    ax.set_title(f'Gaia G − {INST} Color-Magnitude'); ax.legend(fontsize=7)
+    ax.set_xlabel(f'{ref} − {INST} (mag)'); ax.set_ylabel(f'{ref} mag')
+    ax.set_title(f'{ref} − {INST} Color-Magnitude'); ax.legend(fontsize=7)
 
     # ── 2,0: (xi,eta) Residual Scatter ───────────────────────────────────────
     ax = axes[2, 0]
@@ -160,8 +172,8 @@ def _diagnostic_plots(result: dict, det_dir: Path) -> None:
             dr = np.sqrt(sub['residual_xi_mas']**2 + sub['residual_eta_mas']**2)
             ax.scatter(sub['gaia_gmag'], dr, c=col, alpha=0.5, s=10, label=lbl)
     ax.set_yscale('log')
-    ax.set_xlabel('Gaia G (mag)'); ax.set_ylabel('|residual| (mas)')
-    ax.set_title('Residual vs Gaia Mag'); ax.legend(fontsize=7)
+    ax.set_xlabel(f'{ref} mag'); ax.set_ylabel('|residual| (mas)')
+    ax.set_title(f'Residual vs {ref} Mag'); ax.legend(fontsize=7)
     ax.set_xlim(mag_min - mag_pad, mag_max + mag_pad)
 
     # ── 3,1: Sigma histogram ─────────────────────────────────────────────────
@@ -191,8 +203,8 @@ def _diagnostic_plots(result: dict, det_dir: Path) -> None:
             ax.scatter(sub['gaia_gmag'], sub['residual_sigma'],
                        c=col, alpha=0.5, s=10, label=lbl)
     ax.axhline(5, color='red', ls='--', label='Threshold (5σ)')
-    ax.set_xlabel('Gaia G (mag)'); ax.set_ylabel('σ (Mahalanobis)')
-    ax.set_title('Sigma vs Gaia Mag'); ax.legend(fontsize=7)
+    ax.set_xlabel(f'{ref} mag'); ax.set_ylabel('σ (Mahalanobis)')
+    ax.set_title(f'Sigma vs {ref} Mag'); ax.legend(fontsize=7)
     ax.set_xlim(mag_min - mag_pad, mag_max + mag_pad)
 
     # ── 4,1: Color-color (BP-RP vs G-instrumental) ───────────────────────────
@@ -207,15 +219,16 @@ def _diagnostic_plots(result: dict, det_dir: Path) -> None:
                            c=col, alpha=0.5 if col != 'red' else 0.15,
                            s=12 if col != 'red' else 5, label=lbl)
         ax.invert_yaxis()
-        ax.set_xlabel('BP − RP (mag)'); ax.set_ylabel(f'G − {INST} (mag)')
+        ax.set_xlabel('BP − RP (mag)'); ax.set_ylabel(f'{ref} − {INST} (mag)')
         ax.set_title('Color-Color Diagram'); ax.legend(fontsize=7)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    fig.savefig(det_dir / 'diagnostic_plots.png', dpi=150)
+    fig.savefig(det_dir / f'diagnostic_plots{suffix}.png', dpi=150)
     plt.close(fig)
 
 
-def _offset_histogram(result: dict, det_dir: Path) -> None:
+def _offset_histogram(result: dict, det_dir: Path, ref: str = 'Gaia',
+                      suffix: str = '') -> None:
     """Discovery voting histogram for the winning tier."""
     best = result.get('best') or {}
     hist = best.get('offset_hist')
@@ -238,7 +251,7 @@ def _offset_histogram(result: dict, det_dir: Path) -> None:
     ax.set_title(f"{result['meta'].image_id}  |  "
                  f"best {best.get('tier', '')}  [{best.get('gaia_tier', '')}]")
     fig.tight_layout()
-    fig.savefig(det_dir / 'offset_histogram.png', dpi=120)
+    fig.savefig(det_dir / f'offset_histogram{suffix}.png', dpi=120)
     plt.close(fig)
 
 

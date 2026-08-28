@@ -197,6 +197,10 @@ def run(inst: Instrument, field_root: Path, source_tiers=magnitude_tiers,
                 to_bp3m_schema(dres['matched'], delve_df).to_csv(
                     out_d / MATCHED_DELVE_CSV, index=False)
                 print(f"  DELVE: {dres['params']['n_matches']} matches")
+                if make_plots:
+                    from .plots.xmatch_plots import make_xmatch_plots
+                    make_xmatch_plots(dres, layout.plots_dir(out_d),
+                                      ref='DELVE', suffix='_delve')
             else:
                 print('  DELVE: no solution for this image')
 
