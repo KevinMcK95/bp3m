@@ -604,6 +604,12 @@ class BP3MSolver:
         # Gaia 2p / HST-only: flat position prior + 100 mas/yr PM prior +
         #   magnitude/direction-dependent parallax prior (10 * sigma_F90).
         needs_diffuse = self.gaia_2p  # 2p; HST-only rows added by v2 loader extend this
+        # Stored so the alpha estimator and the test-3 threshold reference can
+        # exclude diffuse-prior stars with one definition (ported back from
+        # ground_to_gaia_xmatch, where 55% 2p turned alpha_raw into 0.001 and
+        # the adaptive threshold into its floor).  _add_gaia_epoch_obs extends
+        # this for epoch stars, whose Gaia prior is replaced by the diffuse one.
+        self.needs_diffuse = np.asarray(needs_diffuse, dtype=bool).copy()
         sigma_plx_prior = np.full(self.n_stars, np.inf)
         if needs_diffuse.any():
             sigma_plx_prior[needs_diffuse] = michalik_sigma_plx_prior(
@@ -1110,6 +1116,9 @@ class BP3MSolver:
         self._sigma_diff_per_star[idx_ep, 1] = 1e4
         self._sigma_diff_per_star[idx_ep, 2] = _SIGMA_PM
         self._sigma_diff_per_star[idx_ep, 3] = _SIGMA_PM
+        # Their Gaia prior was just zeroed and replaced by the diffuse prior, so
+        # they must also leave the alpha / test-3 reference populations.
+        self.needs_diffuse[idx_ep] = True
         self._sigma_diff_per_star[idx_ep[fin_ep], 4] = sigma_plx_ep[fin_ep]
 
         # ── Zero out the Gaia 2p position prior for all 2p stars ──────────────
@@ -2323,8 +2332,13 @@ class BP3MSolver:
             # a chicken-and-egg dependency.  Only applied at iteration >= 3 so
             # early iterations exclude obvious outliers before alpha is reliable.
             prev_use = np.asarray(self._img_data[img]["use_for_fit"])
-            if alpha_scale_chi2 and iteration >= 3 and prev_use.sum() >= 4:
-                chi2_prev = sig_sq[prev_use]
+            # Restricted to informative-prior stars: a diffuse-prior star's
+            # residual is absorbed by its own free PM, so its chi2 ~ 0 drags the
+            # median (and hence alpha_prev) down.  Same restriction as the alpha
+            # estimate below and as ground_to_gaia_xmatch.
+            _alpha_ref = prev_use & ~self.needs_diffuse[sidx]
+            if alpha_scale_chi2 and iteration >= 3 and _alpha_ref.sum() >= 4:
+                chi2_prev = sig_sq[_alpha_ref]
                 alpha_prev = float(max(1.0, np.sqrt(
                     np.median(chi2_prev) / _MEDIAN_CHI2_2)))
                 sig_sq_eff = sig_sq / alpha_prev**2
@@ -2339,7 +2353,13 @@ class BP3MSolver:
             # whose inflated PSF-fit covariances produce artificially small
             # sigma_resid) cannot pull the adaptive threshold down.
             init_trusted  = self._img_data[img]["use_for_align_init"]
-            ok_thresh_ref = ok_glob_here & init_trusted
+            # Exclude diffuse-prior stars from the threshold reference: the fit
+            # absorbs their residual (free PM), so their chi2 ~ 1e-7 collapses
+            # p50 and p16 and the adaptive term degenerates to the floor.
+            # Three-tier fallback mirrors ground_to_gaia_xmatch exactly.
+            ok_thresh_ref = ok_glob_here & init_trusted & ~self.needs_diffuse[sidx]
+            if ok_thresh_ref.sum() < 10:
+                ok_thresh_ref = ok_glob_here & init_trusted
             if ok_thresh_ref.sum() < 10:
                 ok_thresh_ref = ok_glob_here   # fall back if reference set too small
 
@@ -2430,8 +2450,16 @@ class BP3MSolver:
             new_use_astrom[align_init] = new_use[align_init]
             self._img_data[img]["use_for_astrom"] = new_use_astrom
 
-            if new_use.sum() >= 4:
-                chi2_hst = rd_hst["sigma_resid"][new_use]**2
+            # Alpha from informative-prior stars only.  Diffuse-prior stars'
+            # residuals are absorbed by their own free PM, so their chi2 ~ 0
+            # zeroes the median: measured on LSST det_150, all stars gave
+            # alpha_raw = 0.0010 where informative-prior stars gave 0.9862.
+            # bp3m's HST fields are 5p-dominated so the bias is smaller here,
+            # but the estimator's intent is the same.  (Ported back from
+            # ground_to_gaia_xmatch.)
+            alpha_pop = new_use & ~self.needs_diffuse[sidx]
+            if alpha_pop.sum() >= 4:
+                chi2_hst = rd_hst["sigma_resid"][alpha_pop]**2
                 alpha_raw = float(np.sqrt(np.median(chi2_hst) / _MEDIAN_CHI2_2))
                 alpha_raw = min(alpha_raw, inflate_alpha_max)
             else:

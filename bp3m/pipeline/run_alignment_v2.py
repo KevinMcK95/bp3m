@@ -987,7 +987,11 @@ def run_alignment_v2(
                     _xys   = _d['xys'][_use]
                     _X_mat = _d['X_mat'][_use]
                     _JU    = _d['JU'][_use]        # (n, 2, 5)
-                    _C_inv = np.linalg.inv(_d['C_hst'][_use])  # (n, 2, 2)
+                    # Same frame requirement as compute_chi2_per_star: b is in
+                    # pseudo-image coordinates, so the covariance must be
+                    # Cs = J C_hst J^T, not the detector-frame C_hst.
+                    _Cs    = solver._compute_Cs(_img, _r_j)[_use]
+                    _C_inv = np.linalg.inv(_Cs)                # (n, 2, 2)
                     _b     = np.einsum('nkl,l->nk', _X_mat, _r_j) - _xys  # (n, 2)
                     # JU^T @ C_inv: (n, 5, 2)
                     _JtCi  = np.einsum('nki,nkj->nij', _JU, _C_inv)

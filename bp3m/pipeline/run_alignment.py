@@ -485,8 +485,15 @@ def compute_chi2_per_star(solver, r_hat, v_hat, image_names, use_key='use_for_as
         xys    = d['xys'][use]
         X_mat  = d['X_mat'][use]
         JU     = d['JU'][use]
-        C_hst  = d['C_hst'][use]           # (n, 2, 2)
-        C_inv  = np.linalg.inv(C_hst)      # (n, 2, 2)
+        # Covariance must live in the same frame as the residual.  The residual
+        # below is in Gaia pseudo-image coordinates, but C_hst is the DETECTOR-
+        # frame covariance; using it directly rotates the error ellipse by the
+        # image rotation (up to the full orientation for HST), biasing chi2 for
+        # any anisotropic C_hst.  _compute_Cs applies Cs = J C_hst J^T, exactly
+        # as compute_residuals does.  (Still the inflated C_hst — bp3m's chi2
+        # convention measures against the applied error model.)
+        Cs     = solver._compute_Cs(img, r_j)[use]   # (n, 2, 2), pseudo frame
+        C_inv  = np.linalg.inv(Cs)                   # (n, 2, 2)
 
         v_star = v_hat[sidx]               # (n, 5)
         motion = np.einsum('nij,nj->ni', JU, v_star)   # (n, 2)

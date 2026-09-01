@@ -797,6 +797,17 @@ def load_image_data_flc(data_root, field_name: str,
                 for gid in df["Gaia_id"].astype(str)
             ])
             before = int(df["use_for_alignment"].sum())
+            # Snapshot BEFORE the trust filter.  The solver reads this as the
+            # Phase-6 flag: a pair with use_for_align_init_flag=True but
+            # use_for_alignment=False is a real match flagged inactive by the
+            # cross-match, eligible for re-admission by the Phase-2 EM residual
+            # tests (can_enter_fit includes phase6_outlier) while staying out of
+            # the adaptive-threshold reference (use_for_align_init stays False).
+            # Without this column the module docstring's promise that "excluded
+            # pairs remain candidates for re-admission" was false in the v1
+            # pipeline -- only the v2 master loader ever set it, so trust-
+            # flagged pairs (2349 on Leo_I) were permanently excluded.
+            df["use_for_align_init_flag"] = df["use_for_alignment"].copy()
             df["use_for_alignment"] = df["use_for_alignment"] & trusted_mask
             df["use_for_fit"]       = df["use_for_fit"]       & trusted_mask
             n_flagged += before - int(df["use_for_alignment"].sum())
