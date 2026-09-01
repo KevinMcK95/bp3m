@@ -2136,6 +2136,17 @@ def run_pop_fit(
               f"{mu_pop_current[1]:+.4f} ± {sigma_mu_1[1]:.4f}) mas/yr")
 
     # ── Phase 2: joint solve (r + μ_pop) ─────────────────────────────────────
+    # σ_μpop per iteration, from the JOINT shared covariance: the μ_pop block
+    # is C_shared[n_r:, n_r:], i.e. marginal over the alignment r.  (Phase 1's
+    # 2×2 C_shared is conditional on r fixed, which is why it is much smaller.)
+    _n_r_shared = len(image_names) * solver.N_R
+
+    def _sigma_mu_of(_C_shared):
+        if _C_shared is None:
+            return np.nan, np.nan
+        _s = np.sqrt(np.diag(_C_shared[_n_r_shared:, _n_r_shared:]))
+        return float(_s[0]), float(_s[1])
+
     print(f"\n  Phase 2: joint solve ({n_iter_joint} iterations)...")
     C_shared_joint = None
     for jt_iter in range(n_iter_joint):
@@ -2156,8 +2167,10 @@ def run_pop_fit(
             max_sigma_free_pm=max_sigma_free_pm)
         if fit_members_only:
             _restrict_to_members(solver, image_names, member_sidx)
+        _smu = _sigma_mu_of(C_shared_joint)
         print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
-              f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+              f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
+              f"{mu_pop_current[1]:+.4f}±{_smu[1]:.4f})  "
               f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  members={len(member_sidx)}")
         solver._update_R(r_current)
         solver._update_geometry(r_current, a_arr)
@@ -2203,8 +2216,10 @@ def run_pop_fit(
 
             delta_alpha_max = (max(abs(ai[5] - ai[3]) for ai in alpha_info)
                                if alpha_info else 0.0)
+            _smu = _sigma_mu_of(C_shared_joint_p3)
             print(f"    iter {al_iter + 1}/{n_iter_alpha}: "
-                  f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+                  f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
+                  f"{mu_pop_current[1]:+.4f}±{_smu[1]:.4f})  "
                   f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  "
                   f"Δα_max={delta_alpha_max:.3e}  members={len(member_sidx)}")
             if delta_r < 1e-6 and delta_mu < 1e-6 and delta_alpha_max < 1e-4:
@@ -2306,8 +2321,10 @@ def run_pop_fit(
             n_use_img = sum(d['use_for_fit'].sum()
                             for d in (solver._img_data.get(img) for img in image_names)
                             if d is not None)
+            _smu = _sigma_mu_of(C_shared_joint_p4)
             print(f"    iter {h_iter + 1}/{n_iter_phase4}: "
-                  f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+                  f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
+                  f"{mu_pop_current[1]:+.4f}±{_smu[1]:.4f})  "
                   f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  "
                   f"Δuse={n_use_changed}  members={len(member_sidx)}")
             if delta_r < 1e-6 and delta_mu < 1e-6 and n_use_changed == 0:
@@ -2389,9 +2406,11 @@ def run_pop_fit(
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
 
+            _smu = _sigma_mu_of(C_shared_joint_sw)
             print(f"    iter {sw_iter + 1}/{n_iter_phase4}: "
                   f"n_eff={n_eff_new:.0f}/{n_det_total}  "
-                  f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
+                  f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
+                  f"{mu_pop_current[1]:+.4f}±{_smu[1]:.4f})  "
                   f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  Δz={delta_z:.3e}  "
                   f"members={len(member_sidx)}")
             if delta_r < 1e-6 and delta_mu < 1e-6 and delta_z < 1e-2:
