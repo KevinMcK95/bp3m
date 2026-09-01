@@ -17,7 +17,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from .miracle_match import miracle_match, rd2x, rd2y
 from .catalog_matcher import fit_affine_weighted, fit_4p_weighted, apply_affine, compute_mahalanobis, compute_logprob_cost, find_offset, find_scale_and_offset
 from bp3m.instrument_config import get_instrument_config, SIGMA_ROT_DEG, SIGMA_SCALE, SIGMA_SKEW
-from bp3m.astro_utils import GAIA_SYS_DICT
+from bp3m.astro_utils import (GAIA_SYS_DICT, get_tele_position,
+                              get_parallax_factors, propagate_gaia_positions)
 
 def load_gaia_data(target, data_dir):
     gaia_path = os.path.join(data_dir, target, "Gaia", "*_gaia.csv")
@@ -209,13 +210,14 @@ def propagate_gaia_with_cov(df, target_mjd, zero_pm=False):
         plx = df['parallax'].fillna(0.0).values
         pmra, pmdec = df['pmra'].fillna(0.0).values, df['pmdec'].fillna(0.0).values
 
-    with solar_system_ephemeris.set('builtin'): earth_pos = get_body_barycentric('earth', t_hst)
-    X, Y, Z = earth_pos.x.to_value('au'), earth_pos.y.to_value('au'), earth_pos.z.to_value('au')
-    p_ra_cosdec = X * np.sin(ra) - Y * np.cos(ra)
-    p_dec = X * np.cos(ra) * np.sin(dec) + Y * np.sin(ra) * np.sin(dec) - Z * np.cos(dec)
-    ra_off_mas, dec_off_mas = (pmra * dt + plx * p_ra_cosdec), (pmdec * dt + plx * p_dec)
-    ra_prop = df['ra'].values + (ra_off_mas / 3600000.0) / np.cos(dec)
-    dec_prop = df['dec'].values + (dec_off_mas / 3600000.0)
+    # Canonical propagation + parallax factors from bp3m.astro_utils — do NOT
+    # re-derive this physics inline (see propagate_gaia_positions docstring).
+    with solar_system_ephemeris.set('builtin'):
+        tele_xyz = get_tele_position(t_hst, curr_id='earth')
+    p_ra_cosdec, p_dec = get_parallax_factors(
+        df['ra'].values, df['dec'].values, tele_xyz)
+    ra_prop, dec_prop = propagate_gaia_positions(
+        df['ra'].values, df['dec'].values, pmra, pmdec, plx, dt, tele_xyz)
     C0 = construct_gaia_cov(df, zero_pm=zero_pm)
     J = np.zeros((n, 2, 5))
     J[:, 0, 0], J[:, 0, 2], J[:, 0, 3] = 1.0, p_ra_cosdec, dt

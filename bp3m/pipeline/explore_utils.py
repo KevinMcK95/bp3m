@@ -194,23 +194,11 @@ def propagate_gaia(df: pd.DataFrame, target_mjd: float,
         pmra  = df['pmra'].fillna(0.0).values     if 'pmra' in df    else np.zeros(n)
         pmdec = df['pmdec'].fillna(0.0).values    if 'pmdec' in df   else np.zeros(n)
 
+    from bp3m.astro_utils import get_tele_position, propagate_gaia_positions
     with solar_system_ephemeris.set('builtin'):
-        earth = get_body_barycentric('earth', t_target)
-    X = earth.x.to_value('au')
-    Y = earth.y.to_value('au')
-    Z = earth.z.to_value('au')
-
-    p_ra  = X * np.sin(ra_rad) - Y * np.cos(ra_rad)
-    p_dec = (X * np.cos(ra_rad) * np.sin(dec_rad)
-             + Y * np.sin(ra_rad) * np.sin(dec_rad)
-             - Z * np.cos(dec_rad))
-
-    ra_off  = pmra  * dt + plx * p_ra   # mas
-    dec_off = pmdec * dt + plx * p_dec  # mas
-
-    ra_prop  = df['ra'].values  + (ra_off  / 3_600_000.0) / np.cos(dec_rad)
-    dec_prop = df['dec'].values + (dec_off / 3_600_000.0)
-    return ra_prop, dec_prop
+        tele_xyz = get_tele_position(t_target, curr_id='earth')
+    return propagate_gaia_positions(
+        df['ra'].values, df['dec'].values, pmra, pmdec, plx, dt, tele_xyz)
 
 
 # ── Plot helpers ─────────────────────────────────────────────────────────────

@@ -1073,12 +1073,19 @@ def generate_synthetic_epoch_data(
                 p_al_arr[k] = float(pf_ra[0] * np.sin(theta_rad_k)
                                     + pf_dec[0] * np.cos(theta_rad_k))
             except Exception:
-                lam_sun = np.radians(360.0 * (t_yr - 2015.0) % 360.0)
-                cos_dec = np.cos(np.radians(dec))
-                p_al_arr[k] = float(
-                    (-np.sin(lam_sun) * np.sin(theta_deg[k] * np.pi / 180) * cos_dec
-                     + np.cos(lam_sun) * np.cos(theta_deg[k] * np.pi / 180) * cos_dec)
-                )
+                # Circular-orbit approximation of the Earth's barycentric
+                # position, routed through the CANONICAL parallax factors so
+                # the fallback can never disagree in convention.
+                lam_e = np.radians(360.0 * (t_yr - 2015.0) % 360.0) + np.pi
+                _ecl = np.radians(23.4393)
+                xyz_approx = np.array([np.cos(lam_e),
+                                       np.sin(lam_e) * np.cos(_ecl),
+                                       np.sin(lam_e) * np.sin(_ecl)])
+                pf_ra, pf_dec = get_parallax_factors(
+                    np.array([ra]), np.array([dec]), xyz_approx)
+                theta_rad_k = np.radians(theta_deg[k])
+                p_al_arr[k] = float(pf_ra[0] * np.sin(theta_rad_k)
+                                    + pf_dec[0] * np.cos(theta_rad_k))
 
         # ── Expand each transit to n_ccd_per_transit CCD rows ─────────────────
         ccd_time_offset_jyr = np.arange(n_ccd_per_transit) * (10.0 / (365.25 * 86400))

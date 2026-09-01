@@ -275,6 +275,39 @@ def get_parallax_factors(ra_deg, dec_deg, tele_xyz):
     return plx_ra_star, plx_dec
 
 
+def propagate_gaia_positions(ra_deg, dec_deg, pmra_masyr, pmdec_masyr,
+                             parallax_mas, dt_yr, tele_xyz):
+    """
+    Propagate barycentric catalogue positions by proper motion and annual
+    parallax to the epoch whose observer position is *tele_xyz* (AU,
+    barycentric — from get_tele_position).
+
+    THE single implementation of this propagation. Do not re-derive the
+    parallax factors or the mas->deg offsets inline anywhere else: a
+    frame-swap sign bug lived undetected in a duplicated copy of this physics
+    from 2026-06 to 2026-09 (see get_parallax_factors).
+
+    Parameters: ra/dec in degrees; pmra = mu_alpha* (mas/yr); parallax in mas;
+    dt_yr = t_target − t_catalogue in Julian years (scalar or array).
+    Non-finite pm/parallax values are treated as 0.
+
+    Returns (ra_prop_deg, dec_prop_deg).
+    """
+    ra_deg  = np.asarray(ra_deg,  dtype=float)
+    dec_deg = np.asarray(dec_deg, dtype=float)
+    pmra  = np.where(np.isfinite(pmra_masyr),  pmra_masyr,  0.0)
+    pmdec = np.where(np.isfinite(pmdec_masyr), pmdec_masyr, 0.0)
+    plx   = np.where(np.isfinite(parallax_mas), parallax_mas, 0.0)
+
+    f_ra, f_dec = get_parallax_factors(ra_deg, dec_deg, tele_xyz)
+    ra_off_mas  = pmra  * dt_yr + plx * f_ra
+    dec_off_mas = pmdec * dt_yr + plx * f_dec
+
+    ra_prop  = ra_deg  + (ra_off_mas / 3.6e6) / np.cos(dec_deg * DEG2RAD)
+    dec_prop = dec_deg +  dec_off_mas / 3.6e6
+    return ra_prop, dec_prop
+
+
 def build_U_matrix(dt_yr, plx_ra_star, plx_dec):
     """
     Build the 2×5 time-evolution matrix U for a single star/image pair.

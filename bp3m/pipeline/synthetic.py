@@ -183,17 +183,9 @@ def _propagate(df: pd.DataFrame, mjd: float) -> tuple[np.ndarray, np.ndarray]:
     pmdec = df['pmdec'].fillna(0.0).values
     plx   = df['parallax'].fillna(0.0).values
 
+    from bp3m.astro_utils import propagate_gaia_positions
     tele_xyz = get_tele_position(t_hst, curr_id='earth')
-    plx_ra, plx_dec = get_parallax_factors(ra, dec, tele_xyz)
-
-    cos_dec = np.cos(np.radians(dec))
-    # μα* is already α*=α·cos(δ), so divide by cos(δ) to get Δα in degrees
-    ra_off_mas  = pmra  * dt_yr + plx * plx_ra   # mas in α* direction
-    dec_off_mas = pmdec * dt_yr + plx * plx_dec  # mas in δ direction
-
-    ra_prop  = ra  + (ra_off_mas  / cos_dec) / 3.6e6  # degrees
-    dec_prop = dec + dec_off_mas / 3.6e6               # degrees
-    return ra_prop, dec_prop
+    return propagate_gaia_positions(ra, dec, pmra, pmdec, plx, dt_yr, tele_xyz)
 
 
 def _write_synthetic_catalog(src_catalog: Path, dst_catalog: Path,

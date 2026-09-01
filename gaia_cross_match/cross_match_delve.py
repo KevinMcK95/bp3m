@@ -143,17 +143,13 @@ def _propagate_delve(df: pd.DataFrame, target_mjd: float
     pmra    = df['pmra'].values                    # mas/yr
     pmdec   = df['pmdec'].values                   # mas/yr
 
+    from bp3m.astro_utils import (get_tele_position, get_parallax_factors,
+                                  propagate_gaia_positions)
     with solar_system_ephemeris.set('builtin'):
-        earth = get_body_barycentric('earth', t_hst)
-    X, Y, Z = earth.x.to_value('au'), earth.y.to_value('au'), earth.z.to_value('au')
-
-    p_ra  = X * np.sin(ra_rad) - Y * np.cos(ra_rad)
-    p_dec = (X * np.cos(ra_rad) * np.sin(dec_rad)
-             + Y * np.sin(ra_rad) * np.sin(dec_rad)
-             - Z * np.cos(dec_rad))
-
-    ra_prop  = df['ra'].values  + (pmra  * dt + plx * p_ra)  / 3.6e6 / np.cos(dec_rad)
-    dec_prop = df['dec'].values + (pmdec * dt + plx * p_dec) / 3.6e6
+        tele_xyz = get_tele_position(t_hst, curr_id='earth')
+    p_ra, p_dec = get_parallax_factors(df['ra'].values, df['dec'].values, tele_xyz)
+    ra_prop, dec_prop = propagate_gaia_positions(
+        df['ra'].values, df['dec'].values, pmra, pmdec, plx, dt, tele_xyz)
 
     C0 = _construct_delve_cov(df)   # (N, 5, 5)
     J  = np.zeros((n, 2, 5))

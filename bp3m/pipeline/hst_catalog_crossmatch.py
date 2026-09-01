@@ -61,6 +61,7 @@ try:
         build_U_matrix,
         get_tele_position,
         get_parallax_factors,
+        propagate_gaia_positions,
         plane_project,
         plane_project_jacobian,
         plane_project_tangent_derivs,
@@ -1076,10 +1077,9 @@ def _phase0b_anchor_gaia_stars(
         if (gid, sub_name) in already_labelled or sub_name not in sub_trees:
             return None
         dt      = epoch_yr - GAIA_EPOCH_YR
-        _f_ra, _f_dec = get_parallax_factors(
-            ra0_g, dec0_g, _xyz_by_sub.get(sub_name, np.zeros(3)))
-        ra_pred = ra0_g + (pmra * dt + plx * _f_ra) / (np.cos(np.radians(dec0_g)) * 3.6e6)
-        dec_pred = dec0_g + (pmdec * dt + plx * _f_dec) / 3.6e6
+        ra_pred, dec_pred = propagate_gaia_positions(
+            ra0_g, dec0_g, pmra, pmdec, plx, dt,
+            _xyz_by_sub.get(sub_name, np.zeros(3)))
         tree, ra_s, dec_s, mag_s, idx_s = sub_trees[sub_name]
         k = min(n_candidates, len(ra_s))
         dists, ii = tree.query([[ra_pred * cos_dec_global, dec_pred]], k=k)
@@ -1264,9 +1264,8 @@ def _phase2_gaia_catalog_anchor(
                 curr_id='earth')
         except Exception:
             _xyz2 = np.zeros(3)
-        _f_ra2, _f_dec2 = get_parallax_factors(tgt_ra, tgt_dec, _xyz2)
-        ra_pred  = tgt_ra  + (tgt_pmra  * dt + tgt_plx * _f_ra2) / (tgt_cos * 3.6e6)
-        dec_pred = tgt_dec + (tgt_pmdec * dt + tgt_plx * _f_dec2) / 3.6e6
+        ra_pred, dec_pred = propagate_gaia_positions(
+            tgt_ra, tgt_dec, tgt_pmra, tgt_pmdec, tgt_plx, dt, _xyz2)
 
         k = min(n_candidates, len(ra_s))
         query_pts = np.column_stack([ra_pred * cos_dec_global, dec_pred])
@@ -2555,34 +2554,17 @@ def _recover_gaia_matches(
     mean_epoch_yr = float(unmatched['epoch_ref'].mean()) if 'epoch_ref' in unmatched else 2015.0
     gaia_df = gaia_df.copy()
     dt_yr = mean_epoch_yr - 2015.5   # Gaia DR3 reference epoch
-    gaia_df['ra_prop']  = gaia_df['ra'].copy()
-    gaia_df['dec_prop'] = gaia_df['dec'].copy()
-    has_pm = np.isfinite(gaia_df['pmra']) & np.isfinite(gaia_df['pmdec'])
-    if has_pm.any():
-        gaia_df.loc[has_pm, 'ra_prop']  = (
-            gaia_df.loc[has_pm, 'ra']
-            + dt_yr * gaia_df.loc[has_pm, 'pmra'] / 3.6e6
-              / np.cos(gaia_df.loc[has_pm, 'dec'] * DEG2RAD)
-        )
-        gaia_df.loc[has_pm, 'dec_prop'] = (
-            gaia_df.loc[has_pm, 'dec']
-            + dt_yr * gaia_df.loc[has_pm, 'pmdec'] / 3.6e6
-        )
-    # Parallactic displacement at the mean HST epoch (plx known → include it)
-    if 'parallax' in gaia_df.columns:
-        try:
-            _xyz_rec = get_tele_position(
-                AstropyTime(mean_epoch_yr, format='jyear'), curr_id='earth')
-            _plx_rec = np.where(np.isfinite(gaia_df['parallax'].values),
-                                gaia_df['parallax'].values, 0.0)
-            _fr, _fd = get_parallax_factors(
-                gaia_df['ra'].values, gaia_df['dec'].values, _xyz_rec)
-            gaia_df['ra_prop']  = (gaia_df['ra_prop']
-                                   + _plx_rec * _fr / 3.6e6
-                                     / np.cos(gaia_df['dec'].values * DEG2RAD))
-            gaia_df['dec_prop'] = gaia_df['dec_prop'] + _plx_rec * _fd / 3.6e6
-        except Exception:
-            pass
+    try:
+        _xyz_rec = get_tele_position(
+            AstropyTime(mean_epoch_yr, format='jyear'), curr_id='earth')
+    except Exception:
+        _xyz_rec = np.zeros(3)
+    _plx_rec = (gaia_df['parallax'].values if 'parallax' in gaia_df.columns
+                else np.zeros(len(gaia_df)))
+    gaia_df['ra_prop'], gaia_df['dec_prop'] = propagate_gaia_positions(
+        gaia_df['ra'].values, gaia_df['dec'].values,
+        gaia_df['pmra'].values, gaia_df['pmdec'].values,
+        _plx_rec, dt_yr, _xyz_rec)
 
     # ── Learn HST−G colour offsets from already-matched sources (all filters) ──
     # For each available filter, learn the median HST−G colour from existing
@@ -3721,18 +3703,12 @@ def _second_pass_match(
         try:
             _xyz_sp = get_tele_position(
                 AstropyTime(img_epoch, format='mjd'), curr_id='earth')
-            _fr_sp, _fd_sp = get_parallax_factors(
-                _tmpl_ra_arr, _tmpl_dec_arr, _xyz_sp)
         except Exception:
-            _fr_sp = _fd_sp = np.zeros(len(templates))
-
-        # Predicted RA/Dec (degrees); PM in mas/yr
-        pred_ra  = (templates[ra0_col].values
-                    + (templates[pm_ra_col].values * dt_yr + tmpl_plx * _fr_sp)
-                      * MAS_TO_DEG / cos_dec0)
-        pred_dec = (templates[dec0_col].values
-                    + (templates[pm_dec_col].values * dt_yr + tmpl_plx * _fd_sp)
-                      * MAS_TO_DEG)
+            _xyz_sp = np.zeros(3)
+        pred_ra, pred_dec = propagate_gaia_positions(
+            _tmpl_ra_arr, _tmpl_dec_arr,
+            templates[pm_ra_col].values, templates[pm_dec_col].values,
+            tmpl_plx, dt_yr, _xyz_sp)
 
         # Predicted positional sigma (mas → deg)
         pred_sig_ra  = np.hypot(templates[sra0_col].values,
