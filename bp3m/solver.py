@@ -1849,11 +1849,20 @@ class BP3MSolver:
             # Two-phase alignment state (see docstring). Phase A: alpha off.
             _alpha_phase_active = not (two_phase_align and inflate_hst_errors)
             _eff_from_iter = inflate_from_iter
+            _phase_b_start = None
+            # Each phase gets the FULL n_iter budget (per CLI --n_bp3m_iter).
+            _n_iter_loop = (2 * n_iter) if not _alpha_phase_active else n_iter
             if not _alpha_phase_active:
                 print("  two_phase_align: Phase A (α=1) — alpha model deferred "
-                      "until geometry converges")
+                      "until geometry converges "
+                      f"(up to {n_iter} iters per phase)")
 
-            for it_outer in range(n_iter):
+            for it_outer in range(_n_iter_loop):
+                if (_phase_b_start is not None
+                        and it_outer - _phase_b_start >= n_iter):
+                    print(f"  two_phase_align: Phase B budget ({n_iter} iters) "
+                          f"exhausted (star set did not fully stabilise)")
+                    break
                 # Snapshot use_for_fit per image before _update_use_for_fit so
                 # we can attribute per-detection changes to test-3 separately.
                 if verbose_tests:
@@ -1978,10 +1987,9 @@ class BP3MSolver:
                             _converged_now = True
                     else:
                         _n_tol_stable = 0
-                    _phase_a_cap = max(min_outer + 2, n_iter // 2)
-                    if not _converged_now and it_outer + 1 >= _phase_a_cap:
-                        print(f"  two_phase_align: Phase A budget cap "
-                              f"({_phase_a_cap} iters) reached.")
+                    if not _converged_now and it_outer + 1 >= n_iter:
+                        print(f"  two_phase_align: Phase A budget "
+                              f"({n_iter} iters) reached.")
                         _converged_now = True
                     if _converged_now:
                         print(f"\n  two_phase_align: Phase A (α=1) done at "
@@ -1989,6 +1997,7 @@ class BP3MSolver:
                               f"(per-image α enabled).")
                         _alpha_phase_active = True
                         _eff_from_iter = it_outer + 1
+                        _phase_b_start = it_outer + 1
                         _n_tol_stable = 0
                         _n_consec_stable = 0
                         # Re-judge every detection under the inflated model.
@@ -2016,7 +2025,7 @@ class BP3MSolver:
                 if per_iter_callback is not None:
                     per_iter_callback(self, it_outer + 1)
             else:
-                print(f"  Stopped after {n_iter} outer iterations "
+                print(f"  Stopped after {_n_iter_loop} outer iterations "
                       f"(star set did not fully stabilise)")
 
             # Freeze the detection mask and solve once more.  Nothing below
