@@ -161,25 +161,12 @@ def _read_chip_info(flc_path: Path, cat_path: Path) -> dict:
 
 def _propagate(df: pd.DataFrame, mjd: float) -> tuple[np.ndarray, np.ndarray]:
     """
-    Propagate Gaia catalog positions to target MJD using BP3M's parallax convention.
+    Propagate Gaia catalog positions to target MJD.
 
-    BP3M's get_parallax_factors returns NEGATED parallax factors:
-        plx_ra_star = -(X*sin(ra) - Y*cos(ra))
-        plx_dec     = -(X*cos(ra)*sin(dec) + Y*sin(ra)*sin(dec) - Z*cos(dec))
-
-    These factors enter the U matrix as the parallax column, and the sky offset
-    that BP3M models for a star with parallax ϖ at time t is:
-        Δ(α*)_mas = pmra*dt + ϖ * plx_ra_star   (where plx_ra_star is NEGATIVE of standard)
-
-    We must use the same convention here so that the synthetic positions fed
-    to BP3M are internally consistent with what BP3M's U matrix expects.
-
-    The standard astrometric convention (cross_match, astropy) is:
-        parallax_shift_ra  = +X*sin(ra) - Y*cos(ra)  (positive)
-
-    BP3M's convention is the negative of this.  Using cross_match's convention
-    here would create a sign-flipped parallax contribution in the synthetic data,
-    causing pull widths > 1 and systematic image-parameter bias.
+    Uses bp3m.astro_utils.get_parallax_factors, which returns the standard
+    apparent-shift parallax factors (same convention as cross_match.py and the
+    solver's U matrix), so the synthetic positions are internally consistent
+    with what BP3M's design matrices expect.
     """
     _ensure_bp3m()
     from bp3m.astro_utils import get_tele_position, get_parallax_factors
@@ -198,7 +185,6 @@ def _propagate(df: pd.DataFrame, mjd: float) -> tuple[np.ndarray, np.ndarray]:
 
     tele_xyz = get_tele_position(t_hst, curr_id='earth')
     plx_ra, plx_dec = get_parallax_factors(ra, dec, tele_xyz)
-    # plx_ra = -(X*sin(ra) - Y*cos(ra))  [BP3M convention, NEGATED vs standard]
 
     cos_dec = np.cos(np.radians(dec))
     # μα* is already α*=α·cos(δ), so divide by cos(δ) to get Δα in degrees

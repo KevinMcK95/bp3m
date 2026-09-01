@@ -386,8 +386,10 @@ class BP3MSolver:
         #account for systematics in Gaia data
         #amount to inflate uncertainties by
         #might want to change to function of magnitude in the future
-        self.C_survey[self.gaia_6p] *= GAIA_SYS_DICT['mult_6p']
-        self.C_survey[self.gaia_5p] *= GAIA_SYS_DICT['mult_5p']
+        # mult_* are SIGMA multipliers (literature error underestimates), so the
+        # covariance is inflated by their square — same as gaia_cross_match.
+        self.C_survey[self.gaia_6p] *= GAIA_SYS_DICT['mult_6p'] ** 2
+        self.C_survey[self.gaia_5p] *= GAIA_SYS_DICT['mult_5p'] ** 2
         self.C_survey[self.gaia_2p] *= GAIA_SYS_DICT['mult_2p']
         self.C_survey += np.diag(np.array([0,0,
                             GAIA_SYS_DICT['pm_sys_err'],GAIA_SYS_DICT['pm_sys_err'],

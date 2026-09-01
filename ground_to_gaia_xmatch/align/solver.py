@@ -226,8 +226,9 @@ class AlignmentSolver:
         C = sigmas[:, :, None] * corr_mat * sigmas[:, None, :]
 
         # ── Apply GAIA_SYS_DICT inflation (identical to bp3m lines 325-330) ──
-        C[self.gaia_6p] *= GAIA_SYS_DICT['mult_6p']
-        C[self.gaia_5p] *= GAIA_SYS_DICT['mult_5p']
+        # mult_* are SIGMA multipliers — inflate the covariance by their square.
+        C[self.gaia_6p] *= GAIA_SYS_DICT['mult_6p'] ** 2
+        C[self.gaia_5p] *= GAIA_SYS_DICT['mult_5p'] ** 2
         C[self.gaia_2p] *= GAIA_SYS_DICT['mult_2p']
         sys_diag = np.array([0, 0,
                               GAIA_SYS_DICT['pm_sys_err'],

@@ -17,6 +17,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from .miracle_match import miracle_match, rd2x, rd2y
 from .catalog_matcher import fit_affine_weighted, fit_4p_weighted, apply_affine, compute_mahalanobis, compute_logprob_cost, find_offset, find_scale_and_offset
 from bp3m.instrument_config import get_instrument_config, SIGMA_ROT_DEG, SIGMA_SCALE, SIGMA_SKEW
+from bp3m.astro_utils import GAIA_SYS_DICT
 
 def load_gaia_data(target, data_dir):
     gaia_path = os.path.join(data_dir, target, "Gaia", "*_gaia.csv")
@@ -179,17 +180,18 @@ def construct_gaia_cov(df, zero_pm=False):
 
     gaia_6p = np.isfinite(df['pseudocolour'])
     gaia_5p = np.isfinite(df['pmra']) & ~gaia_6p
-    gaia_2p = np.isfinite(df['ra']) & ~gaia_5p
+    gaia_2p = np.isfinite(df['ra']) & ~gaia_5p & ~gaia_6p
 
-    #inflate Gaia covs according to literature
-    covs[gaia_6p] *= 1.22**2
-    covs[gaia_5p] *= 1.05**2
-    covs[gaia_2p] *= 1.00**2
+    #inflate Gaia covs according to literature (mult_* are sigma multipliers)
+    covs[gaia_6p] *= GAIA_SYS_DICT['mult_6p']**2
+    covs[gaia_5p] *= GAIA_SYS_DICT['mult_5p']**2
+    covs[gaia_2p] *= GAIA_SYS_DICT['mult_2p']**2
 
-    #add Gaia systematics according to literature
-    parallax_sys_err = 0.011 #mas, from E. Vasiliev and H. Baumgardt 2021, MNRAS 505, 5978–6002
-    pm_sys_err = 0.026 #mas/yr, from E. Vasiliev and H. Baumgardt 2021, MNRAS 505, 5978–6002
-    covs += np.diag(np.array([0,0,parallax_sys_err,pm_sys_err,pm_sys_err])**2)
+    #add Gaia systematics according to literature (values in GAIA_SYS_DICT,
+    #from E. Vasiliev and H. Baumgardt 2021, MNRAS 505, 5978-6002).
+    #Ordering here is the Gaia-archive one: (ra, dec, parallax, pmra, pmdec).
+    covs += np.diag(np.array([0, 0, GAIA_SYS_DICT['parallax_sys_err'],
+                              GAIA_SYS_DICT['pm_sys_err'], GAIA_SYS_DICT['pm_sys_err']])**2)
 
     return covs
 
@@ -1075,7 +1077,9 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         print(f"Finished {image_name}: Found {len(final_matches)} matches in {time.time()-start_time:.2f}s.", file=original_stdout)
 
     except Exception as e:
+        import traceback
         print(f"Finished {image_name}: Error - {e}", file=original_stdout)
+        traceback.print_exc(file=original_stdout)
     finally:
         sys.stdout = original_stdout
 

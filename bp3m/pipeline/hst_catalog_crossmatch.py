@@ -786,9 +786,6 @@ def _fit_astrometry(ra: np.ndarray, dec: np.ndarray,
 
     A   = np.column_stack([np.ones(n), dt])
 
-    # Check if PM is constrainable (at least 2 distinct epochs)
-    has_pm_dof = np.unique(dt).size >= 2
-
     # RA axis — use lstsq for robustness against degenerate epochs
     w_ra    = 1. / np.maximum(sigma_ra,  1e-6) ** 2
     AW_ra   = A.T * w_ra
@@ -1045,6 +1042,16 @@ def _phase0b_anchor_gaia_stars(
     epoch_lookup = (2000.0 + det_df.groupby('sub_name')['epoch_mjd'].first() / MJD_YR
                     - _MJD0_YR).to_dict()
 
+    # Earth barycentric position per sub-image epoch, for parallax propagation
+    _mjd_by_sub = det_df.groupby('sub_name')['epoch_mjd'].first().to_dict()
+    _xyz_by_sub: dict[str, np.ndarray] = {}
+    for _sn, _mjd in _mjd_by_sub.items():
+        try:
+            _xyz_by_sub[_sn] = get_tele_position(
+                AstropyTime(float(_mjd), format='mjd'), curr_id='earth')
+        except Exception:
+            _xyz_by_sub[_sn] = np.zeros(3)
+
     # ── Build set of (gid, sub_name) pairs already in det_df ─────────────────
     # Skip sub-images where this star is already correctly labelled.
     already_labelled: set[tuple[int, str]] = set()
@@ -1064,13 +1071,15 @@ def _phase0b_anchor_gaia_stars(
     n_anchored  = 0
     n_stars_improved = 0
 
-    def _try_match(gid, ra0_g, dec0_g, pmra, pmdec, g_mag, sub_name, epoch_yr):
+    def _try_match(gid, ra0_g, dec0_g, pmra, pmdec, plx, g_mag, sub_name, epoch_yr):
         """Try to find star (gid) in sub_name; return det_df row index or None."""
         if (gid, sub_name) in already_labelled or sub_name not in sub_trees:
             return None
         dt      = epoch_yr - GAIA_EPOCH_YR
-        ra_pred = ra0_g + pmra  * dt / (np.cos(np.radians(dec0_g)) * 3.6e6)
-        dec_pred = dec0_g + pmdec * dt / 3.6e6
+        _f_ra, _f_dec = get_parallax_factors(
+            ra0_g, dec0_g, _xyz_by_sub.get(sub_name, np.zeros(3)))
+        ra_pred = ra0_g + (pmra * dt + plx * _f_ra) / (np.cos(np.radians(dec0_g)) * 3.6e6)
+        dec_pred = dec0_g + (pmdec * dt + plx * _f_dec) / 3.6e6
         tree, ra_s, dec_s, mag_s, idx_s = sub_trees[sub_name]
         k = min(n_candidates, len(ra_s))
         dists, ii = tree.query([[ra_pred * cos_dec_global, dec_pred]], k=k)
@@ -1102,16 +1111,23 @@ def _phase0b_anchor_gaia_stars(
         dec0_g = float(star['dec'])
         pmra   = float(star.get('pmra_bp3m_cond',  star.get('pmra',  0) or 0) or 0)
         pmdec  = float(star.get('pmdec_bp3m_cond', star.get('pmdec', 0) or 0) or 0)
+        plx    = float(star.get('parallax_bp3m_cond',
+                                star.get('parallax', 0) or 0) or 0)
+        if not np.isfinite(plx):
+            plx = 0.0
         g_mag  = gaia_g_lookup.get(gid, np.nan)
 
         star_added = 0
         for sub_name, epoch_yr in epoch_lookup.items():
-            row_idx = _try_match(gid, ra0_g, dec0_g, pmra, pmdec, g_mag,
+            row_idx = _try_match(gid, ra0_g, dec0_g, pmra, pmdec, plx, g_mag,
                                  sub_name, epoch_yr)
             if row_idx is None:
                 continue
-            det_df.iat[row_idx, det_df.columns.get_loc('has_gaia_match')] = True
-            det_df.iat[row_idx, det_df.columns.get_loc('gaia_source_id')] = np.int64(gid)
+            # row_idx is an index LABEL (from grp.index.values) — use .loc,
+            # not positional .iat, so this stays correct if det_df is ever
+            # reindexed upstream.
+            det_df.loc[row_idx, 'has_gaia_match'] = True
+            det_df.loc[row_idx, 'gaia_source_id'] = np.int64(gid)
             already_labelled.add((gid, sub_name))
             # Remove from tree so it can't be claimed by another star
             tree, ra_s, dec_s, mag_s, idx_s = sub_trees[sub_name]
@@ -1192,6 +1208,8 @@ def _phase2_gaia_catalog_anchor(
     _pmdec   = targets['pmdec'].to_numpy(dtype=float) if 'pmdec' in targets.columns else np.zeros(len(targets))
     tgt_pmra  = np.where(np.isfinite(_pmra),  _pmra,  0.0)
     tgt_pmdec = np.where(np.isfinite(_pmdec), _pmdec, 0.0)
+    _plx      = targets['parallax'].to_numpy(dtype=float) if 'parallax' in targets.columns else np.zeros(len(targets))
+    tgt_plx   = np.where(np.isfinite(_plx), _plx, 0.0)
     tgt_gmag  = targets['gmag'].to_numpy(dtype=float) if 'gmag' in targets.columns else np.full(len(targets), np.nan)
     tgt_cos   = np.cos(np.radians(tgt_dec))
     valid_pos = np.isfinite(tgt_ra) & np.isfinite(tgt_dec)
@@ -1212,10 +1230,9 @@ def _phase2_gaia_catalog_anchor(
                 zp_per_sub[sub] = (med, max(sigma, 0.1))
 
     epoch_lookup = (2000.0 + det_df.groupby('sub_name')['epoch_mjd'].first() / MJD_YR - _MJD0_YR).to_dict()
+    _mjd_by_sub2 = det_df.groupby('sub_name')['epoch_mjd'].first().to_dict()
 
     det_df = det_df.copy()
-    col_match = det_df.columns.get_loc('has_gaia_match')
-    col_gid   = det_df.columns.get_loc('gaia_source_id')
 
     n_anchored = 0
     matched_gids: set[int] = set()
@@ -1239,9 +1256,17 @@ def _phase2_gaia_catalog_anchor(
         tree = cKDTree(np.column_stack([ra_s * cos_dec_global, dec_s]))
 
         # Predict positions for all valid targets simultaneously
+        # (PM + parallactic displacement at this image's epoch)
         dt = epoch_yr - GAIA_EPOCH_YR
-        ra_pred  = tgt_ra  + tgt_pmra  * dt / (tgt_cos * 3.6e6)
-        dec_pred = tgt_dec + tgt_pmdec * dt / 3.6e6
+        try:
+            _xyz2 = get_tele_position(
+                AstropyTime(float(_mjd_by_sub2[sub_name]), format='mjd'),
+                curr_id='earth')
+        except Exception:
+            _xyz2 = np.zeros(3)
+        _f_ra2, _f_dec2 = get_parallax_factors(tgt_ra, tgt_dec, _xyz2)
+        ra_pred  = tgt_ra  + (tgt_pmra  * dt + tgt_plx * _f_ra2) / (tgt_cos * 3.6e6)
+        dec_pred = tgt_dec + (tgt_pmdec * dt + tgt_plx * _f_dec2) / 3.6e6
 
         k = min(n_candidates, len(ra_s))
         query_pts = np.column_stack([ra_pred * cos_dec_global, dec_pred])
@@ -1296,12 +1321,12 @@ def _phase2_gaia_catalog_anchor(
             if det_local not in assign or dist < assign[det_local][0]:
                 assign[det_local] = (dist, int(ti))
 
-        # Apply assignments
+        # Apply assignments (glob_idx is an index LABEL — use .loc, not .iat)
         for det_local, (_, ti) in assign.items():
             glob_idx = idx_s[det_local]
             gid      = int(tgt_ids[ti])
-            det_df.iat[glob_idx, col_match] = True
-            det_df.iat[glob_idx, col_gid]   = np.int64(gid)
+            det_df.loc[glob_idx, 'has_gaia_match'] = True
+            det_df.loc[glob_idx, 'gaia_source_id'] = np.int64(gid)
             n_anchored += 1
             matched_gids.add(gid)
 
@@ -2104,7 +2129,7 @@ def _deduplicate_merged(df: pd.DataFrame, pos_threshold_mas: float = 50.0) -> pd
             val = row.get(col)
             if not val or (isinstance(val, float) and np.isnan(val)):
                 continue
-            for tok in str(val).split(';'):
+            for tok in str(val).split(','):
                 tok = tok.strip()
                 if ':' in tok:
                     snames.add(tok.rsplit(':', 1)[0].strip())
@@ -2114,13 +2139,13 @@ def _deduplicate_merged(df: pd.DataFrame, pos_threshold_mas: float = 50.0) -> pd
         val = row.get(col)
         if not val or (isinstance(val, float) and np.isnan(val)):
             return 0
-        return len([t for t in str(val).split(';') if ':' in t])
+        return len([t for t in str(val).split(',') if ':' in t])
 
     def _hsi_tokens(val) -> list[str]:
         """Parse an hst_indices value into a list of 'sname:idx' token strings."""
         if not val or (isinstance(val, float) and np.isnan(val)):
             return []
-        return [t.strip() for t in str(val).split(';') if ':' in t.strip()]
+        return [t.strip() for t in str(val).split(',') if ':' in t.strip()]
 
     def _merge_two_rows(primary: dict, secondary: dict) -> dict:
         """
@@ -2137,7 +2162,7 @@ def _deduplicate_merged(df: pd.DataFrame, pos_threshold_mas: float = 50.0) -> pd
             filt = col.replace('hst_indices_', '')
             if s_toks and not p_toks:
                 # Only secondary has this filter — copy everything
-                out[col] = ';'.join(s_toks)
+                out[col] = ','.join(s_toks)
                 for prefix in ('mag_wmean_', 'mag_werr_', 'mag_median_',
                                'mag_scatter_', 'n_detect_', 'sub_names_'):
                     scol = prefix + filt
@@ -2150,7 +2175,7 @@ def _deduplicate_merged(df: pd.DataFrame, pos_threshold_mas: float = 50.0) -> pd
                 s_snames = {t.rsplit(':', 1)[0] for t in s_toks}
                 if not (p_snames & s_snames):
                     combined = p_toks + s_toks
-                    out[col] = ';'.join(combined)
+                    out[col] = ','.join(combined)
                     # Update n_detect and mag stats for this filter
                     out[f'n_detect_{filt}'] = (out.get(f'n_detect_{filt}') or 0) + len(s_toks)
                 # else: shared sub_names → keep primary's (genuinely different detections)
@@ -2336,6 +2361,9 @@ def _cross_filter_match(
         d[f'n_detect_{filt}']    = row.get('n_detect', np.nan)
         d[f'sub_names_{filt}']   = row.get('sub_names', '')
         d[f'hst_indices_{filt}'] = row.get('hst_indices', '')
+        # Detection count of the filter currently providing the astrometry
+        # (ra0/dec0/pm...); used to decide astrometry replacement on merge.
+        d['_astrom_ndet'] = row.get('n_detect', 0) or 0
         return d
 
     # Pre-extract gaia_source_id as int64 for all filters.
@@ -2375,13 +2403,36 @@ def _cross_filter_match(
         mx_arr = np.array(merged_x_list)
         my_arr = np.array(merged_y_list)
         tree = cKDTree(np.column_stack([mx_arr, my_arr]))
-        dists, idxs = tree.query(np.column_stack([cur_x, cur_y]),
-                                 k=1, distance_upper_bound=match_radius_mas)
-
-        matched_cur  = dists < match_radius_mas
+        # One-to-one greedy assignment by separation: query several neighbours
+        # per source, then walk all candidate pairs shortest-first so two
+        # sources from this filter can never claim (and overwrite) the same
+        # merged row — the loser falls through to its next-nearest candidate
+        # or becomes a new row.
+        _k_cf = min(3, len(mx_arr))
+        dists_k, idxs_k = tree.query(np.column_stack([cur_x, cur_y]),
+                                     k=_k_cf, distance_upper_bound=match_radius_mas)
+        if _k_cf == 1:
+            dists_k = dists_k[:, np.newaxis]
+            idxs_k  = idxs_k[:, np.newaxis]
+        _ci_flat = np.repeat(np.arange(len(cur_x)), _k_cf)
+        _mi_flat = idxs_k.ravel()
+        _d_flat  = dists_k.ravel()
+        _valid   = (_d_flat < match_radius_mas) & (_mi_flat < len(mx_arr))
+        _order   = np.argsort(_d_flat[_valid])
+        _ci_v, _mi_v = _ci_flat[_valid][_order], _mi_flat[_valid][_order]
+        _used_c: set[int] = set()
+        _used_m: set[int] = set()
+        _pairs: list[tuple[int, int]] = []
+        for _ci, _mi in zip(_ci_v, _mi_v):
+            if _ci not in _used_c and _mi not in _used_m:
+                _pairs.append((int(_ci), int(_mi)))
+                _used_c.add(int(_ci))
+                _used_m.add(int(_mi))
+        matched_cur = np.zeros(len(cur_x), dtype=bool)
+        matched_cur[list(_used_c)] = True
 
         # Populate per-filter columns on matched merged rows
-        for ci, mi in zip(np.where(matched_cur)[0], idxs[matched_cur]):
+        for ci, mi in _pairs:
             row = cur_df.iloc[ci]
             mrow = merged_rows[mi]
             # Append filter to filter_list
@@ -2397,17 +2448,19 @@ def _cross_filter_match(
             # Update is_star flags across filters
             mrow['is_star_all'] = bool(mrow['is_star_all']) and bool(row.get('is_star_all', True))
             mrow['is_star_any'] = bool(mrow['is_star_any']) or  bool(row.get('is_star_any', False))
-            # Prefer the filter with the most detections for primary astrometry
-            # (update ra0, dec0, etc. if current filter has more detections)
+            # Prefer the filter with the most detections for primary astrometry.
+            # Compare against the detection count of whichever filter currently
+            # provides the astrometry (not the first filter, which may already
+            # have been superseded in 3+ filter fields).
             cur_n = row.get('n_detect', 0) or 0
-            old_n_col = f'n_detect_{mrow["filter_list"].split(",")[0]}'
-            old_n = mrow.get(old_n_col, 0) or 0
+            old_n = mrow.get('_astrom_ndet', 0) or 0
             if cur_n > old_n:
                 for col in ('ra0', 'dec0', 'pmra', 'pmdec', 'pm_size_masyr',
                             'sigma_ra0', 'sigma_dec0', 'sigma_pmra', 'sigma_pmdec',
                             'epoch_ref', 'epoch_ref_mjd', 'chi2_ra', 'chi2_dec'):
                     if col in row.index:
                         mrow[col] = row[col]
+                mrow['_astrom_ndet'] = cur_n
             # Update Gaia match from whichever filter has it
             if not mrow.get('has_gaia_match', False) and row.get('has_gaia_match', False):
                 mrow['has_gaia_match'] = True
@@ -2432,6 +2485,7 @@ def _cross_filter_match(
     elif 'n_detect' not in merged_df.columns:
         merged_df['n_detect'] = np.nan
     merged_df['n_filters'] = merged_df['filter_list'].str.count(',') + 1
+    merged_df = merged_df.drop(columns=['_astrom_ndet'], errors='ignore')
 
     merged_df = _deduplicate_merged(merged_df.reset_index(drop=True))
     return merged_df.reset_index(drop=True)
@@ -2445,6 +2499,7 @@ def _recover_gaia_matches(
     match_radius_mas: float = 100.,
     n_candidates: int       = 5,
     color_tolerance: float  = 3.0,
+    exclude_gaia_ids: Optional[set] = None,
 ) -> pd.DataFrame:
     """
     For sources in master_df without a Gaia match, attempt to find a Gaia
@@ -2468,7 +2523,11 @@ def _recover_gaia_matches(
         print("  No Gaia CSV provided; skipping Gaia recovery")
         return pd.DataFrame()
 
-    unmatched = master_df[~master_df['has_gaia_match']].copy().reset_index(drop=True)
+    # Keep the original master_df index so the caller can write the recovered
+    # IDs back onto the corresponding combined_df rows ('orig_index' column).
+    unmatched = master_df[~master_df['has_gaia_match']].copy()
+    _orig_index = unmatched.index.to_numpy()
+    unmatched = unmatched.reset_index(drop=True)
     if len(unmatched) == 0:
         print("  All master sources already have Gaia matches")
         return pd.DataFrame()
@@ -2483,6 +2542,14 @@ def _recover_gaia_matches(
     except Exception as exc:
         print(f"  Warning: cannot load Gaia CSV: {exc}")
         return pd.DataFrame()
+
+    # Never offer Gaia sources that are already claimed by a matched master
+    # row — recovering one would produce a duplicate gaia_source_id.
+    if exclude_gaia_ids:
+        _n_pre = len(gaia_df)
+        gaia_df = gaia_df[~gaia_df['source_id'].isin(exclude_gaia_ids)].reset_index(drop=True)
+        if len(gaia_df) < _n_pre:
+            print(f"  Excluding {_n_pre - len(gaia_df)} already-claimed Gaia sources")
 
     # ── Propagate Gaia positions to mean HST epoch ────────────────────────────
     mean_epoch_yr = float(unmatched['epoch_ref'].mean()) if 'epoch_ref' in unmatched else 2015.0
@@ -2501,6 +2568,21 @@ def _recover_gaia_matches(
             gaia_df.loc[has_pm, 'dec']
             + dt_yr * gaia_df.loc[has_pm, 'pmdec'] / 3.6e6
         )
+    # Parallactic displacement at the mean HST epoch (plx known → include it)
+    if 'parallax' in gaia_df.columns:
+        try:
+            _xyz_rec = get_tele_position(
+                AstropyTime(mean_epoch_yr, format='jyear'), curr_id='earth')
+            _plx_rec = np.where(np.isfinite(gaia_df['parallax'].values),
+                                gaia_df['parallax'].values, 0.0)
+            _fr, _fd = get_parallax_factors(
+                gaia_df['ra'].values, gaia_df['dec'].values, _xyz_rec)
+            gaia_df['ra_prop']  = (gaia_df['ra_prop']
+                                   + _plx_rec * _fr / 3.6e6
+                                     / np.cos(gaia_df['dec'].values * DEG2RAD))
+            gaia_df['dec_prop'] = gaia_df['dec_prop'] + _plx_rec * _fd / 3.6e6
+        except Exception:
+            pass
 
     # ── Learn HST−G colour offsets from already-matched sources (all filters) ──
     # For each available filter, learn the median HST−G colour from existing
@@ -2598,6 +2680,7 @@ def _recover_gaia_matches(
         m, g = int(rows_m[oi]), int(rows_g[oi])
         if m not in used_m and g not in used_g:
             row = unmatched.iloc[m].to_dict()
+            row['orig_index']      = int(_orig_index[m])
             row['gaia_source_id']  = int(gaia_source_ids[g])
             row['gaia_gmag']       = float(gaia_gmags[g])
             row['gaia_sep_mas']    = float(seps[oi])
@@ -2708,11 +2791,12 @@ def _build_gaia_cov5(row: pd.Series) -> tuple:
 
     C = np.outer(sigmas, sigmas) * corr
 
-    # Apply BP3M inflation (same as solver.py)
+    # Apply BP3M inflation (same as solver.py / gaia_cross_match):
+    # mult_* are SIGMA multipliers, so the covariance gets their square.
     if is_6p:
-        C *= GAIA_SYS_DICT['mult_6p']
+        C *= GAIA_SYS_DICT['mult_6p'] ** 2
     elif is_5p:
-        C *= GAIA_SYS_DICT['mult_5p']
+        C *= GAIA_SYS_DICT['mult_5p'] ** 2
     # 2p: multiply by 1.0 (no change)
 
     # Add systematic floors (in variance) for PM and parallax
@@ -2790,7 +2874,10 @@ def _measure_astrometry_proper(
 
     BigCⱼ (2N×2N, pix²): Xⱼ C_r Xⱼᵀ cross-image blocks + α²Jt C_hst Jtᵀ diagonal.
 
-    Returns a DataFrame indexed like combined_df.
+    Returns
+    -------
+    (astrom_df, K_pm) : astrom_df is indexed like combined_df; K_pm is the
+    (N, 2, n_r_total) float32 PM-sensitivity array aligned with astrom_df rows.
     """
     _t0_phase = time.perf_counter()
     print(f"  [phase4] setup: {len(combined_df)} sources, "
@@ -3082,11 +3169,26 @@ def _measure_astrometry_proper(
             dec0_arr = np.array([_img_meta(s)[1]  for s in snames])
             ps_arr   = np.array([_img_meta(s)[2]  for s in snames])
 
-            # Reference sky positions (epoch-propagated for Gaia stars)
+            # Parallax factors at each image epoch — needed both for the
+            # reference trajectory below and for the U design matrix.
+            tele_xyz_T = np.array([_tele_xyz_cache.get(s, _ZERO3)
+                                    for s in snames]).T            # (3, N)
+            plx_ra_all, plx_dec_all = get_parallax_factors(ref_ra, ref_dec, tele_xyz_T)
+
+            # Reference sky positions (epoch-propagated for Gaia stars).
+            # The trajectory must include the parallactic displacement of the
+            # PRIOR parallax (plx_g * f): u[4] is a CORRECTION relative to
+            # plx_g (prior N(0, C_gaia)) and the output adds plx_g back.
+            # Omitting this term let u[4] absorb the full parallax signal, so
+            # plx_out = plx_g + u[4] double-counted plx_g.
             if has_gaia:
                 cos_dec_g   = np.cos(dec_g * DEG2RAD)
-                ra_ref_arr  = ra_g  + pmra_g  * dt_arr / (cos_dec_g * _MAS_PER_DEG)
-                dec_ref_arr = dec_g + pmdec_g * dt_arr / _MAS_PER_DEG
+                ra_ref_arr  = (ra_g
+                               + (pmra_g * dt_arr + plx_g * plx_ra_all)
+                                 / (cos_dec_g * _MAS_PER_DEG))
+                dec_ref_arr = (dec_g
+                               + (pmdec_g * dt_arr + plx_g * plx_dec_all)
+                                 / _MAS_PER_DEG)
             else:
                 ra_ref_arr  = np.full(N, ref_ra)
                 dec_ref_arr = np.full(N, ref_dec)
@@ -3110,10 +3212,6 @@ def _measure_astrometry_proper(
                     np.full(bad_J.sum(), ra0_field), np.full(bad_J.sum(), dec0_field),
                     np.full(bad_J.sum(), pscale))
                 J_all[bad_J] = J_fb
-
-            tele_xyz_T = np.array([_tele_xyz_cache.get(s, _ZERO3)
-                                    for s in snames]).T            # (3, N)
-            plx_ra_all, plx_dec_all = get_parallax_factors(ref_ra, ref_dec, tele_xyz_T)
 
             U_all = np.zeros((N, 2, 5))
             U_all[:, 0, 0] = 1.;  U_all[:, 1, 1] = 1.
@@ -3571,10 +3669,31 @@ def _second_pass_match(
     cos_dec0 = np.cos(np.deg2rad(dec0))
     MAS_TO_DEG = 1.0 / 3.6e6
 
+    # Template parallaxes (mas) for epoch propagation; 0 where unmeasured.
+    if 'parallax_xmatch' in templates.columns:
+        _tp = templates['parallax_xmatch'].to_numpy(dtype=float)
+        tmpl_plx = np.where(np.isfinite(_tp), _tp, 0.0)
+    else:
+        tmpl_plx = np.zeros(len(templates))
+    _tmpl_ra_arr  = templates[ra0_col].to_numpy(dtype=float)
+    _tmpl_dec_arr = templates[dec0_col].to_numpy(dtype=float)
+
     # ── Per-image matching ────────────────────────────────────────────────────
     # new_assignments: list of (det_row_idx, template_ti) pairs
     new_assignments: list[tuple[int, int]] = []
+    # Seed the claimed set with EVERY detection already assigned to ANY source
+    # (template or not) in the first pass.  Without this a template could
+    # "steal" a detection from a non-template source without evicting it from
+    # that source's hst_indices, so the same measurement would feed two
+    # catalogue rows.  Second-pass matching therefore only ever assigns
+    # detections that no source currently owns.
     claimed_globally: set[int] = set()   # det_row indices already claimed
+    _all_pairs = _parse_hst_indices_columns(combined_df)
+    for _row_pairs in _all_pairs.values():
+        for _sname, _cidx in _row_pairs:
+            _dr = key_to_detrow.get(f'{_sname}:{_cidx}')
+            if _dr is not None:
+                claimed_globally.add(_dr)
 
     # Process images in epoch order (order doesn't affect correctness here
     # since we match against a fixed catalog, not a growing master)
@@ -3595,11 +3714,25 @@ def _second_pass_match(
         # ── Predict template positions at this epoch ──────────────────────
         dt_yr = (img_epoch - tmpl_epoch_mjd.values) / 365.25   # (n_tmpl,)
 
+        # Parallactic displacement at this image epoch (plx * f, in mas).
+        # ra0/dec0 are mean-epoch positions without a parallax model, so this
+        # can carry a constant offset up to ~plx * <f>; that is well inside the
+        # min_match_mas floor and beats ignoring the modulation entirely.
+        try:
+            _xyz_sp = get_tele_position(
+                AstropyTime(img_epoch, format='mjd'), curr_id='earth')
+            _fr_sp, _fd_sp = get_parallax_factors(
+                _tmpl_ra_arr, _tmpl_dec_arr, _xyz_sp)
+        except Exception:
+            _fr_sp = _fd_sp = np.zeros(len(templates))
+
         # Predicted RA/Dec (degrees); PM in mas/yr
         pred_ra  = (templates[ra0_col].values
-                    + templates[pm_ra_col].values * MAS_TO_DEG / cos_dec0 * dt_yr)
+                    + (templates[pm_ra_col].values * dt_yr + tmpl_plx * _fr_sp)
+                      * MAS_TO_DEG / cos_dec0)
         pred_dec = (templates[dec0_col].values
-                    + templates[pm_dec_col].values * MAS_TO_DEG * dt_yr)
+                    + (templates[pm_dec_col].values * dt_yr + tmpl_plx * _fd_sp)
+                      * MAS_TO_DEG)
 
         # Predicted positional sigma (mas → deg)
         pred_sig_ra  = np.hypot(templates[sra0_col].values,
@@ -4071,15 +4204,33 @@ def run_hst_crossmatch(
         except Exception:
             pass
 
+    _claimed_gids: set = set()
+    if len(combined_df) > 0 and 'gaia_source_id' in combined_df.columns:
+        _cg = pd.to_numeric(combined_df['gaia_source_id'],
+                            errors='coerce').fillna(0).astype(np.int64)
+        _claimed_gids = set(int(g) for g in _cg.values if g > 0)
     recovered_df = _recover_gaia_matches(
         combined_df if len(combined_df) > 0 else pd.concat(list(filter_masters.values()), ignore_index=True),
         gaia_csv=gaia_csv,
         match_radius_mas=gaia_recovery_radius_mas,
+        exclude_gaia_ids=_claimed_gids,
     )
     if len(recovered_df) > 0:
         out_path = output_dir / 'gaia_recovered.csv'
         recovered_df.to_csv(out_path, index=False)
         print(f"  Saved {len(recovered_df)} recovered sources → {out_path.name}")
+        # Apply the recovered IDs to the combined catalogue BEFORE Phase 4/6 so
+        # these sources get their Gaia prior in the proper-astrometry fit and
+        # carry has_gaia_match downstream (previously the recovery was written
+        # to gaia_recovered.csv but never used).
+        if len(combined_df) > 0 and 'orig_index' in recovered_df.columns:
+            _ri  = recovered_df['orig_index'].to_numpy(dtype=np.int64)
+            _rg  = recovered_df['gaia_source_id'].to_numpy(dtype=np.int64)
+            _in_idx = np.isin(_ri, combined_df.index.to_numpy())
+            combined_df.loc[_ri[_in_idx], 'gaia_source_id'] = _rg[_in_idx]
+            combined_df.loc[_ri[_in_idx], 'has_gaia_match'] = True
+            print(f"  Applied {int(_in_idx.sum())} recovered Gaia IDs to the "
+                  f"combined catalogue (used as priors in Phase 4)")
 
     # ── Phase 4: proper astrometry with full C_r treatment ───────────────────
     print("\nPhase 6: Proper astrometry with full transformation covariance ...")
@@ -4334,7 +4485,10 @@ def run_hst_crossmatch(
                             outlier_sigma=phase4_outlier_sigma,
                             _det_lookup=_p4.get('det_lookup'),
                             _tele_xyz_cache=_p4.get('tele_xyz_cache'),
-                            _src_detections=_p4.get('src_detections'),
+                            # Re-parse from the merged rows: the cached
+                            # src_detections predates the dedup merge and would
+                            # make this re-fit a no-op on the old detection sets.
+                            _src_detections=None,
                         )
                         for _col in _astrom_4b.columns:
                             combined_dedup4b.loc[_cdf_4b.index, _col] = _astrom_4b[_col].values
@@ -4508,7 +4662,7 @@ def run_hst_crossmatch(
     field_name = Path(field_dir).name
 
     # Restrict sky and CMD plots to sources with well-measured PMs only,
-    # and further exclude |PM| > 100 mas/yr for plot clarity (measurements
+    # and further exclude |PM| > 50 mas/yr for plot clarity (measurements
     # are retained in combined_df; only the plot subset is filtered).
     _ok_pm = (np.isfinite(combined_df['pmra_xmatch'].values)
               & np.isfinite(combined_df['pmdec_xmatch'].values)) \

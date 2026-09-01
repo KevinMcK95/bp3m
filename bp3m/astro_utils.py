@@ -262,13 +262,16 @@ def get_parallax_factors(ra_deg, dec_deg, tele_xyz):
     ra_rad = ra_deg * DEG2RAD
     dec_rad = dec_deg * DEG2RAD
 
-    # Standard parallax factor formula
-    # plx_ra* = -(X_au * sin(ra) - Y_au * cos(ra))
-    # plx_dec = -(X_au * cos(ra)*sin(dec) + Y_au * sin(ra)*sin(dec) - Z_au * cos(dec))
-    plx_ra_star = -(X_au * np.sin(ra_rad) - Y_au * np.cos(ra_rad))
-    plx_dec = -(X_au * np.cos(ra_rad) * np.sin(dec_rad)
-                + Y_au * np.sin(ra_rad) * np.sin(dec_rad)
-                - Z_au * np.cos(dec_rad))
+    # Standard parallax factor formula (apparent - barycentric displacement per
+    # unit parallax, verified against direct vector geometry):
+    #   plx_ra* = +(X_au * sin(ra) - Y_au * cos(ra))
+    #   plx_dec = +(X_au * cos(ra)*sin(dec) + Y_au * sin(ra)*sin(dec) - Z_au * cos(dec))
+    # NOTE: before 2026-09 these were negated, which sign-flipped the parallax
+    # column of the U design matrix everywhere (solver, v2, xmatch Phase 6).
+    plx_ra_star = X_au * np.sin(ra_rad) - Y_au * np.cos(ra_rad)
+    plx_dec = (X_au * np.cos(ra_rad) * np.sin(dec_rad)
+               + Y_au * np.sin(ra_rad) * np.sin(dec_rad)
+               - Z_au * np.cos(dec_rad))
     return plx_ra_star, plx_dec
 
 

@@ -860,6 +860,10 @@ def fit_star(data, x0, y0, psf_cube, xs, ys, psf_scale, hw,
 
     # Scaled reduced chi-squared RMS: sqrt(Σ(r²/var) / DOF)  (Fortran 'c')
     dof = max(n_g - 4, 1)
+    # NAMING HAZARD: 'chi2' here is sqrt(reduced chi^2) (Fortran 'c'
+    # convention), NOT a chi^2. Downstream cuts like chi2 < 5 are
+    # really reduced-chi^2 < 25. Do not "fix" without updating every
+    # consumer's threshold.
     chi2 = float(np.sqrt(np.sum(r[good] ** 2 / var[good]) / dof))
 
     # Saturated pixel count in fit window (Fortran 'n') — uses raw data, not residual
@@ -1353,7 +1357,7 @@ def classify_stars(records,
     ----------
     conc_lo          : float — initial lower bound; upper = 1/conc_lo
     conc_width_factor: float — adaptive half-width multiplier (default 4)
-    conc_min_width   : float — floor on adaptive half-width (default 0.05)
+    conc_min_width   : float — floor on adaptive half-width (default 0.01)
     qfit_global_max  : float — hard upper limit regardless of adaptive threshold
     qfit_percentile  : int   — percentile of qfit used as the locus anchor
     qfit_multiplier  : float — multiplier above the percentile → threshold

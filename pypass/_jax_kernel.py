@@ -640,6 +640,7 @@ def _sigma_clip_jax_results(
         sum_abs_res  = float(np.sum(np.abs(r[g])))
         sum_abs_data = float(np.sum(np.abs(pv[g] - sky)))
         qfit = sum_abs_res / max(sum_abs_data, 1e-10)
+        # NAMING HAZARD: 'chi2' = sqrt(reduced chi^2), matching numpy fit_star.
         dof  = max(n_g - 4, 1)
         chi2 = float(np.sqrt(np.sum(r[g] ** 2 / var[g]) / dof))
 
@@ -877,6 +878,7 @@ def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool):
         sum_abs_res  = jnp.sum(jnp.abs(r)             * valid_bool)
         sum_abs_data = jnp.sum(jnp.abs(pixel_vals - sky) * valid_bool)
         qfit  = sum_abs_res / jnp.maximum(sum_abs_data, 1e-10)
+        # NAMING HAZARD: 'chi2' = sqrt(reduced chi^2), matching numpy fit_star.
         dof   = jnp.maximum(n_good - 4.0, 1.0)
         chi2  = jnp.sqrt(jnp.sum(r ** 2 / var * valid_bool) / dof)
 

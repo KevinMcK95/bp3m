@@ -281,7 +281,9 @@ def validate_filter_group(group, ref_name, zp_dict, mag_scatter_thr, offset_tol_
             pulls = (mags - mu_w) / errs
         else:
             mu_w  = np.median(mags)
-            sig_w = mad(mags)
+            # 1.4826 converts MAD to a Gaussian-sigma estimate; without it the
+            # pulls are overestimated ~1.5x and z_outlier fires too aggressively.
+            sig_w = 1.4826 * mad(mags)
             pulls = (mags - mu_w) / (sig_w if sig_w > 0 else 1.0)
 
         outlier_mask = np.abs(pulls) > z_outlier
@@ -349,10 +351,12 @@ def write_source_quality(data, source_stats, image_stats, mag_scatter_thr):
     df = df.merge(source_stats, on='gaia_source_id', how='left')
     df['mag_residual_from_wmean'] = df['mag_normalized'] - df['mag_norm_wmean']
 
-    # This image is consistent if it is not in the outlier list for this source
+    # This image is consistent if it is not in the outlier list for this source.
+    # Exact token membership — substring matching would false-positive when one
+    # image name is a prefix/substring of another.
     name = data['image_name']
-    df['is_mag_consistent'] = ~df['outlier_images'].fillna('').str.contains(
-        name, regex=False)
+    df['is_mag_consistent'] = ~df['outlier_images'].fillna('').map(
+        lambda s: name in s.split(','))
     df.loc[df['n_same_filter'] == 1, 'is_mag_consistent'] = True  # solo: can't assess
 
     s = image_stats[data['image_name']]
