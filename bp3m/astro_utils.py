@@ -445,7 +445,12 @@ def compute_poly_jacobian(r_j, X_c, Y_c, poly_order):
     # Same 1/2048^(deg-1) scaling as in build_X_matrix — derivatives carry
     # the same scale factor so that the Jacobian is consistent with X_mat.
     _S = 2048.0
-    col = 8
+    # Quadratic+ coefficients start at column 6: (a,b,c,d,dRA0,dDec0) then the
+    # per-degree blocks — same layout as build_X_matrix. (col=8 was the stale
+    # pre-reparameterization layout with w/z; it made poly_order>=2 crash with
+    # IndexError after the w/z removal, and would silently misread for
+    # poly_order>=3.)
+    col = 6
     for deg in range(2, poly_order + 1):
         scale = _S ** (deg - 1)
         # x-equation block
