@@ -252,7 +252,8 @@ class BP3MSolver:
                  use_pair_prior=False,
                  fit_epoch_distortion=False, epoch_dist_order=3,
                  epoch_gap_days=180.0, epoch_dist_sigma_mas=10.0,
-                 epoch_breaks=None, epoch_dist_min_images=3):
+                 epoch_breaks=None, epoch_dist_min_images=3,
+                 epoch_dist_groupby='full'):
         """
         Parameters
         ----------
@@ -308,6 +309,10 @@ class BP3MSolver:
         self._ed_sigma_mas     = float(epoch_dist_sigma_mas)
         self._ed_breaks_jyear  = list(epoch_breaks) if epoch_breaks else []
         self._ed_min_images    = int(epoch_dist_min_images)
+        if epoch_dist_groupby not in ('full', 'no_filter', 'no_epoch', 'static'):
+            raise ValueError(f"epoch_dist_groupby must be one of "
+                             f"full/no_filter/no_epoch/static, got {epoch_dist_groupby!r}")
+        self._ed_groupby       = epoch_dist_groupby
         self.ed_groups         = []     # list of dicts (key, imgs, mean_mjd, ...)
         self._ed_gidx          = {}     # img -> group index or -1
         self.ED_K              = 0
@@ -340,6 +345,15 @@ class BP3MSolver:
         break_mjds = [float(_Time(b, format='jyear').mjd)
                       for b in self._ed_breaks_jyear]
 
+        # Grouping granularity (--epoch_dist_groupby). Chip is ALWAYS kept —
+        # the underlying GDC corrections are per chip.
+        #   full      : (inst, det, chip, filter) x epoch      [default]
+        #   no_filter : (inst, det, chip)         x epoch
+        #   no_epoch  : (inst, det, chip, filter), single static D
+        #   static    : (inst, det, chip),         single static D
+        _use_filter = self._ed_groupby in ('full', 'no_epoch')
+        _use_epoch  = self._ed_groupby in ('full', 'no_filter')
+
         by_key = {}
         for img in self.image_names:
             meta = self.images[img]
@@ -348,7 +362,7 @@ class BP3MSolver:
             key0 = (str(meta.get('instrument', '?')),
                     str(meta.get('detector', '?')),
                     chip,
-                    str(meta.get('filter', '?')))
+                    str(meta.get('filter', '?')) if _use_filter else '*')
             by_key.setdefault(key0, []).append((float(meta['hst_time_mjd']), img))
 
         self.ed_groups = []
@@ -356,13 +370,16 @@ class BP3MSolver:
         n_skipped = 0
         for key0, lst in sorted(by_key.items()):
             lst.sort()
-            clusters = [[lst[0]]]
-            for prev, cur in zip(lst[:-1], lst[1:]):
-                crosses = any(prev[0] < b <= cur[0] for b in break_mjds)
-                if (cur[0] - clusters[-1][-1][0]) > self._ed_gap_days or crosses:
-                    clusters.append([cur])
-                else:
-                    clusters[-1].append(cur)
+            if not _use_epoch:
+                clusters = [lst]           # one static D for the whole key
+            else:
+                clusters = [[lst[0]]]
+                for prev, cur in zip(lst[:-1], lst[1:]):
+                    crosses = any(prev[0] < b <= cur[0] for b in break_mjds)
+                    if (cur[0] - clusters[-1][-1][0]) > self._ed_gap_days or crosses:
+                        clusters.append([cur])
+                    else:
+                        clusters[-1].append(cur)
             for ep_id, cl in enumerate(clusters):
                 imgs = [im for _, im in cl]
                 mean_mjd = float(np.mean([m for m, _ in cl]))
@@ -382,7 +399,8 @@ class BP3MSolver:
         self.n_ed = self.ED_K * len(self.ed_groups)
         print(f"  epoch-distortion: {len(self.ed_groups)} chip-groups x "
               f"{self.ED_K} coeffs = {self.n_ed} shared parameters "
-              f"(order {self._ed_order}, gap {self._ed_gap_days:.0f} d, "
+              f"(groupby={self._ed_groupby}, order {self._ed_order}, "
+              f"gap {self._ed_gap_days:.0f} d, "
               f"prior {self._ed_sigma_mas:.1f} mas"
               + (f", {n_skipped} images unfitted" if n_skipped else "") + ")")
         for g, grp in enumerate(self.ed_groups):

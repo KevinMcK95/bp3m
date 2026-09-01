@@ -44,6 +44,7 @@ def run_alignment(  # noqa: C901
     epoch_dist_sigma: float = 10.0,
     epoch_breaks=None,
     epoch_dist_min_images: int = 3,
+    epoch_dist_groupby: str = 'full',
     no_prefilter: bool = False,
     no_plots: bool = False,
     images: list[str] | None = None,
@@ -255,7 +256,8 @@ def run_alignment(  # noqa: C901
                           epoch_gap_days=epoch_gap_days,
                           epoch_dist_sigma_mas=epoch_dist_sigma,
                           epoch_breaks=epoch_breaks,
-                          epoch_dist_min_images=epoch_dist_min_images)
+                          epoch_dist_min_images=epoch_dist_min_images,
+                          epoch_dist_groupby=epoch_dist_groupby)
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
 
@@ -399,6 +401,7 @@ def run_alignment(  # noqa: C901
             'epoch_dist_sigma_mas': epoch_dist_sigma,
             'epoch_breaks': list(epoch_breaks) if epoch_breaks else [],
             'epoch_dist_min_images': epoch_dist_min_images,
+            'epoch_dist_groupby': epoch_dist_groupby,
             'n_epoch_dist_groups': len(getattr(solver, 'ed_groups', [])),
             'poly_order':   poly_order,
         },

@@ -284,6 +284,13 @@ def _parse_args():
                          'gap clustering at these times')
     bp.add_argument('--epoch_dist_min_images', type=int, default=3,
                     help='Minimum images for a group to receive a correction')
+    bp.add_argument('--epoch_dist_groupby', type=str, default='full',
+                    choices=['full', 'no_filter', 'no_epoch', 'static'],
+                    help='Grouping granularity for the shared distortion: '
+                         'full = inst/det/chip/filter x epoch (default); '
+                         'no_filter = inst/det/chip x epoch; '
+                         'no_epoch = one static D per inst/det/chip/filter; '
+                         'static = one static D per inst/det/chip.')
     bp.add_argument('--no_inflate_hst_errors', action='store_true',
                     help='Disable per-image HST error inflation (default: inflation enabled)')
     bp.add_argument('--no_align_prior', action='store_true',
@@ -1238,6 +1245,7 @@ def main():
                 epoch_dist_sigma=args.epoch_dist_sigma,
                 epoch_breaks=args.epoch_breaks,
                 epoch_dist_min_images=args.epoch_dist_min_images,
+                epoch_dist_groupby=args.epoch_dist_groupby,
                         use_sparse=args.sparse,
                         no_plots=args.no_plots,
                         images=[_img],
@@ -1302,6 +1310,7 @@ def main():
                 epoch_dist_sigma=args.epoch_dist_sigma,
                 epoch_breaks=args.epoch_breaks,
                 epoch_dist_min_images=args.epoch_dist_min_images,
+                epoch_dist_groupby=args.epoch_dist_groupby,
                 use_sparse=args.sparse,
                 no_plots=args.no_plots,
                 images=_bp3m_images,
@@ -1362,6 +1371,7 @@ def main():
                 epoch_dist_sigma=args.epoch_dist_sigma,
                 epoch_breaks=args.epoch_breaks,
                 epoch_dist_min_images=args.epoch_dist_min_images,
+                epoch_dist_groupby=args.epoch_dist_groupby,
             )
         else:
             run_alignment(
@@ -1381,6 +1391,7 @@ def main():
                 epoch_dist_sigma=args.epoch_dist_sigma,
                 epoch_breaks=args.epoch_breaks,
                 epoch_dist_min_images=args.epoch_dist_min_images,
+                epoch_dist_groupby=args.epoch_dist_groupby,
                 use_sparse=args.sparse,
                 no_plots=args.no_plots,
                 images=_bp3m_images,
