@@ -38,6 +38,7 @@ from typing import Optional
 from .astro_utils import (
     plane_project, plane_project_jacobian, plane_project_tangent_derivs,
     get_parallax_factors, build_U_matrix, build_X_matrix,
+    epoch_distortion_basis, epoch_distortion_n_shape, epoch_distortion_pairs,
     hst_position_cov, rotation_matrix_from_abcd, gaia_cov_to_survey_cov,
     abcd_from_rotation_pixscale_skew, n_r_from_poly_order, compute_poly_jacobian,
     get_tele_position, michalik_sigma_plx_prior, RAD2MAS, DEG2RAD, GAIA_SYS_DICT
@@ -248,7 +249,10 @@ class BP3MSolver:
                  prior_sigma_skew=None, prior_sigma_pointing=None,
                  prior_sigma_pair_rot_deg=None, prior_sigma_pair_scale=None,
                  prior_sigma_pair_skew=None, prior_sigma_pair_pointing=None,
-                 use_pair_prior=False):
+                 use_pair_prior=False,
+                 fit_epoch_distortion=False, epoch_dist_order=3,
+                 epoch_gap_days=180.0, epoch_dist_sigma_mas=10.0,
+                 epoch_breaks=None, epoch_dist_min_images=3):
         """
         Parameters
         ----------
@@ -297,11 +301,113 @@ class BP3MSolver:
         self.n_stars = len(gaia_catalog)
         self.n_images = len(image_names)
 
+        # ── Shared epoch-distortion correction D (see epoch_distortion_basis) ─
+        self._ed_enabled       = bool(fit_epoch_distortion)
+        self._ed_order         = int(epoch_dist_order)
+        self._ed_gap_days      = float(epoch_gap_days)
+        self._ed_sigma_mas     = float(epoch_dist_sigma_mas)
+        self._ed_breaks_jyear  = list(epoch_breaks) if epoch_breaks else []
+        self._ed_min_images    = int(epoch_dist_min_images)
+        self.ed_groups         = []     # list of dicts (key, imgs, mean_mjd, ...)
+        self._ed_gidx          = {}     # img -> group index or -1
+        self.ED_K              = 0
+        self.n_ed              = 0
+        if self._ed_enabled:
+            self._build_epoch_distortion_groups()
+
         self._cache_gaia()
         self._precompute_geometry()
         self._init_transforms()
 
     # ── Gaia data caching ──────────────────────────────────────────────────────
+
+    def _build_epoch_distortion_groups(self):
+        """
+        Assign every image to an (instrument, detector, chip, filter, epoch)
+        group for the shared epoch-distortion correction.
+
+        Epochs: images of the same (inst, det, chip, filter) are sorted by
+        observation MJD and split where the gap exceeds epoch_gap_days, or at
+        the explicit epoch_breaks boundaries (decimal years). Groups with
+        fewer than epoch_dist_min_images images get no correction (their
+        images are flagged -1 and a warning is printed). Single-epoch groups
+        ARE fitted: their D is anchored by the Gaia J2016 positions.
+        """
+        from astropy.time import Time as _Time
+        n_shape   = epoch_distortion_n_shape(self._ed_order)
+        self.ED_K = 2 * n_shape
+
+        break_mjds = [float(_Time(b, format='jyear').mjd)
+                      for b in self._ed_breaks_jyear]
+
+        by_key = {}
+        for img in self.image_names:
+            meta = self.images[img]
+            chip = ('hi' if img.endswith('_hi')
+                    else 'lo' if img.endswith('_lo') else 'chip')
+            key0 = (str(meta.get('instrument', '?')),
+                    str(meta.get('detector', '?')),
+                    chip,
+                    str(meta.get('filter', '?')))
+            by_key.setdefault(key0, []).append((float(meta['hst_time_mjd']), img))
+
+        self.ed_groups = []
+        self._ed_gidx = {img: -1 for img in self.image_names}
+        n_skipped = 0
+        for key0, lst in sorted(by_key.items()):
+            lst.sort()
+            clusters = [[lst[0]]]
+            for prev, cur in zip(lst[:-1], lst[1:]):
+                crosses = any(prev[0] < b <= cur[0] for b in break_mjds)
+                if (cur[0] - clusters[-1][-1][0]) > self._ed_gap_days or crosses:
+                    clusters.append([cur])
+                else:
+                    clusters[-1].append(cur)
+            for ep_id, cl in enumerate(clusters):
+                imgs = [im for _, im in cl]
+                mean_mjd = float(np.mean([m for m, _ in cl]))
+                if len(imgs) < self._ed_min_images:
+                    n_skipped += len(imgs)
+                    print(f"    epoch-distortion: group {key0} epoch {ep_id} "
+                          f"has only {len(imgs)} image(s) < "
+                          f"{self._ed_min_images} — no correction fitted")
+                    continue
+                g = len(self.ed_groups)
+                for im in imgs:
+                    self._ed_gidx[im] = g
+                self.ed_groups.append(dict(
+                    instrument=key0[0], detector=key0[1], chip=key0[2],
+                    filter=key0[3], epoch_id=ep_id, mean_mjd=mean_mjd,
+                    images=imgs))
+        self.n_ed = self.ED_K * len(self.ed_groups)
+        print(f"  epoch-distortion: {len(self.ed_groups)} chip-groups x "
+              f"{self.ED_K} coeffs = {self.n_ed} shared parameters "
+              f"(order {self._ed_order}, gap {self._ed_gap_days:.0f} d, "
+              f"prior {self._ed_sigma_mas:.1f} mas"
+              + (f", {n_skipped} images unfitted" if n_skipped else "") + ")")
+        for g, grp in enumerate(self.ed_groups):
+            from astropy.time import Time as _T
+            print(f"    D[{g}] {grp['instrument']}/{grp['detector']} "
+                  f"{grp['filter']} chip={grp['chip']} epoch~"
+                  f"{_T(grp['mean_mjd'], format='mjd').jyear:.2f} "
+                  f"({len(grp['images'])} images)")
+
+    def _ed_cols(self, img):
+        """Global shared-vector column indices of img's D block (or None)."""
+        g = self._ed_gidx.get(img, -1)
+        if not self._ed_enabled or g < 0:
+            return None
+        off = self.N_R * self.n_images + g * self.ED_K
+        return np.arange(off, off + self.ED_K)
+
+    def _ed_disp(self, img, shared_vec):
+        """(n, 2) epoch-distortion displacement for img at the current shared
+        vector, in pixels. Zero when disabled/unfitted/legacy-length vector."""
+        cols = self._ed_cols(img)
+        d = self._img_data.get(img)
+        if cols is None or d is None or shared_vec.size <= cols[0]:
+            return 0.0
+        return np.einsum('nkl,l->nk', d["B_mat"], shared_vec[cols])
 
     def _cache_gaia(self):
         g = self.gaia_cat
@@ -848,6 +954,15 @@ class BP3MSolver:
                 "xys"            : xys,               # (n, 2) Gaia pseudo-image xy
                 "JU"             : JU,                # (n, 2, 5)
                 "X_mat"          : X_mat,             # (n, 2, N_R)
+                "B_mat"          : (epoch_distortion_basis(
+                                        X_c, Y_c, self._ed_order,
+                                        half_x=2048.0,
+                                        half_y=(507.0 if str(meta.get('detector','')).upper() == 'IR'
+                                                else 1024.0))
+                                    if (self._ed_enabled and self._ed_gidx.get(img, -1) >= 0)
+                                    else None),   # (n, 2, ED_K) epoch-distortion basis
+                "ed_sigma_px"    : (self._ed_sigma_mas / meta["orig_pixel_scale"]
+                                    if self._ed_enabled else None),
                 "C_hst"          : C_hst,             # (n, 2, 2) — may be inflated
                 "C_hst_orig"     : C_hst.copy(),      # (n, 2, 2) — original, never modified
                 "X_c"            : X_c,               # (n,) centered HST x (needed for poly Jacobian)
@@ -1246,6 +1361,15 @@ class BP3MSolver:
         """
         nr = self.N_R
         n_r = nr * self.n_images
+        n_s = n_r + self.n_ed          # shared dim: per-image r blocks + epoch-D
+        if self.n_ed and r_current.size == n_r:
+            # legacy-length input: append zero epoch-distortion coefficients
+            r_current = np.concatenate([r_current, np.zeros(self.n_ed)])
+
+        def _cols_of(j_idx, img):
+            base = np.arange(j_idx * nr, j_idx * nr + nr)
+            ec = self._ed_cols(img)
+            return base if ec is None else np.concatenate([base, ec])
 
         # ── Precision matrices and information vectors ─────────────────────────
         H_vv = self.C_survey_inv.copy()
@@ -1265,7 +1389,7 @@ class BP3MSolver:
         h_align = h_base.copy()
         h_all   = h_base.copy()
 
-        H_rr = np.zeros((n_r, n_r))
+        H_rr = np.zeros((n_s, n_s))
 
         K_img = {}
         XCs_xresid = {}
@@ -1303,7 +1427,11 @@ class BP3MSolver:
             X    = d["X_mat"]    # (n, 2, N_R)
             xys  = d["xys"]      # (n, 2)
 
-            r_j = r_current[cs:cs + nr]
+            r_j  = r_current[cs:cs + nr]
+            cols = _cols_of(j_idx, img)
+            if len(cols) > nr:                      # epoch-distortion active
+                X = np.concatenate([X, d["B_mat"]], axis=2)   # (n, 2, nr+K)
+            s_j = r_current[cols]
 
             Cs     = self._compute_Cs(img, r_j)   # (n, 2, 2)
             Cs_inv = np.linalg.inv(Cs)
@@ -1311,7 +1439,7 @@ class BP3MSolver:
             if z_weights is not None:
                 Cs_inv = Cs_inv * z[:, None, None]
 
-            x_pred  = np.einsum('nkl,l->nk', X, r_j)
+            x_pred  = np.einsum('nkl,l->nk', X, s_j)
             x_resid = xys - x_pred
 
             JUT_Cs = np.einsum('nki,nkl->nil', JU, Cs_inv)
@@ -1337,7 +1465,7 @@ class BP3MSolver:
 
             # H_rr/XCs_xresid: alignment stars only (calibrate image transform)
             XCsX = np.einsum('nki,nkl,nlj->ij', X[use_align], Cs_inv[use_align], X[use_align])
-            H_rr[cs:cs+nr, cs:cs+nr] += XCsX
+            H_rr[np.ix_(cols, cols)] += XCsX
             XCs_xresid[img] = np.einsum('nki,nkl,nl->ni', X[use_align], Cs_inv[use_align], x_resid[use_align])
 
             H_rr[cs:cs+nr, cs:cs+nr] += d["C_r_prior_inv"]
@@ -1354,6 +1482,14 @@ class BP3MSolver:
                 if not (self.exclude_2p_from_alignment and self.gaia_2p[i]):
                     h_align[i] += contrib['h_contrib']
 
+        # ── Epoch-distortion coefficient prior: diagonal, sigma in pixels ────
+        if self.n_ed:
+            for g, grp in enumerate(self.ed_groups):
+                sig_px = self._img_data[grp['images'][0]]["ed_sigma_px"]
+                off = n_r + g * self.ED_K
+                H_rr[np.arange(off, off + self.ED_K),
+                     np.arange(off, off + self.ED_K)] += sig_px ** -2
+
         # ── Hi/lo chip coupling prior: off-diagonal blocks in H_rr ───────────
         for hi_idx, lo_idx in self._chip_pairs:
             C_cp = self._chip_pair_couplings[(hi_idx, lo_idx)]
@@ -1368,9 +1504,16 @@ class BP3MSolver:
         a_align = np.einsum('nij,nj->ni', C_vT, h_align)  # for Schur complement rhs
         a       = np.einsum('nij,nj->ni', C_vT, h_all)    # returned stellar posteriors
 
-        # ── Schur complement for Δr ────────────────────────────────────────────
+        # ── Schur complement for the shared parameters (r blocks + epoch-D) ──
         Cr_inv = H_rr.copy()
-        rhs    = np.zeros(n_r)
+        rhs    = np.zeros(n_s)
+
+        # Epoch-D prior rhs: pull toward zero from the current iterate
+        if self.n_ed:
+            for g, grp in enumerate(self.ed_groups):
+                sig_px = self._img_data[grp['images'][0]]["ed_sigma_px"]
+                off = n_r + g * self.ED_K
+                rhs[off:off + self.ED_K] += (0.0 - r_current[off:off + self.ED_K]) * sig_px ** -2
 
         for j_idx, img in enumerate(self.image_names):
             r_prior_j      = self._img_data[img]["r_prior"]
@@ -1381,6 +1524,7 @@ class BP3MSolver:
             d = self._img_data[img]
             if d is None or K_img[img] is None:
                 continue
+            cols = _cols_of(j_idx, img)
             use  = d["use_for_fit"]
             # The Schur correction K^T C_v K must use the same star set as
             # H_rr (XCsX).  When 2p stars are excluded from alignment, K must
@@ -1390,13 +1534,13 @@ class BP3MSolver:
             sidx = d["sidx"][use]
             K    = K_img[img][use]
 
-            rhs[cs:cs+nr] += XCs_xresid[img].sum(axis=0)
+            rhs[cols] += XCs_xresid[img].sum(axis=0)
 
             CvT_K    = np.einsum('nij,njk->nik', C_vT[sidx], K)
             KT_CvT_K = np.einsum('nji,njk->ik',  K, CvT_K)
-            Cr_inv[cs:cs+nr, cs:cs+nr] -= KT_CvT_K
+            Cr_inv[np.ix_(cols, cols)] -= KT_CvT_K
 
-            rhs[cs:cs+nr] += np.einsum('nji,nj->i', K, a_align[sidx])
+            rhs[cols] += np.einsum('nji,nj->i', K, a_align[sidx])
 
             for j2_idx, img2 in enumerate(self.image_names):
                 if j2_idx <= j_idx:
@@ -1419,9 +1563,9 @@ class BP3MSolver:
                 CvT_K2 = np.einsum('nij,njk->nik', CvT_c, K2[idx2])
                 block  = np.einsum('nji,njk->ik', K[idx1], CvT_K2)
 
-                cs2 = j2_idx * nr
-                Cr_inv[cs:cs+nr,   cs2:cs2+nr] -= block
-                Cr_inv[cs2:cs2+nr, cs:cs+nr]   -= block.T
+                cols2 = _cols_of(j2_idx, img2)
+                Cr_inv[np.ix_(cols,  cols2)] -= block
+                Cr_inv[np.ix_(cols2, cols)]  -= block.T
 
         # ── Hi/lo chip coupling prior: rhs pull toward partner's current iterate ─
         for hi_idx, lo_idx in self._chip_pairs:
@@ -1672,6 +1816,8 @@ class BP3MSolver:
 
         r_hat = np.concatenate([self._img_data[img]["r_init"]
                                  for img in self.image_names])
+        if self.n_ed:
+            r_hat = np.concatenate([r_hat, np.zeros(self.n_ed)])
         self._update_R(r_hat)
         nr  = self.N_R
         C_r = None
@@ -1684,21 +1830,31 @@ class BP3MSolver:
 
         def _delta_summary(diff):
             """Return formatted strings: (max_location_str, per_param_stats_str)."""
+            n_r_only  = nr * self.n_images
+            diff_r    = diff[:n_r_only]
             imax      = int(np.argmax(diff))
-            img_idx   = imax // nr
-            param_idx = imax % nr
-            max_str   = (f"{diff[imax]:.3e}"
-                         f"  [{self.image_names[img_idx]} / {_pnames[param_idx]}]")
+            if imax >= n_r_only:                    # epoch-distortion coefficient
+                g, k = divmod(imax - n_r_only, self.ED_K)
+                max_str = (f"{diff[imax]:.3e}"
+                           f"  [epoch-D group {g} / coeff {k}]")
+            else:
+                img_idx   = imax // nr
+                param_idx = imax % nr
+                max_str   = (f"{diff[imax]:.3e}"
+                             f"  [{self.image_names[img_idx]} / {_pnames[param_idx]}]")
 
             parts = []
             for p in range(nr):
-                vals = diff[p::nr]
+                vals = diff_r[p::nr]
                 med  = float(np.median(vals))
                 if _n_imgs > 1:
                     w68 = float(np.percentile(vals, 84) - np.percentile(vals, 16))
                     parts.append(f"{_pnames[p]}: {med:.2e} [{w68:.2e}]")
                 else:
                     parts.append(f"{_pnames[p]}: {med:.2e}")
+            if len(diff) > n_r_only:
+                parts.append(f"epoch-D: {float(np.median(diff[n_r_only:])):.2e} "
+                             f"[max {float(np.max(diff[n_r_only:])):.2e}]")
             return max_str, '  '.join(parts)
 
         def _inner_converge(r_hat, label, z_weights=None):
@@ -2096,6 +2252,9 @@ class BP3MSolver:
             # Residual = xys - (X r - JU a) = xys - X r + JU a.
             pred  = (np.einsum('nij,j->ni',  X,  r_j)
                      - np.einsum('nij,nj->ni', JU, a_arr[sidx]))   # (n, 2)
+            _edd = self._ed_disp(img, r_hat)
+            if not np.isscalar(_edd):
+                pred = pred + _edd
             res   = xys - pred                                        # (n, 2)
 
             chi2  = np.einsum('ni,nij,nj->n', res, Cs_inv, res)     # (n,)
@@ -2803,6 +2962,9 @@ class BP3MSolver:
 
             pred  = (np.einsum('nij,j->ni', X_mat, r_j)
                      - np.einsum('nij,nj->ni', JU, a_arr[sidx]))
+            _edd = self._ed_disp(img, r_hat)
+            if not np.isscalar(_edd):
+                pred = pred + _edd
             resid = xys - pred
             mah2  = np.einsum('ni,nij,nj->n', resid, Cs_inv, resid)
             sigma_resid = np.sqrt(np.maximum(mah2, 0.))
@@ -2903,10 +3065,13 @@ class BP3MSolver:
         """
         nr      = self.N_R
         n_r_tot = nr * self.n_images
+        n_s_tot = n_r_tot + self.n_ed
         n_stars = self.n_stars
 
-        # Build K_all[i, :, cs:cs+nr] = Σ_{detections of star i in img j} K_{ij}
-        K_all = np.zeros((n_stars, 5, n_r_tot))
+        # Build K_all[i, :, cols(j)] = Σ_{detections of star i in img j} K_{ij}
+        # cols(j) = the image's r block plus (when fit_epoch_distortion) its
+        # group's epoch-D slice — K_img columns follow the same layout.
+        K_all = np.zeros((n_stars, 5, n_s_tot))
 
         for j_idx, img in enumerate(self.image_names):
             if K_img.get(img) is None:
@@ -2918,9 +3083,16 @@ class BP3MSolver:
             if not use_any.any():
                 continue
             sidx = d['sidx'][use_any]
-            K    = K_img[img][use_any]   # (n, 5, nr)
+            K    = K_img[img][use_any]   # (n, 5, m)
             cs   = j_idx * nr
-            np.add.at(K_all[:, :, cs:cs + nr], sidx, K)
+            ec   = self._ed_cols(img)
+            if ec is None or K.shape[2] == nr:
+                np.add.at(K_all[:, :, cs:cs + nr], sidx, K)
+            else:
+                np.add.at(K_all[:, :, cs:cs + nr], sidx, K[:, :, :nr])
+                _tmp = np.zeros((n_stars, 5, self.ED_K))
+                np.add.at(_tmp, sidx, K[:, :, nr:])
+                K_all[:, :, ec[0]:ec[0] + self.ED_K] += _tmp
 
         # C_extra[i] = (C_vT[i] @ K_all[i]) @ C_r @ (C_vT[i] @ K_all[i]).T
         CvT_K   = np.einsum('nij,njk->nik', C_vT, K_all)           # (n_stars, 5, n_r_tot)
@@ -2966,7 +3138,12 @@ class BP3MSolver:
             K     = K_img[img][use_any]
             CvT_K = np.einsum('nij,njk->nik', C_vT[sidx], K)
             cs    = j_idx * nr
-            r_j_delta = r_samp[:, cs:cs+nr] - r_hat[cs:cs+nr]
+            ec    = self._ed_cols(img)
+            if ec is not None and K.shape[2] > nr:
+                cols = np.concatenate([np.arange(cs, cs + nr), ec])
+            else:
+                cols = np.arange(cs, cs + nr)
+            r_j_delta = r_samp[:, cols] - r_hat[cols]
             corr      = np.einsum('sk,njk->snj', r_j_delta, CvT_K)
             v_samp[:, sidx, :] += corr
 
@@ -3034,6 +3211,9 @@ class BP3MSolver:
             # Model prediction: X r_j - JU v_hat_i
             pred = (np.einsum('nij,j->ni', X_mat, r_j)
                     - np.einsum('nij,nj->ni', JU, v_hat[sidx]))   # (n, 2)
+            _edd = self._ed_disp(img, r_hat)
+            if not np.isscalar(_edd):
+                pred = pred + _edd
             resid = xys - pred  # (n, 2)
 
             # ── Total uncertainty in pseudo-image space ───────────────────────
@@ -3134,6 +3314,9 @@ class BP3MSolver:
             # Pseudo-image residual: xys - (X r_j - JU v_hat_i)
             pred         = (np.einsum('nij,j->ni', X_mat, r_j)
                             - np.einsum('nij,nj->ni', JU, v_hat[sidx]))
+            _edd = self._ed_disp(img, r_hat)
+            if not np.isscalar(_edd):
+                pred = pred + _edd
             resid_pseudo = xys - pred    # (n, 2)
 
             # Total covariance in pseudo-image frame
@@ -3233,6 +3416,9 @@ class BP3MSolver:
             #   resid = xys - pred = xys - X r_j + JU a_arr
             pred  = (np.einsum('nij,j->ni', X_mat, r_j)
                      - np.einsum('nij,nj->ni', JU, a_arr[sidx]))   # (n, 2)
+            _edd = self._ed_disp(img, r_hat)
+            if not np.isscalar(_edd):
+                pred = pred + _edd
             resid = xys - pred   # (n, 2)
 
             # Mahalanobis distance (HST noise only)

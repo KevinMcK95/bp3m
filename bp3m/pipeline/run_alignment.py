@@ -38,6 +38,12 @@ def run_alignment(  # noqa: C901
     use_sparse: bool = False,
     inflate_hst_errors: bool = True,
     two_phase_align: bool = False,
+    fit_epoch_distortion: bool = False,
+    epoch_dist_order: int = 3,
+    epoch_gap_days: float = 180.0,
+    epoch_dist_sigma: float = 10.0,
+    epoch_breaks=None,
+    epoch_dist_min_images: int = 3,
     no_prefilter: bool = False,
     no_plots: bool = False,
     images: list[str] | None = None,
@@ -228,6 +234,8 @@ def run_alignment(  # noqa: C901
             filtered_spi, gaia_catalog)
 
     # ── Initialise solver ─────────────────────────────────────────────────────
+    if use_sparse and fit_epoch_distortion:
+        raise ValueError("--fit_epoch_distortion is not supported with --sparse yet")
     SolverClass = BP3MSolverSparse if use_sparse else BP3MSolver
     solver = SolverClass(imgs, filtered_spi, gaia_catalog,
                           star_id_to_idx, image_names, star_in_image,
@@ -241,7 +249,13 @@ def run_alignment(  # noqa: C901
                           prior_sigma_pair_scale=prior_sigma_pair_scale,
                           prior_sigma_pair_skew=prior_sigma_pair_skew,
                           prior_sigma_pair_pointing=prior_sigma_pair_pointing,
-                          use_pair_prior=use_pair_prior)
+                          use_pair_prior=use_pair_prior,
+                          fit_epoch_distortion=fit_epoch_distortion,
+                          epoch_dist_order=epoch_dist_order,
+                          epoch_gap_days=epoch_gap_days,
+                          epoch_dist_sigma_mas=epoch_dist_sigma,
+                          epoch_breaks=epoch_breaks,
+                          epoch_dist_min_images=epoch_dist_min_images)
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
 
@@ -379,6 +393,13 @@ def run_alignment(  # noqa: C901
             'split_ccd':    split_ccd,
             'inflate_hst_errors': inflate_hst_errors,
             'two_phase_align': two_phase_align,
+            'fit_epoch_distortion': fit_epoch_distortion,
+            'epoch_dist_order': epoch_dist_order,
+            'epoch_gap_days': epoch_gap_days,
+            'epoch_dist_sigma_mas': epoch_dist_sigma,
+            'epoch_breaks': list(epoch_breaks) if epoch_breaks else [],
+            'epoch_dist_min_images': epoch_dist_min_images,
+            'n_epoch_dist_groups': len(getattr(solver, 'ed_groups', [])),
             'poly_order':   poly_order,
         },
     )
@@ -642,7 +663,38 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
     # 3. Full covariance arrays
     np.save(output_dir / "v_cov_marginalised.npy", v_cov)
     np.save(output_dir / "C_vT.npy", C_vT)
-    np.save(output_dir / "C_r.npy", C_r)
+    _n_r_only = solver.N_R * solver.n_images
+    if getattr(solver, 'n_ed', 0):
+        # C_r.npy keeps its legacy shape/meaning: the per-image r-block
+        # MARGINAL covariance (marginalised over the epoch-D coefficients).
+        np.save(output_dir / "C_r.npy", C_r[:_n_r_only, :_n_r_only])
+        np.save(output_dir / "C_epoch_distortion.npy", C_r[_n_r_only:, _n_r_only:])
+        np.save(output_dir / "C_r_epoch_cross.npy", C_r[:_n_r_only, _n_r_only:])
+        from bp3m.astro_utils import epoch_distortion_pairs
+        _prs = epoch_distortion_pairs(solver._ed_order)
+        _nsh = len(_prs)
+        _rows = []
+        _dvec = r_hat[_n_r_only:]
+        _dsig = np.sqrt(np.maximum(np.diag(C_r[_n_r_only:, _n_r_only:]), 0.0))
+        for _g, _grp in enumerate(solver.ed_groups):
+            for _k in range(solver.ED_K):
+                _axis = 'x' if _k < _nsh else 'y'
+                _i, _j = _prs[_k % _nsh]
+                _rows.append(dict(
+                    group=_g, instrument=_grp['instrument'],
+                    detector=_grp['detector'], chip=_grp['chip'],
+                    filter=_grp['filter'], epoch_id=_grp['epoch_id'],
+                    mean_mjd=_grp['mean_mjd'], n_images=len(_grp['images']),
+                    axis=_axis, leg_i=_i, leg_j=_j,
+                    coeff_px=float(_dvec[_g * solver.ED_K + _k]),
+                    sigma_px=float(_dsig[_g * solver.ED_K + _k]),
+                ))
+        import pandas as _pd
+        _pd.DataFrame(_rows).to_csv(output_dir / "epoch_distortion.csv", index=False)
+        print(f"  Saved: epoch_distortion.csv  ({len(solver.ed_groups)} chip-groups, "
+              f"order {solver._ed_order}), C_epoch_distortion.npy")
+    else:
+        np.save(output_dir / "C_r.npy", C_r)
 
     # 4. Per-detection use flags (for reproducibility and hierarchical modelling)
     # use_for_fit[img]   : (n,) bool — detection used for ALIGNMENT (constrains r_hat)

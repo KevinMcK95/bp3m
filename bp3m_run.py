@@ -268,6 +268,22 @@ def _parse_args():
                          '(rejection via adaptive thresholds only), then '
                          're-converge with the per-image alpha model enabled, '
                          'warm-started from the Phase A geometry.')
+    bp.add_argument('--fit_epoch_distortion', action='store_true',
+                    help='Fit a shared low-order distortion correction per '
+                         '(instrument, detector, chip, filter, epoch) group, '
+                         'Legendre basis of total degree 2..order (degrees 0-1 '
+                         'excluded: degenerate with per-image alignment).')
+    bp.add_argument('--epoch_dist_order', type=int, default=3,
+                    help='Maximum total degree of the epoch-distortion basis')
+    bp.add_argument('--epoch_gap_days', type=float, default=180.0,
+                    help='Time gap that starts a new epoch group')
+    bp.add_argument('--epoch_dist_sigma', type=float, default=10.0,
+                    help='Gaussian prior width per epoch-distortion coefficient (mas)')
+    bp.add_argument('--epoch_breaks', type=float, nargs='+', default=None,
+                    help='Explicit epoch boundaries (decimal years), overrides '
+                         'gap clustering at these times')
+    bp.add_argument('--epoch_dist_min_images', type=int, default=3,
+                    help='Minimum images for a group to receive a correction')
     bp.add_argument('--no_inflate_hst_errors', action='store_true',
                     help='Disable per-image HST error inflation (default: inflation enabled)')
     bp.add_argument('--no_align_prior', action='store_true',
@@ -1216,6 +1232,12 @@ def main():
                         min_stars_split_ccd=args.min_stars_split_ccd,
                         inflate_hst_errors=not args.no_inflate_hst_errors,
                 two_phase_align=args.two_phase_align,
+                fit_epoch_distortion=args.fit_epoch_distortion,
+                epoch_dist_order=args.epoch_dist_order,
+                epoch_gap_days=args.epoch_gap_days,
+                epoch_dist_sigma=args.epoch_dist_sigma,
+                epoch_breaks=args.epoch_breaks,
+                epoch_dist_min_images=args.epoch_dist_min_images,
                         use_sparse=args.sparse,
                         no_plots=args.no_plots,
                         images=[_img],
@@ -1274,6 +1296,12 @@ def main():
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 inflate_hst_errors=not args.no_inflate_hst_errors,
                 two_phase_align=args.two_phase_align,
+                fit_epoch_distortion=args.fit_epoch_distortion,
+                epoch_dist_order=args.epoch_dist_order,
+                epoch_gap_days=args.epoch_gap_days,
+                epoch_dist_sigma=args.epoch_dist_sigma,
+                epoch_breaks=args.epoch_breaks,
+                epoch_dist_min_images=args.epoch_dist_min_images,
                 use_sparse=args.sparse,
                 no_plots=args.no_plots,
                 images=_bp3m_images,
@@ -1328,6 +1356,12 @@ def main():
                 poly_order=args.poly_order,
                 inflate_hst_errors=not args.no_inflate_hst_errors,
                 two_phase_align=args.two_phase_align,
+                fit_epoch_distortion=args.fit_epoch_distortion,
+                epoch_dist_order=args.epoch_dist_order,
+                epoch_gap_days=args.epoch_gap_days,
+                epoch_dist_sigma=args.epoch_dist_sigma,
+                epoch_breaks=args.epoch_breaks,
+                epoch_dist_min_images=args.epoch_dist_min_images,
             )
         else:
             run_alignment(
@@ -1341,6 +1375,12 @@ def main():
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 inflate_hst_errors=not args.no_inflate_hst_errors,
                 two_phase_align=args.two_phase_align,
+                fit_epoch_distortion=args.fit_epoch_distortion,
+                epoch_dist_order=args.epoch_dist_order,
+                epoch_gap_days=args.epoch_gap_days,
+                epoch_dist_sigma=args.epoch_dist_sigma,
+                epoch_breaks=args.epoch_breaks,
+                epoch_dist_min_images=args.epoch_dist_min_images,
                 use_sparse=args.sparse,
                 no_plots=args.no_plots,
                 images=_bp3m_images,

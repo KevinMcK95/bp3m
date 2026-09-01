@@ -275,6 +275,62 @@ def get_parallax_factors(ra_deg, dec_deg, tele_xyz):
     return plx_ra_star, plx_dec
 
 
+def epoch_distortion_n_shape(order):
+    """Number of scalar shape functions for the epoch-distortion basis."""
+    return sum(deg + 1 for deg in range(2, order + 1))
+
+
+def epoch_distortion_pairs(order):
+    """(i, j) Legendre-degree pairs, total degree 2..order, in fixed order."""
+    return [(deg - j, j) for deg in range(2, order + 1) for j in range(deg + 1)]
+
+
+def epoch_distortion_basis(X_c, Y_c, order=3, half_x=2048.0, half_y=1024.0):
+    """
+    Shared epoch-distortion basis: products of Legendre polynomials
+    P_i(x)P_j(y) with total degree i+j in [2, order], evaluated on
+    chip-normalised coordinates (X_c/half_x, Y_c/half_y).
+
+    Degrees 0 and 1 are deliberately EXCLUDED: constant and linear terms are
+    exactly degenerate with coherent shifts of the per-image alignment
+    parameters (a,b,c,d,dRA0,dDec0). Legendre products are used instead of raw
+    monomials so the retained shapes are orthogonal to {1, x, y} over the
+    uniform chip domain — near-zero statistical coupling to the alignment
+    under roughly uniform star coverage, and coefficients with a stable
+    meaning across fields (pixels of displacement at basis amplitude ~1).
+
+    Returns
+    -------
+    B : (n, 2, K) with K = 2 * n_shape — columns 0..n_shape-1 displace x,
+        columns n_shape..K-1 displace y, in PIXELS per unit coefficient.
+    """
+    xt = np.asarray(X_c, float) / half_x
+    yt = np.asarray(Y_c, float) / half_y
+
+    def _leg(t, k):
+        if k == 0:
+            return np.ones_like(t)
+        if k == 1:
+            return t
+        if k == 2:
+            return 1.5 * t * t - 0.5
+        if k == 3:
+            return 2.5 * t ** 3 - 1.5 * t
+        # generic recurrence for k >= 4
+        pm2, pm1 = _leg(t, k - 2), _leg(t, k - 1)
+        return ((2 * k - 1) * t * pm1 - (k - 1) * pm2) / k
+
+    pairs = epoch_distortion_pairs(order)
+    n_shape = len(pairs)
+    n = len(xt)
+    B = np.zeros((n, 2, 2 * n_shape))
+    for k, (i, j) in enumerate(pairs):
+        phi = _leg(xt, i) * _leg(yt, j)
+        B[:, 0, k] = phi
+        B[:, 1, n_shape + k] = phi
+    return B
+
+
 def propagate_gaia_positions(ra_deg, dec_deg, pmra_masyr, pmdec_masyr,
                              parallax_mas, dt_yr, tele_xyz):
     """
