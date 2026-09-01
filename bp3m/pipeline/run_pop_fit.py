@@ -2845,6 +2845,7 @@ def _lookup_lvd(lvd_dir: Path, key: str) -> dict:
       sigma_plx_tot    — parallax prior width (mas), from distance uncertainty
       mu_pop_init      — (pmra, pmdec) tuple (mas/yr), from pmra/pmdec columns
       mu_pop_prior_sigma — prior width on μ_pop (mas/yr), 3× max(PM errors)
+      sigma_pm         — internal PM dispersion (mas/yr), vlos_sigma/(4.7405 d_kpc)
       d_kpc            — distance (kpc), for informational printing
     """
     import numpy as np
@@ -2881,6 +2882,12 @@ def _lookup_lvd(lvd_dir: Path, key: str) -> dict:
                 sigma_d = (d_hi - d_lo) / 2.0
                 params['sigma_plx_tot'] = sigma_d / d_kpc ** 2   # mas
 
+            # Internal PM dispersion from the line-of-sight velocity dispersion,
+            # assuming isotropy: sigma_pm [mas/yr] = sigma_vlos [km/s] / (4.7405 d [kpc])
+            vlos_sig = float(row.get('vlos_sigma', np.nan))
+            if np.isfinite(vlos_sig) and vlos_sig > 0:
+                params['sigma_pm'] = vlos_sig / (4.740470463533348 * d_kpc)
+
         pmra  = float(row.get('pmra',  np.nan))
         pmdec = float(row.get('pmdec', np.nan))
         if np.isfinite(pmra) and np.isfinite(pmdec):
@@ -2910,8 +2917,10 @@ def main():
                         help='Target name (must match the field directory from bp3m)')
     parser.add_argument('--output_dir', type=str, default='.',
                         help='Root output directory (same as passed to bp3m)')
-    parser.add_argument('--sigma_pm', type=float, default=0.0075,
-                        help='Cluster PM dispersion (mas/yr)')
+    parser.add_argument('--sigma_pm', type=float, default=None,
+                        help='Cluster PM dispersion (mas/yr). Derived from --lvd_key '
+                             'vlos_sigma and distance if both exist; otherwise defaults '
+                             'to 0.0075 (Leo I).')
     parser.add_argument('--plx_pop', type=float, default=None,
                         help='Cluster parallax (mas). Derived from --lvd_key distance if '
                              'not given; otherwise defaults to 0.003873 (Leo I).')
@@ -3010,6 +3019,7 @@ def main():
     args = parser.parse_args()
 
     # ── Resolve LVD-derived parameters ───────────────────────────────────────
+    _sigma_pm         = args.sigma_pm          # None if not given by user
     _plx_pop          = args.plx_pop           # None if not given by user
     _sigma_plx_tot    = args.sigma_plx_tot     # None if not given by user
     _mu_pop_prior_sigma = args.mu_pop_prior_sigma  # None if not given by user
@@ -3035,7 +3045,12 @@ def main():
                 print(f"  μ_pop_init = {_lvd['mu_pop_init']} mas/yr")
             if 'mu_pop_prior_sigma' in _lvd:
                 print(f"  μ_pop σ    = {_lvd['mu_pop_prior_sigma']:.4f} mas/yr")
+            if 'sigma_pm' in _lvd:
+                print(f"  σ_pm       = {_lvd['sigma_pm']:.4f} mas/yr  "
+                      f"(from vlos_sigma / 4.7405 d)")
             # Only fill in values the user did not supply explicitly
+            if _sigma_pm is None:
+                _sigma_pm = _lvd.get('sigma_pm')
             if _plx_pop is None:
                 _plx_pop = _lvd.get('plx_pop')
             if _sigma_plx_tot is None:
@@ -3048,6 +3063,8 @@ def main():
             print(f"WARNING: LVD lookup failed ({exc}); falling back to defaults.")
 
     # Apply fallback defaults for any still-unset parameters
+    if _sigma_pm is None:
+        _sigma_pm = 0.0075
     if _plx_pop is None:
         _plx_pop = 0.003873
     if _sigma_plx_tot is None:
@@ -3072,7 +3089,7 @@ def main():
     run_pop_fit(
         output_dir=Path(args.output_dir).resolve(),
         field_name=args.name.replace(' ', '_'),
-        sigma_pm=args.sigma_pm,
+        sigma_pm=_sigma_pm,
         plx_pop=_plx_pop,
         sigma_plx_tot=_sigma_plx_tot,
         mu_pop_prior_sigma=_mu_pop_prior_sigma,
