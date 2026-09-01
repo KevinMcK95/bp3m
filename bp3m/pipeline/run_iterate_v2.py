@@ -224,6 +224,18 @@ def main():
         run_hst_crossmatch(**crossmatch_kwargs, bp3m_results_dir=bp3m_v2_dir,
                            cycle_id=cycle)
 
+
+    # Save the command only on successful completion so interrupted runs
+    # do not overwrite the record of the last successful invocation.
+    import sys as _sys, shlex as _shlex
+    from datetime import datetime as _datetime
+    _cmd_file = bp3m_v2_dir / 'bp3m_v2_command.txt'
+    _cmd_file.parent.mkdir(parents=True, exist_ok=True)
+    _cmd_file.write_text(
+        f"# {_datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        + ' '.join(_shlex.quote(a) for a in _sys.argv) + '\n'
+    )
+
     print(f"\n{'#'*60}")
     print(f"# Done.")
     print(f"#   Results: {bp3m_v2_dir}")

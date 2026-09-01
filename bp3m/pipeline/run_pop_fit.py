@@ -3101,3 +3101,15 @@ def main():
         use_qso_anchors=not args.no_qso_anchors,
         qso_anchors_csv=[Path(p) for p in args.qso_anchors_csv] if args.qso_anchors_csv else None,
     )
+
+    # Save the command only on successful completion so interrupted runs
+    # do not overwrite the record of the last successful invocation.
+    import sys as _sys, shlex as _shlex
+    from datetime import datetime as _datetime
+    _cmd_file = (Path(args.output_dir).resolve() / args.name.replace(' ', '_')
+                 / 'BP3M_pop_fit_results' / 'bp3m_pop_fit_command.txt')
+    _cmd_file.parent.mkdir(parents=True, exist_ok=True)
+    _cmd_file.write_text(
+        f"# {_datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        + ' '.join(_shlex.quote(a) for a in _sys.argv) + '\n'
+    )
