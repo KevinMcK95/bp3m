@@ -213,7 +213,13 @@ def _gate_thresh(thresh, p50, df, floor,
     if not np.isfinite(p50):
         return float(thresh), False, False
     if gate_mult is not None and p50 > gate_mult * float(_c2.median(df=df)):
-        return float(floor), True, False
+        # Population inconsistent with its own errors. Cap at the CEILING
+        # rather than collapsing to the floor: in crowded fields the elevated
+        # chi2 median is endemic (blending noise outside the error model), and
+        # the floor rejected ~30% of detections that the pre-gate pipeline
+        # kept. The ceiling still stops runaway adaptive thresholds.
+        ceil = (ceiling_mult if ceiling_mult is not None else 6.0) * float(floor)
+        return float(min(thresh, ceil)), True, False
     if ceiling_mult is not None:
         ceil = ceiling_mult * float(floor)
         if thresh > ceil:
@@ -2258,7 +2264,8 @@ class BP3MSolver:
         if (_gated_5 or _gated_2) and not skip_star_tests:
             print(f"    WARNING population inconsistent with its own errors "
                   f"(p50={p50_5:.2f} > {thresh_gate_mult}x theory) — adaptive "
-                  f"threshold refused, using floor {floor_5:.2f}")
+                  f"threshold capped at ceiling "
+                  f"({thresh_ceiling_mult}x floor = {thresh_ceiling_mult*floor_5:.2f})")
         # Admission: a star must clear thresh_gaia to be (re-)included.
         ok_gaia_admit = np.where(self.gaia_2p,
                                  chi2_gaia < thresh_gaia_2,

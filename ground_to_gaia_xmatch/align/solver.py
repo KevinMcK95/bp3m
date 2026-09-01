@@ -1097,7 +1097,11 @@ class AlignmentSolver:
         if not np.isfinite(p50):
             return float(thresh), False, False
         if gate_mult is not None and p50 > gate_mult * float(chi2_dist.median(df=df)):
-            return float(floor), True, False
+            # Cap at the ceiling rather than collapsing to the floor — the
+            # floor gutted crowded fields where inflated chi2 medians are
+            # endemic (same change as bp3m/solver._gate_thresh).
+            ceil = (ceiling_mult if ceiling_mult is not None else 6.0) * float(floor)
+            return float(min(thresh, ceil)), True, False
         if ceiling_mult is not None:
             ceil = ceiling_mult * float(floor)
             if thresh > ceil:
@@ -1257,8 +1261,8 @@ class AlignmentSolver:
                   f"df=2:{th2:.2f} {_pct_str(p16_2,p50_2,p84_2,int(obs_2p.sum()))}  "
                   f"diffuse:{thresh_diff:.1f}")
             _gs = []
-            if _d.get('gated_5'):  _gs.append('5p GATED->floor')
-            if _d.get('gated_2'):  _gs.append('2p GATED->floor')
+            if _d.get('gated_5'):  _gs.append('5p GATED->ceiling')
+            if _d.get('gated_2'):  _gs.append('2p GATED->ceiling')
             if _d.get('capped_5'): _gs.append('5p capped')
             if _d.get('capped_2'): _gs.append('2p capped')
             print(f"    chi2 outliers (of {n_obs} observed): "
@@ -1267,7 +1271,7 @@ class AlignmentSolver:
             if _d.get('gated_5') or _d.get('gated_2'):
                 print(f"    WARNING population inconsistent with its own errors "
                       f"(p50={_d['p50_5']:.2f} > {thresh_gate_mult}x theory) — "
-                      f"adaptive threshold refused, using floor")
+                      f"adaptive threshold capped at ceiling")
 
         # ── Test 3: Per-image position chi2 + alpha inflation ────────────────
         # Use HST-only chi2 (no C_r, no C_vT) for the threshold test —
