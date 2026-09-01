@@ -1589,6 +1589,16 @@ def _plot_member_selection_panels(
             m &= np.isfinite(a)
         return int(m.sum())
 
+    # Compact band labels: filter alone when unique, else filter/camera.
+    _filt_counts: dict[str, int] = {}
+    for _b in bands:
+        _filt_counts[_b.split('/')[0]] = _filt_counts.get(_b.split('/')[0], 0) + 1
+
+    def _short(b):
+        parts = b.split('/')
+        return parts[0] if _filt_counts.get(parts[0], 1) == 1 or len(parts) == 1 \
+            else f'{parts[0]}/{parts[1]}'
+
     panels = [('VPD (pop-fit free PM)', pm_free[:, 0], pm_free[:, 1],
                'pmra [mas/yr]', 'pmdec [mas/yr]', False)]
     if np.isfinite(bp_rp).any():
@@ -1596,18 +1606,25 @@ def _plot_member_selection_panels(
     for i in range(len(bands)):
         for j in range(i + 1, len(bands)):
             b, r = bands[i], bands[j]
+            # Same-filter cross-camera colours are 0 by construction: the
+            # validator's per-source stats are grouped by FILTER, so both
+            # filter_camera rows carry the identical mag_norm_wmean.
+            if b.split('/')[0] == r.split('/')[0]:
+                continue
             if _n_joint(hst_mags[b], hst_mags[r]) < min_pair:
                 continue
-            panels.append((f'{b} − {r} CMD', hst_mags[b] - hst_mags[r],
-                           hst_mags[r], f'{b} − {r}', r, True))
+            panels.append((f'{_short(b)} − {_short(r)} CMD',
+                           hst_mags[b] - hst_mags[r], hst_mags[r],
+                           f'{_short(b)} − {_short(r)}', _short(r), True))
     for b1, b2, b3 in combinations(bands, 3):
         if len({b.split('/')[0] for b in (b1, b2, b3)}) < 3:
             continue
         if _n_joint(hst_mags[b1], hst_mags[b2], hst_mags[b3]) < min_pair:
             continue
-        panels.append((f'({b1}−{b2}) vs ({b2}−{b3})',
+        s1, s2, s3 = _short(b1), _short(b2), _short(b3)
+        panels.append((f'({s1}−{s2}) vs ({s2}−{s3})',
                        hst_mags[b1] - hst_mags[b2], hst_mags[b2] - hst_mags[b3],
-                       f'{b1} − {b2}', f'{b2} − {b3}', False))
+                       f'{s1} − {s2}', f'{s2} − {s3}', False))
     panels.append(('Parallax', gmag, plx_free, 'G', 'parallax [mas]', False))
 
     ncol = 3
@@ -1638,8 +1655,8 @@ def _plot_member_selection_panels(
         for _m, _kw, _lbl in _cats:
             ax.scatter(xv[fin & _m], yv[fin & _m], label=_lbl, **_kw)
         ax.set_xlabel(xl); ax.set_ylabel(yl)
-        ax.set_title(f'{title}  ({int((fin & member_mask).sum())} mem)',
-                     fontsize=10)
+        _ttl = f'{title}  ({int((fin & member_mask).sum())} mem)'
+        ax.set_title(_ttl, fontsize=9 if len(_ttl) > 45 else 10)
         if inv:
             ax.invert_yaxis()
         if title.startswith('VPD'):
