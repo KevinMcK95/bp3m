@@ -295,6 +295,15 @@ def _load_all_detections(field_dir: Path,
     n_r          = C_r.shape[0] // n_sub
     poly_order   = _infer_poly_order(n_r)
 
+    # Epoch-distortion correction from the v1 fit (None if not fitted):
+    # detections are corrected at load time (x' = x + R^{-1} B d) so every
+    # downstream phase is automatically consistent with the D-full model.
+    from bp3m.epoch_distortion import EpochDistortion
+    _ed_obj = EpochDistortion.load(bp3m_dir)
+    if _ed_obj is not None:
+        print(f"  epoch-distortion: applying v1 D correction "
+              f"({_ed_obj.n_groups()} groups) to all detections")
+
     # Use run_config.json if available (written by run_alignment._save_results)
     run_cfg_path = bp3m_dir / 'run_config.json'
     if run_cfg_path.exists():
@@ -533,6 +542,16 @@ def _load_all_detections(field_dir: Path,
         gaia_match = _load_gaia_match_lookup(img_dir)
 
         r_j, C_r_j = r_vecs[sub_name]
+
+        # Epoch-distortion: correct detector coordinates so the X·r model
+        # below reproduces the v1 fit's X·r + B·d predictions.
+        if _ed_obj is not None and _ed_obj.has(sub_name):
+            _corr = _ed_obj.detector_correction(
+                sub_name, cat_xgdc[idx] - Xo_sub, cat_ygdc[idx] - Yo_sub,
+                r_j[:4])
+            cat_xgdc = cat_xgdc.copy(); cat_ygdc = cat_ygdc.copy()
+            cat_xgdc[idx] = cat_xgdc[idx] + _corr[:, 0]
+            cat_ygdc[idx] = cat_ygdc[idx] + _corr[:, 1]
 
         # Alpha inflation: scale HST covariances by alpha^2 before projecting.
         alpha  = alpha_lookup.get(sub_name, 1.0)

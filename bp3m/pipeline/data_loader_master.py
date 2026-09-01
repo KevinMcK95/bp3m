@@ -564,6 +564,18 @@ def load_master_v2(
 
     valid_sub_names = set(images.keys())
 
+    # ── Epoch-distortion correction from the v1 fit (None if not fitted) ─────
+    from bp3m.epoch_distortion import EpochDistortion
+    _v1_dir = Path(data_root) / field_name / 'BP3M_results'
+    _ed_obj = EpochDistortion.load(_v1_dir)
+    _ed_abcd: dict[str, tuple] = {}
+    if _ed_obj is not None:
+        _xdf_ed = pd.read_csv(_v1_dir / 'image_transformations.csv')
+        _ed_abcd = {str(r.image_name): (r.a, r.b, r.c, r.d)
+                    for r in _xdf_ed.itertuples()}
+        print(f"  epoch-distortion: applying v1 D correction "
+              f"({_ed_obj.n_groups()} groups) to master detections")
+
     # ── Load FITS catalogs (cached per base image) ────────────────────────────
     fits_cache: dict[str, dict | None] = {}
     psf_hw_cache: dict[str, int] = {}
@@ -680,6 +692,7 @@ def load_master_v2(
 
             X[k]         = fits_data["x_gdc"][ci]
             Y[k]         = fits_data["y_gdc"][ci]
+            # (epoch-distortion correction applied vectorised below)
             X_orig[k]    = fits_data["x"][ci]
             Y_orig[k]    = fits_data["y"][ci]
             x_err[k]     = sx
@@ -688,6 +701,19 @@ def load_master_v2(
             qfit_arr[k]  = fits_data["qfit"][ci]
             mag_arr[k]   = fits_data["mag"][ci]
             ok_sat[k]    = (fits_data["n_sat"][ci] / window_area) < _MAX_SAT_FRAC
+
+        # Epoch-distortion correction from the v1 fit (x' = x + R^{-1} B d):
+        # keeps the v2 solve consistent with a v1 fit that modelled X r + B d.
+        if _ed_obj is not None and _ed_obj.has(sub_name) and sub_name in _ed_abcd:
+            _fin = np.isfinite(X) & np.isfinite(Y)
+            if _fin.any():
+                _meta_ed = images.get(sub_name, {})
+                _Xo = float(_meta_ed.get('Xo', 2048.0))
+                _Yo = float(_meta_ed.get('Yo', 2048.0))
+                _corr = _ed_obj.detector_correction(
+                    sub_name, X[_fin] - _Xo, Y[_fin] - _Yo, _ed_abcd[sub_name])
+                X[_fin] = X[_fin] + _corr[:, 0]
+                Y[_fin] = Y[_fin] + _corr[:, 1]
 
         ok_pos = np.isfinite(X) & np.isfinite(Y)
 

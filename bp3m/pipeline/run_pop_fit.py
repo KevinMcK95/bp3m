@@ -1957,6 +1957,34 @@ def run_pop_fit(
         star_id_to_idx, image_names, star_in_image = build_index_maps(
             filtered_spi, gaia_catalog)
 
+    # ── Apply the v1 epoch-distortion correction to the detector coords ──────
+    # The v1 fit may have modelled positions as X r + B d; the pop-fit solver
+    # models X r only, so correct the detections once at load time:
+    # x' = x + R^{-1} (B d)  (see bp3m/epoch_distortion.py).
+    from bp3m.epoch_distortion import EpochDistortion
+    _ed_obj = EpochDistortion.load(bp3m_dir)
+    if _ed_obj is not None:
+        _xdf_ed = pd.read_csv(bp3m_dir / 'image_transformations.csv').set_index('image_name')
+        _n_corr_img = 0
+        for _img in image_names:
+            if not _ed_obj.has(_img) or _img not in _xdf_ed.index:
+                continue
+            _row = _xdf_ed.loc[_img]
+            _meta = imgs[_img]
+            _Xo = float(_meta.get('Xo', 2048.0)); _Yo = float(_meta.get('Yo', 2048.0))
+            _df = filtered_spi[_img]
+            _corr = _ed_obj.detector_correction(
+                _img,
+                _df['X'].to_numpy(float) - _Xo,
+                _df['Y'].to_numpy(float) - _Yo,
+                (_row['a'], _row['b'], _row['c'], _row['d']))
+            _df['X'] = _df['X'].to_numpy(float) + _corr[:, 0]
+            _df['Y'] = _df['Y'].to_numpy(float) + _corr[:, 1]
+            _n_corr_img += 1
+        print(f"  epoch-distortion: v1 D correction applied to detections in "
+              f"{_n_corr_img}/{len(image_names)} images "
+              f"({_ed_obj.n_groups()} groups)")
+
     # Warn about any mismatch with v1 image set
     if v1_image_names:
         v1_set  = set(v1_image_names)
