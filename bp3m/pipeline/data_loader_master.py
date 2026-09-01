@@ -411,6 +411,9 @@ def load_master_v2(
             # are first enabled (avoids bulk-PM=0 bias pulling the transformation)
             "pmra_xmatch":    float(row.get("pmra_xmatch",  np.nan) or np.nan),
             "pmdec_xmatch":   float(row.get("pmdec_xmatch", np.nan) or np.nan),
+            # Signed parallax, kept alongside the abs value below: it seeds the
+            # diffuse-prior parallax mean when the source is enabled in v2.
+            "parallax_xmatch": float(row.get("parallax_xmatch", np.nan) or np.nan),
             # PM magnitude and parallax from crossmatch (for HST-only quality cuts)
             "pm_abs_masyr":   float(np.hypot(
                 float(row.get("pmra_xmatch",  0) or 0),
@@ -809,6 +812,8 @@ def load_master_v2(
             # Crossmatch PM seed — used to init v_survey when these sources are enabled
             "pmra_xmatch":  [r.get("pmra_xmatch",  np.nan) for r in hst_only_survivors],
             "pmdec_xmatch": [r.get("pmdec_xmatch", np.nan) for r in hst_only_survivors],
+            "parallax_xmatch": [r.get("parallax_xmatch", np.nan)
+                                for r in hst_only_survivors],
         })
         gaia_catalog = pd.concat([gaia_real_subset, hst_rows], ignore_index=True)
     else:

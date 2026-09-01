@@ -643,6 +643,15 @@ class BP3MSolver:
         # Stars with DELVE PM have their PM prior supplied via C_survey_inv (above);
         # the flat 100 mas/yr diffuse PM prior is disabled for them.
         self._C_VG_inv_per_star = np.zeros((self.n_stars, N_V), dtype=float)
+        # h-side companion to _C_VG_inv_per_star.  The diffuse prior is a
+        # DIAGONAL precision added to H_vv; with no matching information-vector
+        # term its mean is implicitly zero.  Seeding a non-zero prior mean m
+        # (e.g. the xmatch PM/parallax for v2 HST-only stars) therefore requires
+        # h += C_VG_inv * m, which is what this array carries — writing the seed
+        # into v_survey alone is a NO-OP for the solve, because
+        # C_survey_inv_dot_v = C_survey_inv @ v_survey and the PM/plx rows of
+        # C_survey_inv are zero for exactly the stars that have a diffuse prior.
+        self._C_VG_h_per_star = np.zeros((self.n_stars, N_V), dtype=float)
         self._C_VG_inv_per_star[needs_diffuse, 0] = _SIGMA_POS**-2
         self._C_VG_inv_per_star[needs_diffuse, 1] = _SIGMA_POS**-2
         needs_diffuse_pm = needs_diffuse & ~self._has_delve_pm
@@ -1242,8 +1251,11 @@ class BP3MSolver:
         # h_all: prior + alignment + astrometry-only contributions.
         #   Used to compute the returned stellar posteriors so that astrometry-only
         #   detections constrain each star's own v_hat.
-        h_align = self.C_survey_inv_dot_v.copy()
-        h_all   = self.C_survey_inv_dot_v.copy()
+        _vg_h  = getattr(self, '_C_VG_h_per_star', None)
+        h_base = (self.C_survey_inv_dot_v + _vg_h
+                  if _vg_h is not None else self.C_survey_inv_dot_v)
+        h_align = h_base.copy()
+        h_all   = h_base.copy()
 
         H_rr = np.zeros((n_r, n_r))
 

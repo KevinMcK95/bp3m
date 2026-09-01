@@ -812,13 +812,35 @@ def _reopen_detections(
         else:
             thresh = _FLOOR
 
-        new_use  = sig_sq < thresh
+        ok = sig_sq < thresh
+
+        # Preserve the v1 tier structure instead of flattening it.  The old
+        # code set use_for_fit = use_for_astrom = ok, which (a) promoted
+        # astrometry-only detections — DELVE-only stars, callback-admitted
+        # HST-only stars — into the ALIGNMENT tier they were deliberately kept
+        # out of, and (b) bypassed the solver's own hard ceilings.  Alignment
+        # eligibility here is: the detection passed the loader's initial
+        # alignment quality (use_for_align_init) OR v1's converged fit kept it
+        # in alignment (use_fit at entry, i.e. the imported v1 tier) — the
+        # pop-fit analogue of the solver's can_enter_fit ratchet.  Any detection
+        # that passes the residual test may serve ASTROMETRY, which is the
+        # re-opening this function exists for.
+        align_eligible = (np.asarray(d.get('use_for_align_init', use_fit),
+                                     dtype=bool) | use_fit)
+        hard_ok = np.asarray(d.get('use_for_fit_max',
+                                   np.ones_like(ok, dtype=bool)), dtype=bool)
+        infl = d.get('influence_excl')
+        if infl is not None:
+            hard_ok = hard_ok & ~np.asarray(infl, dtype=bool)
+
+        new_use    = ok & align_eligible & hard_ok
+        new_astrom = ok & hard_ok
         n_after  = int(new_use.sum())
         n_added  = int(np.sum(new_use & ~use_fit))
         n_removed = int(np.sum(~new_use & use_fit))
 
         d['use_for_fit']    = new_use
-        d['use_for_astrom'] = new_use.copy()
+        d['use_for_astrom'] = new_astrom
 
         n_total = int(d['n'])
         info.append((img, n_total, n_before, n_after, n_added, n_removed, thresh))

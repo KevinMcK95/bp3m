@@ -263,29 +263,41 @@ class V2AlignmentCallback:
             # transformation away from the Gaia-constrained solution.
             if self.pm_init is not None:
                 n_seeded = 0
-                seeded_stars: set[int] = set()
+                n_plx_seeded = 0
                 for idx in hst_detect_count:
                     if hst_detect_count[idx] < 2:
                         continue
                     pmra_seed  = float(self.pm_init[idx, 0])
                     pmdec_seed = float(self.pm_init[idx, 1])
+                    plx_seed   = (float(self.pm_init[idx, 2])
+                                  if self.pm_init.shape[1] > 2 else np.nan)
                     if np.isfinite(pmra_seed) and np.isfinite(pmdec_seed):
+                        # The seed becomes the diffuse prior's MEAN via the
+                        # h-side companion array: h += C_VG_inv * seed.  The old
+                        # implementation wrote v_survey and recomputed
+                        # C_survey_inv_dot_v, which is identically zero on the
+                        # PM/plx rows for HST-only stars (their C_survey_inv has
+                        # only the position block) — the seed never reached the
+                        # solve and the prior stayed N(0, sigma_diffuse).
+                        solver._C_VG_h_per_star[idx, 2] = (
+                            solver._C_VG_inv_per_star[idx, 2] * pmra_seed)
+                        solver._C_VG_h_per_star[idx, 3] = (
+                            solver._C_VG_inv_per_star[idx, 3] * pmdec_seed)
+                        # v_survey too: harmless for the solve, but it is the
+                        # test-1 reference (v_prior aliases v_survey without
+                        # DELVE), so the star is judged against its seed.
                         solver.v_survey[idx, 2] = pmra_seed
                         solver.v_survey[idx, 3] = pmdec_seed
-                        # Keep v_survey-derived quantities in sync
-                        seeded_stars.add(idx)
                         n_seeded += 1
+                        if np.isfinite(plx_seed):
+                            solver._C_VG_h_per_star[idx, 4] = (
+                                solver._C_VG_inv_per_star[idx, 4] * plx_seed)
+                            solver.v_survey[idx, 4] = plx_seed
+                            n_plx_seeded += 1
                 if n_seeded > 0:
-                    # Recompute the cached C_survey_inv_dot_v for seeded rows so
-                    # the solver's next update starts from the correct prior term.
-                    seeded = np.array(sorted(seeded_stars), dtype=int)
-                    solver.C_survey_inv_dot_v[seeded] = np.einsum(
-                        'nij,nj->ni',
-                        solver.C_survey_inv[seeded],
-                        solver.v_survey[seeded],
-                    )
-                    print(f"  [V2Callback] Seeded PM from xmatch for {n_seeded} "
-                          f"HST-only sources")
+                    print(f"  [V2Callback] Seeded diffuse-prior mean from xmatch "
+                          f"for {n_seeded} HST-only sources "
+                          f"({n_plx_seeded} with parallax)")
 
             self._enabled = True
             total_hst_enabled = sum(1 for cnt in hst_detect_count.values() if cnt >= 2)
@@ -850,12 +862,15 @@ def run_alignment_v2(
     # start at PM=0, which would pull the transformation away from the Gaia
     # solution.  NaN entries are skipped (v_survey left at 0 for those stars).
     _n_stars = len(gaia_catalog)
-    pm_init = np.full((_n_stars, 2), np.nan)
+    pm_init = np.full((_n_stars, 3), np.nan)   # (pmra, pmdec, parallax) seeds
     if "pmra_xmatch" in gaia_catalog.columns:
         pm_init[:, 0] = pd.to_numeric(
             gaia_catalog["pmra_xmatch"],  errors='coerce').fillna(np.nan).values
         pm_init[:, 1] = pd.to_numeric(
             gaia_catalog["pmdec_xmatch"], errors='coerce').fillna(np.nan).values
+    if "parallax_xmatch" in gaia_catalog.columns:
+        pm_init[:, 2] = pd.to_numeric(
+            gaia_catalog["parallax_xmatch"], errors='coerce').fillna(np.nan).values
     n_pm_seeds = int(np.isfinite(pm_init[:, 0]).sum())
     print(f"  PM init seeds from xmatch: {n_pm_seeds}/{int(hst_only_mask.sum())} "
           f"HST-only sources have finite pmra_xmatch")
