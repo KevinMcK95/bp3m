@@ -1704,6 +1704,7 @@ def run_pop_fit(
     fit_members_only: bool = False,
     mu_pop_init: tuple[float, float] | None = None,
     mu_pop_init_source: str | None = None,
+    member_seed_csv: "Path | str | None" = None,
     freeze_mu_pop_init: bool = False,
     poly_order: int | None = None,
     no_plots: bool = False,
@@ -2031,12 +2032,31 @@ def run_pop_fit(
         _mu_boot = _estimate_mu_pop(gaia_catalog)
 
     # ── Initial member selection using v1 PMs only ────────────────────────────
-    print("\n  Selecting initial members from v1 bp3m PMs...")
-    member_sidx = _select_initial_members(
-        _pmra_v1_only, _pmdec_v1_only,
-        _sig_pmra_init, _sig_pmdec_init, _corr_pm_init,
-        _mu_boot, member_sigma_clip, sigma_pm, pm_sys_floor)
-    print(f"  Initial members: {len(member_sidx)}")
+    if member_seed_csv is not None:
+        # Hand-drawn seed (e.g. from notebook 07_member_selection): replaces the
+        # sigma-clip initial selection. The phases still refine membership.
+        _seed_path = Path(member_seed_csv)
+        _seed = pd.read_csv(_seed_path, dtype={'gaia_source_id': np.int64})
+        if 'trusted' in _seed.columns:
+            _seed = _seed[_seed['trusted'].astype(bool)]
+        _seed_ids = [int(g) for g in _seed['gaia_source_id'].values]
+        _found    = [star_id_to_idx[g] for g in _seed_ids if g in star_id_to_idx]
+        _n_miss   = len(_seed_ids) - len(_found)
+        member_sidx = np.array(sorted(_found), dtype=int)
+        print(f"\n  Initial members from seed CSV {_seed_path.name}: "
+              f"{len(member_sidx)} matched"
+              + (f"  ({_n_miss} seed IDs not in this field's star list)" if _n_miss else ""))
+        if len(member_sidx) < 3:
+            raise ValueError(
+                f"member_seed_csv matched only {len(member_sidx)} stars — "
+                f"check that the IDs come from this field's catalogues.")
+    else:
+        print("\n  Selecting initial members from v1 bp3m PMs...")
+        member_sidx = _select_initial_members(
+            _pmra_v1_only, _pmdec_v1_only,
+            _sig_pmra_init, _sig_pmdec_init, _corr_pm_init,
+            _mu_boot, member_sigma_clip, sigma_pm, pm_sys_floor)
+        print(f"  Initial members: {len(member_sidx)}")
 
     # ── μ_pop prior: weighted mean of initial members ─────────────────────────
     _extra = sigma_pm ** 2 + pm_sys_floor ** 2
@@ -3047,6 +3067,11 @@ def main():
                              'sigma-clip bootstrap as the starting centre. Combine with '
                              '--freeze_mu_pop_init to skip the bootstrap entirely. '
                              '(e.g. --mu_pop_init -0.06 -0.11)')
+    parser.add_argument('--member_seed_csv', type=str, default=None,
+                        help='CSV with gaia_source_id (+ optional trusted bool) from the '
+                             'interactive selection notebook (07_member_selection). '
+                             'Replaces the sigma-clip initial member selection; the '
+                             'fit phases still refine membership from there.')
     parser.add_argument('--freeze_mu_pop_init', action='store_true',
                         help='Skip the sigma-clip bootstrap and use --mu_pop_init directly '
                              'as the starting μ_pop and prior centre. Useful for sparse '
@@ -3170,6 +3195,7 @@ def main():
         fit_members_only=args.fit_members_only,
         mu_pop_init=_mu_pop_init,
         mu_pop_init_source=_mu_init_src,
+        member_seed_csv=args.member_seed_csv,
         freeze_mu_pop_init=args.freeze_mu_pop_init,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
