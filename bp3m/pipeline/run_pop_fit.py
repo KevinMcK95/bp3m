@@ -2230,6 +2230,7 @@ def run_pop_fit(
     _mem_sig_ra  = _sig_pmra_init[member_sidx]
     _mem_sig_dec = _sig_pmdec_init[member_sidx]
     _fin_m = np.isfinite(_mem_pm_ra) & np.isfinite(_mem_pm_dec)
+    _n_prior_members = int(_fin_m.sum())
     if _fin_m.sum() >= 3:
         _wra  = 1.0 / (_mem_sig_ra[_fin_m]  ** 2 + _extra)
         _wdec = 1.0 / (_mem_sig_dec[_fin_m] ** 2 + _extra)
@@ -2237,16 +2238,33 @@ def run_pop_fit(
         _mu_dec_v1  = float(np.sum(_wdec * _mem_pm_dec[_fin_m]) / np.sum(_wdec))
         _unc_ra_v1  = float(1.0 / np.sqrt(np.sum(_wra)))
         _unc_dec_v1 = float(1.0 / np.sqrt(np.sum(_wdec)))
-        mu_pop_prior = np.array([_mu_ra_v1, _mu_dec_v1])
+        _mu_v1_mean = np.array([_mu_ra_v1, _mu_dec_v1])
+    else:
+        _mu_v1_mean = None
+        _unc_ra_v1 = _unc_dec_v1 = 0.0
+
+    if freeze_mu_pop_init and _mu_init_arr is not None:
+        # --freeze_mu_pop_init: the explicit hyperprior is centred on
+        # --mu_pop_init, as documented. (Previously the v1-member weighted
+        # mean silently overrode the centre, so a tiny --mu_pop_prior_sigma
+        # pinned μ_pop to the v1 mean instead of the requested value.)
+        mu_pop_prior = _mu_boot.copy()
+        print(f"  μ_pop prior centred on --mu_pop_init (frozen): "
+              f"({mu_pop_prior[0]:+.4f}, {mu_pop_prior[1]:+.4f}) mas/yr  "
+              f"[prior σ = ±{mu_pop_prior_sigma:.2g} mas/yr]")
+        if _mu_v1_mean is not None:
+            print(f"  v1-member weighted mean (N={_n_prior_members}, reference only): "
+                  f"({_mu_v1_mean[0]:+.4f} ± {_unc_ra_v1:.4f}, "
+                  f"{_mu_v1_mean[1]:+.4f} ± {_unc_dec_v1:.4f}) mas/yr")
+    elif _mu_v1_mean is not None:
+        mu_pop_prior = _mu_v1_mean
+        print(f"  μ_pop prior from v1 members (N={_n_prior_members}): "
+              f"({mu_pop_prior[0]:+.4f} ± {_unc_ra_v1:.4f}, "
+              f"{mu_pop_prior[1]:+.4f} ± {_unc_dec_v1:.4f}) mas/yr  "
+              f"[prior σ = ±{mu_pop_prior_sigma:.2g} mas/yr]")
     else:
         print("  WARNING: too few members with finite v1 PMs; using bootstrap center as prior")
         mu_pop_prior = _mu_boot.copy()
-        _unc_ra_v1 = _unc_dec_v1 = 0.0
-    _n_prior_members = int(_fin_m.sum()) if '_fin_m' in dir() else 0
-    print(f"  μ_pop prior from v1 members (N={_n_prior_members}): "
-          f"({mu_pop_prior[0]:+.4f} ± {_unc_ra_v1:.4f}, "
-          f"{mu_pop_prior[1]:+.4f} ± {_unc_dec_v1:.4f}) mas/yr  "
-          f"[prior σ = ±{mu_pop_prior_sigma:.2f} mas/yr]")
 
     C_pop_prior_inv = np.eye(2) / mu_pop_prior_sigma ** 2
     mu_pop_current  = mu_pop_prior.copy()
