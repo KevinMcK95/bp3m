@@ -1703,6 +1703,7 @@ def run_pop_fit(
     max_sigma_free_pm: float = 1.0,
     fit_members_only: bool = False,
     mu_pop_init: tuple[float, float] | None = None,
+    mu_pop_init_source: str | None = None,
     freeze_mu_pop_init: bool = False,
     poly_order: int | None = None,
     no_plots: bool = False,
@@ -2065,6 +2066,31 @@ def run_pop_fit(
     C_pop_prior_inv = np.eye(2) / mu_pop_prior_sigma ** 2
     mu_pop_current  = mu_pop_prior.copy()
 
+    # ── Nσ reference: the initial μ_pop, with its provenance ─────────────────
+    # Every phase prints the Mahalanobis distance of the current μ_pop from
+    # this reference, using that phase's own posterior μ_pop covariance.
+    _mu_init_ref = _mu_boot.copy()
+    if freeze_mu_pop_init and _mu_init_arr is not None:
+        _mu_ref_label = f'--mu_pop_init [{mu_pop_init_source or "user"}]'
+    elif _mu_init_arr is not None and mu_pop_init_source:
+        _mu_ref_label = f'sigma-clip bootstrap seeded from [{mu_pop_init_source}] init'
+    elif _v1_pm_loaded:
+        _mu_ref_label = 'empirical v1 sigma-clip bootstrap'
+    else:
+        _mu_ref_label = 'empirical Gaia sigma-clip bootstrap'
+    print(f"  Nσ reference: μ_init=({_mu_init_ref[0]:+.4f}, {_mu_init_ref[1]:+.4f}) mas/yr  "
+          f"({_mu_ref_label})")
+
+    def _nsig_init(_mu, _C2):
+        """Mahalanobis distance of _mu from μ_init under 2×2 posterior cov _C2."""
+        if _C2 is None:
+            return np.nan
+        try:
+            _d = np.asarray(_mu, float) - _mu_init_ref
+            return float(np.sqrt(_d @ np.linalg.solve(np.asarray(_C2, float), _d)))
+        except Exception:
+            return np.nan
+
     # Print Gaia weighted PM mean for the same initial members (reference only)
     _gaia_pmra_col   = gaia_catalog['pmra'].to_numpy(float)[member_sidx]
     _gaia_pmdec_col  = gaia_catalog['pmdec'].to_numpy(float)[member_sidx]
@@ -2125,7 +2151,8 @@ def run_pop_fit(
             max_sigma_free_pm=max_sigma_free_pm)
         print(f"    iter {mu_iter + 1}/{n_iter_mu}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr  "
-              f"Δμ={delta_mu:.4e}  members={len(member_sidx)}")
+              f"Δμ={delta_mu:.4e}  Nσ_init={_nsig_init(mu_pop_current, C_shared_mu):.2f}  "
+              f"members={len(member_sidx)}")
         if delta_mu < 1e-6:
             print(f"    Converged.")
             break
@@ -2133,7 +2160,9 @@ def run_pop_fit(
     if C_shared_mu is not None:
         sigma_mu_1 = np.sqrt(np.diag(C_shared_mu))
         print(f"  Phase 1 final: μ_pop=({mu_pop_current[0]:+.4f} ± {sigma_mu_1[0]:.4f}, "
-              f"{mu_pop_current[1]:+.4f} ± {sigma_mu_1[1]:.4f}) mas/yr")
+              f"{mu_pop_current[1]:+.4f} ± {sigma_mu_1[1]:.4f}) mas/yr  "
+              f"Nσ_init={_nsig_init(mu_pop_current, C_shared_mu):.2f} "
+              f"(cov conditional on r fixed)")
 
     # ── Phase 2: joint solve (r + μ_pop) ─────────────────────────────────────
     # σ_μpop per iteration, from the JOINT shared covariance: the μ_pop block
@@ -2141,10 +2170,15 @@ def run_pop_fit(
     # 2×2 C_shared is conditional on r fixed, which is why it is much smaller.)
     _n_r_shared = len(image_names) * solver.N_R
 
+    def _mu_cov_of(_C_shared):
+        """2×2 marginal μ_pop covariance block of the joint shared covariance."""
+        return None if _C_shared is None else _C_shared[_n_r_shared:, _n_r_shared:]
+
     def _sigma_mu_of(_C_shared):
-        if _C_shared is None:
+        _C2 = _mu_cov_of(_C_shared)
+        if _C2 is None:
             return np.nan, np.nan
-        _s = np.sqrt(np.diag(_C_shared[_n_r_shared:, _n_r_shared:]))
+        _s = np.sqrt(np.diag(_C2))
         return float(_s[0]), float(_s[1])
 
     print(f"\n  Phase 2: joint solve ({n_iter_joint} iterations)...")
@@ -2171,7 +2205,9 @@ def run_pop_fit(
         print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
               f"{mu_pop_current[1]:+.4f}±{_smu[1]:.4f})  "
-              f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  members={len(member_sidx)}")
+              f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  "
+              f"Nσ_init={_nsig_init(mu_pop_current, _mu_cov_of(C_shared_joint)):.2f}  "
+              f"members={len(member_sidx)}")
         solver._update_R(r_current)
         solver._update_geometry(r_current, a_arr)
         if delta_r < 1e-6 and delta_mu < 1e-6:
@@ -2221,7 +2257,9 @@ def run_pop_fit(
                   f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
                   f"{mu_pop_current[1]:+.4f}±{_smu[1]:.4f})  "
                   f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  "
-                  f"Δα_max={delta_alpha_max:.3e}  members={len(member_sidx)}")
+                  f"Δα_max={delta_alpha_max:.3e}  "
+                  f"Nσ_init={_nsig_init(mu_pop_current, _mu_cov_of(C_shared_joint_p3)):.2f}  "
+                  f"members={len(member_sidx)}")
             if delta_r < 1e-6 and delta_mu < 1e-6 and delta_alpha_max < 1e-4:
                 print(f"    Converged.")
                 break
@@ -2326,7 +2364,9 @@ def run_pop_fit(
                   f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
                   f"{mu_pop_current[1]:+.4f}±{_smu[1]:.4f})  "
                   f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  "
-                  f"Δuse={n_use_changed}  members={len(member_sidx)}")
+                  f"Δuse={n_use_changed}  "
+                  f"Nσ_init={_nsig_init(mu_pop_current, _mu_cov_of(C_shared_joint_p4)):.2f}  "
+                  f"members={len(member_sidx)}")
             if delta_r < 1e-6 and delta_mu < 1e-6 and n_use_changed == 0:
                 print(f"    Converged.")
                 break
@@ -2412,6 +2452,7 @@ def run_pop_fit(
                   f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
                   f"{mu_pop_current[1]:+.4f}±{_smu[1]:.4f})  "
                   f"Δr={delta_r:.3e}  Δμ={delta_mu:.3e}  Δz={delta_z:.3e}  "
+                  f"Nσ_init={_nsig_init(mu_pop_current, _mu_cov_of(C_shared_joint_sw)):.2f}  "
                   f"members={len(member_sidx)}")
             if delta_r < 1e-6 and delta_mu < 1e-6 and delta_z < 1e-2:
                 print(f"    Converged.")
@@ -2423,7 +2464,8 @@ def run_pop_fit(
     sigma_mu_joint = (np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
                       if C_shared_joint is not None else np.array([np.nan, np.nan]))
     print(f"\n  Final: μ_pop=({mu_pop_current[0]:+.4f} ± {sigma_mu_joint[0]:.4f}, "
-          f"{mu_pop_current[1]:+.4f} ± {sigma_mu_joint[1]:.4f}) mas/yr")
+          f"{mu_pop_current[1]:+.4f} ± {sigma_mu_joint[1]:.4f}) mas/yr  "
+          f"Nσ_init={_nsig_init(mu_pop_current, C_shared_joint[n_r:, n_r:] if C_shared_joint is not None else None):.2f}")
     print(f"  Final members: {len(member_sidx)}")
 
     # ── Final posterior pass at convergence ───────────────────────────────────
@@ -3044,6 +3086,7 @@ def main():
     _mu_pop_prior_sigma = args.mu_pop_prior_sigma  # None if not given by user
     _mu_pop_init      = (tuple(args.mu_pop_init) if args.mu_pop_init is not None
                          else None)
+    _mu_init_src      = 'user' if args.mu_pop_init is not None else None
 
     if args.lvd_key is not None:
         import os
@@ -3076,6 +3119,7 @@ def main():
                 _sigma_plx_tot = _lvd.get('sigma_plx_tot')
             if _mu_pop_init is None and 'mu_pop_init' in _lvd:
                 _mu_pop_init = _lvd['mu_pop_init']
+                _mu_init_src = 'LVD'
             if _mu_pop_prior_sigma is None and 'mu_pop_prior_sigma' in _lvd:
                 _mu_pop_prior_sigma = _lvd['mu_pop_prior_sigma']
         except Exception as exc:
@@ -3125,6 +3169,7 @@ def main():
         max_sigma_free_pm=args.max_sigma_free_pm,
         fit_members_only=args.fit_members_only,
         mu_pop_init=_mu_pop_init,
+        mu_pop_init_source=_mu_init_src,
         freeze_mu_pop_init=args.freeze_mu_pop_init,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
