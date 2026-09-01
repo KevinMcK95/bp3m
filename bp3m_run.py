@@ -263,6 +263,11 @@ def _parse_args():
                     help='Minimum stars required on each CCD half to allow splitting. '
                          'Images where either half has fewer than N stars are kept unsplit. '
                          'Only applies when --no_split_ccd is not set. (default: 20)')
+    bp.add_argument('--two_phase_align', action='store_true',
+                    help='Two-phase alignment: converge with alpha OFF first '
+                         '(rejection via adaptive thresholds only), then '
+                         're-converge with the per-image alpha model enabled, '
+                         'warm-started from the Phase A geometry.')
     bp.add_argument('--no_inflate_hst_errors', action='store_true',
                     help='Disable per-image HST error inflation (default: inflation enabled)')
     bp.add_argument('--no_align_prior', action='store_true',
@@ -1210,6 +1215,7 @@ def main():
                         split_ccd=not args.no_split_ccd,
                         min_stars_split_ccd=args.min_stars_split_ccd,
                         inflate_hst_errors=not args.no_inflate_hst_errors,
+                two_phase_align=args.two_phase_align,
                         use_sparse=args.sparse,
                         no_plots=args.no_plots,
                         images=[_img],
@@ -1267,6 +1273,7 @@ def main():
                 split_ccd=not args.no_split_ccd,
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 inflate_hst_errors=not args.no_inflate_hst_errors,
+                two_phase_align=args.two_phase_align,
                 use_sparse=args.sparse,
                 no_plots=args.no_plots,
                 images=_bp3m_images,
@@ -1320,6 +1327,7 @@ def main():
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 poly_order=args.poly_order,
                 inflate_hst_errors=not args.no_inflate_hst_errors,
+                two_phase_align=args.two_phase_align,
             )
         else:
             run_alignment(
@@ -1332,6 +1340,7 @@ def main():
                 split_ccd=not args.no_split_ccd,
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 inflate_hst_errors=not args.no_inflate_hst_errors,
+                two_phase_align=args.two_phase_align,
                 use_sparse=args.sparse,
                 no_plots=args.no_plots,
                 images=_bp3m_images,

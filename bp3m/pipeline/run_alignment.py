@@ -37,6 +37,7 @@ def run_alignment(  # noqa: C901
     min_stars_split_ccd: int = 20,
     use_sparse: bool = False,
     inflate_hst_errors: bool = True,
+    two_phase_align: bool = False,
     no_prefilter: bool = False,
     no_plots: bool = False,
     images: list[str] | None = None,
@@ -344,6 +345,7 @@ def run_alignment(  # noqa: C901
         n_iter=n_iter,
         clip_sigma=clip,
         inflate_hst_errors=inflate_hst_errors,
+        two_phase_align=two_phase_align,
         inflate_alpha_max=inflate_alpha_max,
         prefilter=not no_prefilter,
         use_influence_clip=use_influence_clip,
@@ -376,6 +378,7 @@ def run_alignment(  # noqa: C901
             'clip_sigma':   clip_sigma,
             'split_ccd':    split_ccd,
             'inflate_hst_errors': inflate_hst_errors,
+            'two_phase_align': two_phase_align,
             'poly_order':   poly_order,
         },
     )

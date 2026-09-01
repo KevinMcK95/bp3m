@@ -1483,6 +1483,7 @@ class BP3MSolver:
 
     def fit(self, n_iter=20, tol=1e-6, clip_sigma=4.5, inflate_hst_errors=False,
             inflate_from_iter=3, inflate_alpha_max=3.0, min_outer_iters=None,
+            two_phase_align=False,
             mask_tol_frac=1e-3, mask_tol_iters=3,
             hst_fit_sigma_mult=0.5,
             prefilter=True, chi2_threshold=None, alpha_scale_chi2=False,
@@ -1532,6 +1533,17 @@ class BP3MSolver:
             If True, apply per-image C_hst inflation (alpha adjustment) starting
             at outer iteration inflate_from_iter.  Can cause oscillation; leave
             False unless you have a specific reason to enable it.
+        two_phase_align : bool, default False
+            Split the EM into two phases: Phase A iterates with alpha OFF
+            (outlier rejection via the adaptive population-relative thresholds
+            only, which are rank-based and robust to a mis-scaled error model)
+            until the normal convergence criteria fire; Phase B then enables
+            the per-image alpha model warm-started from the converged
+            geometry, clears the test-4 ratchet so every detection is
+            re-judged under the inflated error model, and iterates to
+            convergence again. Decouples geometry convergence from error-model
+            estimation (alpha is measured at a fixed point instead of chasing
+            a moving target). No effect unless inflate_hst_errors is True.
         inflate_from_iter : int, default 3
             First outer iteration (0-based) at which alpha inflation updates fire.
             Default 3 gives outlier rejection time to stabilise before alpha is
@@ -1834,6 +1846,12 @@ class BP3MSolver:
             _n_det_tot = sum(d["n"] for d in self._img_data.values() if d)
             _mask_tol = int(max(1, round(mask_tol_frac * _n_det_tot)))
             _n_consec_stable = 0  # consecutive iters with 0 tests-1/2/3 changes
+            # Two-phase alignment state (see docstring). Phase A: alpha off.
+            _alpha_phase_active = not (two_phase_align and inflate_hst_errors)
+            _eff_from_iter = inflate_from_iter
+            if not _alpha_phase_active:
+                print("  two_phase_align: Phase A (α=1) — alpha model deferred "
+                      "until geometry converges")
 
             for it_outer in range(n_iter):
                 # Snapshot use_for_fit per image before _update_use_for_fit so
@@ -1845,8 +1863,9 @@ class BP3MSolver:
 
                 clip_info, ok_star_new, n_use_changed = self._update_use_for_fit(
                     r_hat, a_arr, C_r, C_vT, clip_sigma, iteration=it_outer,
-                    ok_star_prev=ok_star_prev, inflate_errors=inflate_hst_errors,
-                    inflate_from_iter=inflate_from_iter,
+                    ok_star_prev=ok_star_prev,
+                    inflate_errors=inflate_hst_errors and _alpha_phase_active,
+                    inflate_from_iter=_eff_from_iter,
                     inflate_alpha_max=inflate_alpha_max,
                     hst_fit_sigma_mult=hst_fit_sigma_mult,
                     chi2_threshold=chi2_threshold, alpha_scale_chi2=alpha_scale_chi2)
@@ -1902,14 +1921,16 @@ class BP3MSolver:
                       f"{n_use_changed} test-3 changes"
                       + _t4_str
                       + f"  ({n_total_changed} total)")
+                _alpha_on_now = (inflate_hst_errors and _alpha_phase_active
+                                 and it_outer >= _eff_from_iter)
                 for img, n_use, n_tot, alpha_applied, alpha_raw, n_astrom_only in clip_info:
                     tags = []
-                    if inflate_hst_errors and it_outer >= 3:
+                    if _alpha_on_now:
                         tags.append("α-inflated")
                     if alpha_scale_chi2 and it_outer >= 3:
                         tags.append("α-scaled-chi2")
                     tag_str = f"  [{', '.join(tags)}]" if tags else ""
-                    if inflate_hst_errors and it_outer >= 3:
+                    if _alpha_on_now:
                         alpha_str = (f"α_applied={alpha_applied:.3f}  "
                                      f"α_raw={alpha_raw:.3f}")
                     else:
@@ -1940,18 +1961,37 @@ class BP3MSolver:
                 # and tracks the flip count (Spearman +0.65).  Requiring exactly
                 # zero therefore never terminates on a large field.
                 _stable_124 = (n_global_changed == 0 and n_inf_new == 0)
+                _converged_now = False
                 if _stable_124 and n_use_changed == 0 and it_outer >= min_outer:
                     print(f"  Tests 1-4 stable — stopping.")
-                    break
-                if _stable_124 and it_outer >= min_outer and n_use_changed <= _mask_tol:
+                    _converged_now = True
+                elif _stable_124 and it_outer >= min_outer and n_use_changed <= _mask_tol:
                     _n_tol_stable += 1
                     if _n_tol_stable >= mask_tol_iters:
                         print(f"  Tests 1-2/4 stable and test-3 flicker "
                               f"{n_use_changed} <= {_mask_tol} for "
                               f"{mask_tol_iters} iters — stopping.")
-                        break
+                        _converged_now = True
                 else:
                     _n_tol_stable = 0
+                if _converged_now:
+                    if not _alpha_phase_active:
+                        # Phase A converged: enable the per-image alpha model,
+                        # warm-started from this geometry. Reset the stability
+                        # counters and the test-4 ratchet so every detection is
+                        # re-judged under the inflated error model.
+                        print(f"\n  two_phase_align: Phase A (α=1) converged at "
+                              f"outer iter {it_outer+1} — starting Phase B "
+                              f"(per-image α enabled).")
+                        _alpha_phase_active = True
+                        _eff_from_iter = it_outer + 1
+                        _n_tol_stable = 0
+                        _n_consec_stable = 0
+                        for _d in self._img_data.values():
+                            if _d is not None and "influence_excl" in _d:
+                                _d["influence_excl"][:] = False
+                    else:
+                        break
 
                 r_hat, C_r, a_arr, K_img, C_vT = _inner_converge(
                     r_hat, f'outer {it_outer+1}')
