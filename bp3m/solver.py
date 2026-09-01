@@ -1960,38 +1960,55 @@ class BP3MSolver:
                 # plateaus (mean of last 10 / previous 10 = 1.02 over 50 iters)
                 # and tracks the flip count (Spearman +0.65).  Requiring exactly
                 # zero therefore never terminates on a large field.
-                _stable_124 = (n_global_changed == 0 and n_inf_new == 0)
                 _converged_now = False
-                if _stable_124 and n_use_changed == 0 and it_outer >= min_outer:
-                    print(f"  Tests 1-4 stable — stopping.")
-                    _converged_now = True
-                elif _stable_124 and it_outer >= min_outer and n_use_changed <= _mask_tol:
-                    _n_tol_stable += 1
-                    if _n_tol_stable >= mask_tol_iters:
-                        print(f"  Tests 1-2/4 stable and test-3 flicker "
-                              f"{n_use_changed} <= {_mask_tol} for "
-                              f"{mask_tol_iters} iters — stopping.")
+                if not _alpha_phase_active:
+                    # Phase A convergence: without alpha the borderline
+                    # test-1/2 chi2 flicker never reaches exactly zero (Leo_I
+                    # showed a period-20 limit cycle of 1-2 stars for 50
+                    # iterations), so Phase A uses a RELAXED criterion — total
+                    # mask churn across tests 1-4 within the test-3 tolerance
+                    # for mask_tol_iters consecutive iterations — plus a hard
+                    # budget cap so Phase B is always reached. Phase B (below)
+                    # keeps the strict criteria and the freeze-mask final
+                    # solve, so the reported solution is unaffected.
+                    _tot_changed = n_global_changed + n_use_changed + n_inf_new
+                    if it_outer >= min_outer and _tot_changed <= _mask_tol:
+                        _n_tol_stable += 1
+                        if _n_tol_stable >= mask_tol_iters:
+                            _converged_now = True
+                    else:
+                        _n_tol_stable = 0
+                    _phase_a_cap = max(min_outer + 2, n_iter // 2)
+                    if not _converged_now and it_outer + 1 >= _phase_a_cap:
+                        print(f"  two_phase_align: Phase A budget cap "
+                              f"({_phase_a_cap} iters) reached.")
                         _converged_now = True
-                else:
-                    _n_tol_stable = 0
-                if _converged_now:
-                    if not _alpha_phase_active:
-                        # Phase A converged: enable the per-image alpha model,
-                        # warm-started from this geometry. Reset the stability
-                        # counters and the test-4 ratchet so every detection is
-                        # re-judged under the inflated error model.
-                        print(f"\n  two_phase_align: Phase A (α=1) converged at "
+                    if _converged_now:
+                        print(f"\n  two_phase_align: Phase A (α=1) done at "
                               f"outer iter {it_outer+1} — starting Phase B "
                               f"(per-image α enabled).")
                         _alpha_phase_active = True
                         _eff_from_iter = it_outer + 1
                         _n_tol_stable = 0
                         _n_consec_stable = 0
+                        # Re-judge every detection under the inflated model.
                         for _d in self._img_data.values():
                             if _d is not None and "influence_excl" in _d:
                                 _d["influence_excl"][:] = False
-                    else:
+                else:
+                    _stable_124 = (n_global_changed == 0 and n_inf_new == 0)
+                    if _stable_124 and n_use_changed == 0 and it_outer >= min_outer:
+                        print(f"  Tests 1-4 stable — stopping.")
                         break
+                    if _stable_124 and it_outer >= min_outer and n_use_changed <= _mask_tol:
+                        _n_tol_stable += 1
+                        if _n_tol_stable >= mask_tol_iters:
+                            print(f"  Tests 1-2/4 stable and test-3 flicker "
+                                  f"{n_use_changed} <= {_mask_tol} for "
+                                  f"{mask_tol_iters} iters — stopping.")
+                            break
+                    else:
+                        _n_tol_stable = 0
 
                 r_hat, C_r, a_arr, K_img, C_vT = _inner_converge(
                     r_hat, f'outer {it_outer+1}')
