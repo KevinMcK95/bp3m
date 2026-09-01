@@ -1705,6 +1705,8 @@ def run_pop_fit(
     mu_pop_init: tuple[float, float] | None = None,
     mu_pop_init_source: str | None = None,
     member_seed_csv: "Path | str | None" = None,
+    use_member_seed: bool = False,
+    freeze_member_seed: bool = False,
     freeze_mu_pop_init: bool = False,
     poly_order: int | None = None,
     no_plots: bool = False,
@@ -2032,6 +2034,15 @@ def run_pop_fit(
         _mu_boot = _estimate_mu_pop(gaia_catalog)
 
     # ── Initial member selection using v1 PMs only ────────────────────────────
+    # --use_member_seed / --freeze_member_seed: auto-locate the CSV written by
+    # notebook 07_member_selection in the field directory.
+    if member_seed_csv is None and (use_member_seed or freeze_member_seed):
+        member_seed_csv = data_root / field_name / 'member_seed.csv'
+        if not Path(member_seed_csv).exists():
+            raise FileNotFoundError(
+                f"use_member_seed/freeze_member_seed: no seed found at "
+                f"{member_seed_csv} — draw and save one with notebook "
+                f"07_member_selection first.")
     if member_seed_csv is not None:
         # Hand-drawn seed (e.g. from notebook 07_member_selection): replaces the
         # sigma-clip initial selection. The phases still refine membership.
@@ -2057,6 +2068,19 @@ def run_pop_fit(
             _sig_pmra_init, _sig_pmdec_init, _corr_pm_init,
             _mu_boot, member_sigma_clip, sigma_pm, pm_sys_floor)
         print(f"  Initial members: {len(member_sidx)}")
+
+    # Freeze semantics: membership refinement in the phases may REMOVE stars
+    # from the seed-defined group but can never add stars from outside it.
+    _seed_frozen_sidx = None
+    if freeze_member_seed:
+        _seed_frozen_sidx = np.asarray(member_sidx, int).copy()
+        print(f"  Freeze: membership restricted to the {len(_seed_frozen_sidx)} "
+              f"seed stars (phases can remove, never add)")
+
+    def _freeze_members(_sidx):
+        if _seed_frozen_sidx is None:
+            return _sidx
+        return np.intersect1d(np.asarray(_sidx, int), _seed_frozen_sidx)
 
     # ── μ_pop prior: weighted mean of initial members ─────────────────────────
     _extra = sigma_pm ** 2 + pm_sys_floor ** 2
@@ -2165,10 +2189,10 @@ def run_pop_fit(
         _a_free, _C_free = _compute_free_stellar_posterior(
             a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
             solver._C_VG_inv_per_star)
-        member_sidx = _select_members_from_a(
+        member_sidx = _freeze_members(_select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
-            max_sigma_free_pm=max_sigma_free_pm)
+            max_sigma_free_pm=max_sigma_free_pm))
         print(f"    iter {mu_iter + 1}/{n_iter_mu}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr  "
               f"Δμ={delta_mu:.4e}  Nσ_init={_nsig_init(mu_pop_current, C_shared_mu):.2f}  "
@@ -2215,10 +2239,10 @@ def run_pop_fit(
         _a_free, _C_free = _compute_free_stellar_posterior(
             a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
             solver._C_VG_inv_per_star)
-        member_sidx = _select_members_from_a(
+        member_sidx = _freeze_members(_select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
-            max_sigma_free_pm=max_sigma_free_pm)
+            max_sigma_free_pm=max_sigma_free_pm))
         if fit_members_only:
             _restrict_to_members(solver, image_names, member_sidx)
         _smu = _sigma_mu_of(C_shared_joint)
@@ -2256,10 +2280,10 @@ def run_pop_fit(
             _a_free, _C_free = _compute_free_stellar_posterior(
                 a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
                 solver._C_VG_inv_per_star)
-            member_sidx = _select_members_from_a(
+            member_sidx = _freeze_members(_select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
-                max_sigma_free_pm=max_sigma_free_pm)
+                max_sigma_free_pm=max_sigma_free_pm))
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
 
@@ -2369,10 +2393,10 @@ def run_pop_fit(
             )
             ok_star_prev = ok_star
 
-            member_sidx = _select_members_from_a(
+            member_sidx = _freeze_members(_select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
-                max_sigma_free_pm=max_sigma_free_pm)
+                max_sigma_free_pm=max_sigma_free_pm))
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
 
@@ -2459,10 +2483,10 @@ def run_pop_fit(
             _a_free, _C_free = _compute_free_stellar_posterior(
                 a_arr, C_vT_sw, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
                 solver._C_VG_inv_per_star)
-            member_sidx = _select_members_from_a(
+            member_sidx = _freeze_members(_select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
-                max_sigma_free_pm=max_sigma_free_pm)
+                max_sigma_free_pm=max_sigma_free_pm))
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
 
@@ -3067,6 +3091,13 @@ def main():
                              'sigma-clip bootstrap as the starting centre. Combine with '
                              '--freeze_mu_pop_init to skip the bootstrap entirely. '
                              '(e.g. --mu_pop_init -0.06 -0.11)')
+    parser.add_argument('--use_member_seed', action='store_true',
+                        help='Use <field>/member_seed.csv (saved by notebook '
+                             '07_member_selection) as the initial member selection.')
+    parser.add_argument('--freeze_member_seed', action='store_true',
+                        help='Like --use_member_seed, but membership refinement can only '
+                             'REMOVE stars from the seed set — stars outside the seed can '
+                             'never become members.')
     parser.add_argument('--member_seed_csv', type=str, default=None,
                         help='CSV with gaia_source_id (+ optional trusted bool) from the '
                              'interactive selection notebook (07_member_selection). '
@@ -3196,6 +3227,8 @@ def main():
         mu_pop_init=_mu_pop_init,
         mu_pop_init_source=_mu_init_src,
         member_seed_csv=args.member_seed_csv,
+        use_member_seed=args.use_member_seed,
+        freeze_member_seed=args.freeze_member_seed,
         freeze_mu_pop_init=args.freeze_mu_pop_init,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
