@@ -593,6 +593,7 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
                 np.isfinite(d_img.get('alpha_raw', np.nan))
                 and np.isfinite(d_img.get('alpha_max', np.nan))
                 and d_img.get('alpha_raw', 0.0) >= d_img.get('alpha_max', np.inf) - 1e-9),
+            ed_group=int(getattr(solver, '_ed_gidx', {}).get(img, -1)),
             **{f'r_{k}': float(r_j[k]) for k in range(6, solver.N_R)},
         ))
     pd.DataFrame(rows).to_csv(output_dir / "image_transformations.csv", index=False)
@@ -680,11 +681,17 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
             for _k in range(solver.ED_K):
                 _axis = 'x' if _k < _nsh else 'y'
                 _i, _j = _prs[_k % _nsh]
+                _meta0 = solver.images[_grp['images'][0]]
                 _rows.append(dict(
                     group=_g, instrument=_grp['instrument'],
                     detector=_grp['detector'], chip=_grp['chip'],
                     filter=_grp['filter'], epoch_id=_grp['epoch_id'],
                     mean_mjd=_grp['mean_mjd'], n_images=len(_grp['images']),
+                    order=solver._ed_order,
+                    half_x=2048.0,
+                    half_y=(507.0 if str(_grp['detector']).upper() == 'IR'
+                            else 1024.0),
+                    pscale_mas=float(_meta0.get('orig_pixel_scale', 50.0)),
                     axis=_axis, leg_i=_i, leg_j=_j,
                     coeff_px=float(_dvec[_g * solver.ED_K + _k]),
                     sigma_px=float(_dsig[_g * solver.ED_K + _k]),
