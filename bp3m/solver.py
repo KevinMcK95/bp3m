@@ -315,7 +315,21 @@ class BP3MSolver:
         # Survey astrometry vector: v_s,i = (0, 0, pmra, pmdec, parallax)
         # (Δα*, Δδ) = 0 since Gaia position IS the reference; updates captured in v_T,i
         self.gaia_6p = np.isfinite(g['pseudocolour'])
-        self.gaia_5p = np.isfinite(g['pmra']) & ~self.gaia_6p
+        # Synthetic rows (negative Gaia_id: DELVE-only, v2 HST-only) are never
+        # Gaia solutions.  DELVE-only rows carry their DELVE PM in the bare
+        # `pmra` column, which previously made isfinite(pmra) classify them as
+        # gaia_5p — contradicting the intended design (the test-1 comment says
+        # "For DELVE-only stars (gaia_2p) ..."), skewing the 5p/2p df split and
+        # diagnostics, and leaving a VETOED DELVE-only star with no PM prior at
+        # all (near-singular H_vv for singly-detected stars).  As gaia_2p they
+        # get the standard diffuse treatment, with the DELVE prior replacing the
+        # flat PM prior via needs_diffuse_pm exactly like a real 2p+DELVE star.
+        # Only the SIGN is needed, so a float64 round-trip of a 19-digit id is
+        # harmless here (solver.py has no module-level pandas import).
+        _synthetic = (g['Gaia_id'].fillna(0).to_numpy(float) < 0
+                      if 'Gaia_id' in g.columns
+                      else np.zeros(self.n_stars, dtype=bool))
+        self.gaia_5p = np.isfinite(g['pmra']) & ~self.gaia_6p & ~_synthetic
         # 6p sources have full 5D Gaia astrometry (pmra/pmdec/parallax) like 5p;
         # they are NOT 2p just because they also have a pseudocolour measurement.
         self.gaia_2p = np.isfinite(self.gaia_ra) & ~self.gaia_5p & ~self.gaia_6p
@@ -525,6 +539,12 @@ class BP3MSolver:
                         C_delve_5p = surv_C_delve[surv_full5]     # (n5, 5, 5)
                         delve_full_5d_5p = (np.isfinite(surv_d_sig[surv_full5]).all(axis=1) &
                                     (surv_d_sig[surv_full5] > 0).all(axis=1))
+                        # Mirror the 2p branch: a 5p star with an incomplete
+                        # DELVE 5x5 never had the prior combined, so revert the
+                        # flag — otherwise _has_delve_pm mislabels it Gaia+DELVE
+                        # in plots and v_prior/C_prior get pointlessly recomputed.
+                        if (~delve_full_5d_5p).any():
+                            has_delve_pm[idx5[~delve_full_5d_5p]] = False
                         if delve_full_5d_5p.any():
                             C_delve_inv_5p = np.linalg.inv(C_delve_5p[delve_full_5d_5p])
                             idx5_5d = idx5[delve_full_5d_5p]
@@ -778,9 +798,9 @@ class BP3MSolver:
             # Used to permanently block implausible cross-matches (> 100 px after
             # subtracting the median bulk offset).  Without w/z, there is always a
             # bulk offset in r_init predictions, so we always subtract the median.
-            # Use only PM and parallax (cols 2-4): position offset Δα,Δδ = 0 at
-            # reference epoch. v_survey[:, 0:2] stores absolute ra/dec in degrees,
-            # which would produce spuriously large offsets for non-Gaia stars.
+            # Use only PM and parallax (cols 2-4).  v_survey[:, 0:2] is zero by
+            # construction (the Gaia position IS the reference; offsets live in
+            # v_T), so slicing 2: just makes that explicit and future-proof.
             _v_pm_plx = np.zeros_like(self.v_survey[sidx])
             _v_pm_plx[:, 2:] = self.v_survey[sidx, 2:]
             ave_motion_offset = np.einsum('nij,nj->ni', JU, _v_pm_plx)
@@ -1098,6 +1118,15 @@ class BP3MSolver:
         # ── Zero out the Gaia 5p prior for all epoch stars ────────────────────
         # The 5p summary solution is derived from the same epoch transits we are
         # incorporating directly, so using it as a prior would double-count.
+        _hd = getattr(self, '_has_delve_pm', None)
+        if _hd is not None and bool(_hd[idx_ep].any()):
+            _n_wiped = int(_hd[idx_ep].sum())
+            print(f"[Solver] WARNING: {_n_wiped} epoch star(s) had a combined "
+                  f"DELVE prior; zeroing the Gaia prior for epoch data discards "
+                  f"it too (DELVE + epoch-AL combination is not implemented). "
+                  f"_has_delve_pm cleared for them so downstream labels stay "
+                  f"truthful.")
+            _hd[idx_ep] = False
         self.C_survey_inv[idx_ep]       = 0.0
         self.C_survey_inv_dot_v[idx_ep] = 0.0
 
@@ -1709,6 +1738,13 @@ class BP3MSolver:
         z_weights_out = None   # set below if use_soft_weights=True
 
         if use_soft_weights and clip_sigma is not None:
+            # TODO(IRLS): this branch never runs the star-level tests, so
+            # ok_star stays all-True and sigma_from_gaia_prior stays zero —
+            # prior fallback then acts on the logdet checks alone and the
+            # diagnostic column is meaningless.  Also, the docstring's claim
+            # that z-mode replaces the hard masks with use_for_fit_max is NOT
+            # implemented: use_align stays use_for_fit, so soft weighting can
+            # down-weight but never re-admit.  Fix both when IRLS is next used.
             print(f'\n Phase 2 (soft-weight IRLS): Student-t downweighting  (ν={student_t_nu})')
 
             # Seed PM estimates for all stars (including HST-only) before IRLS
@@ -2007,10 +2043,10 @@ class BP3MSolver:
         Why this exists
         ---------------
         The EM loop tests a_arr at the TOP of each iteration and re-solves at the
-        BOTTOM.  On the `break` path that is harmless (a_arr was not re-solved, so
-        the tested and returned solutions are the same object).  On the exhaustion
-        path — `for ... else: "Stopped after N outer iterations"` — the returned
-        a_arr is one solve NEWER than anything that was tested.
+        BOTTOM — and since the frozen-mask finalisation ALWAYS re-solves after
+        the loop (break path included), the a_arr being reported is newer than
+        anything the in-loop tests saw on every path.  These final tests are
+        therefore required unconditionally, not only on the exhaustion path.
 
         If the EM has converged, one extra solve moves nothing and the distinction
         is academic.  If it is still OSCILLATING, the tested and returned states
@@ -2464,6 +2500,12 @@ class BP3MSolver:
                 alpha_raw = min(alpha_raw, inflate_alpha_max)
             else:
                 alpha_raw = 1.0
+            # Persist the measured factor and its cap so save_results can report
+            # them: alpha_applied alone cannot distinguish "residuals were fine"
+            # from "inflation hit the ceiling and the errors are understated".
+            self._img_data[img]["alpha_raw"]   = alpha_raw
+            self._img_data[img]["alpha_max"]   = float(inflate_alpha_max)
+            self._img_data[img]["n_alpha_ref"] = int(alpha_pop.sum())
 
             if inflate_errors and iteration >= inflate_from_iter:
                 # alpha_raw is measured against the already-inflated C_hst, so it
@@ -2819,8 +2861,9 @@ class BP3MSolver:
             r_samp = r_hat[:, None] + (vecs * np.sqrt(vals)[None, :]) @ rng.standard_normal((n_r, n_samples))
             r_samp = r_samp.T  # (n_samples, n_r)
 
-        # v_hat(r) = a + B r  where B_{i,j} = -C_vT_i K_{i,j}
-        # v_samp[s, i] = a_i - Σ_j (C_vT_i K_{i,j}) r_j^(s)
+        # v_hat(r) = a + Σ_j (C_vT_i K_{i,j}) (r_j - r_hat_j)
+        # (positive sign — same linearisation as compute_analytic_posteriors;
+        # from x = X r - JU v, h_v(r) = h_v(r_hat) + K (r - r_hat).)
         v_samp = np.tile(a_arr[None, :, :], (n_samples, 1, 1))  # (n_samp, n_stars, 5)
 
         nr = self.N_R
@@ -3130,10 +3173,14 @@ class BP3MSolver:
             X_c = X_mat[:, 0, 0]
             Y_c = X_mat[:, 0, 1]
 
-            # Magnitude from stars_per_image
+            # Magnitude from stars_per_image, re-applying the SAME filter that
+            # _precompute_geometry used to build _img_data.  Indexing the raw
+            # frame would silently misalign magnitudes whenever the isin filter
+            # dropped rows (e.g. a catalogue restricted after loading).
             spi = self.stars_per_image.get(img)
             if spi is not None and "mag" in spi.columns:
-                mag_vals = spi["mag"].values
+                _keep = spi["Gaia_id"].isin(self.star_id_to_idx).to_numpy()
+                mag_vals = spi["mag"].to_numpy(float)[_keep]
             else:
                 mag_vals = np.full(len(sidx), np.nan)
 

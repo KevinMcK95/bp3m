@@ -97,7 +97,7 @@ def make_plots(solver, images, gaia_catalog,
     # Full marginal covariance = r-propagation + conditional, with prior fallback.
     from bp3m.pipeline.run_alignment import _apply_prior_fallback
     _failed_prior = ~getattr(solver, 'ok_star', np.ones(solver.n_stars, bool))
-    v_cov_full, v_mean = _apply_prior_fallback(
+    v_cov_full, v_mean, _ = _apply_prior_fallback(
         v_cov + C_vT, v_mean, solver.C_prior, solver.v_prior,
         failed_prior_test=_failed_prior)
 

@@ -308,6 +308,12 @@ def run_alignment(  # noqa: C901
                 _pmra_ab  = float(_qrow['pmra_aberr_uas'])  * 1e-3
                 _pmdec_ab = float(_qrow['pmdec_aberr_uas']) * 1e-3
 
+                # NOTE (deliberate asymmetry): this tightens the SOLVE prior
+                # (C_survey_inv / C_survey_inv_dot_v) but not v_prior/C_prior,
+                # so test 1 still measures QSO stars against the Gaia
+                # measurement alone.  A QSO pulled to the aberration PM is thus
+                # judged for consistency with Gaia, not with its own anchor —
+                # the test stays independent of the prior being imposed.
                 solver.C_survey_inv[_sidx, 2, 2] += _sigma_qso_pm_inv_sq
                 solver.C_survey_inv[_sidx, 3, 3] += _sigma_qso_pm_inv_sq
                 solver.C_survey_inv[_sidx, 4, 4] += _sigma_qso_plx_inv_sq
@@ -452,7 +458,10 @@ def _apply_prior_fallback(v_cov_full, v_mean, C_prior_arr, v_prior_arr,
         v_cov_full[use_prior] = C_prior_arr[use_prior]
         v_mean[use_prior]     = v_prior_arr[use_prior]
 
-    return v_cov_full, v_mean
+    # The mask is returned so callers can RECORD which stars were replaced —
+    # silent replacement left downstream consumers no way to tell a fitted
+    # posterior from a prior echo.
+    return v_cov_full, v_mean, use_prior
 
 
 # ── Internal: write result CSVs and npy ─────────────────────────────────────
@@ -513,7 +522,7 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
     import pandas as pd
 
     _failed_prior = ~getattr(solver, 'ok_star', np.ones(solver.n_stars, bool))
-    v_cov_full, v_mean = _apply_prior_fallback(
+    v_cov_full, v_mean, _used_prior = _apply_prior_fallback(
         v_cov + C_vT, v_mean, solver.C_prior, solver.v_prior,
         failed_prior_test=_failed_prior)
 
@@ -550,6 +559,16 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
             Xo_pivot=meta.get('Xo', 2048.0),
             Yo_pivot=meta.get('Yo', 2048.0),
             alpha=alpha_applied,
+            # alpha_raw is the LAST measured inflation step (pre-cap);
+            # saturated_alpha flags that the measurement hit inflate_alpha_max,
+            # i.e. the residuals wanted more inflation than was applied.
+            alpha_raw=float(d_img.get('alpha_raw', np.nan)),
+            alpha_max=float(d_img.get('alpha_max', np.nan)),
+            n_alpha_ref=int(d_img.get('n_alpha_ref', 0)),
+            saturated_alpha=bool(
+                np.isfinite(d_img.get('alpha_raw', np.nan))
+                and np.isfinite(d_img.get('alpha_max', np.nan))
+                and d_img.get('alpha_raw', 0.0) >= d_img.get('alpha_max', np.inf) - 1e-9),
             **{f'r_{k}': float(r_j[k]) for k in range(6, solver.N_R)},
         ))
     pd.DataFrame(rows).to_csv(output_dir / "image_transformations.csv", index=False)
@@ -576,6 +595,14 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
     with np.errstate(invalid='ignore', divide='ignore'):
         g['chi2_hst_red'] = np.where(n_chi2 > 0, chi2_hst / (2 * n_chi2), np.nan)
 
+    # Star-level test diagnostics (parity with ground_to_gaia_xmatch).
+    # sigma_from_gaia_prior = sqrt(chi2_gaia) from the FINAL star tests, so it
+    # describes the solution actually written out; ok_star is that test's
+    # verdict; prior_fallback records which rows below are the prior, not a fit.
+    g['sigma_from_gaia_prior'] = solver.sigma_from_gaia_prior
+    g['ok_star']               = getattr(solver, 'ok_star',
+                                         np.ones(solver.n_stars, bool))
+    g['prior_fallback']        = _used_prior
     g['delta_racosdec_bp3m'] = v_mean[:, 0]
     g['delta_dec_bp3m']      = v_mean[:, 1]
     g['pmra_bp3m']           = v_mean[:, 2]

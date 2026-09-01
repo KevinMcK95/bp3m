@@ -47,8 +47,12 @@ class V2AlignmentCallback:
 
     Pre-inclusion phase (it_outer < hst_enable_iter):
         Computes raw pixel residuals for HST-only detections against the current
-        transformation.  Detections with residual > outlier_sigma * pixel_scale
-        are soft-flagged (recorded but not yet removed).
+        transformation.  Detections with residual > outlier_sigma PIXELS are
+        soft-flagged (recorded but not yet removed).  NOTE the residual ignores
+        the star's own PM, so a genuinely fast HST-only star (PM x baseline
+        > outlier_sigma px) is soft-flagged and permanently removed at the
+        transition — a deliberate simplification with a selection effect
+        against high-PM sources.
 
     Transition (it_outer == hst_enable_iter):
         Permanently removes detections that were soft-flagged in any prior
@@ -161,10 +165,10 @@ class V2AlignmentCallback:
                     continue
 
                 soft = self._get_soft_flags(img, len(sidx))
-                # Flag detections with large residuals
-                pscale = solver.images[img].get("orig_pixel_scale", 50.0)  # mas/pix
-                # Residuals are in Gaia pseudo-image pixels (same pixel scale)
-                threshold_px = self.outlier_sigma  # dimensionless in pixel units
+                # Flag detections with large residuals.  Both resid_px and the
+                # threshold are in Gaia pseudo-image PIXELS — a direct pixel
+                # comparison, not outlier_sigma x pixel_scale.
+                threshold_px = self.outlier_sigma
                 bad = hst_mask & (resid_px > threshold_px)
                 soft[bad] += 1
                 n_flagged += int(bad.sum())

@@ -780,7 +780,7 @@ def _reopen_detections(
     The threshold mirrors v1's _adapt_thresh formula:
         thresh = max(p50 + k*(p50 - p16),  chi2_floor)
     where the percentiles are computed on sigma_resid² for the currently-used
-    detections only, and chi2_floor = chi2.ppf(0.90, df=2) ≈ 4.61.
+    detections only, and chi2_floor = chi2.ppf(0.99, df=2) ≈ 9.21.
 
     Updates d['use_for_fit'] and d['use_for_astrom'] in place.
 

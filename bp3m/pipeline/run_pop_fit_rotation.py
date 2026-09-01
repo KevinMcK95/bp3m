@@ -70,7 +70,10 @@ _DEG2RAD = np.pi / 180.0
 _ARCSEC2KPC = 4.84814e-6   # 1 arcsec at 1 kpc = 4.84814e-6 kpc
 
 # Tilted-ring models from HI kinematic studies.
-# Columns: projected ring radius (arcsec), V_rot (km/s), PA of receding major axis (deg), i (deg).
+# Columns: ring radius (arcsec) — the ring's MAJOR-AXIS (galactocentric
+# angular) radius, as tabulated by the HI studies — V_rot (km/s), PA of the
+# receding major axis (deg), i (deg).  Per-star lookups must therefore use the
+# elliptical radius sqrt(xi^2 + (eta/cos i)^2); see compute_rotation_offsets.
 
 # NGC 55 — Westmeier et al. 2013, Table 4
 _NGC55_TRING = np.array([
@@ -211,15 +214,29 @@ def compute_rotation_offsets(
 
     tring = gp.get('tilted_ring')
     if tring is not None:
-        # Projected angular radius for each star
-        r_as = np.sqrt(x_as**2 + y_as**2)
+        # Ring radii are the rings' MAJOR-AXIS (galactocentric angular) radii,
+        # so the correct per-star lookup radius is the elliptical radius
+        # sqrt(xi^2 + (eta/cos i)^2), not the circular projected radius
+        # sqrt(x^2 + y^2).  The circular radius matches only on the major axis;
+        # near the minor axis it under-selects rings by a factor 1/cos(i) —
+        # ~1.3x for NGC 300 (i~40 deg), up to ~10x for NGC 55 (i~84 deg) —
+        # pulling V_rot/PA/inc from too-far-in rings.  The elliptical radius
+        # depends on the ring geometry it selects, so solve by fixed point:
+        # PA/inc vary slowly with radius and 3 iterations converge to well
+        # under a ring spacing.
+        r_tbl = tring[:, 0]
+        r_ell = np.sqrt(x_as**2 + y_as**2)      # start from circular radius
+        for _ in range(3):
+            pa_it  = np.interp(r_ell, r_tbl, tring[:, 2]) * _DEG2RAD + theta_offset
+            inc_it = np.interp(r_ell, r_tbl, tring[:, 3]) * _DEG2RAD
+            ci_it  = np.maximum(np.abs(np.cos(inc_it)), 0.05)
+            xi_it  = x_as * np.sin(pa_it) + y_as * np.cos(pa_it)
+            eta_it = x_as * np.cos(pa_it) - y_as * np.sin(pa_it)
+            r_ell  = np.sqrt(xi_it**2 + (eta_it / ci_it)**2)
 
-        # Interpolate ring parameters at each star's projected radius.
-        # np.interp clamps to first/last table value outside the range.
-        r_tbl    = tring[:, 0]
-        vrot_r   = np.interp(r_as, r_tbl, tring[:, 1])   # km/s
-        pa_r_rad = np.interp(r_as, r_tbl, tring[:, 2]) * _DEG2RAD + theta_offset
-        inc_r    = np.interp(r_as, r_tbl, tring[:, 3])   # degrees
+        vrot_r   = np.interp(r_ell, r_tbl, tring[:, 1])   # km/s
+        pa_r_rad = np.interp(r_ell, r_tbl, tring[:, 2]) * _DEG2RAD + theta_offset
+        inc_r    = np.interp(r_ell, r_tbl, tring[:, 3])   # degrees
         cos_i    = np.cos(inc_r * _DEG2RAD)               # per-star array
 
         V_rot = f * vrot_r
@@ -1383,6 +1400,10 @@ def run_pop_fit_rotation(
             delta_f     = abs(f_new     - f_current)     if fit_f     else 0.0
             delta_theta = abs(theta_new - theta_current) if fit_theta else 0.0
             _mu_pop_used = mu_pop_current.copy()
+            # Snapshot the rot offsets the solve just baked into a_arr, BEFORE
+            # recomputing them with the updated (f, theta): the free-posterior
+            # strip below must remove exactly what was added.
+            _rot_ra_used, _rot_dec_used = rot_ra, rot_dec
             mu_pop_current = mu_pop_new
             f_current      = f_new
             theta_current  = theta_new
@@ -1395,8 +1416,17 @@ def run_pop_fit_rotation(
             if delta_mu < 1e-6 and delta_f < 1e-6 and delta_theta < 1e-8:
                 print(f"    Converged.")
                 break
-        # Final member re-selection using converged (f, θ)
-        _a_free, _C_free = _free_posterior(a_arr, C_vT, _member_sidx_ft, mu_pop_current)
+        # Final member re-selection using converged (f, θ).
+        # STRIP with what the last solve baked in (_mu_pop_used and the
+        # pre-update rot offsets) — the _free_posterior closure late-binds
+        # rot_ra/rot_dec, which were just recomputed with the NEW (f, θ), so it
+        # cannot be used here.  SELECT against the updated model, as every
+        # other phase does.  Negligible when Phase 4 converged; wrong by the
+        # last step size when n_iter_ft was exhausted.
+        _a_free, _C_free = _compute_free_stellar_posterior_rot(
+            a_arr, C_vT, _member_sidx_ft,
+            sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+            solver._C_VG_inv_per_star, _rot_ra_used, _rot_dec_used)
         member_sidx = _select_members(_a_free, mu_pop_current, _C_free)
         print(f"  Phase 4 final member re-selection: {len(member_sidx)}")
 
@@ -1410,8 +1440,15 @@ def run_pop_fit_rotation(
                 sigma_theta_final = float(np.sqrt(max(C_shared_ft[_it, _it], 0.0)))
 
     n_r = len(image_names) * solver.N_R
-    sigma_mu_joint = (np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
-                      if C_shared_joint is not None else np.array([np.nan, np.nan]))
+    # When Phase 4 ran, mu_pop_current came from the (mu, f, theta) solves, so
+    # its uncertainty is the Phase-4 covariance's mu block — which also carries
+    # the mu/f/theta degeneracy.  The Phase-2/3 joint covariance is stale then.
+    if C_shared_ft is not None:
+        sigma_mu_joint = np.sqrt(np.maximum(np.diag(C_shared_ft[:2, :2]), 0.0))
+    elif C_shared_joint is not None:
+        sigma_mu_joint = np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
+    else:
+        sigma_mu_joint = np.array([np.nan, np.nan])
     print(f"\n  Final: μ_pop=({mu_pop_current[0]:+.4f} ± {sigma_mu_joint[0]:.4f}, "
           f"{mu_pop_current[1]:+.4f} ± {sigma_mu_joint[1]:.4f}) mas/yr")
     print(f"  f={f_current:.4f} ± {sigma_f_final:.4f}  "

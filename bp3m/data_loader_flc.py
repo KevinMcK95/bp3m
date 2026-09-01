@@ -788,6 +788,18 @@ def load_image_data_flc(data_root, field_name: str,
 
         # Apply to each image's use_for_alignment / use_for_fit
         n_flagged = 0
+        # Guard against a silently useless catalogue: ids here are matched as
+        # STRINGS, so a legacy cross_match_catalog.csv whose gaia_source_id was
+        # float-formatted ("3.88e+18") matches nothing and every pair defaults
+        # to trusted=True below.  Detect that case and say so.
+        _catalog_ids = {sid for sid, _ in trust_lookup}
+        _star_ids = set()
+        for _df in stars_per_image.values():
+            _star_ids.update(_df["Gaia_id"].astype(str))
+        if _catalog_ids and not (_catalog_ids & _star_ids):
+            print("  WARNING: cross_match_catalog.csv gaia_source_id values match "
+                  "NO loaded star ids (float-formatted legacy catalogue?) — the "
+                  "trustworthiness filter is a no-op this run.")
         for img_name, df in stars_per_image.items():
             for gid in df["Gaia_id"].astype(str):
                 trust_lookup.setdefault((gid, img_name), True)
