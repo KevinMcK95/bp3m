@@ -61,6 +61,136 @@ def _mem_legend_handles():
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
+def _plot_gaia_posterior_comparison(gaia_catalog, v_mean, v_cov_full, plot_dir):
+    """Parallax one-to-one vs Gaia + posterior pull distributions (plx, pmra,
+    pmdec) vs Gaia.  Pull = (BP3M − Gaia)/sqrt(σ_Gaia² + σ_BP3M²); the
+    posterior contains the Gaia prior, so widths < 1 are expected where the
+    prior dominates — the diagnostic value is in the tails and the mean."""
+    import matplotlib.pyplot as plt
+    from scipy.stats import norm
+
+    plx_g  = gaia_catalog['parallax'].to_numpy(float)
+    splx_g = gaia_catalog['parallax_error'].to_numpy(float)
+    pmra_g = gaia_catalog['pmra'].to_numpy(float)
+    spmra_g = gaia_catalog['pmra_error'].to_numpy(float)
+    pmdec_g = gaia_catalog['pmdec'].to_numpy(float)
+    spmdec_g = gaia_catalog['pmdec_error'].to_numpy(float)
+    gmag   = gaia_catalog['gmag'].to_numpy(float)
+
+    plx_b,  splx_b  = v_mean[:, 4], np.sqrt(np.maximum(v_cov_full[:, 4, 4], 0))
+    pmra_b, spmra_b = v_mean[:, 2], np.sqrt(np.maximum(v_cov_full[:, 2, 2], 0))
+    pmdec_b, spmdec_b = v_mean[:, 3], np.sqrt(np.maximum(v_cov_full[:, 3, 3], 0))
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    # (0,0) parallax one-to-one
+    ax = axes[0, 0]
+    ok = np.isfinite(plx_g) & (splx_g > 0) & np.isfinite(plx_b)
+    if ok.any():
+        ax.errorbar(plx_g[ok], plx_b[ok], xerr=splx_g[ok], yerr=splx_b[ok],
+                    fmt='none', ecolor='0.8', elinewidth=0.5, zorder=1)
+        sc = ax.scatter(plx_g[ok], plx_b[ok], c=gmag[ok], s=10, cmap='viridis',
+                        zorder=2)
+        plt.colorbar(sc, ax=ax, label='G [mag]')
+        lo = np.nanpercentile(np.r_[plx_g[ok], plx_b[ok]], 1)
+        hi = np.nanpercentile(np.r_[plx_g[ok], plx_b[ok]], 99)
+        pad = 0.1 * (hi - lo + 1e-6)
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], 'k--', lw=1)
+        ax.set_xlim(lo - pad, hi + pad); ax.set_ylim(lo - pad, hi + pad)
+    ax.set_xlabel('Gaia parallax [mas]')
+    ax.set_ylabel('BP3M parallax [mas]')
+    ax.set_title(f'Parallax: BP3M vs Gaia  (n={int(ok.sum())})')
+
+    # pull panels
+    panels = [
+        (axes[0, 1], 'parallax', plx_b, plx_g, splx_b, splx_g),
+        (axes[1, 0], 'pmra',     pmra_b, pmra_g, spmra_b, spmra_g),
+        (axes[1, 1], 'pmdec',    pmdec_b, pmdec_g, spmdec_b, spmdec_g),
+    ]
+    for ax, name, b, g, sb, sg in panels:
+        m = np.isfinite(b) & np.isfinite(g) & (sg > 0)
+        pull = (b[m] - g[m]) / np.sqrt(sg[m] ** 2 + sb[m] ** 2)
+        pull = pull[np.isfinite(pull)]
+        if len(pull) == 0:
+            ax.set_title(f'{name}: no comparable stars'); continue
+        mu, med = float(np.mean(pull)), float(np.median(pull))
+        sd  = float(np.std(pull))
+        mad = float(1.4826 * np.median(np.abs(pull - med)))
+        rng = max(5.0, min(10.0, 1.2 * np.percentile(np.abs(pull), 99)))
+        bins = np.linspace(-rng, rng, 61)
+        ax.hist(pull, bins=bins, density=True, color='steelblue',
+                edgecolor='white', lw=0.3, alpha=0.85)
+        x = np.linspace(-rng, rng, 300)
+        ax.plot(x, norm.pdf(x), 'k--', lw=1, label='N(0,1)')
+        ax.plot(x, norm.pdf(x, med, mad), 'r-', lw=1,
+                label=f'N({med:+.2f}, {mad:.2f})')
+        ax.set_title(f'{name} pull vs Gaia   '
+                     f'μ={mu:+.3f} (med {med:+.3f})  σ={sd:.3f} (MAD {mad:.3f})',
+                     fontsize=10)
+        ax.set_xlabel('(BP3M − Gaia) / σ_combined')
+        ax.legend(fontsize=8)
+
+    fig.suptitle('BP3M posteriors vs Gaia (posterior includes the Gaia prior:\n'
+                 'width < 1 expected where the prior dominates)', fontsize=11)
+    fig.tight_layout()
+    _save(fig, plot_dir / 'parallax_gaia_comparison.png')
+
+
+def _plot_epoch_distortion_maps(solver, r_hat, plot_dir):
+    """2 × N_groups map of the fitted epoch-distortion field: rows = x/y
+    displacement, columns = (inst/det, chip, filter, epoch) groups, diverging
+    colormap centred at zero, per-panel colorbars in mas."""
+    if not getattr(solver, 'n_ed', 0):
+        return
+    import matplotlib.pyplot as plt
+    from astropy.time import Time as _Time
+    from bp3m.astro_utils import epoch_distortion_basis
+
+    n_r_only = solver.N_R * solver.n_images
+    if r_hat.size <= n_r_only:
+        return
+    d_vec = r_hat[n_r_only:]
+    G = len(solver.ed_groups)
+
+    fig, axes = plt.subplots(2, G, figsize=(3.4 * G, 6.4), squeeze=False)
+    for g, grp in enumerate(solver.ed_groups):
+        meta = solver.images[grp['images'][0]]
+        pscale = float(meta['orig_pixel_scale'])          # mas / px
+        half_y = 507.0 if str(grp['detector']).upper() == 'IR' else 1024.0
+        gx = np.linspace(-2048, 2048, 81)
+        gy = np.linspace(-half_y, half_y, 41)
+        GX, GY = np.meshgrid(gx, gy)
+        B = epoch_distortion_basis(GX.ravel(), GY.ravel(), solver._ed_order,
+                                   half_x=2048.0, half_y=half_y)
+        disp = np.einsum('nkl,l->nk', B, d_vec[g * solver.ED_K:(g + 1) * solver.ED_K])
+        dx = (disp[:, 0] * pscale).reshape(GX.shape)      # mas
+        dy = (disp[:, 1] * pscale).reshape(GX.shape)
+        yr = _Time(grp['mean_mjd'], format='mjd').jyear
+        for row, (mp, lbl) in enumerate([(dx, 'D$_x$'), (dy, 'D$_y$')]):
+            ax = axes[row, g]
+            vmax = max(float(np.max(np.abs(mp))), 1e-3)
+            im = ax.pcolormesh(GX, GY, mp, cmap='RdBu_r',
+                               vmin=-vmax, vmax=vmax, shading='auto')
+            cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cb.set_label(f'{lbl} [mas]', fontsize=8)
+            cb.ax.tick_params(labelsize=7)
+            ax.set_aspect('equal')
+            ax.tick_params(labelsize=7)
+            if row == 0:
+                ax.set_title(f"{grp['filter']} {grp['chip']}\n"
+                             f"{grp['instrument']}/{grp['detector']} "
+                             f"{yr:.2f} ({len(grp['images'])} img)", fontsize=8)
+            if g == 0:
+                ax.set_ylabel(f'{lbl}   Y$_c$ [px]', fontsize=8)
+            if row == 1:
+                ax.set_xlabel('X$_c$ [px]', fontsize=8)
+    fig.suptitle('Epoch-distortion corrections D (Legendre, degrees 2'
+                 f'..{solver._ed_order}; degree ≤1 excluded — lives in the '
+                 'per-image alignment)', fontsize=10)
+    fig.tight_layout()
+    _save(fig, plot_dir / 'epoch_distortion_maps.png')
+
+
 def make_plots(solver, images, gaia_catalog,
                r_hat, v_hat, v_mean, v_cov, C_vT, C_r,
                output_dir,
@@ -845,6 +975,16 @@ def make_plots(solver, images, gaia_catalog,
         _plot_sky_and_cmd(ra, dec, _d_mag, _d_color, pm_size, pm_unc, _ok_d,
                           plot_dir, is_member=_is_mem_sky, fname=_fname,
                           color_label=_clabel, mag_label=_mlabel)
+
+    # ── Figures: parallax vs Gaia + posterior pulls; epoch-distortion maps ──
+    try:
+        _plot_gaia_posterior_comparison(gaia_catalog, v_mean, v_cov_full, plot_dir)
+    except Exception as _e:
+        print(f"  WARNING: parallax_gaia_comparison.png failed — {_e}")
+    try:
+        _plot_epoch_distortion_maps(solver, r_hat, plot_dir)
+    except Exception as _e:
+        print(f"  WARNING: epoch_distortion_maps.png failed — {_e}")
 
     # ── Figure: HST XY residuals + BP3M proper motions on detector ───────────
     if not plot_residuals:
