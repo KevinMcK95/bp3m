@@ -1610,7 +1610,6 @@ def _plot_member_selection_panels(
                        f'{b1} − {b2}', f'{b2} − {b3}', False))
     panels.append(('Parallax', gmag, plx_free, 'G', 'parallax [mas]', False))
 
-    seed_rej = (seed_mask & ~member_mask) if seed_mask is not None else None
     ncol = 3
     nrow = int(np.ceil(len(panels) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 4.0 * nrow))
@@ -1618,14 +1617,26 @@ def _plot_member_selection_panels(
     for ax, (title, x, y, xl, yl, inv) in zip(axes, panels):
         xv = np.asarray(x, float); yv = np.asarray(y, float)
         fin = np.isfinite(xv) & np.isfinite(yv)
-        ax.scatter(xv[fin & ~member_mask], yv[fin & ~member_mask],
-                   s=4, c='0.75', lw=0, label='non-member')
-        if seed_rej is not None and seed_rej.any():
-            ax.scatter(xv[fin & seed_rej], yv[fin & seed_rej], s=14,
-                       facecolors='none', edgecolors='darkorange', lw=0.8,
-                       label='seed, rejected')
-        ax.scatter(xv[fin & member_mask], yv[fin & member_mask],
-                   s=8, c='crimson', lw=0, label='member')
+        if seed_mask is not None:
+            # Four-way designation: seed membership × final membership
+            _cats = [
+                (~seed_mask & ~member_mask, dict(s=4, c='0.75', lw=0),
+                 'Seed non-member, rejected'),
+                (~seed_mask & member_mask, dict(s=10, c='royalblue', lw=0),
+                 'Seed non-member, accepted'),
+                (seed_mask & ~member_mask,
+                 dict(s=14, facecolors='none', edgecolors='darkorange', lw=0.8),
+                 'Seed member, rejected'),
+                (seed_mask & member_mask, dict(s=8, c='crimson', lw=0),
+                 'Seed member, accepted'),
+            ]
+        else:
+            _cats = [
+                (~member_mask, dict(s=4, c='0.75', lw=0), 'non-member'),
+                (member_mask, dict(s=8, c='crimson', lw=0), 'member'),
+            ]
+        for _m, _kw, _lbl in _cats:
+            ax.scatter(xv[fin & _m], yv[fin & _m], label=_lbl, **_kw)
         ax.set_xlabel(xl); ax.set_ylabel(yl)
         ax.set_title(f'{title}  ({int((fin & member_mask).sum())} mem)',
                      fontsize=10)
