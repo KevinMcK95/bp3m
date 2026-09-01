@@ -1539,6 +1539,117 @@ def _plot_pop_residual_maps(
 
 # ── Soft-weight diagnostic plot ───────────────────────────────────────────────
 
+
+def _plot_member_selection_panels(
+    gaia_catalog, member_mask, pm_free, plx_free,
+    field_dir, out_path, seed_mask=None, mu_pop=None,
+    min_pair: int = 20, vpd_zoom: float = 3.0,
+):
+    """Final-membership panels: VPD, Gaia CMD, HST CMDs, colour-colour,
+    parallax vs G — grey non-members, red members, orange = seeded but
+    rejected. Mirrors notebook 07_member_selection's panel construction
+    (keep the two in sync).
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from itertools import combinations
+
+    n = len(gaia_catalog)
+    gmag  = gaia_catalog['gmag'].to_numpy(float)
+    bp_rp = (gaia_catalog['bp_rp'].to_numpy(float)
+             if 'bp_rp' in gaia_catalog.columns else np.full(n, np.nan))
+
+    # HST photometry from the validator catalogue, keyed by Gaia_id
+    hst_mags: dict[str, np.ndarray] = {}
+    cmc_path = Path(field_dir) / 'cross_match_catalog.csv'
+    if cmc_path.exists():
+        try:
+            _cat  = pd.read_csv(cmc_path, dtype={'gaia_source_id': np.int64})
+            _wide = (_cat.pivot_table(index='gaia_source_id',
+                                      columns='filter_camera',
+                                      values='mag_norm_wmean', aggfunc='first'))
+            _gids = gaia_catalog['Gaia_id'].to_numpy(np.int64)
+            for band in _wide.columns:
+                _ser = _wide[band]
+                hst_mags[str(band)] = (
+                    pd.Series(_gids).map(_ser).to_numpy(float))
+        except Exception as _exc:
+            print(f"    (cross_match_catalog.csv unusable for panels: {_exc})")
+
+    _WL = {'F275W': 275, 'F336W': 336, 'F390W': 390, 'F435W': 435,
+           'F438W': 438, 'F475W': 475, 'F555W': 555, 'F606W': 606,
+           'F625W': 625, 'F775W': 775, 'F814W': 814, 'F850LP': 900,
+           'F110W': 1100, 'F125W': 1250, 'F160W': 1600}
+    bands = sorted(hst_mags, key=lambda b: _WL.get(b.split('/')[0].upper(), 9999))
+
+    def _n_joint(*arrs):
+        m = np.ones(n, bool)
+        for a in arrs:
+            m &= np.isfinite(a)
+        return int(m.sum())
+
+    panels = [('VPD (pop-fit free PM)', pm_free[:, 0], pm_free[:, 1],
+               'pmra [mas/yr]', 'pmdec [mas/yr]', False)]
+    if np.isfinite(bp_rp).any():
+        panels.append(('Gaia CMD', bp_rp, gmag, 'BP − RP', 'G', True))
+    for i in range(len(bands)):
+        for j in range(i + 1, len(bands)):
+            b, r = bands[i], bands[j]
+            if _n_joint(hst_mags[b], hst_mags[r]) < min_pair:
+                continue
+            panels.append((f'{b} − {r} CMD', hst_mags[b] - hst_mags[r],
+                           hst_mags[r], f'{b} − {r}', r, True))
+    for b1, b2, b3 in combinations(bands, 3):
+        if len({b.split('/')[0] for b in (b1, b2, b3)}) < 3:
+            continue
+        if _n_joint(hst_mags[b1], hst_mags[b2], hst_mags[b3]) < min_pair:
+            continue
+        panels.append((f'({b1}−{b2}) vs ({b2}−{b3})',
+                       hst_mags[b1] - hst_mags[b2], hst_mags[b2] - hst_mags[b3],
+                       f'{b1} − {b2}', f'{b2} − {b3}', False))
+    panels.append(('Parallax', gmag, plx_free, 'G', 'parallax [mas]', False))
+
+    seed_rej = (seed_mask & ~member_mask) if seed_mask is not None else None
+    ncol = 3
+    nrow = int(np.ceil(len(panels) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 4.0 * nrow))
+    axes = np.atleast_1d(axes).ravel()
+    for ax, (title, x, y, xl, yl, inv) in zip(axes, panels):
+        xv = np.asarray(x, float); yv = np.asarray(y, float)
+        fin = np.isfinite(xv) & np.isfinite(yv)
+        ax.scatter(xv[fin & ~member_mask], yv[fin & ~member_mask],
+                   s=4, c='0.75', lw=0, label='non-member')
+        if seed_rej is not None and seed_rej.any():
+            ax.scatter(xv[fin & seed_rej], yv[fin & seed_rej], s=14,
+                       facecolors='none', edgecolors='darkorange', lw=0.8,
+                       label='seed, rejected')
+        ax.scatter(xv[fin & member_mask], yv[fin & member_mask],
+                   s=8, c='crimson', lw=0, label='member')
+        ax.set_xlabel(xl); ax.set_ylabel(yl)
+        ax.set_title(f'{title}  ({int((fin & member_mask).sum())} mem)',
+                     fontsize=10)
+        if inv:
+            ax.invert_yaxis()
+        if title.startswith('VPD'):
+            _cx, _cy = ((float(mu_pop[0]), float(mu_pop[1]))
+                        if mu_pop is not None else (0.0, 0.0))
+            ax.plot([_cx], [_cy], marker='+', ms=14, c='k', mew=1.5, zorder=5)
+            ax.set_xlim(_cx - vpd_zoom, _cx + vpd_zoom)
+            ax.set_ylim(_cy - vpd_zoom, _cy + vpd_zoom)
+    for ax in axes[len(panels):]:
+        ax.set_visible(False)
+    axes[0].legend(fontsize=8, loc='upper right')
+    fig.suptitle(f'Final members: {int(member_mask.sum())} of {n} stars',
+                 y=1.001)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    return out_path
+
+
 def _plot_soft_weights_pop(
     z_weights_final: dict,
     p3_active: dict,
@@ -2071,6 +2182,8 @@ def run_pop_fit(
 
     # Freeze semantics: membership refinement in the phases may REMOVE stars
     # from the seed-defined group but can never add stars from outside it.
+    _seed_initial_sidx = (np.asarray(member_sidx, int).copy()
+                          if member_seed_csv is not None else None)
     _seed_frozen_sidx = None
     if freeze_member_seed:
         _seed_frozen_sidx = np.asarray(member_sidx, int).copy()
@@ -2823,6 +2936,24 @@ def run_pop_fit(
 
     # ── Plots ─────────────────────────────────────────────────────────────────
     if not no_plots:
+        try:
+            _mem_mask = np.zeros(solver.n_stars, bool)
+            _mem_mask[np.asarray(member_sidx, int)] = True
+            _seed_mask = None
+            if _seed_initial_sidx is not None:
+                _seed_mask = np.zeros(solver.n_stars, bool)
+                _seed_mask[_seed_initial_sidx] = True
+            _panels_png = _plot_member_selection_panels(
+                gaia_catalog, _mem_mask,
+                v_mean_free_marg[:, 2:4], v_mean_free_marg[:, 4],
+                field_dir=data_root / field_name,
+                out_path=output_pfr / 'plots' / 'member_selection_panels.png',
+                seed_mask=_seed_mask, mu_pop=mu_pop_current,
+            )
+            print(f"  Saved: {_panels_png}")
+        except Exception as _exc:
+            print(f"  WARNING: member_selection_panels.png failed — {_exc}")
+
         if z_weights_final is not None and _p3_active is not None:
             try:
                 print("\n  Plotting soft-weight diagnostic...")
