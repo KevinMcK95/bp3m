@@ -45,9 +45,9 @@ from bp3m.instrument_config import get_instrument_config
 # independent per-detection positional systematic (residual distortion, CTE,
 # cross-filter centroid shifts — measured at the multi-mas level) while
 # preserving the relative weighting of detections.  Overridable via
-# --bp3m_pos_err_floor; 0.01 px ≈ 0.5 mas (ACS), may grow as the systematics
-# budget firms up.
-_MIN_POS_ERR_PX: float = 0.01
+# --bp3m_pos_err_floor; 0.05 px ≈ 2.5 mas (ACS): covers the measured epoch
+# systematics (Draco 0.01-px runs demoted whole early-ACS epochs, 2026-09-02).
+_MIN_POS_ERR_PX: float = 0.05
 
 # Maximum fraction of the PSF fitting window that may be saturated for a source
 # to be eligible as an initial alignment star.  Half-width is read from

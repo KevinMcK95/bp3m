@@ -668,7 +668,7 @@ def run_alignment_v2(
     verbose_tests: bool = False,
     hst_pm_sigma_diffuse: float = 100.0,
     bp3m_dir: Path | None = None,
-    pos_err_floor: float = 5e-3,
+    pos_err_floor: float = 0.05,
     det_chi2_threshold: float | None = None,
     use_soft_weights: bool = False,
     student_t_nu: float = 50.0,

@@ -75,7 +75,7 @@ def run_alignment(  # noqa: C901
     influence_raw_cooks_d: bool = False,
     use_two_tier: bool = False,
     no_align_prior: bool = False,
-    pos_err_floor: float = 5e-3,
+    pos_err_floor: float = 0.05,
     plot_residuals: bool = False,
     plot_influence: bool = False,
     use_qso_anchors: bool = True,

@@ -316,11 +316,11 @@ def _parse_args():
                          'refined by the joint tests). Requires indv fits '
                          'run on the SAME cross-match outputs (checked per '
                          'image; mismatches fall back with a warning).')
-    bp.add_argument('--bp3m_pos_err_floor', type=float, default=0.01,
+    bp.add_argument('--bp3m_pos_err_floor', type=float, default=0.05,
                     help='Per-detection positional systematics floor in pixels, added '
                          'IN QUADRATURE to the HST uncertainties before BP3M '
-                         '(default 0.01 px = 0.50 mas ACS/WFC, 0.40 mas WFC3/UVIS, '
-                         '1.3 mas WFC3/IR; models residual distortion/CTE/cross-filter '
+                         '(default 0.05 px = 2.5 mas ACS/WFC, 2.0 mas WFC3/UVIS, '
+                         '6.5 mas WFC3/IR; models residual distortion/CTE/cross-filter '
                          'systematics and prevents numerically unstable residuals for '
                          'very bright stars)')
     bp.add_argument('--no_influence_clip', action='store_true',

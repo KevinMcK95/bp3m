@@ -69,7 +69,7 @@ def _ensure_bp3m():
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _MAX_SAT_FRAC      = 0.25   # matches data_loader_flc._MAX_SAT_FRAC
-_MIN_POS_ERR_PX    = 0.01   # positional systematics floor (px), added in quadrature
+_MIN_POS_ERR_PX    = 0.05   # positional systematics floor (px), added in quadrature
 
 # HST-only eligibility defaults
 _HST_MAX_PM_UNC    = 5.0    # mas/yr — global quality cut
