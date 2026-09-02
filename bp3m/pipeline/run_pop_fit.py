@@ -2754,11 +2754,15 @@ def run_pop_fit(
         C_shared_joint = C_shared_joint_sw
 
     n_r = len(image_names) * solver.N_R
-    sigma_mu_joint = (np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
-                      if C_shared_joint is not None else np.array([np.nan, np.nan]))
+    if C_shared_joint is None:
+        # n_iter_joint=0 (e.g. pop-fit v2 frozen-alignment default): the
+        # Phase-1 mu covariance is the final one.
+        sigma_mu_joint = sigma_mu_1
+    else:
+        sigma_mu_joint = np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
     print(f"\n  Final: μ_pop=({mu_pop_current[0]:+.4f} ± {sigma_mu_joint[0]:.4f}, "
           f"{mu_pop_current[1]:+.4f} ± {sigma_mu_joint[1]:.4f}) mas/yr  "
-          f"Nσ_init={_nsig_init(mu_pop_current, C_shared_joint[n_r:, n_r:] if C_shared_joint is not None else None):.2f}")
+          f"Nσ_init={_nsig_init(mu_pop_current, C_shared_joint[n_r:, n_r:] if C_shared_joint is not None else np.diag(sigma_mu_joint ** 2)):.2f}")
     print(f"  Final members: {len(member_sidx)}")
 
     # ── Final posterior pass at convergence ───────────────────────────────────
