@@ -68,6 +68,10 @@ def _write_xmatch_status(root: Path, status: str, params_meta: dict,
     }, indent=2))
 
 
+# Current matching-algorithm version (see params_meta note in run_cross_match).
+XMATCH_ALGO_VERSION = 3
+
+
 def _xmatch_cache_status(hst_root: Path, params_meta: dict
                           ) -> tuple[str, str]:
     """Return (action, reason) where action is 'skip' or 'run'.
@@ -329,7 +333,7 @@ def run_cross_match(
         #   v2 = mode-centred 2p propagation + dispersion window
         #   v3 = + zero-PM coverage term in the 2p window; API pix-floor
         #        default aligned to the CLI (0.5 px)
-        'xmatch_algo_version':  3,
+        'xmatch_algo_version':  XMATCH_ALGO_VERSION,
         'hst_pix_floor':        hst_pix_floor,
         'min_matches':          min_matches,
         'zero_pm':              zero_pm,

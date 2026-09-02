@@ -297,6 +297,14 @@ def _parse_args():
                     help='Disable the alignment parameter prior (a,b,c,d,delta_ra0,delta_dec0). '
                          'Sets the prior precision to zero so posteriors are determined entirely '
                          'by the data. Useful for diagnosing prior-driven biases.')
+    bp.add_argument('--use_indv_outputs', action='store_true',
+                    help='Warm-start the joint fit from BP3M_indv_results/: '
+                         'per-image r_init from the indv posterior, indv-'
+                         'rejected detections hard-blocked from alignment, '
+                         'indv-accepted ones seed the initial mask (still '
+                         'refined by the joint tests). Requires indv fits '
+                         'run on the SAME cross-match outputs (checked per '
+                         'image; mismatches fall back with a warning).')
     bp.add_argument('--bp3m_pos_err_floor', type=float, default=0.01,
                     help='Per-detection positional systematics floor in pixels, added '
                          'IN QUADRATURE to the HST uncertainties before BP3M '
@@ -1221,6 +1229,19 @@ def main():
                                if len(_spi_all[n]) >= args.bp3m_min_stars]
 
             _indv_root = output_dir / field / "BP3M_indv_results"
+
+            def _indv_extra_cfg(_img_name):
+                """Record exact match provenance in each indv run_config so
+                --use_indv_outputs can verify the joint fit sees the same
+                cross-match outputs (md5, not mtime heuristics)."""
+                import hashlib as _hl
+                _m = (output_dir / field / 'HST' / 'mastDownload' / 'HST'
+                      / _img_name / 'matched_gaia.csv')
+                _cfg = {}
+                if _m.exists():
+                    _cfg['matched_gaia_md5'] = _hl.md5(_m.read_bytes()).hexdigest()
+                    _cfg['matched_gaia_mtime'] = _m.stat().st_mtime
+                return _cfg
             print("\n" + "─"*50)
             print(f"Individual image fitting: {len(_indv_names)} images")
             print(f"Output: {_indv_root}")
@@ -1271,6 +1292,7 @@ def main():
                         use_two_tier=args.two_tier,
                         no_align_prior=args.no_align_prior,
                         pos_err_floor=args.bp3m_pos_err_floor,
+                        extra_run_config=_indv_extra_cfg(_img),
                         plot_residuals=args.plot_residuals,
                         plot_influence=args.plot_influence,
                         bp3m_dir=_indv_root / _img,
@@ -1336,6 +1358,7 @@ def main():
                 use_two_tier=args.two_tier,
                 no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
+                use_indv_outputs=args.use_indv_outputs,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
@@ -1417,6 +1440,7 @@ def main():
                 use_two_tier=args.two_tier,
                 no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
+                use_indv_outputs=args.use_indv_outputs,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,

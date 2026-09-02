@@ -44,6 +44,8 @@ def run_alignment(  # noqa: C901
     epoch_dist_sigma: float = 10.0,
     epoch_breaks=None,
     epoch_dist_min_images: int = 3,
+    use_indv_outputs: bool = False,
+    extra_run_config: dict | None = None,
     epoch_dist_groupby: str = 'full',
     no_prefilter: bool = False,
     no_plots: bool = False,
@@ -261,6 +263,11 @@ def run_alignment(  # noqa: C901
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
 
+    _indv_init_stats = None
+    if use_indv_outputs:
+        _indv_init_stats = _apply_indv_init(
+            solver, image_names, data_root, field_name)
+
     # ── QSO anchor prior injection ────────────────────────────────────────────
     # Replaces the diffuse global prior on PM+parallax with a tight secular-
     # aberration prior for vetted QSO anchors.  Adds σ_κ^{-2} to the PM rows
@@ -389,6 +396,9 @@ def run_alignment(  # noqa: C901
         output_bp3m, solver, imgs, gaia_catalog, image_names,
         r_hat, C_r, v_hat, C_vT, v_mean, v_cov, K_img, a_arr,
         run_config={
+            **(extra_run_config or {}),
+            'use_indv_outputs': use_indv_outputs,
+            'indv_init_stats': _indv_init_stats,
             'n_iter':       n_iter,
             'n_samples':    n_samples,
             'clip_sigma':   clip_sigma,
@@ -541,6 +551,149 @@ def compute_chi2_per_star(solver, r_hat, v_hat, image_names, use_key='use_for_as
         np.add.at(n_det, sidx, 1)
 
     return chi2, n_det
+
+
+def _apply_indv_init(solver, image_names, data_root, field_name):
+    """--use_indv_outputs: warm-start the joint fit from per-image fits.
+
+    Asymmetric trust (2026-09-02 design):
+      - r_init            <- indv posterior r (better than transformation.csv)
+      - indv-REJECTED detections (present in the indv fit but excluded from
+        both alignment and astrometry there): hard-blocked from the joint
+        alignment tier (they failed chi2 even under Gaia-propagation-sized
+        errors -> near-certain junk).  use_for_align_init_flag is cleared so
+        trust-flag re-admission cannot bring them back.
+      - indv-ACCEPTED alignment detections: seed the initial use_for_fit mask
+        only; the joint tests refine freely (indv vetting is only good to the
+        Gaia-propagation error scale).
+      - alpha is NOT imported (indv alpha=1 is a blindness artifact).
+
+    Per-image provenance: the indv fit must postdate the current
+    matched_gaia.csv (exact md5 when the indv run recorded one) and the match
+    sidecar must carry the current xmatch_algo_version.  Failing images fall
+    back to the standard initialisation with a reason count.
+    """
+    import hashlib
+    import json as _json
+    import pandas as _pd
+    from bp3m.pipeline.cross_match import XMATCH_ALGO_VERSION
+
+    indv_root = Path(data_root) / field_name / 'BP3M_indv_results'
+    hst_root  = Path(data_root) / field_name / 'HST' / 'mastDownload' / 'HST'
+    _sol_gid = np.zeros(solver.n_stars, dtype=np.int64)
+    for _g, _i in solver.star_id_to_idx.items():
+        _sol_gid[int(_i)] = np.int64(_g)
+
+    stats = {'n_warm': 0, 'n_fallback': 0, 'n_rejected_dets': 0,
+             'n_seed_dets': 0, 'fallback_reasons': {}}
+
+    def _fb(reason, n=1):
+        stats['n_fallback'] += n
+        stats['fallback_reasons'][reason] = \
+            stats['fallback_reasons'].get(reason, 0) + n
+
+    bases: dict[str, list] = {}
+    for img in image_names:
+        base = img[:-3] if img.endswith(('_hi', '_lo')) else img
+        bases.setdefault(base, []).append(img)
+
+    for base, subs in sorted(bases.items()):
+        d_indv = indv_root / base
+        req = [d_indv / f for f in ('image_transformations.csv',
+                                    'stellar_astrometry.csv',
+                                    'use_for_fit.npz', 'star_indices.npz',
+                                    'run_config.json')]
+        if not all(f.exists() for f in req):
+            _fb('no indv outputs', len(subs)); continue
+        matched = hst_root / base / 'matched_gaia.csv'
+        sidecar = hst_root / base / 'xmatch_status.json'
+        if not matched.exists():
+            _fb('no matched_gaia.csv', len(subs)); continue
+        try:
+            _cfg = _json.load(open(d_indv / 'run_config.json'))
+        except Exception:
+            _fb('unreadable indv run_config', len(subs)); continue
+        _md5_rec = _cfg.get('matched_gaia_md5')
+        if _md5_rec is not None:
+            if hashlib.md5(matched.read_bytes()).hexdigest() != _md5_rec:
+                _fb('matches changed since indv fit (md5)', len(subs)); continue
+        elif matched.stat().st_mtime >= (d_indv / 'stellar_astrometry.csv').stat().st_mtime:
+            _fb('matches newer than indv fit', len(subs)); continue
+        try:
+            _ver = _json.load(open(sidecar)).get('params', {}).get('xmatch_algo_version')
+        except Exception:
+            _ver = None
+        if _ver != XMATCH_ALGO_VERSION:
+            _fb(f'match algo v{_ver} != v{XMATCH_ALGO_VERSION}', len(subs)); continue
+
+        it = _pd.read_csv(d_indv / 'image_transformations.csv').set_index('image_name')
+        sa = _pd.read_csv(d_indv / 'stellar_astrometry.csv',
+                          dtype={'Gaia_id': np.int64})
+        uff = np.load(d_indv / 'use_for_fit.npz')
+        si  = np.load(d_indv / 'star_indices.npz')
+        _ufa_p = d_indv / 'use_for_astrom.npz'
+        ufa = np.load(_ufa_p) if _ufa_p.exists() else None
+        gids_indv = sa['Gaia_id'].to_numpy(np.int64)
+
+        for sub in subs:
+            d = solver._img_data.get(sub)
+            if d is None or sub not in it.index or sub not in si.files:
+                _fb('sub-image mismatch (chip split?)'); continue
+            row = it.loc[sub]
+            nr = solver.N_R
+            r_vec = np.asarray(d['r_init'], float).copy()
+            r_vec[0:4] = [float(row['a']), float(row['b']),
+                          float(row['c']), float(row['d'])]
+            if nr > 4:
+                r_vec[4] = -float(row.get('delta_ra0_mas', 0.0))
+            if nr > 5:
+                r_vec[5] = -float(row.get('delta_dec0_mas', 0.0))
+            _poly_ok = True
+            for k in range(6, nr):
+                if f'r_{k}' in row.index:
+                    r_vec[k] = float(row[f'r_{k}'])
+                else:
+                    _poly_ok = False
+                    break
+            if not _poly_ok:
+                _fb('poly_order mismatch'); continue
+
+            sidx_i = si[sub]
+            m_fit  = uff[sub].astype(bool) if sub in uff.files else \
+                     np.zeros(len(sidx_i), bool)
+            m_ast  = (ufa[sub].astype(bool)
+                      if (ufa is not None and sub in ufa.files) else m_fit)
+            g_all  = gids_indv[sidx_i]
+            g_fit  = gids_indv[sidx_i[m_fit]]
+            g_keep = gids_indv[sidx_i[m_fit | m_ast]]
+            g_rej  = np.setdiff1d(g_all, g_keep)
+
+            jg   = _sol_gid[d['sidx']]
+            seen = np.isin(jg, g_all)
+            rej  = np.isin(jg, g_rej) if len(g_rej) else np.zeros(len(jg), bool)
+            acc  = np.isin(jg, g_fit) if len(g_fit) else np.zeros(len(jg), bool)
+
+            d['r_init'] = r_vec
+            _uf = np.asarray(d['use_for_fit'], bool)
+            # acceptance list seeds the mask (only where indv saw the star)
+            _uf = _uf & np.where(seen, acc, True)
+            # rejections are hard-blocked from alignment, incl. re-admission
+            _uf &= ~rej
+            d['use_for_fit'] = _uf
+            if 'use_for_align_init_flag' in d:
+                d['use_for_align_init_flag'] = \
+                    np.asarray(d['use_for_align_init_flag'], bool) & ~rej
+            stats['n_rejected_dets'] += int(rej.sum())
+            stats['n_seed_dets']     += int((seen & acc).sum())
+            stats['n_warm'] += 1
+
+    print(f"  use_indv_outputs: warm-started {stats['n_warm']} images "
+          f"({stats['n_seed_dets']} seeded alignment dets, "
+          f"{stats['n_rejected_dets']} indv-rejected dets hard-blocked); "
+          f"{stats['n_fallback']} images fell back")
+    for r, n in sorted(stats['fallback_reasons'].items()):
+        print(f"    fallback [{r}]: {n} images")
+    return stats
 
 
 def _save_results(output_dir, solver, images, gaia_catalog, image_names,
