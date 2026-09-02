@@ -159,7 +159,7 @@ def _match_one(args):
 
         process_single_image(
             hst_dict, gaia_df,
-            hst_pix_floor=kwargs.get('hst_pix_floor', 0.05),
+            hst_pix_floor=kwargs.get('hst_pix_floor', 0.5),
             min_matches=kwargs.get('min_matches', 3),
             zero_pm=kwargs.get('zero_pm', False),
             max_mag_diff=kwargs.get('max_mag_diff', 3.0),
@@ -229,7 +229,7 @@ def run_cross_match(
     telescope: str = 'HST',
     im_type: str = '_flc',
     n_processes: int = 4,
-    hst_pix_floor: float = 0.05,
+    hst_pix_floor: float = 0.5,   # match the bp3m CLI default (--cross_match_pix_floor)
     min_matches: int = 3,
     zero_pm: bool = False,
     max_mag_diff: float = 3.0,
@@ -311,10 +311,13 @@ def run_cross_match(
     params_meta = {
         # Matching-algorithm version: bump on any change to the matching
         # LOGIC (not just parameters) so every cached result in the archive
-        # self-invalidates on the next touch.  v2 = field-typical 2p
-        # propagation (mode PM/plx fill) + dispersion-based 2p search window
-        # (2026-09-02); v1/absent = legacy 0-PM propagation.
-        'xmatch_algo_version':  2,
+        # self-invalidates on the next touch.  Policy (2026-09-02): ANY
+        # algorithm change bumps this, no equivalence arguments.
+        #   v1/absent = legacy 0-PM propagation, 100 mas/yr 2p fill
+        #   v2 = mode-centred 2p propagation + dispersion window
+        #   v3 = + zero-PM coverage term in the 2p window; API pix-floor
+        #        default aligned to the CLI (0.5 px)
+        'xmatch_algo_version':  3,
         'hst_pix_floor':        hst_pix_floor,
         'min_matches':          min_matches,
         'zero_pm':              zero_pm,
