@@ -462,7 +462,20 @@ def main(argv=None):
         argv.remove('--catalog_only')
         return _catalog_main(argv)
     from bp3m.pipeline.run_pop_fit import main as _joint_main
-    return _joint_main(argv + ['--use_master_v2'])
+    extra = ['--use_master_v2']
+    # SAFE DEFAULT: keep the alignment FROZEN (mu-only Phase 1).  With
+    # HST-only-dominated membership the joint r+mu phases have a runaway
+    # mu_pop <-> alignment soft mode (Leo_I 2026-09-01: joint drifted to
+    # (-0.41,+0.23) while the Gaia PMs of the same members give
+    # (-0.06,-0.12)).  Pass --n_iter_joint/--n_iter_alpha explicitly to
+    # opt in to the joint phases regardless.
+    if not any(a.startswith('--n_iter_joint') for a in argv):
+        extra += ['--n_iter_joint', '0']
+        if not any(a.startswith('--n_iter_alpha') for a in argv):
+            extra += ['--n_iter_alpha', '0']
+        print('bp3m-pop-fit-v2: alignment frozen (mu-only solve; '
+              'pass --n_iter_joint to enable joint phases)')
+    return _joint_main(argv + extra)
 
 
 if __name__ == '__main__':
