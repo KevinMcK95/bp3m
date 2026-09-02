@@ -2817,6 +2817,58 @@ def run_pop_fit(
     # A_i = C_vT_i @ K_all_i  (sensitivity of v_i to r, n_stars × 5 × n_r_tot)
     CvT_K = np.einsum('nij,njk->nik', C_vT_final, K_all)
 
+    # ── Frame-marginalised μ_pop covariance (cut posterior; frozen-r mode) ────
+    # μ̂ is a function of the frozen frame r̂.  Conditional on r̂ its
+    # covariance is C_mu_cond; r̂ itself carries the ALIGNMENT-ONLY posterior
+    # C_r_align from the upstream v1/v2 run.  Marginalising over the frame as
+    # a single SHARED nuisance:
+    #     C_mu_total = C_mu_cond + B C_r_align Bᵀ,   B = ∂μ̂/∂r̂
+    # B is assembled from the same per-star response matrices (CvT_K) used by
+    # compute_analytic_posteriors — the K-based propagation, so no double
+    # counting: C_mu_cond is detection noise given the frame; the second term
+    # is the alignment information that determined the frame.  The frame term
+    # is common-mode by construction: it does NOT average down with the
+    # number of members (naive per-star inflation would).  The overlap
+    # correlation from members that are also alignment stars is neglected
+    # (slightly conservative).
+    _C_mu_total = None
+    if C_shared_joint is None:
+        _, _, _C_mu_cond, _, _, _, _ = _solve(
+            member_sidx, mu_pop_current, r_current, fix_r_arg=True,
+            z_weights_arg=z_weights_final)
+        _B_mu = (sigma_pm ** -2) * (
+            _C_mu_cond @ CvT_K[member_sidx][:, 2:4, :].sum(axis=0))
+        _C_r_align = None
+        try:
+            _C_r_file = np.load(bp3m_dir / 'C_r.npy')
+            _pos = {n: k for k, n in enumerate(v1_image_names)}
+            if (all(img in _pos for img in image_names)
+                    and _C_r_file.shape[0] == len(v1_image_names) * nr):
+                _sel = np.concatenate([
+                    np.arange(_pos[img] * nr, _pos[img] * nr + nr)
+                    for img in image_names])
+                _C_r_align = _C_r_file[np.ix_(_sel, _sel)]
+            else:
+                print("  WARNING: cannot map upstream C_r.npy onto the "
+                      "pop-fit image set — using the pop-fit C_r for the "
+                      "frame floor instead")
+        except Exception as _exc:
+            print(f"  WARNING: upstream C_r.npy unavailable ({_exc}) — "
+                  f"using the pop-fit C_r for the frame floor")
+        if _C_r_align is None:
+            _C_r_align = C_r
+        _C_frame = _B_mu @ _C_r_align @ _B_mu.T
+        _C_frame = 0.5 * (_C_frame + _C_frame.T)
+        _C_mu_total = _C_mu_cond + _C_frame
+        _s_c = np.sqrt(np.diag(_C_mu_cond))
+        _s_f = np.sqrt(np.maximum(np.diag(_C_frame), 0.0))
+        _s_t = np.sqrt(np.diag(_C_mu_total))
+        print("  Frame-marginalised μ_pop uncertainty (cut posterior):")
+        print(f"    conditional on r_hat: ({_s_c[0]:.4f}, {_s_c[1]:.4f}) mas/yr")
+        print(f"    frame floor         : ({_s_f[0]:.4f}, {_s_f[1]:.4f}) mas/yr")
+        print(f"    marginalised        : ({_s_t[0]:.4f}, {_s_t[1]:.4f}) mas/yr")
+        sigma_mu_joint = _s_t
+
     # Step 3: μ_pop sensitivity for member stars
     #   ∂v_i/∂μ_pop = σ_pm^{-2} C_vT_i[:, 2:4]  (only for members, 0 for non-members)
     B_all = np.zeros((solver.n_stars, 5, 2))
@@ -2988,7 +3040,8 @@ def run_pop_fit(
         print(f"  WARNING: detections.npz failed — {_exc}")
 
     # 6. mu_pop.json
-    _C_mu = C_shared_final[n_r:, n_r:]   # (2, 2) μ_pop posterior covariance
+    _C_mu = (C_shared_final[n_r:, n_r:] if _C_mu_total is None
+             else _C_mu_total)           # (2, 2) μ_pop posterior covariance
     _corr_mu = (float(_C_mu[0, 1] / (sigma_mu_joint[0] * sigma_mu_joint[1]))
                 if (sigma_mu_joint[0] > 0 and sigma_mu_joint[1] > 0) else 0.0)
 
@@ -3029,6 +3082,16 @@ def run_pop_fit(
         'mu_pop_dec_masyr':      float(mu_pop_current[1]),
         'sigma_mu_pop_ra':       float(sigma_mu_joint[0]),
         'sigma_mu_pop_dec':      float(sigma_mu_joint[1]),
+        # frozen-r mode: conditional/frame decomposition of sigma_mu
+        # (sigma_mu_pop_* above = frame-marginalised cut posterior)
+        'sigma_mu_cond_ra':      (float(np.sqrt(_C_mu_cond[0, 0]))
+                                  if _C_mu_total is not None else None),
+        'sigma_mu_cond_dec':     (float(np.sqrt(_C_mu_cond[1, 1]))
+                                  if _C_mu_total is not None else None),
+        'sigma_mu_frame_ra':     (float(np.sqrt(max(_C_frame[0, 0], 0)))
+                                  if _C_mu_total is not None else None),
+        'sigma_mu_frame_dec':    (float(np.sqrt(max(_C_frame[1, 1], 0)))
+                                  if _C_mu_total is not None else None),
         'corr_mu_pop_ra_dec':    _corr_mu,
         'mu_gaia_ra_masyr':      float(_mu_g[0]),
         'mu_gaia_dec_masyr':     float(_mu_g[1]),
