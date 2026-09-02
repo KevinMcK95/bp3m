@@ -608,8 +608,11 @@ def load_image_data_flc(data_root, field_name: str,
             gaia_csv = Path(gaia_csv)
             if not gaia_csv.exists():
                 raise FileNotFoundError(f"Gaia CSV not found: {gaia_csv}")
-            print(f"Loading Gaia catalog: {gaia_csv.name}")
+            print(f"Loading Gaia catalog: {gaia_csv.name}", flush=True)
+            import time as _time
+            _t0 = _time.time()
             gaia_raw = pd.read_csv(gaia_csv).rename(columns={"SOURCE_ID": "source_id"})
+            print(f"  {len(gaia_raw)} rows in {_time.time()-_t0:.1f}s", flush=True)
     else:
         gaia_files = sorted(glob.glob(str(gaia_dir / "*_gaia.csv")))
         if not gaia_files:
@@ -657,12 +660,20 @@ def load_image_data_flc(data_root, field_name: str,
     images: dict          = {}
     stars_per_image: dict = {}
     summary_rows: list    = []
-    keep_gaia_mask        = np.zeros(len(gaia_catalog), dtype=bool)
 
     gaia_id_set = set(gaia_catalog["Gaia_id"].values)
 
     skipped = []
-    for img_dir in img_dirs:
+    observed_gaia_ids: set = set()
+    _n_load = (len(img_dirs) if restrict_images is None
+               else min(len(img_dirs), len(restrict_images)))
+    if _n_load > 50:
+        from tqdm import tqdm as _tqdm
+        _iter_dirs = _tqdm(img_dirs, desc="  Loading image data", unit="img",
+                           dynamic_ncols=True)
+    else:
+        _iter_dirs = img_dirs
+    for img_dir in _iter_dirs:
         img_name = img_dir.name
         if restrict_images is not None and img_name not in restrict_images:
             continue
@@ -687,8 +698,10 @@ def load_image_data_flc(data_root, field_name: str,
         images[img_name]          = meta
         stars_per_image[img_name] = stars_df
 
-        # Track which Gaia sources are observed
-        keep_gaia_mask |= gaia_catalog["Gaia_id"].isin(stars_df["Gaia_id"])
+        # Track which Gaia sources are observed (set accumulation; a
+        # full-catalog isin per image is O(n_images x n_gaia) — minutes of
+        # silent stall on Omega_Cen's 1677 images)
+        observed_gaia_ids.update(stars_df["Gaia_id"].values)
 
         summary_rows.append({
             "image_name":       img_name,
@@ -719,6 +732,8 @@ def load_image_data_flc(data_root, field_name: str,
             "yt_o":             meta["yt_o"],
             "n_matched":        len(stars_df),
         })
+
+    keep_gaia_mask = gaia_catalog["Gaia_id"].isin(observed_gaia_ids).to_numpy()
 
     if skipped:
         print(f"  Skipped {len(skipped)} directories (missing required files): "
