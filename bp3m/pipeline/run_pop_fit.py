@@ -1866,6 +1866,7 @@ def run_pop_fit(
     hst_max_per_image: int = 1000,
     det_chi2_threshold_v2: float | None = None,
     members_hst_only: bool = False,
+    members_5p_only: bool = False,
 ) -> Path:
     """
     Run population PM fitting.
@@ -2320,16 +2321,29 @@ def run_pop_fit(
         print(f"  members_hst_only: {len(_gaia_pos_sidx)} Gaia-matched stars "
               f"barred from membership")
 
+    # --members_5p_only (TEST): bar stars WITHOUT a Gaia PM solution (2p
+    # stars, and synthetic HST-only rows) from membership — their PMs are
+    # frame-coupled, the ingredient of the mixed-membership mu<->r feedback.
+    _no5p_sidx = None
+    if members_5p_only:
+        _no5p_sidx = np.where(~(
+            np.isfinite(gaia_catalog['pmra'].to_numpy(float))
+            & np.isfinite(gaia_catalog['pmdec'].to_numpy(float))))[0]
+        print(f"  members_5p_only: {len(_no5p_sidx)} stars without Gaia PMs "
+              f"barred from membership")
+
     def _freeze_members(_sidx):
         _sidx = np.asarray(_sidx, int)
         if _seed_frozen_sidx is not None:
             _sidx = np.intersect1d(_sidx, _seed_frozen_sidx)
         if _gaia_pos_sidx is not None:
             _sidx = np.setdiff1d(_sidx, _gaia_pos_sidx)
+        if _no5p_sidx is not None:
+            _sidx = np.setdiff1d(_sidx, _no5p_sidx)
         return _sidx
 
     member_sidx = _freeze_members(member_sidx)
-    if members_hst_only:
+    if members_hst_only or members_5p_only:
         print(f"  Initial members after Gaia bar: {len(member_sidx)}")
 
     # ── μ_pop prior: weighted mean of initial members ─────────────────────────
@@ -3497,6 +3511,9 @@ def main(argv=None):
                         help='master_v2: per-image cap on HST-only sources, '
                              'ranked by PM precision (default 1000; raise to '
                              'use more faint stars)')
+    parser.add_argument('--members_5p_only', action='store_true',
+                        help='TEST: bar stars without Gaia PM solutions (2p, '
+                             'HST-only) from membership')
     parser.add_argument('--members_hst_only', action='store_true',
                         help='TEST: bar Gaia-matched stars from membership; '
                              'only HST-only stars inform mu_pop')
@@ -3621,6 +3638,7 @@ def main(argv=None):
         hst_max_per_image=args.hst_max_per_image,
         det_chi2_threshold_v2=args.det_chi2_threshold_v2,
         members_hst_only=args.members_hst_only,
+        members_5p_only=args.members_5p_only,
     )
 
     # Save the command only on successful completion so interrupted runs
