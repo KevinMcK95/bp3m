@@ -122,9 +122,26 @@ def _has_mag_calibration(catalog_path: Path) -> bool:
         return True   # if we can't tell, don't skip
 
 
+# The Gaia catalogue is shipped to each worker ONCE via the pool
+# initializer.  Passing it inside every task pickled/unpickled a ~10^5-row
+# DataFrame per image, which fragments the worker heaps — glibc never
+# returns those arenas, so RSS grows monotonically through the image list
+# (looks exactly like a leak at --n_processes 32 on a big field).
+_WORKER_GAIA_DF = None
+
+
+def _pool_init(gaia_df):
+    global _WORKER_GAIA_DF
+    _WORKER_GAIA_DF = gaia_df
+
+
 def _match_one(args):
     """Worker: cross-match one image. Returns (image_name, n_matched, error)."""
-    hst_dict, gaia_df, kwargs = args
+    if len(args) == 3:          # sequential path passes the df directly
+        hst_dict, gaia_df, kwargs = args
+    else:
+        hst_dict, kwargs = args
+        gaia_df = _WORKER_GAIA_DF
     from gaia_cross_match.cross_match import process_single_image
 
     root        = Path(hst_dict['root'])
@@ -385,8 +402,13 @@ def run_cross_match(
 
     results = []
     if n_processes > 1 and len(work) > 1:
-        with ProcessPoolExecutor(max_workers=n_processes) as ex:
-            futures = {ex.submit(_match_one, w): w for w in work}
+        import multiprocessing as _mp
+        with ProcessPoolExecutor(
+                max_workers=n_processes,
+                mp_context=_mp.get_context("forkserver"),
+                initializer=_pool_init, initargs=(gaia_df,),
+                max_tasks_per_child=25) as ex:
+            futures = {ex.submit(_match_one, (w[0], w[2])): w for w in work}
             for fut in as_completed(futures):
                 name, n, err = fut.result()
                 if err:

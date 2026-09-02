@@ -1113,6 +1113,11 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         print(f"Finished {image_name}: Error - {e}", file=original_stdout)
         traceback.print_exc(file=original_stdout)
     finally:
+        try:
+            if hasattr(sys.stdout, 'log'):
+                sys.stdout.log.close()   # FileLogger never closed its handle
+        except Exception:
+            pass
         sys.stdout = original_stdout
 
 def main():
