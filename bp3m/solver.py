@@ -1001,7 +1001,7 @@ class BP3MSolver:
                 # covariances) cannot bias the threshold even if they are later
                 # re-evaluated by the EM loop.
                 "use_for_align_init": good_for_fitting.copy(),  # False for Phase-6 outliers (don't inflate threshold)
-                "phase6_outlier":     _phase6_outlier.copy(),   # True for Phase-6 Gaia outliers (can re-enter)
+                "phase6_outlier":     _phase6_outlier.copy(),   # True for Phase-6 Gaia outliers (astrometry-tier re-admission only)
             }
 
         n_total = sum(d["n"] for d in self._img_data.values() if d)
@@ -2774,12 +2774,15 @@ class BP3MSolver:
             # removed from use_for_fit it cannot re-enter via residual tests.
             align_init    = np.asarray(self._img_data[img]["use_for_align_init"], dtype=bool)
             current_fit   = np.asarray(self._img_data[img]["use_for_fit"],        dtype=bool)
-            # Phase-6 outliers (real Gaia detections flagged inactive by the
-            # crossmatch astrometry fit) can also re-enter alignment if their
-            # residuals are acceptable at the current transformation.
+            # Phase-6 outliers (real Gaia detections flagged not-trustworthy by
+            # the cross-match validator) may NOT re-enter alignment: in crowded
+            # fields these pairs are blends, and re-admitting them to the fit
+            # widened ngc_7099 member pmdec sigma_MAD 0.165 -> 0.30 (bright) /
+            # 0.61 (faint).  They remain candidates for the ASTROMETRY tier
+            # below -- their epochs still constrain their own star's PM.
             phase6_out    = np.asarray(self._img_data[img].get("phase6_outlier",
                                        np.zeros(len(current_fit), bool)), dtype=bool)
-            can_enter_fit = align_init | current_fit | phase6_out
+            can_enter_fit = align_init | current_fit
             new_use = new_use & can_enter_fit
 
             # Starving-chip demotion: while an image is demoted its ALIGNMENT
@@ -2801,6 +2804,23 @@ class BP3MSolver:
             # it is managed externally by V2AlignmentCallback.
             new_use_astrom = np.asarray(self._img_data[img]["use_for_astrom"], dtype=bool).copy()
             new_use_astrom[align_init] = _admit[align_init]
+            # Phase-6 (trust-flagged) pairs: astrometry-tier-only re-admission.
+            # Same residual test, hysteresis, and hard ceilings as alignment
+            # admissions -- they just never touch the transformation.  Their
+            # pre-update use_for_astrom (still intact at phase6 positions of
+            # the copy) provides the hysteresis reference.
+            if phase6_out.any():
+                _p6_ok = ok_glob_here & np.asarray(
+                    self._img_data[img]["use_for_fit_max"], dtype=bool)
+                if infl_excl is not None:
+                    _p6_ok = _p6_ok & ~infl_excl
+                if adaptive_delta > 0:
+                    _p6_resid = np.where(new_use_astrom,
+                                         sig_sq_eff < thresh_expel,
+                                         ok_resid_admit)
+                else:
+                    _p6_resid = ok_resid_admit
+                new_use_astrom[phase6_out] = (_p6_ok & _p6_resid)[phase6_out]
             self._img_data[img]["use_for_astrom"] = new_use_astrom
 
             # Alpha from informative-prior stars only.  Diffuse-prior stars'
