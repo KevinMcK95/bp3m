@@ -154,7 +154,7 @@ def get_hst_params(flc_file, catalog_file=None):
             "instrument": instrument, "detector": detector,
             "chip_dims": {ext: (h.get('NAXIS1'), h.get('NAXIS2')) for ext, h in sci_hdrs.items()}}
 
-def construct_gaia_cov(df, zero_pm=False):
+def construct_gaia_cov(df, zero_pm=False, fill_pm_plx=None):
     n = len(df)
     errors = np.zeros((n, 5))
     errors[:, 0], errors[:, 1] = df['ra_error'].values, df['dec_error'].values
@@ -163,8 +163,21 @@ def construct_gaia_cov(df, zero_pm=False):
         errors[:, 2] = 20.0 # 20 mas
         errors[:, 3], errors[:, 4] = 100.0, 100.0 # 100 mas/yr
     else:
-        errors[:, 2] = df['parallax_error'].fillna(20.0).values
-        errors[:, 3], errors[:, 4] = df['pmra_error'].fillna(100.0).values, df['pmdec_error'].fillna(100.0).values
+        # 2p stars: the error fill sets the effective SEARCH WINDOW after
+        # propagation.  The legacy 100 mas/yr made every candidate within
+        # ~2 px look consistent, so in dense high-PM fields mismatches
+        # survived regardless of where the prediction was centred.  With a
+        # field-typical fill available, use 2x the field PM dispersion about
+        # the mode instead — a wrong candidate 75 mas off-track becomes a
+        # multi-sigma outlier and the star is left unmatched rather than
+        # poisoned.
+        if fill_pm_plx is not None and "pm_sig" in fill_pm_plx:
+            _pm_fill = 2.0 * fill_pm_plx["pm_sig"]
+            _plx_fill = max(2.0 * fill_pm_plx.get("plx_sig", 10.0), 0.1)
+        else:
+            _pm_fill, _plx_fill = 100.0, 20.0
+        errors[:, 2] = df['parallax_error'].fillna(_plx_fill).values
+        errors[:, 3], errors[:, 4] = df['pmra_error'].fillna(_pm_fill).values, df['pmdec_error'].fillna(_pm_fill).values
 
     corrs = {(0, 1): 'ra_dec_corr', (0, 2): 'ra_parallax_corr', (0, 3): 'ra_pmra_corr', (0, 4): 'ra_pmdec_corr',
              (1, 2): 'dec_parallax_corr', (1, 3): 'dec_pmra_corr', (1, 4): 'dec_pmdec_corr',
@@ -224,7 +237,7 @@ def propagate_gaia_with_cov(df, target_mjd, zero_pm=False, fill_pm_plx=None):
         df['ra'].values, df['dec'].values, tele_xyz)
     ra_prop, dec_prop = propagate_gaia_positions(
         df['ra'].values, df['dec'].values, pmra, pmdec, plx, dt, tele_xyz)
-    C0 = construct_gaia_cov(df, zero_pm=zero_pm)
+    C0 = construct_gaia_cov(df, zero_pm=zero_pm, fill_pm_plx=fill_pm_plx)
     J = np.zeros((n, 2, 5))
     J[:, 0, 0], J[:, 0, 2], J[:, 0, 3] = 1.0, p_ra_cosdec, dt
     J[:, 1, 1], J[:, 1, 2], J[:, 1, 4] = 1.0, p_dec, dt
@@ -776,8 +789,9 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             plx=gaia_df['parallax'].values if 'parallax' in gaia_df else None)
         if _fill["method"] != "none":
             print(f"  2p propagation fill ({_fill['method']}, n={_fill['n']}): "
-                  f"pm=({_fill['pmra']:+.2f},{_fill['pmdec']:+.2f}) mas/yr  "
-                  f"plx={_fill['plx']:+.3f} mas")
+                  f"pm=({_fill['pmra']:+.2f},{_fill['pmdec']:+.2f}) "
+                  f"±{_fill.get('pm_sig', float('nan')):.2f} mas/yr  "
+                  f"plx={_fill['plx']:+.3f} ±{_fill.get('plx_sig', float('nan')):.2f} mas")
         ra_prop, dec_prop, Ct = propagate_gaia_with_cov(
             gaia_df, params['obs_epoch_mjd'], zero_pm=zero_pm,
             fill_pm_plx=_fill)

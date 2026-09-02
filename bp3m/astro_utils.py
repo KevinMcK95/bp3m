@@ -653,6 +653,13 @@ def field_typical_astrometry(pmra, pmdec, plx=None,
                    pmdec=float(0.5 * (ey[j] + ey[j + 1])),
                    method="mode")
 
+    # Robust PM dispersion about the adopted centre — the physically
+    # meaningful search-window scale for stars without their own PMs.
+    # (Filling 2p PM errors with 100 mas/yr makes every candidate within
+    # ~2 px "consistent", so mismatches survive any centring fix.)
+    dr = _np.hypot(pr - out["pmra"], pd_ - out["pmdec"])
+    out["pm_sig"] = float(max(1.4826 * _np.median(dr), 0.3))
+
     if plx is not None:
         plx = _np.asarray(plx, float)
         pfin = _np.isfinite(plx)
@@ -667,4 +674,9 @@ def field_typical_astrometry(pmra, pmdec, plx=None,
             out["plx"] = float(0.5 * (e[_np.argmax(hs)] + e[_np.argmax(hs) + 1]))
         elif pfin.any():
             out["plx"] = float(_np.median(plx[pfin]))
+        if pfin.any():
+            _pv = plx[pfin]
+            out["plx_sig"] = float(max(
+                1.4826 * _np.median(_np.abs(_pv - out["plx"])), 0.05))
+    out.setdefault("plx_sig", 0.5)
     return out
