@@ -300,8 +300,10 @@ def _parse_args():
     bp.add_argument('--bp3m_pos_err_floor', type=float, default=0.01,
                     help='Per-detection positional systematics floor in pixels, added '
                          'IN QUADRATURE to the HST uncertainties before BP3M '
-                         '(default 0.001 px; prevents numerically unstable residuals for '
-                         'very bright stars with sub-pixel PSF uncertainties)')
+                         '(default 0.01 px = 0.50 mas ACS/WFC, 0.40 mas WFC3/UVIS, '
+                         '1.3 mas WFC3/IR; models residual distortion/CTE/cross-filter '
+                         'systematics and prevents numerically unstable residuals for '
+                         'very bright stars)')
     bp.add_argument('--no_influence_clip', action='store_true',
                     help='Disable test-4 Cook\'s D influence clipping (default: enabled; '
                          'targets moderate-outlier high-leverage detections missed by the sigma threshold)')
