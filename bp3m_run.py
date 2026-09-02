@@ -628,6 +628,61 @@ def _resolve_pointings(args):
                   f"box={sw_i:.4f}×{sh_i:.4f} deg")
 
 
+
+def _indv_pool_init():
+    """Initializer for the --fit_indv_images_only worker pool: cap BLAS
+    threading (each worker solves a small single-image system; n_processes
+    workers x multi-threaded BLAS would oversubscribe the box) and force a
+    headless matplotlib backend.  Respects explicit user settings."""
+    for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+               "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(_v, "1")
+    os.environ.setdefault("MPLBACKEND", "Agg")
+
+
+def _run_indv_one(img_name, run_kw, indv_root, extra_cfg):
+    """Worker for --fit_indv_images_only.
+
+    Runs a single-image alignment fit with all solver output redirected to
+    BP3M_indv_results/{image}/processing_log.txt (mirroring the per-image
+    logs written by the PSF-fitting and cross-match steps), so the parent
+    can print one summary line per image instead of the full solver output.
+    Returns (image, err, n_align_used, n_astrom_used, n_detections, seconds).
+    """
+    import contextlib
+    import time
+    import traceback
+
+    t0 = time.time()
+    out_dir = Path(indv_root) / img_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    err = None
+    n_fit = n_astrom = n_det = -1
+    with open(out_dir / "processing_log.txt", "w", buffering=1) as log, \
+            contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+        try:
+            import matplotlib
+            matplotlib.use("Agg", force=True)
+            from bp3m.pipeline.run_alignment import run_alignment
+            run_alignment(images=[img_name], bp3m_dir=out_dir,
+                          extra_run_config=extra_cfg,
+                          min_align_demote=0,  # never freeze a single-image fit
+                          **run_kw)
+        except Exception as exc:  # full traceback goes to the log
+            traceback.print_exc()
+            err = f"{type(exc).__name__}: {exc}"
+    if err is None:
+        try:
+            with np.load(out_dir / "use_for_fit.npz") as zf:
+                n_fit = int(sum(int(np.sum(zf[k] > 0)) for k in zf.files))
+                n_det = int(sum(int(np.asarray(zf[k]).size) for k in zf.files))
+            with np.load(out_dir / "use_for_astrom.npz") as za:
+                n_astrom = int(sum(int(np.sum(za[k] > 0)) for k in za.files))
+        except Exception:
+            pass
+    return img_name, err, n_fit, n_astrom, n_det, time.time() - t0
+
+
 def main():
     args = _parse_args()
 
@@ -1253,26 +1308,16 @@ def main():
                     _cfg['matched_gaia_md5'] = _hl.md5(_m.read_bytes()).hexdigest()
                     _cfg['matched_gaia_mtime'] = _m.stat().st_mtime
                 return _cfg
-            print("\n" + "─"*50)
-            print(f"Individual image fitting: {len(_indv_names)} images")
-            print(f"Output: {_indv_root}")
-            print("─"*50)
-
-            _n_ok, _n_fail = 0, 0
-            _n_total = len(_indv_names)
-            for _i_img, _img in enumerate(_indv_names, 1):
-                print(f"\n  ── {_img}  ({_i_img}/{_n_total}) ──")
-                try:
-                    run_alignment(
-                        output_dir=output_dir, field_name=field,
-                        n_iter=args.n_bp3m_iter,
-                        n_samples=args.n_samples,
-                        mcmc_posteriors=args.mcmc_posteriors,
-                        clip_sigma=args.bp3m_clip_sigma,
-                        poly_order=args.poly_order,
-                        split_ccd=not args.no_split_ccd,
-                        min_stars_split_ccd=args.min_stars_split_ccd,
-                        inflate_hst_errors=not args.no_inflate_hst_errors,
+            _run_kw = dict(
+                output_dir=output_dir, field_name=field,
+                n_iter=args.n_bp3m_iter,
+                n_samples=args.n_samples,
+                mcmc_posteriors=args.mcmc_posteriors,
+                clip_sigma=args.bp3m_clip_sigma,
+                poly_order=args.poly_order,
+                split_ccd=not args.no_split_ccd,
+                min_stars_split_ccd=args.min_stars_split_ccd,
+                inflate_hst_errors=not args.no_inflate_hst_errors,
                 two_phase_align=args.two_phase_align,
                 fit_epoch_distortion=args.fit_epoch_distortion,
                 epoch_dist_order=args.epoch_dist_order,
@@ -1281,45 +1326,101 @@ def main():
                 epoch_breaks=args.epoch_breaks,
                 epoch_dist_min_images=args.epoch_dist_min_images,
                 epoch_dist_groupby=args.epoch_dist_groupby,
-                        use_sparse=args.sparse,
-                        no_plots=args.no_plots,
-                        images=[_img],
-                        remove_images=None,
-                        restrict_filters=None,
-                        restrict_instdet=None,
-                        bp3m_min_stars=0,
-                        checkpoint_dir=None,
-                        use_influence_clip=not args.no_influence_clip,
-                        prior_sigma_rot_deg=args.prior_sigma_rot_deg,
-                        prior_sigma_scale=args.prior_sigma_scale,
-                        prior_sigma_skew=args.prior_sigma_skew,
-                        prior_sigma_pointing=args.prior_sigma_pointing,
-                        inflate_alpha_max=args.inflate_alpha_max,
-                        influence_k=args.influence_k,
-                        influence_floor_sr=args.influence_floor_sr,
-                        influence_floor_sd=args.influence_floor_sd,
-                        influence_raw_cooks_d=args.influence_raw_cooks_d,
-                        verbose_tests=args.verbose_tests,
-                        use_two_tier=args.two_tier,
-                        no_align_prior=args.no_align_prior,
-                        pos_err_floor=args.bp3m_pos_err_floor,
-                        extra_run_config=_indv_extra_cfg(_img),
-                        min_align_demote=0,   # never freeze a single-image fit
-                        plot_residuals=args.plot_residuals,
-                        plot_influence=args.plot_influence,
-                        bp3m_dir=_indv_root / _img,
-                        gaia_csv=gaia_csv_path,
-                        qso_anchors_csv=_qso_anchors_csv if _qso_exists(_qso_anchors_csv) else None,
-                        use_delve=args.use_delve,
-                        delve_use_for_align=args.delve_use_for_align,
-                    )
-                    _n_ok += 1
-                except Exception as _exc:
-                    import traceback as _tb
-                    print(f"  WARNING: {_img} failed: {_exc}")
-                    _tb.print_exc()
-                    _n_fail += 1
+                use_sparse=args.sparse,
+                no_plots=args.no_plots,
+                remove_images=None,
+                restrict_filters=None,
+                restrict_instdet=None,
+                bp3m_min_stars=0,
+                checkpoint_dir=None,
+                use_influence_clip=not args.no_influence_clip,
+                prior_sigma_rot_deg=args.prior_sigma_rot_deg,
+                prior_sigma_scale=args.prior_sigma_scale,
+                prior_sigma_skew=args.prior_sigma_skew,
+                prior_sigma_pointing=args.prior_sigma_pointing,
+                inflate_alpha_max=args.inflate_alpha_max,
+                influence_k=args.influence_k,
+                influence_floor_sr=args.influence_floor_sr,
+                influence_floor_sd=args.influence_floor_sd,
+                influence_raw_cooks_d=args.influence_raw_cooks_d,
+                verbose_tests=args.verbose_tests,
+                use_two_tier=args.two_tier,
+                no_align_prior=args.no_align_prior,
+                pos_err_floor=args.bp3m_pos_err_floor,
+                plot_residuals=args.plot_residuals,
+                plot_influence=args.plot_influence,
+                gaia_csv=gaia_csv_path,
+                qso_anchors_csv=(_qso_anchors_csv
+                                 if _qso_exists(_qso_anchors_csv) else None),
+                use_delve=args.use_delve,
+                delve_use_for_align=args.delve_use_for_align,
+            )
 
+            from datetime import datetime as _dt
+            _n_total = len(_indv_names)
+            _n_proc = max(1, min(args.n_processes, _n_total))
+            print("\n" + "─"*50)
+            print(f"Individual image fitting: {_n_total} images "
+                  f"({_n_proc} process{'es' if _n_proc > 1 else ''})")
+            print(f"Output: {_indv_root}")
+            print("Per-image logs: {image}/processing_log.txt")
+            print(f"Start: {_dt.now():%Y-%m-%d %H:%M:%S}")
+            print("─"*50, flush=True)
+
+            _n_ok, _n_fail, _n_done = 0, 0, 0
+
+            def _indv_report(_res):
+                _img_r, _err, _n_fit, _n_astrom, _n_det, _dt_s = _res
+                _im = _imgs_all.get(_img_r, {})
+                _tag = "/".join(str(_im.get(_k) or '?')
+                                for _k in ('instrument', 'detector', 'filter'))
+                _ts = _dt.now().strftime('%Y-%m-%d %H:%M:%S')
+                if _err:
+                    print(f"  [{_ts}] {_img_r} ({_n_done}/{_n_total}) {_tag}  "
+                          f"FAILED: {_err} — see {_img_r}/processing_log.txt",
+                          flush=True)
+                    return False
+                print(f"  [{_ts}] {_img_r} ({_n_done}/{_n_total}) {_tag}  "
+                      f"align {_n_fit}/{_n_det}, astrom {_n_astrom}  "
+                      f"[{_dt_s:.1f}s]", flush=True)
+                return True
+
+            if _n_proc > 1:
+                import multiprocessing as _mp
+                from concurrent.futures import (ProcessPoolExecutor,
+                                                as_completed)
+                with ProcessPoolExecutor(
+                        max_workers=_n_proc,
+                        mp_context=_mp.get_context("forkserver"),
+                        initializer=_indv_pool_init,
+                        max_tasks_per_child=25) as _ex:
+                    _futs = {_ex.submit(_run_indv_one, _img, _run_kw,
+                                        _indv_root, _indv_extra_cfg(_img)): _img
+                             for _img in _indv_names}
+                    for _fut in as_completed(_futs):
+                        try:
+                            _res = _fut.result()
+                        except Exception as _exc:
+                            _res = (_futs[_fut],
+                                    f"{type(_exc).__name__}: {_exc}",
+                                    -1, -1, -1, 0.0)
+                        _n_done += 1
+                        if _indv_report(_res):
+                            _n_ok += 1
+                        else:
+                            _n_fail += 1
+            else:
+                for _img in _indv_names:
+                    _res = _run_indv_one(_img, _run_kw, _indv_root,
+                                         _indv_extra_cfg(_img))
+                    _n_done += 1
+                    if _indv_report(_res):
+                        _n_ok += 1
+                    else:
+                        _n_fail += 1
+
+            print("─"*50)
+            print(f"End: {_dt.now():%Y-%m-%d %H:%M:%S}")
             print(f"\nIndividual fitting complete: {_n_ok} succeeded, {_n_fail} failed")
 
         elif args.test_synthetic:
