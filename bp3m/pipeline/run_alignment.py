@@ -46,6 +46,8 @@ def run_alignment(  # noqa: C901
     epoch_dist_min_images: int = 3,
     use_indv_outputs: bool = False,
     extra_run_config: dict | None = None,
+    test_hysteresis_delta: float = 1.0,
+    min_align_demote: int = 5,
     epoch_dist_groupby: str = 'full',
     no_prefilter: bool = False,
     no_plots: bool = False,
@@ -365,6 +367,8 @@ def run_alignment(  # noqa: C901
     clip = clip_sigma if clip_sigma > 0 else None
     t0 = time.time()
     r_hat, C_r, v_hat, C_vT, a_arr, K_img, _ = solver.fit(
+        adaptive_delta=test_hysteresis_delta,
+        min_align_demote=min_align_demote,
         n_iter=n_iter,
         clip_sigma=clip,
         inflate_hst_errors=inflate_hst_errors,
@@ -398,6 +402,8 @@ def run_alignment(  # noqa: C901
         run_config={
             **(extra_run_config or {}),
             'use_indv_outputs': use_indv_outputs,
+            'test_hysteresis_delta': test_hysteresis_delta,
+            'min_align_demote': min_align_demote,
             'indv_init_stats': _indv_init_stats,
             'n_iter':       n_iter,
             'n_samples':    n_samples,

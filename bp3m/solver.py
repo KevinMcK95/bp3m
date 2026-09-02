@@ -1644,6 +1644,7 @@ class BP3MSolver:
     # ── Public fit interface ───────────────────────────────────────────────────
 
     def fit(self, n_iter=20, tol=1e-6, clip_sigma=4.5, inflate_hst_errors=False,
+            adaptive_delta=1.0, min_align_demote=5,
             inflate_from_iter=3, inflate_alpha_max=3.0, min_outer_iters=None,
             two_phase_align=False,
             mask_tol_frac=1e-3, mask_tol_iters=3,
@@ -1875,10 +1876,25 @@ class BP3MSolver:
                              f"[max {float(np.max(diff[n_r_only:])):.2e}]")
             return max_str, '  '.join(parts)
 
+        # ── Starving-chip demotion (min_align_demote > 0) ────────────────
+        # An image whose alignment count collapses below the threshold is
+        # demoted to astrometry-only: its detections keep contributing to the
+        # star posteriors, but its r is FROZEN at the last converged value
+        # (2 stars + a free pointing can swing ~50 mas per iteration and
+        # globalise the test-3 limit cycle; a frozen r also removes the
+        # ill-conditioned block that made the inner loop crawl).  Promotion
+        # back requires min_align_demote + 3 admitted stars (hysteresis).
+        self._align_demoted: set = set()
+        _img_block = {img: slice(j * self.N_R, (j + 1) * self.N_R)
+                      for j, img in enumerate(self.image_names)}
+
         def _inner_converge(r_hat, label, z_weights=None):
             """Iterate _solve_one_pass until max|Δr| < tol. Returns updated r_hat etc."""
             for it_i in range(500):
                 r_new, C_r_i, a_i, K_i, CvT_i = self._solve_one_pass(r_hat, z_weights=z_weights)
+                for _dimg in self._align_demoted:
+                    _bl = _img_block[_dimg]
+                    r_new[_bl] = r_hat[_bl]     # frozen: no update, no Δr
                 diff = np.abs(r_new - r_hat)
                 delta = np.max(diff)
                 r_hat = r_new
@@ -2046,12 +2062,35 @@ class BP3MSolver:
 
                 clip_info, ok_star_new, n_use_changed = self._update_use_for_fit(
                     r_hat, a_arr, C_r, C_vT, clip_sigma, iteration=it_outer,
+                    adaptive_delta=adaptive_delta,
                     ok_star_prev=ok_star_prev,
                     inflate_errors=inflate_hst_errors and _alpha_phase_active,
                     inflate_from_iter=_eff_from_iter,
                     inflate_alpha_max=inflate_alpha_max,
                     hst_fit_sigma_mult=hst_fit_sigma_mult,
                     chi2_threshold=chi2_threshold, alpha_scale_chi2=alpha_scale_chi2)
+
+                # ── demote/promote starving chips (see note above) ────────
+                # Decisions only; the masks themselves are managed inside
+                # _update_use_for_fit (astrometry follows admissions, the
+                # alignment mask empties while demoted, churn stays clean).
+                if min_align_demote > 0:
+                    for _img, _d in self._img_data.items():
+                        if _d is None:
+                            continue
+                        _n_fit = int(_d.get("n_fit_wouldbe",
+                                     np.asarray(_d["use_for_fit"], bool).sum()))
+                        if _img in self._align_demoted:
+                            if _n_fit >= min_align_demote + 3:
+                                self._align_demoted.discard(_img)
+                                print(f"    {_img}: re-promoted to alignment "
+                                      f"({_n_fit} admitted stars)")
+                        elif _n_fit < min_align_demote:
+                            self._align_demoted.add(_img)
+                            print(f"    {_img}: only {_n_fit} alignment stars "
+                                  f"— demoted to astrometry-only (r frozen)")
+                            _d["use_for_fit"] = np.zeros_like(
+                                np.asarray(_d["use_for_fit"], bool))
 
                 n_global_changed = int(np.sum(ok_star_prev != ok_star_new))
                 n_total_changed  = n_global_changed + n_use_changed
@@ -2298,7 +2337,7 @@ class BP3MSolver:
         return z_dict, n_det_total, n_eff_total
 
     def _final_star_tests(self, v_hat, C_vT, ok_star_prev=None,
-                          adaptive_k=5.0, adaptive_delta=0.1, chi2_pval=0.95,
+                          adaptive_k=5.0, adaptive_delta=1.0, chi2_pval=0.95,
                           verbose=True):
         """
         Re-run tests 1 and 2 on the FINAL a_arr, after the EM loop has ended.
@@ -2403,7 +2442,7 @@ class BP3MSolver:
 
     def _update_use_for_fit(self, r_hat, v_hat, C_r, C_vT, clip_sigma,
                             chi2_pval=0.95, iteration=0,
-                            adaptive_k=5.0, adaptive_delta=0.1,
+                            adaptive_k=5.0, adaptive_delta=1.0,
                             sigma_pm_diffuse=100.0, sigma_plx_diffuse=20.0,
                             ok_star_prev=None, inflate_errors=False,
                             inflate_from_iter=3, inflate_alpha_max=3.0,
@@ -2741,13 +2780,25 @@ class BP3MSolver:
             can_enter_fit = align_init | current_fit | phase6_out
             new_use = new_use & can_enter_fit
 
+            # Starving-chip demotion: while an image is demoted its ALIGNMENT
+            # mask stays empty (its r is frozen), but ASTROMETRY keeps
+            # following the admissions — that is the point of the demotion —
+            # and the would-be count feeds the promotion check.  Zeroing here
+            # (not post-hoc) keeps the churn counters honest: a demoted image
+            # contributes 0 test-3 changes instead of admit/zero flapping.
+            _admit = new_use
+            self._img_data[img]["n_fit_wouldbe"] = int(np.sum(_admit))
+            if img in getattr(self, "_align_demoted", set()):
+                new_use = np.zeros_like(new_use)
+
             n_use_changed += int(np.sum(current_fit != new_use))
 
-            # Astrometry mask: match use_for_fit for initially-aligned stars.
-            # HST-only stars (align_init=False) keep their use_for_astrom unchanged —
+            # Astrometry mask: match the ADMISSIONS for initially-aligned stars
+            # (not the post-demotion alignment mask).  HST-only stars
+            # (align_init=False) keep their use_for_astrom unchanged —
             # it is managed externally by V2AlignmentCallback.
             new_use_astrom = np.asarray(self._img_data[img]["use_for_astrom"], dtype=bool).copy()
-            new_use_astrom[align_init] = new_use[align_init]
+            new_use_astrom[align_init] = _admit[align_init]
             self._img_data[img]["use_for_astrom"] = new_use_astrom
 
             # Alpha from informative-prior stars only.  Diffuse-prior stars'

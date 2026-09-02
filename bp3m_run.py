@@ -297,6 +297,17 @@ def _parse_args():
                     help='Disable the alignment parameter prior (a,b,c,d,delta_ra0,delta_dec0). '
                          'Sets the prior precision to zero so posteriors are determined entirely '
                          'by the data. Useful for diagnosing prior-driven biases.')
+    bp.add_argument('--test_hysteresis_delta', type=float, default=1.0,
+                    help='Width of the reject/re-admit dead-band for tests '
+                         '1-3 (adaptive_k + delta for expulsion vs adaptive_k '
+                         'for admission). Was effectively 0.1; 1.0 gives a '
+                         '~20%% threshold gap that stops borderline '
+                         'detections from oscillating.')
+    bp.add_argument('--min_align_demote', type=int, default=5,
+                    help='Images whose alignment-star count falls below this '
+                         'are demoted to astrometry-only with their '
+                         'transformation frozen at the last converged value '
+                         '(re-promoted at count >= N+3). 0 disables.')
     bp.add_argument('--use_indv_outputs', action='store_true',
                     help='Warm-start the joint fit from BP3M_indv_results/: '
                          'per-image r_init from the indv posterior, indv-'
@@ -1293,6 +1304,7 @@ def main():
                         no_align_prior=args.no_align_prior,
                         pos_err_floor=args.bp3m_pos_err_floor,
                         extra_run_config=_indv_extra_cfg(_img),
+                        min_align_demote=0,   # never freeze a single-image fit
                         plot_residuals=args.plot_residuals,
                         plot_influence=args.plot_influence,
                         bp3m_dir=_indv_root / _img,
@@ -1359,6 +1371,8 @@ def main():
                 no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
                 use_indv_outputs=args.use_indv_outputs,
+                test_hysteresis_delta=args.test_hysteresis_delta,
+                min_align_demote=args.min_align_demote,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
@@ -1441,6 +1455,8 @@ def main():
                 no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
                 use_indv_outputs=args.use_indv_outputs,
+                test_hysteresis_delta=args.test_hysteresis_delta,
+                min_align_demote=args.min_align_demote,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 use_qso_anchors=not args.no_qso_anchors,
