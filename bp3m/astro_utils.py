@@ -658,7 +658,15 @@ def field_typical_astrometry(pmra, pmdec, plx=None,
     # (Filling 2p PM errors with 100 mas/yr makes every candidate within
     # ~2 px "consistent", so mismatches survive any centring fix.)
     dr = _np.hypot(pr - out["pmra"], pd_ - out["pmdec"])
-    out["pm_sig"] = float(max(1.4826 * _np.median(dr), 0.3))
+    # sigma-clipped local dispersion: the raw MAD is inflated by the broad
+    # field population; iterate so the width reflects the DOMINANT clump.
+    sig = 1.4826 * float(_np.median(dr))
+    for _ in range(3):
+        _in = dr < 3.0 * sig
+        if _in.sum() < max(10, min_n_mode // 3):
+            break
+        sig = max(1.4826 * float(_np.median(dr[_in])), 0.3)
+    out["pm_sig"] = float(max(sig, 0.3))
 
     if plx is not None:
         plx = _np.asarray(plx, float)
