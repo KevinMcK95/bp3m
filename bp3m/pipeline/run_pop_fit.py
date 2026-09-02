@@ -719,13 +719,14 @@ def _compute_alpha_updates(
     r_current: np.ndarray,
     a_arr: np.ndarray,
     alpha_damp: float = 0.5,
+    alpha_max: float = 3.0,
 ) -> list:
     """
     Compute and apply per-image alpha inflation from HST-only residual chi2.
 
     Mirrors the v1 bp3m logic with under-relaxation to prevent 2-cycle oscillation:
         alpha_raw  = sqrt( median(sigma_resid²) / (2 ln 2) )
-        alpha_new  = max(1.0, alpha_prev × alpha_raw^alpha_damp)
+        alpha_new  = min(max(1.0, alpha_prev × alpha_raw^alpha_damp), alpha_max)
 
     alpha_damp=1.0 is the full unrelaxed step; alpha_damp=0.5 (default) takes a
     geometric-mean step that damps the 2-cycle without slowing convergence near
@@ -757,7 +758,8 @@ def _compute_alpha_updates(
         else:
             alpha_raw = 1.0
 
-        alpha_new              = float(max(1.0, alpha_prev * alpha_raw ** alpha_damp))
+        alpha_new              = float(min(max(1.0, alpha_prev * alpha_raw ** alpha_damp),
+                                           alpha_max))
         d['alpha_applied']     = alpha_new
         d['C_hst']             = alpha_new ** 2 * d['C_hst_orig']
         info.append((img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new))

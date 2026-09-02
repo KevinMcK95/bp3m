@@ -1713,14 +1713,16 @@ class BP3MSolver:
             adjusted.  Pass 0 when starting from a pre-validated alpha (e.g. the
             v1 BP3M result) so alpha can decrease from the v1 starting value on
             the very first EM iteration.  The update formula is always
-            ``max(1.0, alpha_prev * alpha_raw)`` so alpha never drops below 1
-            relative to C_hst_orig, regardless of this setting.
+            ``min(max(1.0, alpha_prev * alpha_raw), inflate_alpha_max)`` so
+            alpha never drops below 1 relative to C_hst_orig and never exceeds
+            the cumulative cap, regardless of this setting.
         inflate_alpha_max : float, default 3.0
-            Maximum value of alpha_raw allowed in a single iteration.  Caps
-            explosive single-step alpha jumps that can occur when a poorly-
-            constrained image shifts abruptly and drives residuals of other
-            images to appear large.  Alpha can still grow to any value across
-            multiple iterations; this only limits per-step growth.
+            Cap on the CUMULATIVE inflation alpha_applied (and on alpha_raw in
+            a single step).  Without the cumulative cap the per-step products
+            compound without bound (observed 14.65 with a 3.0 cap).  Images at
+            the cap are reported as saturated -- alpha_raw still records the
+            per-step demanded factor -- and the test-3 gate carve-out treats
+            them as legitimately under-inflated.
         min_outer_iters : int or None, default None
             Minimum number of outer EM iterations before early stopping is
             allowed.  None → 4 if inflate_hst_errors else 2.  Set explicitly
@@ -2833,7 +2835,14 @@ class BP3MSolver:
                 # so a decrease from alpha=2.0 to 2.0*alpha_raw is fully supported
                 # as long as the result stays >= 1.0.
                 alpha_prev = self._img_data[img].get("alpha_applied", 1.0)
-                alpha_j    = float(max(1.0, alpha_prev * alpha_raw))
+                # Cap the CUMULATIVE inflation: alpha_raw is capped per step,
+                # but the product compounds across iterations (observed 14.65x
+                # against a 3.0 cap -- chi2 deflated ~215x, letting a
+                # misfitting image float in the fit while contributing almost
+                # nothing).  The saturation carve-out in the test-3 gate
+                # already assumes alpha_applied <= inflate_alpha_max.
+                alpha_j    = float(min(max(1.0, alpha_prev * alpha_raw),
+                                       inflate_alpha_max))
                 self._img_data[img]["alpha_applied"] = alpha_j
                 self._img_data[img]["C_hst"] = (
                     alpha_j**2 * self._img_data[img]["C_hst_orig"])

@@ -1411,7 +1411,11 @@ class AlignmentSolver:
             # Apply alpha inflation to C_src (mirrors bp3m inflate_hst_errors)
             if inflate_errors and iteration >= inflate_from_iter:
                 alpha_prev = self._img_data[img].get('alpha_applied', 1.0)
-                alpha_j    = float(max(1.0, alpha_prev * alpha_raw))
+                # Cumulative cap (mirrors bp3m solver.py): per-step alpha_raw
+                # is capped above, but the product compounds across iterations
+                # without this clamp.
+                alpha_j    = float(min(max(1.0, alpha_prev * alpha_raw),
+                                       inflate_alpha_max))
                 self._img_data[img]['alpha_applied'] = alpha_j
                 self._img_data[img]['C_src'] = (
                     alpha_j**2 * self._img_data[img]['C_src_orig'])
