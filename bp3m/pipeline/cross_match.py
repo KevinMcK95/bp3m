@@ -309,6 +309,12 @@ def run_cross_match(
         return []
 
     params_meta = {
+        # Matching-algorithm version: bump on any change to the matching
+        # LOGIC (not just parameters) so every cached result in the archive
+        # self-invalidates on the next touch.  v2 = field-typical 2p
+        # propagation (mode PM/plx fill) + dispersion-based 2p search window
+        # (2026-09-02); v1/absent = legacy 0-PM propagation.
+        'xmatch_algo_version':  2,
         'hst_pix_floor':        hst_pix_floor,
         'min_matches':          min_matches,
         'zero_pm':              zero_pm,
