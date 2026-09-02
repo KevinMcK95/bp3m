@@ -703,6 +703,81 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
         _pd.DataFrame(_rows).to_csv(output_dir / "epoch_distortion.csv", index=False)
         print(f"  Saved: epoch_distortion.csv  ({len(solver.ed_groups)} chip-groups, "
               f"order {solver._ed_order}), C_epoch_distortion.npy")
+        # Linear-deviation aggregation: per-group inverse-variance-weighted
+        # mean of each image's fitted-vs-header linear terms.  D itself starts
+        # at degree 2 (deg 0-1 are alignment-degenerate), so the group-level
+        # scale/rotation/skew deviation of the GDC lives in the per-image
+        # (a,b,c,d) posteriors; this re-attributes it to the group for the
+        # archive program.  Deviation matrix Delta = (F - P) P^{-1} with
+        # F = fitted [[a,b],[c,d]], P = header prior; components follow bp3m
+        # conventions (rot from b-c, on_skew (a-d)/2, off_skew (b+c)/2).
+        _lin_rows = []
+        _comp_names = ('scale', 'rot', 'on_skew', 'off_skew')
+        for _g, _grp in enumerate(solver.ed_groups):
+            _devs, _vars = [], []
+            for _im in _grp['images']:
+                _j = image_names.index(_im)
+                _cs = _j * solver.N_R
+                _F = r_hat[_cs:_cs + 4].reshape(2, 2)
+                _P = solver._img_data[_im]['r_prior'][:4].reshape(2, 2)
+                _Cj = C_r[_cs:_cs + 4, _cs:_cs + 4]
+                _detP = _P[0, 0] * _P[1, 1] - _P[0, 1] * _P[1, 0]
+                if abs(_detP) < 1e-12:
+                    continue
+                _Q = np.array([[_P[1, 1], -_P[0, 1]],
+                               [-_P[1, 0], _P[0, 0]]]) / _detP
+                _D = (_F - _P) @ _Q
+                _sig2 = np.diag(_Cj)                       # var(a,b,c,d)
+                _vD = np.empty((2, 2))                     # var of Delta elems
+                _vD[0, 0] = _sig2[0]*_Q[0, 0]**2 + _sig2[1]*_Q[1, 0]**2
+                _vD[0, 1] = _sig2[0]*_Q[0, 1]**2 + _sig2[1]*_Q[1, 1]**2
+                _vD[1, 0] = _sig2[2]*_Q[0, 0]**2 + _sig2[3]*_Q[1, 0]**2
+                _vD[1, 1] = _sig2[2]*_Q[0, 1]**2 + _sig2[3]*_Q[1, 1]**2
+                _devs.append([(_D[0, 0] + _D[1, 1]) / 2,   # scale (fractional)
+                              (_D[0, 1] - _D[1, 0]) / 2,   # rotation (rad)
+                              (_D[0, 0] - _D[1, 1]) / 2,   # on-axis skew
+                              (_D[0, 1] + _D[1, 0]) / 2])  # off-axis skew
+                _vars.append([(_vD[0, 0] + _vD[1, 1]) / 4,
+                              (_vD[0, 1] + _vD[1, 0]) / 4,
+                              (_vD[0, 0] + _vD[1, 1]) / 4,
+                              (_vD[0, 1] + _vD[1, 0]) / 4])
+            if not _devs:
+                continue
+            _devs = np.asarray(_devs); _vars = np.asarray(_vars)
+            _w = 1.0 / np.maximum(_vars, 1e-30)
+            _mean = (_w * _devs).sum(0) / _w.sum(0)
+            _msig = 1.0 / np.sqrt(_w.sum(0))
+            _scat = _devs.std(0, ddof=1) if len(_devs) > 1 else np.zeros(4)
+            _meta0 = solver.images[_grp['images'][0]]
+            _hx = 2048.0
+            _ps = float(_meta0.get('orig_pixel_scale', 50.0))
+            _row = dict(group=_g, instrument=_grp['instrument'],
+                        detector=_grp['detector'], chip=_grp['chip'],
+                        filter=_grp['filter'], epoch_id=_grp['epoch_id'],
+                        mean_mjd=_grp['mean_mjd'], n_images=len(_devs))
+            for _k, _nm in enumerate(_comp_names):
+                _row[f'{_nm}_dev'] = float(_mean[_k])
+                _row[f'{_nm}_sigma'] = float(_msig[_k])
+                _row[f'{_nm}_scatter'] = float(_scat[_k])
+                # displacement this deviation produces at the chip x-edge
+                _row[f'{_nm}_edge_mas'] = float(_mean[_k] * _hx * _ps)
+            _lin_rows.append(_row)
+        if _lin_rows:
+            _pd.DataFrame(_lin_rows).to_csv(
+                output_dir / "epoch_distortion_linear.csv", index=False)
+            print("  Saved: epoch_distortion_linear.csv  (per-group IVW "
+                  "linear deviations from header priors)")
+            for _row in _lin_rows:
+                _tag = (f"{_row['instrument']}/{_row['detector']}/"
+                        f"{_row['chip']}/{_row['filter']}/e{_row['epoch_id']}")
+                _parts = []
+                for _nm in _comp_names:
+                    _ns = (_row[f'{_nm}_dev'] / _row[f'{_nm}_sigma']
+                           if _row[f'{_nm}_sigma'] > 0 else np.nan)
+                    _parts.append(f"{_nm}={_row[f'{_nm}_edge_mas']:+.2f}mas"
+                                  f"({_ns:+.1f}s)")
+                print(f"    linear dev g{_row['group']} {_tag}: "
+                      + "  ".join(_parts))
     else:
         np.save(output_dir / "C_r.npy", C_r)
 
