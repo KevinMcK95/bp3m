@@ -501,17 +501,22 @@ def _joint_solve_pop(
     H_vv[member_sidx, 3, 3] += sigma_pm_inv_sq
     H_vv[member_sidx, 4, 4] += sigma_plx_inv_sq
 
-    # Information vectors: start from Gaia prior contribution
-    h_align = solver.C_survey_inv_dot_v.copy()
-    h_all   = solver.C_survey_inv_dot_v.copy()
+    # Information vector: start from Gaia prior contribution.
+    # CONSISTENCY (2026-09-02): a single h channel feeds BOTH the r- and
+    # mu-Schur corrections.  The old second channel (h_align: fit-only
+    # detections against the FULL-precision C_vT) produced hybrid posteriors
+    # a_align != a; feeding a_align to the r equation while the mu equation
+    # saw a broke the joint fixed point wherever astrometry-only detections
+    # exist — a slow mu_pop wander in v1 pop-fit, and a constant-rate runaway
+    # in pop-fit v2 (astrom-only stars dominate).  Astrom-only detections
+    # still never constrain r directly (K/XCsX are fit-masked); they only
+    # sharpen the star posteriors that the shared solve conditions on.
+    h_all = solver.C_survey_inv_dot_v.copy()
 
     # Population prior RHS for member stars
-    h_align[member_sidx, 2] += sigma_pm_inv_sq * mu_pop_current[0]
-    h_align[member_sidx, 3] += sigma_pm_inv_sq * mu_pop_current[1]
-    h_all  [member_sidx, 2] += sigma_pm_inv_sq * mu_pop_current[0]
-    h_all  [member_sidx, 3] += sigma_pm_inv_sq * mu_pop_current[1]
-    h_align[member_sidx, 4] += sigma_plx_inv_sq * plx_pop
-    h_all  [member_sidx, 4] += sigma_plx_inv_sq * plx_pop
+    h_all[member_sidx, 2] += sigma_pm_inv_sq * mu_pop_current[0]
+    h_all[member_sidx, 3] += sigma_pm_inv_sq * mu_pop_current[1]
+    h_all[member_sidx, 4] += sigma_plx_inv_sq * plx_pop
 
     # QSO anchor prior: per-source secular aberration PM + zero parallax.
     # sigma_qso_pm = 0.35 µas/yr = 3.5e-4 mas/yr (σ_κ, Klioner 2021)
@@ -523,10 +528,8 @@ def _joint_solve_pop(
         H_vv[qso_sidx, 2, 2] += _sigma_qso_pm_inv_sq
         H_vv[qso_sidx, 3, 3] += _sigma_qso_pm_inv_sq
         H_vv[qso_sidx, 4, 4] += _sigma_qso_plx_inv_sq
-        h_align[qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
-        h_align[qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
-        h_all  [qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
-        h_all  [qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
+        h_all[qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
+        h_all[qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
         # RHS for parallax prior: 0 (plx_pop_qso = 0, so += 0)
 
     # ── Per-image accumulation ─────────────────────────────────────────────────
@@ -573,8 +576,6 @@ def _joint_solve_pop(
 
         np.add.at(H_vv, sidx_any,
                   np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
-        np.subtract.at(h_align, sidx_fit,
-                       np.einsum('nik,nk->ni', JUT_Cs[use_fit], x_resid[use_fit]))
         np.subtract.at(h_all, sidx_any,
                        np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
 
@@ -596,8 +597,8 @@ def _joint_solve_pop(
     _safe_sidx = np.where(_invertible)[0]
     if len(_safe_sidx) > 0:
         C_vT[_safe_sidx] = np.linalg.inv(H_vv[_safe_sidx])
-    a_align = np.einsum('nij,nj->ni', C_vT, h_align)
-    a       = np.einsum('nij,nj->ni', C_vT, h_all)
+    a = np.einsum('nij,nj->ni', C_vT, h_all)
+    a_align = a   # single consistent posterior (see CONSISTENCY note above)
 
     # ── Shared system (μ or r+μ) ───────────────────────────────────────────────
     Lambda = np.zeros((n_shared, n_shared))
