@@ -602,3 +602,69 @@ def abcd_from_rotation_pixscale_skew(rotation_deg, pixel_scale_ratio, on_skew, o
     c = -s * sin_r + off_skew
     d = s * cos_r - on_skew
     return a, b, c, d
+
+
+def field_typical_astrometry(pmra, pmdec, plx=None,
+                             bin_masyr=0.1, smooth_bins=2.0, min_n_mode=30):
+    """Field-typical (pmra, pmdec, parallax) for propagating stars WITHOUT
+    their own astrometric solution (Gaia 2p, HST-only) during cross-matching.
+
+    In dense fields with large systemic PM, propagating 2p stars at 0 PM
+    matches them to whatever source sits nearest the un-propagated position
+    (Omega_Cen 2026-09-02: 23% of 2p "stars" at PM~0 vs 2% at the systemic
+    PM).  The fix is to centre the search at the PM of the DOMINANT field
+    population:
+
+      - n >= min_n_mode: smoothed 2D histogram mode of (pmra, pmdec) —
+        a median can land between cluster and field populations, the mode
+        locks onto the dominant one.  Parallax: 1D mode the same way.
+      - n <  min_n_mode: component-wise median (mode too noisy).
+      - n == 0: zeros (the legacy behaviour).
+
+    Returns dict(pmra, pmdec, plx, method, n).
+    """
+    import numpy as _np
+
+    pmra = _np.asarray(pmra, float)
+    pmdec = _np.asarray(pmdec, float)
+    fin = _np.isfinite(pmra) & _np.isfinite(pmdec)
+    n = int(fin.sum())
+    out = {"pmra": 0.0, "pmdec": 0.0, "plx": 0.0, "method": "none", "n": n}
+    if n == 0:
+        return out
+
+    pr, pd_ = pmra[fin], pmdec[fin]
+    if n < min_n_mode:
+        out.update(pmra=float(_np.median(pr)), pmdec=float(_np.median(pd_)),
+                   method="median")
+    else:
+        from scipy.ndimage import gaussian_filter
+        med = _np.array([_np.median(pr), _np.median(pd_)])
+        mad = _np.maximum(1.4826 * _np.array(
+            [_np.median(_np.abs(pr - med[0])),
+             _np.median(_np.abs(pd_ - med[1]))]), bin_masyr)
+        half = _np.clip(10.0 * mad, 2.0, 50.0)
+        bins = [_np.arange(med[k] - half[k], med[k] + half[k] + bin_masyr,
+                           bin_masyr) for k in (0, 1)]
+        H, ex, ey = _np.histogram2d(pr, pd_, bins=bins)
+        Hs = gaussian_filter(H, smooth_bins)
+        i, j = _np.unravel_index(_np.argmax(Hs), Hs.shape)
+        out.update(pmra=float(0.5 * (ex[i] + ex[i + 1])),
+                   pmdec=float(0.5 * (ey[j] + ey[j + 1])),
+                   method="mode")
+
+    if plx is not None:
+        plx = _np.asarray(plx, float)
+        pfin = _np.isfinite(plx)
+        if pfin.sum() >= min_n_mode and out["method"] == "mode":
+            from scipy.ndimage import gaussian_filter1d
+            pv = plx[pfin]
+            medp = float(_np.median(pv))
+            madp = max(1.4826 * float(_np.median(_np.abs(pv - medp))), 0.02)
+            b = _np.arange(medp - 10 * madp, medp + 10 * madp + 0.02, 0.02)
+            h, e = _np.histogram(pv, bins=b)
+            hs = gaussian_filter1d(h.astype(float), smooth_bins)
+            out["plx"] = float(0.5 * (e[_np.argmax(hs)] + e[_np.argmax(hs) + 1]))
+        elif pfin.any():
+            out["plx"] = float(_np.median(plx[pfin]))
+    return out

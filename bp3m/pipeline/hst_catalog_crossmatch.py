@@ -1177,6 +1177,7 @@ def _phase2_gaia_catalog_anchor(
     n_candidates: int = 5,
     mag_n_sigma: float = 3.0,
     mag_floor: float = 0.15,
+    fill_pm_plx: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Phase 2: Search for Gaia catalog stars NOT covered by Phase 1 (V1 BP3M
@@ -1225,10 +1226,15 @@ def _phase2_gaia_catalog_anchor(
     tgt_dec  = targets['dec'].to_numpy(dtype=float)
     _pmra    = targets['pmra'].to_numpy(dtype=float)  if 'pmra'  in targets.columns else np.zeros(len(targets))
     _pmdec   = targets['pmdec'].to_numpy(dtype=float) if 'pmdec' in targets.columns else np.zeros(len(targets))
-    tgt_pmra  = np.where(np.isfinite(_pmra),  _pmra,  0.0)
-    tgt_pmdec = np.where(np.isfinite(_pmdec), _pmdec, 0.0)
+    # 2p stars are propagated at the FIELD-TYPICAL astrometry (from the
+    # anchor run's fitted PMs), not at 0: in dense high-PM fields the 0-PM
+    # prediction matches the wrong source (the one nearest the un-propagated
+    # position).  fill_pm_plx=None keeps the legacy 0 fill.
+    _f = fill_pm_plx or {"pmra": 0.0, "pmdec": 0.0, "plx": 0.0}
+    tgt_pmra  = np.where(np.isfinite(_pmra),  _pmra,  _f["pmra"])
+    tgt_pmdec = np.where(np.isfinite(_pmdec), _pmdec, _f["pmdec"])
     _plx      = targets['parallax'].to_numpy(dtype=float) if 'parallax' in targets.columns else np.zeros(len(targets))
-    tgt_plx   = np.where(np.isfinite(_plx), _plx, 0.0)
+    tgt_plx   = np.where(np.isfinite(_plx), _plx, _f["plx"])
     tgt_gmag  = targets['gmag'].to_numpy(dtype=float) if 'gmag' in targets.columns else np.full(len(targets), np.nan)
     tgt_cos   = np.cos(np.radians(tgt_dec))
     valid_pos = np.isfinite(tgt_ra) & np.isfinite(tgt_dec)
@@ -4137,10 +4143,25 @@ def run_hst_crossmatch(
     # For Gaia catalog stars NOT covered by Phase 1, search using Gaia catalog
     # PM.  Includes new Gaia sources and 2p stars not measured in V1 BP3M.
     print("\nPhase 2: Gaia catalog anchoring (non-V1 stars) ...")
+    from bp3m.astro_utils import field_typical_astrometry
+    _fill2 = None
+    if _v1_astrom_path.exists():
+        _va = pd.read_csv(_v1_astrom_path,
+                          usecols=['pmra_bp3m', 'pmdec_bp3m', 'parallax_bp3m',
+                                   'n_hst_used', 'prior_fallback'])
+        _ok = (_va['n_hst_used'] > 0) & ~_va['prior_fallback'].astype(bool)
+        _fill2 = field_typical_astrometry(
+            _va.loc[_ok, 'pmra_bp3m'], _va.loc[_ok, 'pmdec_bp3m'],
+            plx=_va.loc[_ok, 'parallax_bp3m'])
+        print(f"  2p propagation fill from anchor-run astrometry "
+              f"({_fill2['method']}, n={_fill2['n']}): "
+              f"pm=({_fill2['pmra']:+.2f},{_fill2['pmdec']:+.2f}) mas/yr  "
+              f"plx={_fill2['plx']:+.3f} mas")
     det_df = _phase2_gaia_catalog_anchor(
         det_df, gaia_csv=gaia_csv,
         anchor_gaia_ids=_v1_anchor_ids,
-        search_radius_px=50.0, n_candidates=5)
+        search_radius_px=50.0, n_candidates=5,
+        fill_pm_plx=_fill2)
 
     # ── Post-Phase-2: per-image Gaia match residual summary ──────────────────
     _print_all_gaia_residuals(det_df, gaia_csv=gaia_csv,

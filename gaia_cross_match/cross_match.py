@@ -196,7 +196,7 @@ def construct_gaia_cov(df, zero_pm=False):
 
     return covs
 
-def propagate_gaia_with_cov(df, target_mjd, zero_pm=False):
+def propagate_gaia_with_cov(df, target_mjd, zero_pm=False, fill_pm_plx=None):
     ref_epoch = df['ref_epoch'].iloc[0] if 'ref_epoch' in df.columns else 2016.0
     t_hst = Time(target_mjd, format='mjd')
     dt = (t_hst.jyear - ref_epoch)
@@ -207,8 +207,14 @@ def propagate_gaia_with_cov(df, target_mjd, zero_pm=False):
         plx = np.zeros(n)
         pmra, pmdec = np.zeros(n), np.zeros(n)
     else:
-        plx = df['parallax'].fillna(0.0).values
-        pmra, pmdec = df['pmra'].fillna(0.0).values, df['pmdec'].fillna(0.0).values
+        # Stars without their own solution (2p) are propagated at the
+        # field-typical astrometry when provided — NOT at 0 PM, which in
+        # dense high-PM fields matches them to the wrong source (the one
+        # nearest the un-propagated position).
+        _f = fill_pm_plx or {"pmra": 0.0, "pmdec": 0.0, "plx": 0.0}
+        plx = df['parallax'].fillna(_f["plx"]).values
+        pmra  = df['pmra'].fillna(_f["pmra"]).values
+        pmdec = df['pmdec'].fillna(_f["pmdec"]).values
 
     # Canonical propagation + parallax factors from bp3m.astro_utils — do NOT
     # re-derive this physics inline (see propagate_gaia_positions docstring).
@@ -764,7 +770,17 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         params['min_matches'] = min_matches
 
         # --- Propagate Gaia to HST epoch and project to pixel frame ---
-        ra_prop, dec_prop, Ct = propagate_gaia_with_cov(gaia_df, params['obs_epoch_mjd'], zero_pm=zero_pm)
+        from bp3m.astro_utils import field_typical_astrometry
+        _fill = field_typical_astrometry(
+            gaia_df['pmra'].values, gaia_df['pmdec'].values,
+            plx=gaia_df['parallax'].values if 'parallax' in gaia_df else None)
+        if _fill["method"] != "none":
+            print(f"  2p propagation fill ({_fill['method']}, n={_fill['n']}): "
+                  f"pm=({_fill['pmra']:+.2f},{_fill['pmdec']:+.2f}) mas/yr  "
+                  f"plx={_fill['plx']:+.3f} mas")
+        ra_prop, dec_prop, Ct = propagate_gaia_with_cov(
+            gaia_df, params['obs_epoch_mjd'], zero_pm=zero_pm,
+            fill_pm_plx=_fill)
         dx_deg_full = rd2x(ra_prop, dec_prop, params['ra_cen'], params['dec_cen'])
         dy_deg_full = rd2y(ra_prop, dec_prop, params['ra_cen'], params['dec_cen'])
         scale_deg = params['pixel_scale'] / 3600.0
