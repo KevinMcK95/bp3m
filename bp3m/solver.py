@@ -2778,8 +2778,8 @@ class BP3MSolver:
             # the cross-match validator) may NOT re-enter alignment: in crowded
             # fields these pairs are blends, and re-admitting them to the fit
             # widened ngc_7099 member pmdec sigma_MAD 0.165 -> 0.30 (bright) /
-            # 0.61 (faint).  They remain candidates for the ASTROMETRY tier
-            # below -- their epochs still constrain their own star's PM.
+            # 0.61 (faint).  They do not re-enter astrometry either -- see the
+            # note at the use_for_astrom update below.
             phase6_out    = np.asarray(self._img_data[img].get("phase6_outlier",
                                        np.zeros(len(current_fit), bool)), dtype=bool)
             can_enter_fit = align_init | current_fit
@@ -2804,23 +2804,15 @@ class BP3MSolver:
             # it is managed externally by V2AlignmentCallback.
             new_use_astrom = np.asarray(self._img_data[img]["use_for_astrom"], dtype=bool).copy()
             new_use_astrom[align_init] = _admit[align_init]
-            # Phase-6 (trust-flagged) pairs: astrometry-tier-only re-admission.
-            # Same residual test, hysteresis, and hard ceilings as alignment
-            # admissions -- they just never touch the transformation.  Their
-            # pre-update use_for_astrom (still intact at phase6 positions of
-            # the copy) provides the hysteresis reference.
-            if phase6_out.any():
-                _p6_ok = ok_glob_here & np.asarray(
-                    self._img_data[img]["use_for_fit_max"], dtype=bool)
-                if infl_excl is not None:
-                    _p6_ok = _p6_ok & ~infl_excl
-                if adaptive_delta > 0:
-                    _p6_resid = np.where(new_use_astrom,
-                                         sig_sq_eff < thresh_expel,
-                                         ok_resid_admit)
-                else:
-                    _p6_resid = ok_resid_admit
-                new_use_astrom[phase6_out] = (_p6_ok & _p6_resid)[phase6_out]
+            # NOTE (2026-09-02): an astrometry-tier-only re-admission of
+            # Phase-6 pairs was tried here and REVERTED the same day.  In the
+            # joint solve, astrometry detections feed the star's PM, so blend
+            # epochs polluted stellar astrometry, inflated those stars'
+            # residuals in good images, and triggered a test-3/test-4
+            # expulsion cascade (ngc_7099: alignment tier 23k -> 10k dets,
+            # test-4 avalanches vs 0 without it; reproduced in Draco).  If
+            # Phase-6 epochs are ever reclaimed, it must happen POST-SOLVE
+            # (frozen r, per-star refit) so nothing feeds back into the fit.
             self._img_data[img]["use_for_astrom"] = new_use_astrom
 
             # Alpha from informative-prior stars only.  Diffuse-prior stars'

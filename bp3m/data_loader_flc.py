@@ -830,11 +830,12 @@ def load_image_data_flc(data_root, field_name: str,
             # Snapshot BEFORE the trust filter.  The solver reads this as the
             # Phase-6 flag: a pair with use_for_align_init_flag=True but
             # use_for_alignment=False is a real match flagged inactive by the
-            # cross-match, eligible for ASTROMETRY-TIER re-admission by the
-            # Phase-2 EM residual tests (never alignment: in crowded fields
-            # these pairs are blends and re-admitting them to the fit widened
-            # ngc_7099 member PMs) while staying out of the adaptive-threshold
-            # reference (use_for_align_init stays False).
+            # cross-match.  Phase-6 pairs are currently excluded from BOTH
+            # tiers (alignment re-admission widened ngc_7099 member PMs;
+            # astrometry-tier re-admission fed blend epochs back into stellar
+            # PMs and cascaded into test-3/4 expulsions -- tried and reverted
+            # 2026-09-02).  The flag is kept for diagnostics and for a future
+            # post-solve per-star refit.
             # Without this column the module docstring's promise that "excluded
             # pairs remain candidates for re-admission" was false in the v1
             # pipeline -- only the v2 master loader ever set it, so trust-
