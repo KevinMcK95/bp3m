@@ -172,8 +172,21 @@ def construct_gaia_cov(df, zero_pm=False, fill_pm_plx=None):
         # multi-sigma outlier and the star is left unmatched rather than
         # poisoned.
         if fill_pm_plx is not None and "pm_sig" in fill_pm_plx:
-            _pm_fill = 2.0 * fill_pm_plx["pm_sig"]
-            _plx_fill = max(2.0 * fill_pm_plx.get("plx_sig", 10.0), 0.1)
+            # Width = 2x the field dispersion, combined in quadrature with
+            # 0.4x the mode amplitude: guarantees a genuine ZERO-PM star is
+            # never more than ~2.5 sigma from the mode-propagated prediction,
+            # even in kinematically cold high-PM fields where the clipped
+            # dispersion alone would hard-reject real non-members.  The
+            # one-to-one cost competition + magnitude term (which did the
+            # actual phantom rejection in Omega Cen) arbitrate within the
+            # window.
+            _mode_amp = float(np.hypot(fill_pm_plx.get("pmra", 0.0),
+                                       fill_pm_plx.get("pmdec", 0.0)))
+            _pm_fill = float(np.hypot(2.0 * fill_pm_plx["pm_sig"],
+                                      0.4 * _mode_amp))
+            _plx_fill = max(float(np.hypot(2.0 * fill_pm_plx.get("plx_sig", 10.0),
+                                           0.4 * abs(fill_pm_plx.get("plx", 0.0)))),
+                            0.1)
         else:
             _pm_fill, _plx_fill = 100.0, 20.0
         errors[:, 2] = df['parallax_error'].fillna(_plx_fill).values
