@@ -1864,6 +1864,7 @@ def run_pop_fit(
     hst_min_detect: int = 3,
     hst_max_per_image: int = 1000,
     det_chi2_threshold_v2: float | None = None,
+    members_hst_only: bool = False,
 ) -> Path:
     """
     Run population PM fitting.
@@ -2308,10 +2309,27 @@ def run_pop_fit(
         print(f"  Freeze: membership restricted to the {len(_seed_frozen_sidx)} "
               f"seed stars (phases can remove, never add)")
 
+    # --members_hst_only (TEST): forbid Gaia-matched stars from membership so
+    # only HST-only stars inform mu_pop (they still contribute to their own
+    # astrometry; alignment stars are unaffected).
+    _gaia_pos_sidx = None
+    if members_hst_only:
+        _gaia_pos_sidx = np.where(
+            gaia_catalog['Gaia_id'].to_numpy(np.int64) > 0)[0]
+        print(f"  members_hst_only: {len(_gaia_pos_sidx)} Gaia-matched stars "
+              f"barred from membership")
+
     def _freeze_members(_sidx):
-        if _seed_frozen_sidx is None:
-            return _sidx
-        return np.intersect1d(np.asarray(_sidx, int), _seed_frozen_sidx)
+        _sidx = np.asarray(_sidx, int)
+        if _seed_frozen_sidx is not None:
+            _sidx = np.intersect1d(_sidx, _seed_frozen_sidx)
+        if _gaia_pos_sidx is not None:
+            _sidx = np.setdiff1d(_sidx, _gaia_pos_sidx)
+        return _sidx
+
+    member_sidx = _freeze_members(member_sidx)
+    if members_hst_only:
+        print(f"  Initial members after Gaia bar: {len(member_sidx)}")
 
     # ── μ_pop prior: weighted mean of initial members ─────────────────────────
     _extra = sigma_pm ** 2 + pm_sys_floor ** 2
@@ -3415,6 +3433,9 @@ def main(argv=None):
                         help='master_v2: per-image cap on HST-only sources, '
                              'ranked by PM precision (default 1000; raise to '
                              'use more faint stars)')
+    parser.add_argument('--members_hst_only', action='store_true',
+                        help='TEST: bar Gaia-matched stars from membership; '
+                             'only HST-only stars inform mu_pop')
     parser.add_argument('--det_chi2_threshold_v2', type=float, default=None,
                         help='master_v2: drop individual detections with '
                              'Phase-4 chi2 above this (e.g. 9.0)')
@@ -3535,6 +3556,7 @@ def main(argv=None):
         hst_min_detect=args.hst_min_detect,
         hst_max_per_image=args.hst_max_per_image,
         det_chi2_threshold_v2=args.det_chi2_threshold_v2,
+        members_hst_only=args.members_hst_only,
     )
 
     # Save the command only on successful completion so interrupted runs
