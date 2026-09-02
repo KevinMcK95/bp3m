@@ -128,11 +128,23 @@ def _has_mag_calibration(catalog_path: Path) -> bool:
 # returns those arenas, so RSS grows monotonically through the image list
 # (looks exactly like a leak at --n_processes 32 on a big field).
 _WORKER_GAIA_DF = None
+_WORKER_GAIA_PATH = None
 
 
-def _pool_init(gaia_df):
+def _pool_init(gaia_path):
+    # Workers receive a PATH, not the DataFrame: shipping the ~10^5-row
+    # catalogue through the pool pipes deadlocked at worker-respawn waves
+    # (n_workers x max_tasks_per_child tasks — e.g. exactly 400 images at
+    # 16 workers).  Each worker loads the file once, lazily.
+    global _WORKER_GAIA_PATH
+    _WORKER_GAIA_PATH = gaia_path
+
+
+def _get_worker_gaia():
     global _WORKER_GAIA_DF
-    _WORKER_GAIA_DF = gaia_df
+    if _WORKER_GAIA_DF is None:
+        _WORKER_GAIA_DF = pd.read_pickle(_WORKER_GAIA_PATH)
+    return _WORKER_GAIA_DF
 
 
 def _match_one(args):
@@ -141,7 +153,7 @@ def _match_one(args):
         hst_dict, gaia_df, kwargs = args
     else:
         hst_dict, kwargs = args
-        gaia_df = _WORKER_GAIA_DF
+        gaia_df = _get_worker_gaia()
     from gaia_cross_match.cross_match import process_single_image
 
     root        = Path(hst_dict['root'])
@@ -412,22 +424,31 @@ def run_cross_match(
     results = []
     if n_processes > 1 and len(work) > 1:
         import multiprocessing as _mp
-        with ProcessPoolExecutor(
-                max_workers=n_processes,
-                mp_context=_mp.get_context("forkserver"),
-                initializer=_pool_init, initargs=(gaia_df,),
-                max_tasks_per_child=25) as ex:
-            futures = {ex.submit(_match_one, (w[0], w[2])): w for w in work}
-            for fut in as_completed(futures):
-                name, n, err = fut.result()
-                if err:
-                    print(f"  ERROR {name}: {err}")
-                else:
-                    print(f"  {name}: {n} matches")
-                    results.append(Path(next(
-                        f['root'] for f in folders
-                        if Path(f['root']).name == name
-                    )) / "matched_gaia.csv")
+        _gaia_cache = (Path(output_dir) / field_name / "Gaia"
+                       / ".xmatch_gaia_worker_cache.pkl")
+        gaia_df.to_pickle(_gaia_cache)
+        try:
+            with ProcessPoolExecutor(
+                    max_workers=n_processes,
+                    mp_context=_mp.get_context("forkserver"),
+                    initializer=_pool_init, initargs=(str(_gaia_cache),),
+                    max_tasks_per_child=25) as ex:
+                futures = {ex.submit(_match_one, (w[0], w[2])): w for w in work}
+                for fut in as_completed(futures):
+                    name, n, err = fut.result()
+                    if err:
+                        print(f"  ERROR {name}: {err}")
+                    else:
+                        print(f"  {name}: {n} matches")
+                        results.append(Path(next(
+                            f['root'] for f in folders
+                            if Path(f['root']).name == name
+                        )) / "matched_gaia.csv")
+        finally:
+            try:
+                _gaia_cache.unlink()
+            except OSError:
+                pass
     else:
         for w in tqdm(work, desc="  Cross-matching", unit="img",
                       dynamic_ncols=True):
