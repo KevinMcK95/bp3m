@@ -41,10 +41,13 @@ from astropy.io import fits
 from bp3m.instrument_config import get_instrument_config
 
 # Minimum position uncertainty floor applied to PSF-fit centroids before they
-# reach BP3M.  Prevents astronomically large sigma_resid values for very bright
-# stars whose pure-photon-noise PSF uncertainty is negligibly small compared to
-# true astrometric error sources.  Overridable via --bp3m_pos_err_floor.
-_MIN_POS_ERR_PX: float = 5e-3
+# reach BP3M.  Added IN QUADRATURE (2026-09-02, was a max() clamp): models an
+# independent per-detection positional systematic (residual distortion, CTE,
+# cross-filter centroid shifts — measured at the multi-mas level) while
+# preserving the relative weighting of detections.  Overridable via
+# --bp3m_pos_err_floor; 0.01 px ≈ 0.5 mas (ACS), may grow as the systematics
+# budget firms up.
+_MIN_POS_ERR_PX: float = 0.01
 
 # Maximum fraction of the PSF fitting window that may be saturated for a source
 # to be eligible as an initial alignment star.  Half-width is read from
@@ -314,9 +317,9 @@ def _build_stars_df(img_dir: Path, img_name: str,
     sig_x = np.sqrt(np.maximum(cov_xx, 0.0))
     sig_y = np.sqrt(np.maximum(cov_yy, 0.0))
 
-    # Apply minimum position uncertainty floor
-    sig_x = np.maximum(sig_x, pos_err_floor)
-    sig_y = np.maximum(sig_y, pos_err_floor)
+    # Positional systematics floor, in quadrature (preserves relative weights)
+    sig_x = np.sqrt(sig_x**2 + pos_err_floor**2)
+    sig_y = np.sqrt(sig_y**2 + pos_err_floor**2)
 
     denom = sig_x * sig_y
     corr  = np.where(denom > 0, cov_xy / denom, 0.0)
@@ -402,8 +405,8 @@ def _build_delve_only_stars_df(
         hst_idx       = hst_idx[valid]
         gaia_ids      = gaia_ids[valid]
 
-    sig_x = np.maximum(np.sqrt(np.maximum(cat_cov_xx[hst_idx], 0.0)), pos_err_floor)
-    sig_y = np.maximum(np.sqrt(np.maximum(cat_cov_yy[hst_idx], 0.0)), pos_err_floor)
+    sig_x = np.sqrt(np.maximum(cat_cov_xx[hst_idx], 0.0) + pos_err_floor**2)
+    sig_y = np.sqrt(np.maximum(cat_cov_yy[hst_idx], 0.0) + pos_err_floor**2)
     denom = sig_x * sig_y
     corr  = np.where(denom > 0, cat_cov_xy[hst_idx] / denom, 0.0)
     corr  = np.clip(corr, -0.9999, 0.9999)

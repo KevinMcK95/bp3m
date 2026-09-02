@@ -69,7 +69,7 @@ def _ensure_bp3m():
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _MAX_SAT_FRAC      = 0.25   # matches data_loader_flc._MAX_SAT_FRAC
-_MIN_POS_ERR_PX    = 5e-3   # minimum position error floor in pixels
+_MIN_POS_ERR_PX    = 0.01   # positional systematics floor (px), added in quadrature
 
 # HST-only eligibility defaults
 _HST_MAX_PM_UNC    = 5.0    # mas/yr — global quality cut
@@ -687,8 +687,8 @@ def load_master_v2(
             cxx = fits_data["cov_xx"][ci]
             cyy = fits_data["cov_yy"][ci]
             cxy = fits_data["cov_xy"][ci]
-            sx = max(np.sqrt(max(cxx, 0.0)), pos_err_floor)
-            sy = max(np.sqrt(max(cyy, 0.0)), pos_err_floor)
+            sx = np.sqrt(max(cxx, 0.0) + pos_err_floor**2)
+            sy = np.sqrt(max(cyy, 0.0) + pos_err_floor**2)
             denom = sx * sy
             rho = float(np.clip(cxy / denom if denom > 0 else 0.0, -0.9999, 0.9999))
 

@@ -297,8 +297,9 @@ def _parse_args():
                     help='Disable the alignment parameter prior (a,b,c,d,delta_ra0,delta_dec0). '
                          'Sets the prior precision to zero so posteriors are determined entirely '
                          'by the data. Useful for diagnosing prior-driven biases.')
-    bp.add_argument('--bp3m_pos_err_floor', type=float, default=5e-3,
-                    help='Minimum HST position uncertainty floor in pixels before BP3M '
+    bp.add_argument('--bp3m_pos_err_floor', type=float, default=0.01,
+                    help='Per-detection positional systematics floor in pixels, added '
+                         'IN QUADRATURE to the HST uncertainties before BP3M '
                          '(default 0.001 px; prevents numerically unstable residuals for '
                          'very bright stars with sub-pixel PSF uncertainties)')
     bp.add_argument('--no_influence_clip', action='store_true',
