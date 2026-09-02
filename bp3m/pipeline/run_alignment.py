@@ -402,6 +402,7 @@ def run_alignment(  # noqa: C901
         run_config={
             **(extra_run_config or {}),
             'use_indv_outputs': use_indv_outputs,
+            'pos_err_floor': pos_err_floor,
             'test_hysteresis_delta': test_hysteresis_delta,
             'min_align_demote': min_align_demote,
             'indv_init_stats': _indv_init_stats,
