@@ -399,6 +399,7 @@ def load_master_v2(
 
         source_records.append({
             "has_gaia":       has_gaia,
+            "source_index":   int(row_i),   # row of master_combined_v2.csv
             "gaia_id":        gaia_id,
             "ra":             float(row["ra_xmatch"]),
             "dec":            float(row["dec_xmatch"]),
@@ -497,14 +498,15 @@ def load_master_v2(
 
     valid_recs.sort(key=_quality_key)
 
-    # Assign Gaia_ids in sorted order (used for dedup tracking)
-    next_hst_id = np.int64(-1)
+    # Assign Gaia_ids (used for dedup tracking).  HST-only sources get a
+    # DETERMINISTIC synthetic id -(source_index + 1): stable across quality-
+    # gate settings and across tools, so member seeds and v2 use_for_fit
+    # flags keyed on the master row always map to the same star.
     for rec in valid_recs:
         if rec["has_gaia"]:
             rec["Gaia_id"] = np.int64(rec["gaia_id"])
         else:
-            rec["Gaia_id"] = next_hst_id
-            next_hst_id -= 1
+            rec["Gaia_id"] = np.int64(-(rec["source_index"] + 1))
 
     detection_owner: dict[tuple[str, int], np.int64] = {}
     dedup_recs: list[dict] = []
@@ -807,6 +809,11 @@ def load_master_v2(
         .copy()
         .reset_index(drop=True)
     )
+    _gid_to_srcidx = {int(r["Gaia_id"]): int(r["source_index"])
+                      for r in valid_recs if r["has_gaia"]}
+    gaia_real_subset["source_index"] = np.array(
+        [_gid_to_srcidx.get(int(g), -1) for g in gaia_real_subset["Gaia_id"]],
+        dtype=np.int64)
 
     # Collect surviving HST-only records (Gaia_id < 0 and present in some image)
     hst_only_survivors = [
@@ -820,6 +827,8 @@ def load_master_v2(
     if n_hst_final > 0:
         hst_rows = pd.DataFrame({
             "Gaia_id":      [r["Gaia_id"] for r in hst_only_survivors],
+            "source_index": np.array([r["source_index"]
+                                      for r in hst_only_survivors], np.int64),
             "ra":           [r["ra"]      for r in hst_only_survivors],
             "dec":          [r["dec"]     for r in hst_only_survivors],
             "Gaia_time":    [2016.0] * n_hst_final,

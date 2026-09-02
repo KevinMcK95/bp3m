@@ -385,7 +385,9 @@ def _apply_bp3m_flags(
                 continue
             _sidx = _si[_img]
             _gids = _bp3m_gids[_sidx[_mask]]
-            out[_img] = frozenset(int(g) for g in _gids if g > 0)
+            # g != 0 (not g > 0): master_v2 mode has synthetic NEGATIVE ids
+            # for HST-only stars whose flags must survive this mapping.
+            out[_img] = frozenset(int(g) for g in _gids if g != 0)
         return out
 
     fit_per_img   = _gid_set_from_npz(_uff)
@@ -1857,6 +1859,11 @@ def run_pop_fit(
     lib_dir: "Path | None" = None,
     use_qso_anchors: bool = True,
     qso_anchors_csv: "Path | str | list | None" = None,
+    data_source: str = 'v1',
+    hst_max_pm_unc: float = 5.0,
+    hst_min_detect: int = 3,
+    hst_max_per_image: int = 1000,
+    det_chi2_threshold_v2: float | None = None,
 ) -> Path:
     """
     Run population PM fitting.
@@ -1871,15 +1878,23 @@ def run_pop_fit(
 
     t_start   = time.time()
     data_root  = Path(output_dir)
-    bp3m_dir   = data_root / field_name / 'BP3M_results'
-    output_pfr = data_root / field_name / 'BP3M_pop_fit_results'
+    if data_source == 'master_v2':
+        # Joint pop-fit over the v2 master catalog (incl. HST-only stars):
+        # warm start, alpha, and use flags come from BP3M_v2_results, which
+        # shares the v1 output file contract.
+        bp3m_dir   = data_root / field_name / 'BP3M_v2_results'
+        output_pfr = data_root / field_name / 'BP3M_pop_fit_v2_results'
+    else:
+        bp3m_dir   = data_root / field_name / 'BP3M_results'
+        output_pfr = data_root / field_name / 'BP3M_pop_fit_results'
     output_pfr.mkdir(parents=True, exist_ok=True)
 
     # ── Read v1 run_config ─────────────────────────────────────────────────────
     _cfg_path = bp3m_dir / 'run_config.json'
     if not _cfg_path.exists():
         raise FileNotFoundError(
-            f"BP3M_results/run_config.json not found at {_cfg_path}. Run bp3m first."
+            f"run_config.json not found at {_cfg_path}. Run bp3m"
+            + ("-v2" if data_source == 'master_v2' else "") + " first."
         )
     with open(_cfg_path) as _f:
         v1_cfg = json.load(_f)
@@ -1916,75 +1931,105 @@ def run_pop_fit(
     print(f"  poly_order={poly_order}  split_ccd={v1_split_ccd}  "
           f"v1 images={len(v1_image_names)}")
 
-    # ── Load data — mirrors run_alignment.py exactly ───────────────────────────
-    print(f"\n  Loading bp3m input data for '{field_name}'...")
-    imgs, stars_per_image, gaia_catalog = load_image_data_flc(data_root, field_name)
-    if imgs is None or len(imgs) == 0:
-        raise RuntimeError(f"No usable images found for '{field_name}'.")
-
-    star_id_to_idx, image_names, star_in_image = build_index_maps(
-        stars_per_image, gaia_catalog)
-
-    # Filter to the base names that v1 used (strip _hi/_lo before split)
-    if v1_image_names:
-        v1_bases = set()
-        for n in v1_image_names:
-            base = n[:-3] if n.endswith(('_hi', '_lo')) else n
-            v1_bases.add(base)
-        image_names = [n for n in image_names if n in v1_bases]
-    if not image_names:
-        raise RuntimeError(
-            "No images remain after filtering to v1 image set."
-        )
-
-    filtered_spi = {n: stars_per_image[n] for n in image_names}
-
-    # Filter gaia_catalog to observed stars (same as run_alignment.py)
-    observed_ids: set = set()
-    for spi in filtered_spi.values():
-        observed_ids.update(spi['Gaia_id'].values)
-    gaia_catalog = (gaia_catalog[gaia_catalog['Gaia_id'].isin(observed_ids)]
-                    .reset_index(drop=True))
-    star_id_to_idx = {int(gid): i for i, gid in enumerate(gaia_catalog['Gaia_id'])}
-
-    imgs = {n: imgs[n] for n in image_names}
-
-    # Split ACS chips (same as run_alignment.py)
-    if v1_split_ccd:
-        imgs, filtered_spi = split_images_by_ccd(
-            imgs, filtered_spi, min_stars_per_ccd=min_stars_split_ccd)
-        image_names = sorted(filtered_spi.keys())
+    if data_source == 'master_v2':
+        # ── Load data from the v2 master catalog (incl. HST-only stars) ──────
+        # load_master_v2 handles chip splitting and the epoch-distortion
+        # detector correction internally, and synthesizes diffuse-prior
+        # catalog rows (negative Gaia_id) for HST-only sources.
+        from bp3m.pipeline.data_loader_master import load_master_v2
+        print(f"\n  Loading v2 master-catalog data for '{field_name}'...")
+        imgs, filtered_spi, gaia_catalog, _hst_only_mask = load_master_v2(
+            data_root, field_name,
+            hst_max_pm_unc=hst_max_pm_unc,
+            hst_min_detect=hst_min_detect,
+            hst_max_per_image=hst_max_per_image,
+            det_chi2_threshold=det_chi2_threshold_v2)
+        if imgs is None or len(imgs) == 0:
+            raise RuntimeError(f"No usable v2 images found for '{field_name}'.")
+        # Keep only images the v2 fit actually solved (r_hat must exist).
+        _xdf_names = set(pd.read_csv(
+            bp3m_dir / 'image_transformations.csv')['image_name'].astype(str))
+        _extra_imgs = sorted(n for n in filtered_spi if n not in _xdf_names)
+        if _extra_imgs:
+            print(f"  WARNING: {len(_extra_imgs)} loader images have no v2 "
+                  f"transformation — dropped: {_extra_imgs[:4]} ...")
+            filtered_spi = {n: d for n, d in filtered_spi.items()
+                            if n in _xdf_names}
+            imgs = {n: imgs[n] for n in filtered_spi}
         star_id_to_idx, image_names, star_in_image = build_index_maps(
             filtered_spi, gaia_catalog)
+        print(f"  master_v2 star set: "
+              f"{int((gaia_catalog['Gaia_id'] > 0).sum())} Gaia + "
+              f"{int((gaia_catalog['Gaia_id'] < 0).sum())} HST-only")
+    else:
+        # ── Load data — mirrors run_alignment.py exactly ───────────────────────────
+        print(f"\n  Loading bp3m input data for '{field_name}'...")
+        imgs, stars_per_image, gaia_catalog = load_image_data_flc(data_root, field_name)
+        if imgs is None or len(imgs) == 0:
+            raise RuntimeError(f"No usable images found for '{field_name}'.")
 
-    # ── Apply the v1 epoch-distortion correction to the detector coords ──────
-    # The v1 fit may have modelled positions as X r + B d; the pop-fit solver
-    # models X r only, so correct the detections once at load time:
-    # x' = x + R^{-1} (B d)  (see bp3m/epoch_distortion.py).
-    from bp3m.epoch_distortion import EpochDistortion
-    _ed_obj = EpochDistortion.load(bp3m_dir)
-    if _ed_obj is not None:
-        _xdf_ed = pd.read_csv(bp3m_dir / 'image_transformations.csv').set_index('image_name')
-        _n_corr_img = 0
-        for _img in image_names:
-            if not _ed_obj.has(_img) or _img not in _xdf_ed.index:
-                continue
-            _row = _xdf_ed.loc[_img]
-            _meta = imgs[_img]
-            _Xo = float(_meta.get('Xo', 2048.0)); _Yo = float(_meta.get('Yo', 2048.0))
-            _df = filtered_spi[_img]
-            _corr = _ed_obj.detector_correction(
-                _img,
-                _df['X'].to_numpy(float) - _Xo,
-                _df['Y'].to_numpy(float) - _Yo,
-                (_row['a'], _row['b'], _row['c'], _row['d']))
-            _df['X'] = _df['X'].to_numpy(float) + _corr[:, 0]
-            _df['Y'] = _df['Y'].to_numpy(float) + _corr[:, 1]
-            _n_corr_img += 1
-        print(f"  epoch-distortion: v1 D correction applied to detections in "
-              f"{_n_corr_img}/{len(image_names)} images "
-              f"({_ed_obj.n_groups()} groups)")
+        star_id_to_idx, image_names, star_in_image = build_index_maps(
+            stars_per_image, gaia_catalog)
 
+        # Filter to the base names that v1 used (strip _hi/_lo before split)
+        if v1_image_names:
+            v1_bases = set()
+            for n in v1_image_names:
+                base = n[:-3] if n.endswith(('_hi', '_lo')) else n
+                v1_bases.add(base)
+            image_names = [n for n in image_names if n in v1_bases]
+        if not image_names:
+            raise RuntimeError(
+                "No images remain after filtering to v1 image set."
+            )
+
+        filtered_spi = {n: stars_per_image[n] for n in image_names}
+
+        # Filter gaia_catalog to observed stars (same as run_alignment.py)
+        observed_ids: set = set()
+        for spi in filtered_spi.values():
+            observed_ids.update(spi['Gaia_id'].values)
+        gaia_catalog = (gaia_catalog[gaia_catalog['Gaia_id'].isin(observed_ids)]
+                        .reset_index(drop=True))
+        star_id_to_idx = {int(gid): i for i, gid in enumerate(gaia_catalog['Gaia_id'])}
+
+        imgs = {n: imgs[n] for n in image_names}
+
+        # Split ACS chips (same as run_alignment.py)
+        if v1_split_ccd:
+            imgs, filtered_spi = split_images_by_ccd(
+                imgs, filtered_spi, min_stars_per_ccd=min_stars_split_ccd)
+            image_names = sorted(filtered_spi.keys())
+            star_id_to_idx, image_names, star_in_image = build_index_maps(
+                filtered_spi, gaia_catalog)
+
+        # ── Apply the v1 epoch-distortion correction to the detector coords ──────
+        # The v1 fit may have modelled positions as X r + B d; the pop-fit solver
+        # models X r only, so correct the detections once at load time:
+        # x' = x + R^{-1} (B d)  (see bp3m/epoch_distortion.py).
+        from bp3m.epoch_distortion import EpochDistortion
+        _ed_obj = EpochDistortion.load(bp3m_dir)
+        if _ed_obj is not None:
+            _xdf_ed = pd.read_csv(bp3m_dir / 'image_transformations.csv').set_index('image_name')
+            _n_corr_img = 0
+            for _img in image_names:
+                if not _ed_obj.has(_img) or _img not in _xdf_ed.index:
+                    continue
+                _row = _xdf_ed.loc[_img]
+                _meta = imgs[_img]
+                _Xo = float(_meta.get('Xo', 2048.0)); _Yo = float(_meta.get('Yo', 2048.0))
+                _df = filtered_spi[_img]
+                _corr = _ed_obj.detector_correction(
+                    _img,
+                    _df['X'].to_numpy(float) - _Xo,
+                    _df['Y'].to_numpy(float) - _Yo,
+                    (_row['a'], _row['b'], _row['c'], _row['d']))
+                _df['X'] = _df['X'].to_numpy(float) + _corr[:, 0]
+                _df['Y'] = _df['Y'].to_numpy(float) + _corr[:, 1]
+                _n_corr_img += 1
+            print(f"  epoch-distortion: v1 D correction applied to detections in "
+                  f"{_n_corr_img}/{len(image_names)} images "
+                  f"({_ed_obj.n_groups()} groups)")
     # Warn about any mismatch with v1 image set
     if v1_image_names:
         v1_set  = set(v1_image_names)
@@ -2204,12 +2249,17 @@ def run_pop_fit(
     # --use_member_seed / --freeze_member_seed: auto-locate the CSV written by
     # notebook 07_member_selection in the field directory.
     if member_seed_csv is None and (use_member_seed or freeze_member_seed):
-        member_seed_csv = data_root / field_name / 'member_seed.csv'
-        if not Path(member_seed_csv).exists():
+        _seed_cands = ([data_root / field_name / 'member_seed_v2.csv',
+                        data_root / field_name / 'member_seed.csv']
+                       if data_source == 'master_v2'
+                       else [data_root / field_name / 'member_seed.csv'])
+        member_seed_csv = next((c for c in _seed_cands if c.exists()), None)
+        if member_seed_csv is None:
             raise FileNotFoundError(
                 f"use_member_seed/freeze_member_seed: no seed found at "
-                f"{member_seed_csv} — draw and save one with notebook "
-                f"07_member_selection first.")
+                f"{' or '.join(str(c) for c in _seed_cands)} — draw and save "
+                f"one with notebook 07_member_selection (v1) / "
+                f"08_member_selection_v2 (master_v2) first.")
     if member_seed_csv is not None:
         # Hand-drawn seed (e.g. from notebook 07_member_selection): replaces the
         # sigma-clip initial selection. The phases still refine membership.
@@ -2217,7 +2267,19 @@ def run_pop_fit(
         _seed = pd.read_csv(_seed_path, dtype={'gaia_source_id': np.int64})
         if 'trusted' in _seed.columns:
             _seed = _seed[_seed['trusted'].astype(bool)]
-        _seed_ids = [int(g) for g in _seed['gaia_source_id'].values]
+        if 'source_index' in _seed.columns:
+            # v2 seed (notebook 08): real Gaia id when present, else the
+            # deterministic synthetic id -(source_index + 1) used by
+            # load_master_v2 for HST-only sources.
+            _sgid = (_seed['gaia_source_id'].to_numpy(np.int64)
+                     if 'gaia_source_id' in _seed.columns
+                     else np.zeros(len(_seed), np.int64))
+            _ssrc = pd.to_numeric(_seed['source_index'],
+                                  errors='coerce').fillna(-1).astype(np.int64)
+            _seed_ids = [int(g) if g != 0 else int(-(si + 1))
+                         for g, si in zip(_sgid, _ssrc)]
+        else:
+            _seed_ids = [int(g) for g in _seed['gaia_source_id'].values]
         _found    = [star_id_to_idx[g] for g in _seed_ids if g in star_id_to_idx]
         _n_miss   = len(_seed_ids) - len(_found)
         member_sidx = np.array(sorted(_found), dtype=int)
@@ -3215,7 +3277,7 @@ def _lookup_lvd(lvd_dir: Path, key: str) -> dict:
                      f"(searched dwarf_all.csv and gc_harris.csv)")
 
 
-def main():
+def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -3333,12 +3395,31 @@ def main():
                              '{field}/Gaia/{field}_*_qso_anchors.csv (produced at Phase 1) '
                              'and applies tight secular-aberration '
                              'PM + zero-parallax priors to vetted QSOs.')
+    parser.add_argument('--use_master_v2', action='store_true',
+                        help='JOINT pop-fit v2: load the full v2 master '
+                             'catalog (incl. HST-only stars, synthetic '
+                             'negative ids) via load_master_v2; warm start, '
+                             'alpha and use flags come from BP3M_v2_results; '
+                             'results go to BP3M_pop_fit_v2_results')
+    parser.add_argument('--hst_max_pm_unc', type=float, default=5.0,
+                        help='master_v2: max sigma_pmra_xmatch for HST-only '
+                             'sources (default 5.0 mas/yr)')
+    parser.add_argument('--hst_min_detect', type=int, default=3,
+                        help='master_v2: min detections per HST-only source '
+                             '(default 3)')
+    parser.add_argument('--hst_max_per_image', type=int, default=1000,
+                        help='master_v2: per-image cap on HST-only sources, '
+                             'ranked by PM precision (default 1000; raise to '
+                             'use more faint stars)')
+    parser.add_argument('--det_chi2_threshold_v2', type=float, default=None,
+                        help='master_v2: drop individual detections with '
+                             'Phase-4 chi2 above this (e.g. 9.0)')
     parser.add_argument('--qso_anchors_csv', type=str, default=None, nargs='+',
                         help='Explicit path(s) to qso_anchors CSV file(s).  When multiple '
                              'paths are given they are concatenated and deduped by source_id.  '
                              'Overrides the default glob in {field}/Gaia/.')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # ── Resolve LVD-derived parameters ───────────────────────────────────────
     _sigma_pm         = args.sigma_pm          # None if not given by user
@@ -3445,14 +3526,21 @@ def main():
         lib_dir=Path(_lib_dir_arg) if _lib_dir_arg else None,
         use_qso_anchors=not args.no_qso_anchors,
         qso_anchors_csv=[Path(p) for p in args.qso_anchors_csv] if args.qso_anchors_csv else None,
+        data_source='master_v2' if args.use_master_v2 else 'v1',
+        hst_max_pm_unc=args.hst_max_pm_unc,
+        hst_min_detect=args.hst_min_detect,
+        hst_max_per_image=args.hst_max_per_image,
+        det_chi2_threshold_v2=args.det_chi2_threshold_v2,
     )
 
     # Save the command only on successful completion so interrupted runs
     # do not overwrite the record of the last successful invocation.
     import sys as _sys, shlex as _shlex
     from datetime import datetime as _datetime
+    _pfr_name = ('BP3M_pop_fit_v2_results' if args.use_master_v2
+                 else 'BP3M_pop_fit_results')
     _cmd_file = (Path(args.output_dir).resolve() / args.name.replace(' ', '_')
-                 / 'BP3M_pop_fit_results' / 'bp3m_pop_fit_command.txt')
+                 / _pfr_name / 'bp3m_pop_fit_command.txt')
     _cmd_file.parent.mkdir(parents=True, exist_ok=True)
     _cmd_file.write_text(
         f"# {_datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"

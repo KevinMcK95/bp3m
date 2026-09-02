@@ -1,8 +1,13 @@
 """
-bp3m-pop-fit-v2: catalog-level population PM fit over the hst_xmatch outputs.
+bp3m-pop-fit-v2: population PM fit over the v2 master catalog, including
+HST-only stars far fainter than Gaia.
 
-Where bp3m-pop-fit re-solves the joint alignment+star system for the Gaia
-stars, this tool performs the SAME population analysis one level up: it takes
+DEFAULT (joint) mode delegates to the full bp3m-pop-fit machinery with
+--use_master_v2: the alignment r, every master-catalog star (Gaia + HST-only
+with synthetic negative ids), and mu_pop are solved JOINTLY, exactly analogous
+to the original pop fit — see run_pop_fit.py.  All bp3m-pop-fit options apply.
+
+--catalog_only instead runs the fast catalog-level approximation: it takes
 every source in hst_xmatch/master_combined_v2.csv — including HST-only stars
 far fainter than Gaia — with its per-source PM measurement and covariance
 (conditional on the frozen v1 alignment), and iterates
@@ -237,7 +242,7 @@ def _plot_results(df, member, eligible, mu, plots_dir: Path):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def main(argv=None):
+def _catalog_main(argv=None):
     p = argparse.ArgumentParser(
         description='Catalog-level population PM fit over hst_xmatch outputs')
     p.add_argument('--name', required=True, help='field name')
@@ -430,9 +435,9 @@ def main(argv=None):
         'gaia_source': args.gaia_source,
         'input': 'hst_xmatch/master_combined_v2.csv',
     }
-    with open(out_dir / 'mu_pop.json', 'w') as f:
+    with open(out_dir / 'mu_pop_catalog.json', 'w') as f:
         json.dump(mu_result, f, indent=2)
-    print("  Saved: mu_pop.json")
+    print("  Saved: mu_pop_catalog.json")
 
     if not args.no_plots:
         _plot_results(df, member, eligible, mu, out_dir / 'plots')
@@ -443,6 +448,21 @@ def main(argv=None):
         f.write(f"# {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 + " ".join(sys.argv) + "\n")
     return 0
+
+
+def main(argv=None):
+    """bp3m-pop-fit-v2 entry point.
+
+    Default: the JOINT solve — delegates to bp3m-pop-fit with --use_master_v2
+    (all bp3m-pop-fit options are accepted).  Pass --catalog_only for the fast
+    catalog-level fit implemented in this module.
+    """
+    argv = list(sys.argv[1:]) if argv is None else list(argv)
+    if '--catalog_only' in argv:
+        argv.remove('--catalog_only')
+        return _catalog_main(argv)
+    from bp3m.pipeline.run_pop_fit import main as _joint_main
+    return _joint_main(argv + ['--use_master_v2'])
 
 
 if __name__ == '__main__':
