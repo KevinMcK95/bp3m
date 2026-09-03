@@ -1827,6 +1827,72 @@ def _restrict_to_members(solver, image_names: list, member_sidx: np.ndarray) -> 
 
 # ── Main function ─────────────────────────────────────────────────────────────
 
+def _posthoc_sigma_int(bp3m_dir, output_pfr, mu):
+    """Post-hoc intrinsic PM dispersion (per axis): with alignment, members,
+    and mu_pop frozen, maximise the 1-D profile likelihood
+
+        L(sigma) = prod_i N(pm_i - mu_pop; 0, sigma_q_i^2 + sigma^2)
+
+    over the pop-fit MEMBERS using the UNSHRUNK per-star PMs from the source
+    bp3m solve (diffuse Gaia priors — the pop-fit member posteriors are
+    LVD-shrunk toward mu_pop and would bias sigma low).  Approximation: the
+    source solve's alignment differs slightly from the pop-fit-refined one.
+    Writes sigma_int.json; no sampler needed (user-approved quick method).
+    """
+    import pandas as _pd
+    from scipy.optimize import minimize_scalar as _mins
+    try:
+        pf = _pd.read_csv(output_pfr / 'stellar_astrometry.csv')
+        src = _pd.read_csv(Path(bp3m_dir) / 'stellar_astrometry.csv')
+    except FileNotFoundError:
+        return
+    if 'is_member' not in pf.columns:
+        return
+    ids = set(pf.loc[pf.is_member.astype(bool), 'Gaia_id'].astype(np.int64))
+    u = src[(src.n_hst_used > 0) & ~src.prior_fallback.astype(bool)]
+    m = u[u.Gaia_id.astype(np.int64).isin(ids)]
+    if len(m) < 20:
+        return
+    out = {'n_members_used': int(len(m)),
+           'method': 'profile-MLE, frozen mu_pop/members, unshrunk PMs'}
+    _smad = lambda v: 1.4826 * np.median(np.abs(v - np.median(v)))
+    for ax, mu0 in (('ra', mu['mu_pop_ra_masyr']),
+                    ('dec', mu['mu_pop_dec_masyr'])):
+        pm = m[f'pm{ax}_bp3m'].to_numpy()
+        sq = m[f'sigma_pm{ax}_bp3m'].to_numpy()
+        d = pm - mu0
+        s_mad = _smad(pm)
+        dec_mad = float(np.sqrt(max(s_mad ** 2 - np.median(sq) ** 2, 0.0)))
+
+        def _nll(sig):
+            v = sq ** 2 + sig ** 2
+            return 0.5 * np.sum(d ** 2 / v + np.log(v))
+        res = _mins(_nll, bounds=(0.0, 1.0), method='bounded')
+        s_hat = float(res.x if res.x > 1e-4 else 0.0)
+        lo = hi = s_hat
+        grid = np.linspace(0.0, 1.0, 2001)
+        ok = np.array([_nll(g) for g in grid]) <= res.fun + 0.5
+        if ok.any():
+            lo, hi = float(grid[ok][0]), float(grid[ok][-1])
+        out[f'sigma_int_{ax}_masyr'] = s_hat
+        out[f'sigma_int_{ax}_68lo'] = lo
+        out[f'sigma_int_{ax}_68hi'] = hi
+        out[f'sigma_mad_{ax}'] = float(s_mad)
+        out[f'sigma_mad_deconv_{ax}'] = dec_mad
+        out[f'median_sigma_quoted_{ax}'] = float(np.median(sq))
+        print(f"  sigma_int({ax}): MLE {s_hat*1e3:.1f} "
+              f"[68%: {lo*1e3:.1f}-{hi*1e3:.1f}] uas/yr  "
+              f"(MAD {s_mad*1e3:.1f}, deconv {dec_mad*1e3:.1f}, "
+              f"med sigma_q {np.median(sq)*1e3:.1f})")
+    _floor = mu.get('sigma_pm_masyr')
+    if _floor:
+        out['sigma_pm_prior_masyr'] = float(_floor)
+        print(f"  (population prior / vlos-scale floor: {_floor*1e3:.1f} uas/yr)")
+    with open(output_pfr / 'sigma_int.json', 'w') as _f:
+        json.dump(out, _f, indent=2)
+    print("  Saved: sigma_int.json")
+
+
 def run_pop_fit(
     output_dir: Path,
     field_name: str,
@@ -3173,6 +3239,10 @@ def run_pop_fit(
             },
         }, _f, indent=2)
     print(f"  Saved: mu_pop.json, run_config.json")
+    try:
+        _posthoc_sigma_int(bp3m_dir, output_pfr, mu_result)
+    except Exception as _e:
+        print(f"  WARNING: sigma_int post-hoc failed: {_e}")
 
     # 8. Star influence
     try:
