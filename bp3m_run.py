@@ -371,6 +371,13 @@ def _parse_args():
     bp.add_argument('--bp3m_min_stars', type=int, default=0,
                     help='Exclude images with fewer than this many Gaia cross-matched '
                          'stars from BP3M (default: 0 = keep all images)')
+    bp.add_argument('--n_processes_psf', type=int, default=2,
+                    help='Worker count for the PSF-fitting (pypass) step '
+                         'ONLY. pypass workers are RAM-heavy (~2-3 GB each; '
+                         '16 workers = 35-50 GB and breaches the 64 GB '
+                         'per-user cap), so this defaults to a safe 2 '
+                         'regardless of --n_processes. (Will later default '
+                         'to --n_processes.)')
     bp.add_argument('--epoch_dist_prior', type=str, default=None,
                     help='Comma-separated epoch_distortion.csv paths from '
                          'calibration fields: recentre matching D-group '
@@ -1055,7 +1062,7 @@ def main():
             lib_dir=Path(args.lib_dir),
             telescope=args.telescope,
             im_type=args.hst_im_type,
-            n_processes=args.n_processes,
+            n_processes=args.n_processes_psf,
             verbose=not args.quiet,
             force_refit=args.force_refit_psf,
             clean_psf=args.clean_psf,
