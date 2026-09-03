@@ -432,22 +432,31 @@ def run_cross_match(
                        / ".xmatch_gaia_worker_cache.pkl")
         gaia_df.to_pickle(_gaia_cache)
         try:
-            with ProcessPoolExecutor(
-                    max_workers=n_processes,
-                    mp_context=_mp.get_context("forkserver"),
-                    initializer=_pool_init, initargs=(str(_gaia_cache),),
-                    max_tasks_per_child=25) as ex:
-                futures = {ex.submit(_match_one, (w[0], w[2])): w for w in work}
-                for fut in as_completed(futures):
-                    name, n, err = fut.result()
-                    if err:
-                        print(f"  ERROR {name}: {err}")
-                    else:
-                        print(f"  {name}: {n} matches")
-                        results.append(Path(next(
-                            f['root'] for f in folders
-                            if Path(f['root']).name == name
-                        )) / "matched_gaia.csv")
+            # NOTE: no max_tasks_per_child — mid-pool worker respawn under
+            # forkserver deadlocks at exactly n_workers x 25 tasks (observed
+            # at image 400 with 16 processes, repeatedly).  Memory is
+            # recycled by rebuilding the whole pool every _BATCH images
+            # instead; worker turnover only happens at executor construction.
+            _BATCH = 300
+            for _b0 in range(0, len(work), _BATCH):
+                _batch = work[_b0:_b0 + _BATCH]
+                with ProcessPoolExecutor(
+                        max_workers=min(n_processes, len(_batch)),
+                        mp_context=_mp.get_context("forkserver"),
+                        initializer=_pool_init,
+                        initargs=(str(_gaia_cache),)) as ex:
+                    futures = {ex.submit(_match_one, (w[0], w[2])): w
+                               for w in _batch}
+                    for fut in as_completed(futures):
+                        name, n, err = fut.result()
+                        if err:
+                            print(f"  ERROR {name}: {err}")
+                        else:
+                            print(f"  {name}: {n} matches")
+                            results.append(Path(next(
+                                f['root'] for f in folders
+                                if Path(f['root']).name == name
+                            )) / "matched_gaia.csv")
         finally:
             try:
                 _gaia_cache.unlink()
