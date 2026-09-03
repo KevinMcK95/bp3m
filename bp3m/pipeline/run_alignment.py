@@ -87,6 +87,8 @@ def run_alignment(  # noqa: C901
     use_delve: bool = False,
     delve_use_for_align: bool = False,
     pos_corr_table=None,
+    epoch_dist_prior=None,
+    epoch_dist_prior_inflate: float = 2.0,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -267,6 +269,55 @@ def run_alignment(  # noqa: C901
 
     print(f"  Stars: {solver.n_stars}   Images: {solver.n_images}")
 
+    # ── Calibration D prior import (--epoch_dist_prior) ─────────────────────
+    # Recentre each matching D-group prior on IVW-combined calibration
+    # coefficients (same inst/det/chip/filter, |dmjd|<183 d), widths =
+    # combined sigma x inflate (transfer error dominates coefficient noise).
+    if epoch_dist_prior and getattr(solver, 'n_ed', 0):
+        import pandas as _pd
+        _cal = _pd.concat([_pd.read_csv(_p) for _p in
+                           str(epoch_dist_prior).split(',')],
+                          ignore_index=True)
+        # vet: same thresholds as the GDC-delta exporter
+        _gs = (_cal.groupby(['instrument', 'detector', 'chip', 'filter',
+                             'group'])
+                   .agg(sig=('sigma_px', 'median'),
+                        amp=('coeff_px', lambda v: abs(v).max()))
+                   .reset_index())
+        _bad = _gs[(_gs.sig > 0.05) | (_gs.amp > 0.15)]
+        if len(_bad):
+            _cal = _cal.merge(_bad.assign(_bad=True)
+                              .drop(columns=['sig', 'amp']),
+                              on=['instrument', 'detector', 'chip', 'filter',
+                                  'group'], how='left')
+            _cal = _cal[_cal._bad.isna()]
+        _n_set = 0
+        for _g, _grp in enumerate(solver.ed_groups):
+            _m = _cal[(_cal.instrument == _grp['instrument'])
+                      & (_cal.detector == _grp['detector'])
+                      & (_cal.chip == _grp['chip'])
+                      & (_cal['filter'] == _grp['filter'])
+                      & (abs(_cal.mean_mjd - _grp['mean_mjd']) < 183.0)]
+            if not len(_m):
+                continue
+            _vs, _ws = [], []
+            for _, _gg in _m.groupby(['group'], sort=False):
+                if len(_gg) != solver.ED_K:
+                    continue
+                _vs.append(_gg.coeff_px.to_numpy())
+                _ws.append(1.0 / np.maximum(_gg.sigma_px.to_numpy(),
+                                            1e-4) ** 2)
+            if not _vs:
+                continue
+            _vs = np.array(_vs); _ws = np.array(_ws)
+            _mu = (_vs * _ws).sum(axis=0) / _ws.sum(axis=0)
+            _sig = np.sqrt(1.0 / _ws.sum(axis=0)) * epoch_dist_prior_inflate
+            solver.set_epoch_dist_prior(_g, _mu, _sig)
+            _n_set += 1
+        print(f"  epoch_dist_prior: recentred {_n_set}/{len(solver.ed_groups)}"
+              f" D-group priors on calibration values "
+              f"(inflate x{epoch_dist_prior_inflate})")
+
     _indv_init_stats = None
     if use_indv_outputs:
         _indv_init_stats = _apply_indv_init(
@@ -405,6 +456,8 @@ def run_alignment(  # noqa: C901
             **(extra_run_config or {}),
             'use_indv_outputs': use_indv_outputs,
             'pos_corr_table': (str(pos_corr_table) if pos_corr_table else None),
+            'epoch_dist_prior': (str(epoch_dist_prior)
+                                 if epoch_dist_prior else None),
             'pos_err_floor': pos_err_floor,
             'test_hysteresis_delta': test_hysteresis_delta,
             'min_align_demote': min_align_demote,

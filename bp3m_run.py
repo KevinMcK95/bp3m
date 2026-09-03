@@ -371,6 +371,12 @@ def _parse_args():
     bp.add_argument('--bp3m_min_stars', type=int, default=0,
                     help='Exclude images with fewer than this many Gaia cross-matched '
                          'stars from BP3M (default: 0 = keep all images)')
+    bp.add_argument('--epoch_dist_prior', type=str, default=None,
+                    help='Comma-separated epoch_distortion.csv paths from '
+                         'calibration fields: recentre matching D-group '
+                         'priors on the calibration coefficients (requires '
+                         '--fit_epoch_distortion).')
+    bp.add_argument('--epoch_dist_prior_inflate', type=float, default=2.0)
     bp.add_argument('--pos_corr_table', type=str, default=None,
                     help='Pseudo-GDC centroid-correction table (npz from '
                          'stdpsf_builder/make_pseudo_gdc.py). Applied IN '
@@ -1623,6 +1629,8 @@ def main():
                 use_indv_outputs=args.use_indv_outputs,
                 bp3m_dir=_joint_bp3m_dir,
                 pos_corr_table=args.pos_corr_table,
+                epoch_dist_prior=args.epoch_dist_prior,
+                epoch_dist_prior_inflate=args.epoch_dist_prior_inflate,
                 test_hysteresis_delta=args.test_hysteresis_delta,
                 min_align_demote=args.min_align_demote,
                 plot_residuals=args.plot_residuals,

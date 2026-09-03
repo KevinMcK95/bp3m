@@ -392,7 +392,9 @@ class BP3MSolver:
                 g = len(self.ed_groups)
                 for im in imgs:
                     self._ed_gidx[im] = g
+                # prior_mean/prior_prec settable via set_epoch_dist_prior()
                 self.ed_groups.append(dict(
+                    prior_mean=None, prior_prec=None,
                     instrument=key0[0], detector=key0[1], chip=key0[2],
                     filter=key0[3], epoch_id=ep_id, mean_mjd=mean_mjd,
                     images=imgs))
@@ -409,6 +411,15 @@ class BP3MSolver:
                   f"{grp['filter']} chip={grp['chip']} epoch~"
                   f"{_T(grp['mean_mjd'], format='mjd').jyear:.2f} "
                   f"({len(grp['images'])} images)")
+
+    def set_epoch_dist_prior(self, g, mean, sigma_px):
+        """Centre group g's D prior on `mean` (length ED_K, px) with
+        per-coefficient widths `sigma_px` (scalar or length ED_K)."""
+        mean = np.asarray(mean, float)
+        sig = np.broadcast_to(np.asarray(sigma_px, float), mean.shape)
+        assert mean.size == self.ED_K
+        self.ed_groups[g]['prior_mean'] = mean
+        self.ed_groups[g]['prior_prec'] = sig ** -2.0
 
     def _ed_cols(self, img):
         """Global shared-vector column indices of img's D block (or None)."""
@@ -1501,12 +1512,18 @@ class BP3MSolver:
                     h_align[i] += contrib['h_contrib']
 
         # ── Epoch-distortion coefficient prior: diagonal, sigma in pixels ────
+        # zero-centred by default; set_epoch_dist_prior() recentres a group on
+        # imported calibration coefficients with per-coefficient widths.
         if self.n_ed:
             for g, grp in enumerate(self.ed_groups):
-                sig_px = self._img_data[grp['images'][0]]["ed_sigma_px"]
+                if grp.get('prior_prec') is not None:
+                    prec = grp['prior_prec']
+                else:
+                    sig_px = self._img_data[grp['images'][0]]["ed_sigma_px"]
+                    prec = np.full(self.ED_K, sig_px ** -2)
                 off = n_r + g * self.ED_K
                 H_rr[np.arange(off, off + self.ED_K),
-                     np.arange(off, off + self.ED_K)] += sig_px ** -2
+                     np.arange(off, off + self.ED_K)] += prec
 
         # ── Hi/lo chip coupling prior: off-diagonal blocks in H_rr ───────────
         for hi_idx, lo_idx in self._chip_pairs:
@@ -1526,12 +1543,18 @@ class BP3MSolver:
         Cr_inv = H_rr.copy()
         rhs    = np.zeros(n_s)
 
-        # Epoch-D prior rhs: pull toward zero from the current iterate
+        # Epoch-D prior rhs: pull toward the prior mean from the current iterate
         if self.n_ed:
             for g, grp in enumerate(self.ed_groups):
-                sig_px = self._img_data[grp['images'][0]]["ed_sigma_px"]
+                if grp.get('prior_prec') is not None:
+                    prec = grp['prior_prec']
+                    mu = grp['prior_mean']
+                else:
+                    sig_px = self._img_data[grp['images'][0]]["ed_sigma_px"]
+                    prec = np.full(self.ED_K, sig_px ** -2)
+                    mu = 0.0
                 off = n_r + g * self.ED_K
-                rhs[off:off + self.ED_K] += (0.0 - r_current[off:off + self.ED_K]) * sig_px ** -2
+                rhs[off:off + self.ED_K] += (mu - r_current[off:off + self.ED_K]) * prec
 
         for j_idx, img in enumerate(self.image_names):
             r_prior_j      = self._img_data[img]["r_prior"]
