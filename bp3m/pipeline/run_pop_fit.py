@@ -1830,6 +1830,7 @@ def _restrict_to_members(solver, image_names: list, member_sidx: np.ndarray) -> 
 def run_pop_fit(
     output_dir: Path,
     field_name: str,
+    bp3m_results_name: "str | None" = None,
     sigma_pm: float = 0.0075,
     plx_pop: float = 0.003873,
     sigma_plx_tot: float = 0.0001425,
@@ -1890,8 +1891,12 @@ def run_pop_fit(
         bp3m_dir   = data_root / field_name / 'BP3M_v2_results'
         output_pfr = data_root / field_name / 'BP3M_pop_fit_v2_results'
     else:
-        bp3m_dir   = data_root / field_name / 'BP3M_results'
-        output_pfr = data_root / field_name / 'BP3M_pop_fit_results'
+        bp3m_dir   = data_root / field_name / (bp3m_results_name
+                                               or 'BP3M_results')
+        _sfx = ''
+        if bp3m_results_name and bp3m_results_name != 'BP3M_results':
+            _sfx = '_' + bp3m_results_name.replace('BP3M_results_', '')
+        output_pfr = data_root / field_name / f'BP3M_pop_fit_results{_sfx}'
     output_pfr.mkdir(parents=True, exist_ok=True)
 
     # ── Read v1 run_config ─────────────────────────────────────────────────────
@@ -1969,7 +1974,12 @@ def run_pop_fit(
     else:
         # ── Load data — mirrors run_alignment.py exactly ───────────────────────────
         print(f"\n  Loading bp3m input data for '{field_name}'...")
-        imgs, stars_per_image, gaia_catalog = load_image_data_flc(data_root, field_name)
+        _pct = v1_cfg.get('pos_corr_table')
+        if _pct:
+            print(f"  pop-fit: re-applying the run's pos_corr_table "
+                  f"({Path(_pct).name} et al.) for position consistency")
+        imgs, stars_per_image, gaia_catalog = load_image_data_flc(
+            data_root, field_name, pos_corr_table=_pct)
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable images found for '{field_name}'.")
 
@@ -3387,6 +3397,10 @@ def main(argv=None):
         description='Population PM fitting post-processor (run after bp3m).',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument('--bp3m_results_name', type=str, default=None,
+                        help='Read bp3m outputs from this results dir name '
+                             '(e.g. BP3M_results_ab_pgdc_f01_acs); pop-fit '
+                             'outputs go to BP3M_pop_fit_results_<suffix>.')
     parser.add_argument('--name', required=True,
                         help='Target name (must match the field directory from bp3m)')
     parser.add_argument('--output_dir', type=str, default='.',
@@ -3600,6 +3614,7 @@ def main(argv=None):
             pass
 
     run_pop_fit(
+        bp3m_results_name=args.bp3m_results_name,
         output_dir=Path(args.output_dir).resolve(),
         field_name=args.name.replace(' ', '_'),
         sigma_pm=_sigma_pm,
