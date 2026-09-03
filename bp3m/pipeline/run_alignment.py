@@ -86,6 +86,7 @@ def run_alignment(  # noqa: C901
     verbose_tests: bool = False,
     use_delve: bool = False,
     delve_use_for_align: bool = False,
+    pos_corr_table=None,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -167,7 +168,8 @@ def run_alignment(  # noqa: C901
         data_root, field_name, pos_err_floor=pos_err_floor,
         restrict_images=set(images) if images is not None else None,
         gaia_csv=gaia_csv, use_delve=use_delve,
-        delve_use_for_align=delve_use_for_align)
+        delve_use_for_align=delve_use_for_align,
+        pos_corr_table=pos_corr_table)
     if imgs is None or len(imgs) == 0:
         raise RuntimeError(
             f"No usable images found for '{field_name}'. "
@@ -402,6 +404,7 @@ def run_alignment(  # noqa: C901
         run_config={
             **(extra_run_config or {}),
             'use_indv_outputs': use_indv_outputs,
+            'pos_corr_table': (str(pos_corr_table) if pos_corr_table else None),
             'pos_err_floor': pos_err_floor,
             'test_hysteresis_delta': test_hysteresis_delta,
             'min_align_demote': min_align_demote,

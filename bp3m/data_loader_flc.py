@@ -267,6 +267,18 @@ def _build_stars_df(img_dir: Path, img_name: str,
         cat_y      = tbl["y"].astype(float)
         cat_xgdc   = tbl["x_gdc"].astype(float)
         cat_ygdc   = tbl["y_gdc"].astype(float)
+        # Pseudo-GDC centroid correction (PSF-model bias), applied in memory
+        # only — the catalog on disk is never modified.
+        if (pos_corr is not None and meta is not None
+                and pos_corr.matches(meta.get("instrument", ""),
+                                     meta.get("detector", ""),
+                                     meta.get("filter", ""))):
+            _bx, _by = pos_corr.bias(tbl["x"].astype(float),
+                                     tbl["y"].astype(float),
+                                     tbl["flux"].astype(float),
+                                     float(meta.get("hst_time_mjd", 0.0)))
+            cat_xgdc = cat_xgdc - _bx
+            cat_ygdc = cat_ygdc - _by
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
@@ -388,6 +400,18 @@ def _build_delve_only_stars_df(
         cat_y      = tbl["y"].astype(float)
         cat_xgdc   = tbl["x_gdc"].astype(float)
         cat_ygdc   = tbl["y_gdc"].astype(float)
+        # Pseudo-GDC centroid correction (PSF-model bias), applied in memory
+        # only — the catalog on disk is never modified.
+        if (pos_corr is not None and meta is not None
+                and pos_corr.matches(meta.get("instrument", ""),
+                                     meta.get("detector", ""),
+                                     meta.get("filter", ""))):
+            _bx, _by = pos_corr.bias(tbl["x"].astype(float),
+                                     tbl["y"].astype(float),
+                                     tbl["flux"].astype(float),
+                                     float(meta.get("hst_time_mjd", 0.0)))
+            cat_xgdc = cat_xgdc - _bx
+            cat_ygdc = cat_ygdc - _by
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
@@ -558,7 +582,8 @@ def load_image_data_flc(data_root, field_name: str,
                         restrict_images: "set[str] | frozenset[str] | None" = None,
                         gaia_csv: "str | Path | list | None" = None,
                         use_delve: bool = False,
-                        delve_use_for_align: bool = False):
+                        delve_use_for_align: bool = False,
+                        pos_corr_table: "str | Path | None" = None):
     """
     Load BP3M inputs from the new FLC-based pipeline layout.
 
@@ -663,6 +688,15 @@ def load_image_data_flc(data_root, field_name: str,
 
     gaia_id_set = set(gaia_catalog["Gaia_id"].values)
 
+    _pos_corr = None
+    _n_corr_imgs: list = []
+    if pos_corr_table is not None:
+        from bp3m.pos_corr import PseudoGDC
+        _pos_corr = PseudoGDC(pos_corr_table)
+        print(f"  Pseudo-GDC corrections: {Path(pos_corr_table).name} "
+              f"({_pos_corr.instrument}/{_pos_corr.detector}/"
+              f"{_pos_corr.filter}, md5 {_pos_corr.md5[:8]})")
+
     skipped = []
     observed_gaia_ids: set = set()
     _n_load = (len(img_dirs) if restrict_images is None
@@ -683,7 +717,14 @@ def load_image_data_flc(data_root, field_name: str,
             skipped.append(img_name)
             continue
 
-        stars_df = _build_stars_df(img_dir, img_name, gaia_float_to_int64, pos_err_floor)
+        stars_df = _build_stars_df(img_dir, img_name, gaia_float_to_int64,
+                                   pos_err_floor,
+                                   pos_corr=_pos_corr, meta=meta)
+        if (_pos_corr is not None and stars_df is not None
+                and _pos_corr.matches(meta.get("instrument", ""),
+                                      meta.get("detector", ""),
+                                      meta.get("filter", ""))):
+            _n_corr_imgs.append(img_name)
         if stars_df is None or len(stars_df) == 0:
             skipped.append(img_name)
             continue
@@ -734,6 +775,10 @@ def load_image_data_flc(data_root, field_name: str,
         })
 
     keep_gaia_mask = gaia_catalog["Gaia_id"].isin(observed_gaia_ids).to_numpy()
+
+    if _pos_corr is not None:
+        print(f"  Pseudo-GDC applied to {len(_n_corr_imgs)}/{len(images)} "
+              f"loaded images (others: no matching inst/det/filter)")
 
     if skipped:
         print(f"  Skipped {len(skipped)} directories (missing required files): "

@@ -371,6 +371,15 @@ def _parse_args():
     bp.add_argument('--bp3m_min_stars', type=int, default=0,
                     help='Exclude images with fewer than this many Gaia cross-matched '
                          'stars from BP3M (default: 0 = keep all images)')
+    bp.add_argument('--pos_corr_table', type=str, default=None,
+                    help='Pseudo-GDC centroid-correction table (npz from '
+                         'stdpsf_builder/make_pseudo_gdc.py). Applied IN '
+                         'MEMORY at catalog load to matching inst/det/filter '
+                         'images; nothing on disk is modified.')
+    bp.add_argument('--bp3m_results_suffix', type=str, default=None,
+                    help='Write the joint-fit outputs to '
+                         'BP3M_results_<suffix> instead of BP3M_results '
+                         '(A/B tests without overwriting existing results).')
     bp.add_argument('--force_indv_refit', action='store_true',
                     help='With --fit_indv_images_only: refit every image even '
                          'if cached results are current (same matched_gaia '
@@ -1566,6 +1575,11 @@ def main():
                 epoch_dist_groupby=args.epoch_dist_groupby,
             )
         else:
+            _joint_bp3m_dir = None
+            if args.bp3m_results_suffix:
+                _joint_bp3m_dir = (output_dir / field /
+                                   f"BP3M_results_{args.bp3m_results_suffix}")
+                print(f"  Joint-fit outputs -> {_joint_bp3m_dir}")
             run_alignment(
                 output_dir=output_dir, field_name=field,
                 n_iter=args.n_bp3m_iter,
@@ -1607,6 +1621,8 @@ def main():
                 no_align_prior=args.no_align_prior,
                 pos_err_floor=args.bp3m_pos_err_floor,
                 use_indv_outputs=args.use_indv_outputs,
+                bp3m_dir=_joint_bp3m_dir,
+                pos_corr_table=args.pos_corr_table,
                 test_hysteresis_delta=args.test_hysteresis_delta,
                 min_align_demote=args.min_align_demote,
                 plot_residuals=args.plot_residuals,
