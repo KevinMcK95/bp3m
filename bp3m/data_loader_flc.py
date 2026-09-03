@@ -270,16 +270,17 @@ def _build_stars_df(img_dir: Path, img_name: str,
         cat_ygdc   = tbl["y_gdc"].astype(float)
         # Pseudo-GDC centroid correction (PSF-model bias), applied in memory
         # only — the catalog on disk is never modified.
-        if (pos_corr is not None and meta is not None
-                and pos_corr.matches(meta.get("instrument", ""),
-                                     meta.get("detector", ""),
-                                     meta.get("filter", ""))):
-            _bx, _by = pos_corr.bias(tbl["x"].astype(float),
-                                     tbl["y"].astype(float),
-                                     tbl["flux"].astype(float),
-                                     float(meta.get("hst_time_mjd", 0.0)))
-            cat_xgdc = cat_xgdc - _bx
-            cat_ygdc = cat_ygdc - _by
+        if pos_corr is not None and meta is not None:
+            _t = pos_corr.match(meta.get("instrument", ""),
+                                meta.get("detector", ""),
+                                meta.get("filter", ""))
+            if _t is not None:
+                _bx, _by = _t.bias(tbl["x"].astype(float),
+                                   tbl["y"].astype(float),
+                                   tbl["flux"].astype(float),
+                                   float(meta.get("hst_time_mjd", 0.0)))
+                cat_xgdc = cat_xgdc - _bx
+                cat_ygdc = cat_ygdc - _by
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
@@ -403,16 +404,17 @@ def _build_delve_only_stars_df(
         cat_ygdc   = tbl["y_gdc"].astype(float)
         # Pseudo-GDC centroid correction (PSF-model bias), applied in memory
         # only — the catalog on disk is never modified.
-        if (pos_corr is not None and meta is not None
-                and pos_corr.matches(meta.get("instrument", ""),
-                                     meta.get("detector", ""),
-                                     meta.get("filter", ""))):
-            _bx, _by = pos_corr.bias(tbl["x"].astype(float),
-                                     tbl["y"].astype(float),
-                                     tbl["flux"].astype(float),
-                                     float(meta.get("hst_time_mjd", 0.0)))
-            cat_xgdc = cat_xgdc - _bx
-            cat_ygdc = cat_ygdc - _by
+        if pos_corr is not None and meta is not None:
+            _t = pos_corr.match(meta.get("instrument", ""),
+                                meta.get("detector", ""),
+                                meta.get("filter", ""))
+            if _t is not None:
+                _bx, _by = _t.bias(tbl["x"].astype(float),
+                                   tbl["y"].astype(float),
+                                   tbl["flux"].astype(float),
+                                   float(meta.get("hst_time_mjd", 0.0)))
+                cat_xgdc = cat_xgdc - _bx
+                cat_ygdc = cat_ygdc - _by
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
@@ -692,11 +694,9 @@ def load_image_data_flc(data_root, field_name: str,
     _pos_corr = None
     _n_corr_imgs: list = []
     if pos_corr_table is not None:
-        from bp3m.pos_corr import PseudoGDC
-        _pos_corr = PseudoGDC(pos_corr_table)
-        print(f"  Pseudo-GDC corrections: {Path(pos_corr_table).name} "
-              f"({_pos_corr.instrument}/{_pos_corr.detector}/"
-              f"{_pos_corr.filter}, md5 {_pos_corr.md5[:8]})")
+        from bp3m.pos_corr import PseudoGDCSet
+        _pos_corr = PseudoGDCSet(pos_corr_table)
+        print(f"  Pseudo-GDC corrections: {_pos_corr.summary}")
 
     skipped = []
     observed_gaia_ids: set = set()
@@ -722,9 +722,9 @@ def load_image_data_flc(data_root, field_name: str,
                                    pos_err_floor,
                                    pos_corr=_pos_corr, meta=meta)
         if (_pos_corr is not None and stars_df is not None
-                and _pos_corr.matches(meta.get("instrument", ""),
-                                      meta.get("detector", ""),
-                                      meta.get("filter", ""))):
+                and _pos_corr.match(meta.get("instrument", ""),
+                                    meta.get("detector", ""),
+                                    meta.get("filter", "")) is not None):
             _n_corr_imgs.append(img_name)
         if stars_df is None or len(stars_df) == 0:
             skipped.append(img_name)

@@ -31,6 +31,8 @@ class PseudoGDC:
         self.mjd_sm4 = float(z["mjd_sm4"])
         self.phase_dx = z["phase_dx"].astype(float)
         self.phase_dy = z["phase_dy"].astype(float)
+        self.boundary = float(z["chip_boundary"]) if "chip_boundary" in z \
+            else 2048.0
         self.instrument = str(z["instrument"])
         self.detector = str(z["detector"])
         self.filter = str(z["filter"])
@@ -64,9 +66,9 @@ class PseudoGDC:
         by = np.zeros(n)
         ei = 0 if mjd < self.mjd_sm4 else 1
         fb = np.digitize(flux, self.flux_edges)
-        # chip from mosaic y (ext1 below 2048, ext4 above; matches loader)
-        ci = (y_raw >= 2048.0).astype(int)
-        y_chip = np.where(ci == 1, y_raw - 2048.0, y_raw)
+        # chip from mosaic y (ext1 below the boundary, ext4 above)
+        ci = (y_raw >= self.boundary).astype(int)
+        y_chip = np.where(ci == 1, y_raw - self.boundary, y_raw)
         for c in (0, 1):
             for b in range(self.bias_x.shape[1]):
                 m = (ci == c) & (fb == b)
@@ -83,3 +85,27 @@ class PseudoGDC:
         bx = bx + self.phase_dx[ipy, ipx]
         by = by + self.phase_dy[ipy, ipx]
         return bx, by
+
+
+class PseudoGDCSet:
+    """A collection of PseudoGDC tables (one per inst/det/filter).
+
+    Constructed from a comma-separated list of npz paths; per image the
+    first matching table is used, others leave the image uncorrected.
+    """
+
+    def __init__(self, paths):
+        if isinstance(paths, (str, Path)):
+            paths = [p for p in str(paths).split(",") if p.strip()]
+        self.tables = [PseudoGDC(p.strip()) for p in paths]
+
+    def match(self, instrument: str, detector: str, filt: str):
+        for t in self.tables:
+            if t.matches(instrument, detector, filt):
+                return t
+        return None
+
+    @property
+    def summary(self):
+        return ", ".join(f"{t.instrument}/{t.detector}/{t.filter}"
+                         f"({t.md5[:6]})" for t in self.tables)
