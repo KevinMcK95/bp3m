@@ -371,6 +371,10 @@ def _parse_args():
     bp.add_argument('--bp3m_min_stars', type=int, default=0,
                     help='Exclude images with fewer than this many Gaia cross-matched '
                          'stars from BP3M (default: 0 = keep all images)')
+    bp.add_argument('--force_indv_refit', action='store_true',
+                    help='With --fit_indv_images_only: refit every image even '
+                         'if cached results are current (same matched_gaia '
+                         'md5 and fit parameters).')
     bp.add_argument('--fit_indv_images_only', action='store_true',
                     help='Run BP3M separately on each image and save results in '
                          'BP3M_indv_results/{image_name}/. Skips the joint multi-image fit.')
@@ -1356,9 +1360,48 @@ def main():
                 delve_use_for_align=args.delve_use_for_align,
             )
 
+            # ── Resume: skip images whose indv results are current ─────────
+            # (same matched_gaia.csv md5 — recorded by _indv_extra_cfg — and
+            # the same key fit parameters in run_config.json).
+            import json as _json
+            _cfg_map = {_img: _indv_extra_cfg(_img) for _img in _indv_names}
+            _want_params = {
+                'n_iter': args.n_bp3m_iter, 'n_samples': args.n_samples,
+                'clip_sigma': args.bp3m_clip_sigma,
+                'poly_order': args.poly_order,
+                'split_ccd': not args.no_split_ccd,
+                'inflate_hst_errors': not args.no_inflate_hst_errors,
+                'two_phase_align': args.two_phase_align,
+                'pos_err_floor': args.bp3m_pos_err_floor,
+            }
+
+            def _indv_cached(_img):
+                _d = _indv_root / _img
+                if not ((_d / 'run_config.json').exists()
+                        and (_d / 'stellar_astrometry.csv').exists()):
+                    return False
+                try:
+                    _cfg = _json.loads((_d / 'run_config.json').read_text())
+                except Exception:
+                    return False
+                _md5 = _cfg_map[_img].get('matched_gaia_md5')
+                if _md5 is None or _cfg.get('matched_gaia_md5') != _md5:
+                    return False
+                return all(_cfg.get(_k) == _v
+                           for _k, _v in _want_params.items())
+
+            _n_all = len(_indv_names)
+            if not args.force_indv_refit:
+                _cached = [n for n in _indv_names if _indv_cached(n)]
+                _indv_names = [n for n in _indv_names if n not in set(_cached)]
+                if _cached:
+                    print(f"  {len(_cached)}/{_n_all} images cached "
+                          f"(md5 + fit params match) — skipping; "
+                          f"--force_indv_refit to redo")
+
             from datetime import datetime as _dt
             _n_total = len(_indv_names)
-            _n_proc = max(1, min(args.n_processes, _n_total))
+            _n_proc = max(1, min(args.n_processes, max(_n_total, 1)))
             print("\n" + "─"*50)
             print(f"Individual image fitting: {_n_total} images "
                   f"({_n_proc} process{'es' if _n_proc > 1 else ''})")
@@ -1385,34 +1428,42 @@ def main():
                       f"[{_dt_s:.1f}s]", flush=True)
                 return True
 
-            if _n_proc > 1:
+            if _n_proc > 1 and _n_total > 0:
                 import multiprocessing as _mp
                 from concurrent.futures import (ProcessPoolExecutor,
                                                 as_completed)
-                with ProcessPoolExecutor(
-                        max_workers=_n_proc,
-                        mp_context=_mp.get_context("forkserver"),
-                        initializer=_indv_pool_init,
-                        max_tasks_per_child=25) as _ex:
-                    _futs = {_ex.submit(_run_indv_one, _img, _run_kw,
-                                        _indv_root, _indv_extra_cfg(_img)): _img
-                             for _img in _indv_names}
-                    for _fut in as_completed(_futs):
-                        try:
-                            _res = _fut.result()
-                        except Exception as _exc:
-                            _res = (_futs[_fut],
-                                    f"{type(_exc).__name__}: {_exc}",
-                                    -1, -1, -1, 0.0)
-                        _n_done += 1
-                        if _indv_report(_res):
-                            _n_ok += 1
-                        else:
-                            _n_fail += 1
+                # NOTE: no max_tasks_per_child — mid-pool worker respawn under
+                # forkserver deadlocks at exactly n_workers x 25 tasks (seen
+                # at image 400 on Omega_Cen/47Tuc, same signature as the old
+                # xmatch hang).  Memory is recycled by rebuilding the whole
+                # pool every _BATCH images instead.
+                _BATCH = 300
+                for _b0 in range(0, _n_total, _BATCH):
+                    _batch = _indv_names[_b0:_b0 + _BATCH]
+                    with ProcessPoolExecutor(
+                            max_workers=min(_n_proc, len(_batch)),
+                            mp_context=_mp.get_context("forkserver"),
+                            initializer=_indv_pool_init) as _ex:
+                        _futs = {_ex.submit(_run_indv_one, _img, _run_kw,
+                                            _indv_root,
+                                            _cfg_map[_img]): _img
+                                 for _img in _batch}
+                        for _fut in as_completed(_futs):
+                            try:
+                                _res = _fut.result()
+                            except Exception as _exc:
+                                _res = (_futs[_fut],
+                                        f"{type(_exc).__name__}: {_exc}",
+                                        -1, -1, -1, 0.0)
+                            _n_done += 1
+                            if _indv_report(_res):
+                                _n_ok += 1
+                            else:
+                                _n_fail += 1
             else:
                 for _img in _indv_names:
                     _res = _run_indv_one(_img, _run_kw, _indv_root,
-                                         _indv_extra_cfg(_img))
+                                         _cfg_map[_img])
                     _n_done += 1
                     if _indv_report(_res):
                         _n_ok += 1
