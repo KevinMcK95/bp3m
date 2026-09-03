@@ -235,7 +235,8 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
 
 def _build_stars_df(img_dir: Path, img_name: str,
                     gaia_float_to_int64: dict | None = None,
-                    pos_err_floor: float = _MIN_POS_ERR_PX) -> pd.DataFrame | None:
+                    pos_err_floor: float = _MIN_POS_ERR_PX,
+                    pos_corr=None, meta=None) -> pd.DataFrame | None:
     """
     Build the per-image source DataFrame expected by BP3MSolver.
 
