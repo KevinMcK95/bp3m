@@ -271,14 +271,14 @@ def _build_stars_df(img_dir: Path, img_name: str,
         # Pseudo-GDC centroid correction (PSF-model bias), applied in memory
         # only — the catalog on disk is never modified.
         if pos_corr is not None and meta is not None:
-            _t = pos_corr.match(meta.get("instrument", ""),
-                                meta.get("detector", ""),
-                                meta.get("filter", ""))
-            if _t is not None:
+            _mjd = float(meta.get("hst_time_mjd", 0.0))
+            _ts = pos_corr.match(meta.get("instrument", ""),
+                                 meta.get("detector", ""),
+                                 meta.get("filter", ""), _mjd)
+            for _t in (_ts or []):
                 _bx, _by = _t.bias(tbl["x"].astype(float),
                                    tbl["y"].astype(float),
-                                   tbl["flux"].astype(float),
-                                   float(meta.get("hst_time_mjd", 0.0)))
+                                   tbl["flux"].astype(float), _mjd)
                 cat_xgdc = cat_xgdc - _bx
                 cat_ygdc = cat_ygdc - _by
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
@@ -405,14 +405,14 @@ def _build_delve_only_stars_df(
         # Pseudo-GDC centroid correction (PSF-model bias), applied in memory
         # only — the catalog on disk is never modified.
         if pos_corr is not None and meta is not None:
-            _t = pos_corr.match(meta.get("instrument", ""),
-                                meta.get("detector", ""),
-                                meta.get("filter", ""))
-            if _t is not None:
+            _mjd = float(meta.get("hst_time_mjd", 0.0))
+            _ts = pos_corr.match(meta.get("instrument", ""),
+                                 meta.get("detector", ""),
+                                 meta.get("filter", ""), _mjd)
+            for _t in (_ts or []):
                 _bx, _by = _t.bias(tbl["x"].astype(float),
                                    tbl["y"].astype(float),
-                                   tbl["flux"].astype(float),
-                                   float(meta.get("hst_time_mjd", 0.0)))
+                                   tbl["flux"].astype(float), _mjd)
                 cat_xgdc = cat_xgdc - _bx
                 cat_ygdc = cat_ygdc - _by
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
@@ -724,7 +724,9 @@ def load_image_data_flc(data_root, field_name: str,
         if (_pos_corr is not None and stars_df is not None
                 and _pos_corr.match(meta.get("instrument", ""),
                                     meta.get("detector", ""),
-                                    meta.get("filter", "")) is not None):
+                                    meta.get("filter", ""),
+                                    float(meta.get("hst_time_mjd", 0.0)))
+                is not None):
             _n_corr_imgs.append(img_name)
         if stars_df is None or len(stars_df) == 0:
             skipped.append(img_name)

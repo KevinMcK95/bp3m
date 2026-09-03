@@ -36,12 +36,21 @@ class PseudoGDC:
         self.instrument = str(z["instrument"])
         self.detector = str(z["detector"])
         self.filter = str(z["filter"])
+        # optional epoch-validity window (e.g. GDC-delta tables built from
+        # per-group calibration D fits): applies only to images inside it
+        self.mjd_window = (tuple(float(v) for v in z["mjd_window"])
+                           if "mjd_window" in z else None)
         self.md5 = hashlib.md5(self.path.read_bytes()).hexdigest()
 
-    def matches(self, instrument: str, detector: str, filt: str) -> bool:
-        return (str(instrument).upper() == self.instrument.upper()
+    def matches(self, instrument: str, detector: str, filt: str,
+                mjd: float | None = None) -> bool:
+        if not (str(instrument).upper() == self.instrument.upper()
                 and str(detector).upper() == self.detector.upper()
-                and str(filt).upper() == self.filter.upper())
+                and str(filt).upper() == self.filter.upper()):
+            return False
+        if self.mjd_window is not None and mjd is not None:
+            return self.mjd_window[0] <= mjd <= self.mjd_window[1]
+        return True
 
     def _interp_cell(self, grid2d, xc, yc):
         """Bilinear interpolation of a (7y,7x) cell map, edge-clamped."""
@@ -99,11 +108,13 @@ class PseudoGDCSet:
             paths = [p for p in str(paths).split(",") if p.strip()]
         self.tables = [PseudoGDC(p.strip()) for p in paths]
 
-    def match(self, instrument: str, detector: str, filt: str):
-        for t in self.tables:
-            if t.matches(instrument, detector, filt):
-                return t
-        return None
+    def match(self, instrument: str, detector: str, filt: str,
+              mjd: float | None = None):
+        """ALL matching tables (corrections are additive: e.g. pseudo-GDC
+        PSF-bias + GDC-delta epoch-distortion for the same image)."""
+        out = [t for t in self.tables
+               if t.matches(instrument, detector, filt, mjd)]
+        return out or None
 
     @property
     def summary(self):
