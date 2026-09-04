@@ -141,7 +141,7 @@ def _fmt_eta(seconds: float) -> str:
 def run_bulk(instrument_factory, field_root: Path, exposures,
              n_workers: int, worker_id: int,
              do_xmatch=True, do_align=True, make_plots=False,
-             force=False, dry_run=False, **align_kw):
+             force=False, dry_run=False, redo_before=None, **align_kw):
     """
     Process this worker's slice of `exposures`.
 
@@ -155,8 +155,20 @@ def run_bulk(instrument_factory, field_root: Path, exposures,
 
     field_root = Path(field_root)
     mine = partition(exposures, n_workers, worker_id)
-    todo = mine if force else [e for e in mine
-                               if not is_complete(field_root, f'cfht_{e}')]
+
+    def _fresh(e):
+        """Complete AND newer than redo_before (stale results get redone —
+        e.g. everything produced before the 2026-09 parallax-factor sign fix
+        — while the rerun stays resumable: a redone exposure's new sentinel
+        is newer than the cutoff, so a restart skips it)."""
+        sp = sentinel_path(field_root, f'cfht_{e}')
+        if not sp.exists():
+            return False
+        if redo_before is not None and sp.stat().st_mtime < redo_before:
+            return False
+        return True
+
+    todo = mine if force else [e for e in mine if not _fresh(e)]
 
     print(f'[{_ts()}] [w{worker_id}/{n_workers}] {len(mine)} assigned, '
           f'{len(todo)} to do, {len(mine) - len(todo)} already complete',

@@ -102,6 +102,11 @@ def main(argv=None):
     p.add_argument('--skip-align', action='store_true')
     p.add_argument('--force', action='store_true',
                    help='Redo exposures that already have a completion sentinel')
+    p.add_argument('--redo-before', default=None,
+                   help='Redo exposures whose completion sentinel is older '
+                        'than this (unix mtime or YYYY-MM-DD). Resumable '
+                        'stale-results overwrite, e.g. for the 2026-09 '
+                        'parallax-factor fix.')
     p.add_argument('--dry-run', action='store_true',
                    help='Show this worker\'s slice without running')
     p.add_argument('--status', action='store_true',
@@ -114,13 +119,22 @@ def main(argv=None):
 
     exps = ([int(e) for e in args.exposure] if args.exposure
             else all_exposures(args.instrument, args.field_root))
+    _redo_before = None
+    if args.redo_before is not None:
+        try:
+            _redo_before = float(args.redo_before)
+        except ValueError:
+            import datetime as _dt
+            _redo_before = _dt.datetime.strptime(
+                args.redo_before, '%Y-%m-%d').timestamp()
     bulk.run_bulk(make_factory(args.instrument, args.field_root),
                   args.field_root, exps,
                   n_workers=args.n_workers, worker_id=args.worker_id,
                   do_xmatch=not args.skip_xmatch,
                   do_align=not args.skip_align,
                   make_plots=not args.no_plots,
-                  force=args.force, dry_run=args.dry_run)
+                  force=args.force, dry_run=args.dry_run,
+                  redo_before=_redo_before)
 
 
 if __name__ == '__main__':
