@@ -259,13 +259,26 @@ def run_alignment(  # noqa: C901
     if use_cfht and cfht_dir is not None:
         from bp3m.data_loader_cfht import (collect_cfht_matches,
                                            build_cfht_images)
+        from bp3m.data_loader_cfht import (assign_faint_star_ids,
+                                           build_fallback_hst_images)
         _cm = collect_cfht_matches(data_root / field_name)
         if len(_cm):
+            _cm = assign_faint_star_ids(_cm)
             cimgs, cstars, faint_cat = build_cfht_images(
                 data_root / field_name, cfht_dir, _cm,
                 cfht_prior_inflate=cfht_prior_inflate)
             imgs.update(cimgs)
             filtered_spi.update(cstars)
+            # HST images whose Gaia xmatch failed but that match CFHT:
+            # brought back onto the frame via transformation_cfht_<exp>.csv
+            fimgs, fstars = build_fallback_hst_images(
+                data_root / field_name, _cm,
+                pos_err_floor=pos_err_floor, pos_corr_table=pos_corr_table)
+            if fimgs:
+                imgs.update(fimgs)
+                filtered_spi.update(fstars)
+                print(f'  use_cfht: {len(fimgs)} Gaia-less HST images '
+                      f'recovered via CFHT relative alignments')
             if len(faint_cat):
                 import pandas as _pd_c
                 from astropy.time import Time as _T_c

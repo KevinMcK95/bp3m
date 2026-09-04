@@ -136,7 +136,8 @@ def build_cfht_images(field_dir, cfht_dir, matches: pd.DataFrame,
                                                 _read_cat)
     cfht_dir = Path(cfht_dir)
     images, stars_per_image = {}, {}
-    matches = assign_faint_star_ids(matches)
+    if 'star_id' not in matches.columns:
+        matches = assign_faint_star_ids(matches)
     for (expnum, ext), grp in matches.groupby(['cfht_expnum', 'cfht_ext']):
         post = load_cfht_bulk_posterior(cfht_dir, int(expnum), int(ext))
         if post is None:
@@ -228,3 +229,53 @@ def build_cfht_images(field_dir, cfht_dir, matches: pd.DataFrame,
         ))
     faint_catalog = pd.DataFrame(cat_rows)
     return images, stars_per_image, faint_catalog
+
+
+def build_fallback_hst_images(field_dir, matches: pd.DataFrame,
+                              pos_err_floor: float = 0.05,
+                              pos_corr_table=None):
+    """HST images with CFHT matches but NO Gaia cross-match: initialize from
+    transformation_cfht_<exp>.csv (same schema and Gaia-frame convention as
+    transformation.csv — the CFHT side was pre-aligned by the bulk posterior,
+    so the relative fit already sits on top of it) and build their stars_df
+    from the matched_cfht pairs (star ids: Gaia where known, faint negatives
+    otherwise). Returns (images meta dict, stars_per_image dict)."""
+    from bp3m.data_loader_flc import _read_image_meta, _build_stars_df
+    pos_corr = None
+    if pos_corr_table is not None:
+        from bp3m.pos_corr import PseudoGDCSet
+        pos_corr = PseudoGDCSet(pos_corr_table)
+    field_dir = Path(field_dir)
+    hst_root = field_dir / 'HST' / 'mastDownload' / 'HST'
+    matches = (matches if 'star_id' in matches.columns
+               else assign_faint_star_ids(matches))
+    images, stars_per_image = {}, {}
+    for img_name, grp in matches.groupby('hst_image'):
+        d = hst_root / img_name
+        if (d / 'transformation.csv').exists():
+            continue        # normal Gaia-initialized image
+        # best exposure = most matches with an existing transformation file
+        best = None
+        for exp, g in grp.groupby('cfht_expnum'):
+            tf = d / f'transformation_cfht_{int(exp)}.csv'
+            if tf.exists() and (best is None or len(g) > best[1]):
+                best = (tf.name, len(g))
+        if best is None:
+            continue
+        meta = _read_image_meta(d, img_name, transformation_file=best[0])
+        if meta is None:
+            continue
+        meta['cfht_initialized'] = True
+        override = (grp.drop_duplicates('hst_index')
+                    [['hst_index', 'star_id']]
+                    .rename(columns={'star_id': 'gaia_source_id'}))
+        stars_df = _build_stars_df(d, img_name, None, pos_err_floor,
+                                   pos_corr=pos_corr, meta=meta,
+                                   match_override=override)
+        if stars_df is None or len(stars_df) < 5:
+            continue
+        images[img_name] = meta
+        stars_per_image[img_name] = stars_df
+        print(f'    {img_name}: CFHT-initialized ({best[0]}, '
+              f'{len(stars_df)} matched detections)')
+    return images, stars_per_image

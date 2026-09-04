@@ -162,13 +162,17 @@ def _fcm_to_abcd(A, B, C, D, orig_rot_deg: float) -> np.ndarray:
     return np.array([abcd[0], abcd[1], abcd[2], abcd[3]])
 
 
-def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
+def _read_image_meta(img_dir: Path, img_name: str,
+                     transformation_file: "str | None" = None) -> dict | None:
     """
     Extract all metadata needed by BP3MSolver from the FLC FITS header and
     transformation.csv.  Returns None if any required file is missing.
+    transformation_file overrides the default 'transformation.csv' — used for
+    HST images whose Gaia cross-match failed but that have a CFHT relative
+    alignment (transformation_cfht_<exp>.csv, same schema/frame).
     """
     flc_path  = img_dir / f"{img_name}_flc.fits"
-    tran_path = img_dir / "transformation.csv"
+    tran_path = img_dir / (transformation_file or "transformation.csv")
 
     if not flc_path.exists() or not tran_path.exists():
         return None
@@ -298,7 +302,9 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
 def _build_stars_df(img_dir: Path, img_name: str,
                     gaia_float_to_int64: dict | None = None,
                     pos_err_floor: float = _MIN_POS_ERR_PX,
-                    pos_corr=None, meta=None) -> pd.DataFrame | None:
+                    pos_corr=None, meta=None,
+                    match_override: "pd.DataFrame | None" = None
+                    ) -> pd.DataFrame | None:
     """
     Build the per-image source DataFrame expected by BP3MSolver.
 
@@ -351,7 +357,11 @@ def _build_stars_df(img_dir: Path, img_name: str,
         cat_n_sat  = tbl["n_sat"].astype(int)
 
     # ── Matched Gaia cross-match ──────────────────────────────────────────────
-    match = pd.read_csv(match_path)
+    # CFHT-fallback path: (hst_index, gaia_source_id[int64 star id]) pairs
+    # supplied by the caller — everything else still comes from this image's
+    # own catalog products.
+    match = (match_override if match_override is not None
+             else pd.read_csv(match_path))
 
     hst_idx = match["hst_index"].to_numpy(int)
 
