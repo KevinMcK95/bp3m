@@ -2261,12 +2261,12 @@ class BP3MSolver:
                     print(f"  two_phase_align: Phase B budget ({n_iter} iters) "
                           f"exhausted (star set did not fully stabilise)")
                     break
-                # Snapshot use_for_fit per image before _update_use_for_fit so
-                # we can attribute per-detection changes to test-3 separately.
-                if verbose_tests:
-                    _snap_use_pre = {
-                        img: d["use_for_fit"].copy()
-                        for img, d in self._img_data.items() if d is not None}
+                # Snapshot use_for_fit per image before _update_use_for_fit:
+                # verbose_tests uses it for per-test attribution, and the
+                # re-admissions-only stop rule needs the change DIRECTION.
+                _snap_use_pre = {
+                    img: d["use_for_fit"].copy()
+                    for img, d in self._img_data.items() if d is not None}
 
                 clip_info, ok_star_new, n_use_changed = self._update_use_for_fit(
                     r_hat, a_arr, C_r, C_vT, clip_sigma, iteration=it_outer,
@@ -2277,6 +2277,21 @@ class BP3MSolver:
                     inflate_alpha_max=inflate_alpha_max,
                     hst_fit_sigma_mult=hst_fit_sigma_mult,
                     chi2_threshold=chi2_threshold, alpha_scale_chi2=alpha_scale_chi2)
+
+                # Directional mask-change counts for the re-admissions-only
+                # stop: a NEW REJECTION means the converged solution contained
+                # data now judged bad (must refit); a RE-ADMISSION means the
+                # solution was fit WITHOUT the detection and it now agrees —
+                # refitting can only move the solution within its error bars.
+                _n_new_rej = 0
+                _n_readmit = 0
+                for _img_d, _d in self._img_data.items():
+                    if _d is None or _img_d not in _snap_use_pre:
+                        continue
+                    _pre_d = _snap_use_pre[_img_d]
+                    _post_d = _d["use_for_fit"]
+                    _n_new_rej += int((_pre_d & ~_post_d).sum())
+                    _n_readmit += int((~_pre_d & _post_d).sum())
 
                 # ── demote/promote starving chips (see note above) ────────
                 # Decisions only; the masks themselves are managed inside
@@ -2402,6 +2417,16 @@ class BP3MSolver:
                     # keeps the strict criteria and the freeze-mask final
                     # solve, so the reported solution is unaffected.
                     _tot_changed = n_global_changed + n_use_changed + n_inf_new
+                    _readmit_tol = max(_mask_tol,
+                                       int(round(0.005 * _n_det_tot)))
+                    if (it_outer >= min_outer
+                            and n_global_changed == 0 and n_inf_new == 0
+                            and _n_new_rej == 0
+                            and 0 < _n_readmit <= _readmit_tol):
+                        print(f"  Re-admissions only ({_n_readmit} <= "
+                              f"{_readmit_tol}, no new rejections) — "
+                              f"Phase A done.")
+                        _converged_now = True
                     if it_outer >= min_outer and _tot_changed <= _mask_tol:
                         _n_tol_stable += 1
                         if _n_tol_stable >= mask_tol_iters:
@@ -2429,6 +2454,20 @@ class BP3MSolver:
                     _stable_124 = (n_global_changed == 0 and n_inf_new == 0)
                     if _stable_124 and n_use_changed == 0 and it_outer >= min_outer:
                         print(f"  Tests 1-4 stable — stopping.")
+                        break
+                    # Re-admissions-only stop (prototype rule): no new
+                    # rejections means no contamination is being removed;
+                    # a small set of re-admissions is consistent-by-
+                    # construction and cannot move the solution beyond its
+                    # error bars. Fires immediately (no persistence needed).
+                    _readmit_tol = max(_mask_tol,
+                                       int(round(0.005 * _n_det_tot)))
+                    if (_stable_124 and it_outer >= min_outer
+                            and _n_new_rej == 0
+                            and 0 < _n_readmit <= _readmit_tol):
+                        print(f"  Re-admissions only ({_n_readmit} <= "
+                              f"{_readmit_tol}, no new rejections) — "
+                              f"stopping.")
                         break
                     if _stable_124 and it_outer >= min_outer and n_use_changed <= _mask_tol:
                         _n_tol_stable += 1
