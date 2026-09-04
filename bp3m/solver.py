@@ -2000,6 +2000,19 @@ class BP3MSolver:
                 self._update_geometry(r_new, a_i)
                 return r_new, C_r_i, a_i, K_i, CvT_i
 
+            # Geometry-update gating: re-projecting xys/J/U (_update_geometry)
+            # only matters once the tangent points or stellar positions have
+            # moved enough for the linearisation to drift. Skip it while both
+            # the accumulated pointing residuals and the stellar position
+            # change since the last re-projection stay below the gate; the
+            # converged point always gets a final re-projection in _final().
+            _GEOM_GATE_MAS = 0.2
+            _nr_g = self.N_R
+            _tp_idx = np.concatenate([
+                [j * _nr_g + 4, j * _nr_g + 5]
+                for j in range(self.n_images)]) if self.n_images else None
+            _a_last_geom = None
+
             for it_i in range(500):
                 r_new, _, a_i, K_i, CvT_i = self._solve_one_pass(
                     r_hat, z_weights=z_weights, need_cov=False)
@@ -2010,7 +2023,13 @@ class BP3MSolver:
                 delta = np.max(diff)
                 r_hat = r_new
                 self._update_R(r_hat)
-                self._update_geometry(r_hat, a_i)
+                _tp_max = (np.max(np.abs(r_hat[_tp_idx]))
+                           if _tp_idx is not None else 0.0)
+                _a_max = (np.max(np.abs(a_i[:, :2] - _a_last_geom))
+                          if _a_last_geom is not None else np.inf)
+                if _tp_max > _GEOM_GATE_MAS or _a_max > _GEOM_GATE_MAS:
+                    self._update_geometry(r_hat, a_i)
+                    _a_last_geom = a_i[:, :2].copy()
                 if it_i % 10 == 0:
                     max_str, stats_str = _delta_summary(diff)
                     print(f"  {label}: step {it_i+1:3d},  max|Δr| = {max_str}")
