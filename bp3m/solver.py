@@ -2077,44 +2077,56 @@ class BP3MSolver:
             # uncorrected alignment error, so the production clip_sigma
             # mass-rejects (Leo_I: 79% of detections at 4.5). Only remove
             # the egregious outliers here; Phase 2 does the fine work.
-            _pc_sigma = max(float(prefit_clean_sigma), float(clip_sigma))
-            _pc_chi2 = (chi2_threshold * (_pc_sigma / clip_sigma) ** 2
-                        if chi2_threshold is not None else None)
-            print(f' Phase 0.5: star-only cleaning at frozen r '
+            # Test: per-image robust residual clipping. The un-fit alignment
+            # error at frozen r is COMMON-MODE within an image, so clipping
+            # each detection against its own image's per-axis median/MAD is
+            # immune to it — unlike the Phase-2 adaptive-threshold tests,
+            # which mass-reject in this regime (see _update_use_for_fit gate
+            # note: an un-converged solve makes a huge p50 legitimate).
+            # Monotone by construction: detections are only ever removed;
+            # re-admission rights come back in Phase 2.
+            _pc_sigma = float(prefit_clean_sigma)
+            print(f' Phase 0.5: per-image residual-MAD cleaning at frozen r '
                   f'(up to {prefit_clean_iters} iterations, '
                   f'sigma={_pc_sigma:.1f})')
+            _nr_pc = self.N_R
             for _pc in range(prefit_clean_iters):
-                _, C_r_pc, a_pc, _, CvT_pc = self._solve_one_pass(r_hat)
-                _pre_masks = {
-                    img: (d['use_for_fit'].copy(),
-                          d.get('use_for_astrom',
-                                d['use_for_fit']).copy())
-                    for img, d in self._img_data.items() if d is not None}
-                clip_info, _, _ = self._update_use_for_fit(
-                    r_hat, a_pc, C_r_pc, CvT_pc, _pc_sigma,
-                    ok_star_prev=None, inflate_errors=False,
-                    skip_star_tests=False,
-                    chi2_threshold=_pc_chi2,
-                    alpha_scale_chi2=False)
-                # MONOTONE cleaning: detections may only be REMOVED while r is
-                # frozen — re-admissions are reverted (they get their rights
-                # back in Phase 2). Without this the adaptive threshold and
-                # the tests feed back into a period-2 limit cycle at frozen r.
+                _, _, a_pc, _, _ = self._solve_one_pass(r_hat,
+                                                        need_cov=False)
                 _n_rej = 0
-                for img, d in self._img_data.items():
-                    if d is None or img not in _pre_masks:
+                for _j, img in enumerate(self.image_names):
+                    d = self._img_data.get(img)
+                    if d is None:
                         continue
-                    pre_fit, pre_astrom = _pre_masks[img]
-                    d['use_for_fit'] = d['use_for_fit'] & pre_fit
+                    cols = np.arange(_j * _nr_pc, (_j + 1) * _nr_pc)
+                    ec = self._ed_cols(img)
+                    X = d["X_mat"]
+                    if ec is not None:
+                        cols = np.concatenate([cols, ec])
+                        X = np.concatenate([X, d["B_mat"]], axis=2)
+                    res = (d["xys"]
+                           - np.einsum('nkl,l->nk', X, r_hat[cols])
+                           - np.einsum('nij,nj->ni', d["JU"],
+                                       a_pc[d["sidx"]]))
+                    use = d['use_for_fit']
+                    if use.sum() < 5:
+                        continue
+                    med = np.median(res[use], axis=0)
+                    mad = np.median(np.abs(res[use] - med), axis=0)
+                    sig = np.maximum(1.4826 * mad, 1e-6)
+                    bad = np.any(np.abs(res - med) > _pc_sigma * sig,
+                                 axis=1)
+                    _n_rej += int((use & bad).sum())
+                    d['use_for_fit'] = use & ~bad
                     if 'use_for_astrom' in d:
-                        d['use_for_astrom'] = d['use_for_astrom'] & pre_astrom
-                    _n_rej += int((pre_fit & ~d['use_for_fit']).sum())
+                        d['use_for_astrom'] = d['use_for_astrom'] & ~bad
                 n_in = sum(int(d['use_for_fit'].sum())
                            for d in self._img_data.values() if d is not None)
                 n_tot = sum(int(len(d['use_for_fit']))
                             for d in self._img_data.values() if d is not None)
                 print(f"  Phase 0.5 iter {_pc+1}: {_n_rej} new rejections, "
-                      f"{n_in}/{n_tot} detections kept (r frozen, monotone)")
+                      f"{n_in}/{n_tot} detections kept "
+                      f"(r frozen, per-image MAD)")
                 if _n_rej == 0:
                     break
 
