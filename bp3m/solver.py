@@ -1742,7 +1742,8 @@ class BP3MSolver:
             two_phase_align=False,
             mask_tol_frac=1e-3, mask_tol_iters=3,
             hst_fit_sigma_mult=0.5,
-            prefilter=True, chi2_threshold=None, alpha_scale_chi2=False,
+            prefilter=True, prefit_clean_iters=0,
+            chi2_threshold=None, alpha_scale_chi2=False,
             use_influence_clip=True,
             influence_k: float = 5.0,
             influence_floor_sr: float | None = None,
@@ -2013,7 +2014,11 @@ class BP3MSolver:
                 for j in range(self.n_images)]) if self.n_images else None
             _a_last_geom = None
 
-            for it_i in range(500):
+            # Inner cap 100 (was 500): healthy loops converge in 2-5 steps;
+            # hundreds of steps signal divergence/oscillation, which the
+            # backtracking below addresses directly.
+            delta_prev = np.inf
+            for it_i in range(100):
                 r_new, _, a_i, K_i, CvT_i = self._solve_one_pass(
                     r_hat, z_weights=z_weights, need_cov=False)
                 for _dimg in self._align_demoted:
@@ -2021,6 +2026,15 @@ class BP3MSolver:
                     r_new[_bl] = r_hat[_bl]     # frozen: no update, no Δr
                 diff = np.abs(r_new - r_hat)
                 delta = np.max(diff)
+                # Backtrack on divergence: an update that GROWS by >1.5x vs
+                # the previous step is overshooting (geometry/weight feedback);
+                # halve the step. The fixed point is unchanged — at
+                # convergence steps shrink and backtracking never triggers.
+                if delta > 1.5 * delta_prev and delta > tol:
+                    r_new = r_hat + 0.5 * (r_new - r_hat)
+                    diff = np.abs(r_new - r_hat)
+                    delta = np.max(diff)
+                delta_prev = delta
                 r_hat = r_new
                 self._update_R(r_hat)
                 _tp_max = (np.max(np.abs(r_hat[_tp_idx]))
@@ -2051,6 +2065,50 @@ class BP3MSolver:
             for img in self.image_names:
                 self._img_data[img]["C_r_prior_inv"] = np.zeros((n_r, n_r))
             print(" no_align_prior=True: alignment priors zeroed out")
+
+        # ── Phase 0.5: star-only cleaning at FROZEN r ─────────────────────────
+        # With r held at its initialization (indv warm start / transformation
+        # .csv), iterate stellar-astrometry solves + the standard rejection
+        # tests so obviously-bad stars/detections are removed BEFORE r moves
+        # at all. Bad detections then never contaminate the first joint
+        # solution, and Phase 2 needs fewer outer loops.
+        if prefit_clean_iters and clip_sigma is not None:
+            print(f' Phase 0.5: star-only cleaning at frozen r '
+                  f'(up to {prefit_clean_iters} iterations)')
+            for _pc in range(prefit_clean_iters):
+                _, C_r_pc, a_pc, _, CvT_pc = self._solve_one_pass(r_hat)
+                _pre_masks = {
+                    img: (d['use_for_fit'].copy(),
+                          d.get('use_for_astrom',
+                                d['use_for_fit']).copy())
+                    for img, d in self._img_data.items() if d is not None}
+                clip_info, _, _ = self._update_use_for_fit(
+                    r_hat, a_pc, C_r_pc, CvT_pc, clip_sigma,
+                    ok_star_prev=None, inflate_errors=False,
+                    skip_star_tests=False,
+                    chi2_threshold=chi2_threshold,
+                    alpha_scale_chi2=False)
+                # MONOTONE cleaning: detections may only be REMOVED while r is
+                # frozen — re-admissions are reverted (they get their rights
+                # back in Phase 2). Without this the adaptive threshold and
+                # the tests feed back into a period-2 limit cycle at frozen r.
+                _n_rej = 0
+                for img, d in self._img_data.items():
+                    if d is None or img not in _pre_masks:
+                        continue
+                    pre_fit, pre_astrom = _pre_masks[img]
+                    d['use_for_fit'] = d['use_for_fit'] & pre_fit
+                    if 'use_for_astrom' in d:
+                        d['use_for_astrom'] = d['use_for_astrom'] & pre_astrom
+                    _n_rej += int((pre_fit & ~d['use_for_fit']).sum())
+                n_in = sum(int(d['use_for_fit'].sum())
+                           for d in self._img_data.values() if d is not None)
+                n_tot = sum(int(len(d['use_for_fit']))
+                            for d in self._img_data.values() if d is not None)
+                print(f"  Phase 0.5 iter {_pc+1}: {_n_rej} new rejections, "
+                      f"{n_in}/{n_tot} detections kept (r frozen, monotone)")
+                if _n_rej == 0:
+                    break
 
         # ── Phase 0: pre-filter using one solve + same outlier rejection as Phase 2
         if prefilter and clip_sigma is not None:
