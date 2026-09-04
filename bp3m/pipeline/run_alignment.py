@@ -89,6 +89,7 @@ def run_alignment(  # noqa: C901
     pos_corr_table=None,
     epoch_dist_prior=None,
     epoch_dist_prior_inflate: float = 2.0,
+    n_processes: int = 1,
 ) -> Path:
     """
     Run BP3M Bayesian alignment on a field.
@@ -171,7 +172,8 @@ def run_alignment(  # noqa: C901
         restrict_images=set(images) if images is not None else None,
         gaia_csv=gaia_csv, use_delve=use_delve,
         delve_use_for_align=delve_use_for_align,
-        pos_corr_table=pos_corr_table)
+        pos_corr_table=pos_corr_table,
+        n_processes=n_processes)
     if imgs is None or len(imgs) == 0:
         raise RuntimeError(
             f"No usable images found for '{field_name}'. "

@@ -59,6 +59,44 @@ _MAX_SAT_FRAC: float = 0.25
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+_LDR_STATE: dict = {}
+
+
+def _loader_pool_init(g2i, pos_err_floor, pos_corr_table, pin_blas=True):
+    """Worker initializer for the parallel image loader (BLAS pinned to 1,
+    per-worker PseudoGDCSet rebuilt from the table path). pin_blas=False when
+    called in-process for the serial path — never pin the parent's BLAS."""
+    if pin_blas:
+        for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                   "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[_v] = "1"
+    _LDR_STATE["g2i"] = g2i
+    _LDR_STATE["floor"] = pos_err_floor
+    if pos_corr_table is not None:
+        from bp3m.pos_corr import PseudoGDCSet
+        _LDR_STATE["pc"] = PseudoGDCSet(pos_corr_table)
+    else:
+        _LDR_STATE["pc"] = None
+
+
+def _load_one_image(work):
+    """One image's meta + stars_df (parallel loader worker)."""
+    img_dir_str, img_name = work
+    img_dir = Path(img_dir_str)
+    meta = _read_image_meta(img_dir, img_name)
+    if meta is None:
+        return img_name, None, None, False
+    pc = _LDR_STATE["pc"]
+    stars_df = _build_stars_df(img_dir, img_name, _LDR_STATE["g2i"],
+                               _LDR_STATE["floor"], pos_corr=pc, meta=meta)
+    matched = (pc is not None and stars_df is not None
+               and pc.match(meta.get("instrument", ""),
+                            meta.get("detector", ""),
+                            meta.get("filter", ""),
+                            float(meta.get("hst_time_mjd", 0.0))) is not None)
+    return img_name, meta, stars_df, matched
+
+
 def resolve_gaia_csvs(field_path):
     """Gaia CSV paths for a field, plus whether they came from the sidecar.
 
@@ -611,7 +649,8 @@ def load_image_data_flc(data_root, field_name: str,
                         gaia_csv: "str | Path | list | None" = None,
                         use_delve: bool = False,
                         delve_use_for_align: bool = False,
-                        pos_corr_table: "str | Path | None" = None):
+                        pos_corr_table: "str | Path | None" = None,
+                        n_processes: int = 1):
     """
     Load BP3M inputs from the new FLC-based pipeline layout.
 
@@ -743,31 +782,36 @@ def load_image_data_flc(data_root, field_name: str,
     observed_gaia_ids: set = set()
     _n_load = (len(img_dirs) if restrict_images is None
                else min(len(img_dirs), len(restrict_images)))
+    _work = [(str(d), d.name) for d in img_dirs
+             if restrict_images is None or d.name in restrict_images]
+
+    if n_processes > 1 and len(_work) > 8:
+        # Parallel per-image loading: order-preserving map, same worker code
+        # path as serial (meta + stars_df + pos_corr match flag per image).
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing as _mp
+        _ctx = _mp.get_context("forkserver")
+        _pool = ProcessPoolExecutor(
+            max_workers=min(n_processes, len(_work)),
+            mp_context=_ctx, initializer=_loader_pool_init,
+            initargs=(gaia_float_to_int64, pos_err_floor, pos_corr_table))
+        _results = _pool.map(_load_one_image, _work, chunksize=8)
+    else:
+        _pool = None
+        _loader_pool_init(gaia_float_to_int64, pos_err_floor, pos_corr_table,
+                          pin_blas=False)
+        _results = map(_load_one_image, _work)
+
     if _n_load > 50:
         from tqdm import tqdm as _tqdm
-        _iter_dirs = _tqdm(img_dirs, desc="  Loading image data", unit="img",
-                           dynamic_ncols=True)
-    else:
-        _iter_dirs = img_dirs
-    for img_dir in _iter_dirs:
-        img_name = img_dir.name
-        if restrict_images is not None and img_name not in restrict_images:
-            continue
-
-        meta = _read_image_meta(img_dir, img_name)
+        _results = _tqdm(_results, total=len(_work),
+                         desc="  Loading image data", unit="img",
+                         dynamic_ncols=True)
+    for img_name, meta, stars_df, _corr_matched in _results:
         if meta is None:
             skipped.append(img_name)
             continue
-
-        stars_df = _build_stars_df(img_dir, img_name, gaia_float_to_int64,
-                                   pos_err_floor,
-                                   pos_corr=_pos_corr, meta=meta)
-        if (_pos_corr is not None and stars_df is not None
-                and _pos_corr.match(meta.get("instrument", ""),
-                                    meta.get("detector", ""),
-                                    meta.get("filter", ""),
-                                    float(meta.get("hst_time_mjd", 0.0)))
-                is not None):
+        if _corr_matched:
             _n_corr_imgs.append(img_name)
         if stars_df is None or len(stars_df) == 0:
             skipped.append(img_name)
@@ -817,6 +861,9 @@ def load_image_data_flc(data_root, field_name: str,
             "yt_o":             meta["yt_o"],
             "n_matched":        len(stars_df),
         })
+
+    if _pool is not None:
+        _pool.shutdown()
 
     keep_gaia_mask = gaia_catalog["Gaia_id"].isin(observed_gaia_ids).to_numpy()
 

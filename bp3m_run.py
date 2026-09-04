@@ -1619,6 +1619,7 @@ def main():
                 print(f"  Joint-fit outputs -> {_joint_bp3m_dir}")
             run_alignment(
                 output_dir=output_dir, field_name=field,
+                n_processes=args.n_processes,
                 n_iter=args.n_bp3m_iter,
                 n_samples=args.n_samples,
                 mcmc_posteriors=args.mcmc_posteriors,

@@ -35,6 +35,7 @@ Usage
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -2052,7 +2053,8 @@ def run_pop_fit(
         _gcsv = v1_cfg.get('gaia_csv')
         imgs, stars_per_image, gaia_catalog = load_image_data_flc(
             data_root, field_name, pos_corr_table=_pct,
-            pos_err_floor=_floor, gaia_csv=_gcsv)
+            pos_err_floor=_floor, gaia_csv=_gcsv,
+            n_processes=min(8, os.cpu_count() or 1))
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable images found for '{field_name}'.")
 
