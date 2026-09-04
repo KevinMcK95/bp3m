@@ -170,26 +170,44 @@ def build_cfht_images(field_dir, cfht_dir, matches: pd.DataFrame,
         stars_df = pd.DataFrame({
             'Gaia_id': star_ids,
             'X': xi / CFHT_PSCALE_MAS, 'Y': eta / CFHT_PSCALE_MAS,
-            'x_sig': SIGMA_CFHT_POS_MAS / CFHT_PSCALE_MAS,
-            'y_sig': SIGMA_CFHT_POS_MAS / CFHT_PSCALE_MAS,
+            'x_hst_err': SIGMA_CFHT_POS_MAS / CFHT_PSCALE_MAS,
+            'y_hst_err': SIGMA_CFHT_POS_MAS / CFHT_PSCALE_MAS,
+            'xy_hst_corr': 0.0,
             'mag': sel.mag.to_numpy(), 'mag_err': sel.magerr.to_numpy(),
             'q_hst': 0.05, 'use_for_alignment': True,
+            'use_for_align_init_flag': True,
             'provenance': tier,
         })
+        # duplicate star in one detector (should not happen) — keep first
+        stars_df = stars_df.drop_duplicates('Gaia_id', keep='first')
         A, B, C, D = post['abcd']
-        sA, sB, sC, sD = [max(s, 1e-7) * cfht_prior_inflate
-                          for s in post['sigma_abcd']]
-        sdx, sdy = [max(s, 1.0) * cfht_prior_inflate
-                    for s in post['sigma_pointing_mas']]
+        sA, sB, sC, sD = [max(sg, 1e-7) * cfht_prior_inflate
+                          for sg in post['sigma_abcd']]
+        sdx, sdy = [max(sg, 1.0) * cfht_prior_inflate
+                    for sg in post['sigma_pointing_mas']]
+        # prior mean in bp3m's (rot, scale) parameterisation from the bulk M;
+        # prior widths mapped from the inflated per-parameter sigmas
+        rot_deg = float(np.degrees(np.arctan2(B - C, A + D)))
+        scale = float(np.sqrt(max(A * D - B * C, 1e-12)))
         images[name] = dict(
             instrument='CFHT', detector='MEGACAM', filter='r',
             expnum=int(expnum), ext=int(ext),
             hst_time_mjd=post['mjd'],
             ra0=post['ra0'], dec0=post['dec0'],
+            pixel_scale=CFHT_PSCALE_MAS,
             orig_pixel_scale=CFHT_PSCALE_MAS,
+            orig_rot_deg=rot_deg,
+            initial_scale_ratio=scale,
+            pixel_scale_ratio=scale,
+            rotation_deg=rot_deg,
+            on_skew=0.5 * (A - D), off_skew=0.5 * (B + C),
             fcm_abcd=np.array([A, B, C, D, 0.0, 0.0]),
-            prior_sigma_abcd=(sA, sB, sC, sD),
-            prior_sigma_pointing_mas=(sdx, sdy),
+            # solver prior hooks (_make_image_prior meta overrides)
+            sigma_rot_deg=float(np.degrees(np.hypot(sB, sC))),
+            sigma_scale=float(np.hypot(sA, sD)),
+            sigma_skew=float(0.5 * np.hypot(sA + sD, sB + sC)
+                             * 0 + max(sA, sB, sC, sD)),
+            sigma_pointing=float(max(sdx, sdy)),
             n_bulk_stars=post['n_stars'],
         )
         stars_per_image[name] = stars_df

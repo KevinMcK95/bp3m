@@ -50,6 +50,9 @@ def run_alignment(  # noqa: C901
     min_align_demote: int = 5,
     epoch_dist_groupby: str = 'full',
     no_prefilter: bool = False,
+    use_cfht: bool = False,
+    cfht_dir=None,
+    cfht_prior_inflate: float = 10.0,
     prefit_clean_iters: int = 0,
     prefit_clean_sigma: float = 10.0,
     mask_tol_frac: float = 1e-3,
@@ -246,6 +249,50 @@ def run_alignment(  # noqa: C901
         image_names = sorted(filtered_spi.keys())
         star_id_to_idx, image_names, star_in_image = build_index_maps(
             filtered_spi, gaia_catalog)
+
+    # ── CFHT/UNIONS detectors as jointly-solved images (--use_cfht) ──────────
+    # Positions only — the Gaia+CFHT astrometric solutions are NOT priors on
+    # the stars. Image params init from the bulk posteriors with widths
+    # inflated x cfht_prior_inflate (posterior widths would double-count the
+    # shared Gaia stars). Faint HST+CFHT stars join the star list with flat
+    # PM/plx priors (2p handling).
+    if use_cfht and cfht_dir is not None:
+        from bp3m.data_loader_cfht import (collect_cfht_matches,
+                                           build_cfht_images)
+        _cm = collect_cfht_matches(data_root / field_name)
+        if len(_cm):
+            cimgs, cstars, faint_cat = build_cfht_images(
+                data_root / field_name, cfht_dir, _cm,
+                cfht_prior_inflate=cfht_prior_inflate)
+            imgs.update(cimgs)
+            filtered_spi.update(cstars)
+            if len(faint_cat):
+                import pandas as _pd_c
+                from astropy.time import Time as _T_c
+                _mean_mjd = float(np.mean([m['hst_time_mjd']
+                                           for m in cimgs.values()]))                     if cimgs else 57000.0
+                _f = _pd_c.DataFrame(
+                    {c: np.nan for c in gaia_catalog.columns},
+                    index=range(len(faint_cat)))
+                _f['Gaia_id'] = faint_cat.Gaia_id.to_numpy()
+                _f['ra'] = faint_cat.ra.to_numpy()
+                _f['dec'] = faint_cat.dec.to_numpy()
+                _f['ra_error'] = 1000.0
+                _f['dec_error'] = 1000.0
+                _f['Gaia_time'] = _T_c(_mean_mjd, format='mjd').jyear
+                gaia_catalog = _pd_c.concat([gaia_catalog, _f],
+                                            ignore_index=True)
+            image_names = sorted(filtered_spi.keys())
+            star_id_to_idx, image_names, star_in_image = build_index_maps(
+                filtered_spi, gaia_catalog)
+            _tiers = _pd_c.concat(
+                [df.provenance for df in cstars.values()])                 .value_counts().to_dict() if cstars else {}
+            print(f"  use_cfht: {len(cimgs)} CFHT detectors joined the "
+                  f"joint solve, {len(faint_cat)} faint HST+CFHT stars "
+                  f"added; detection tiers: {_tiers}")
+        else:
+            print('  use_cfht: no matched_cfht tables found — run the '
+                  'HST x CFHT cross-match (Step 4d) first')
 
     # ── Initialise solver ─────────────────────────────────────────────────────
     if use_sparse and fit_epoch_distortion:

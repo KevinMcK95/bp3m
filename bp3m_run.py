@@ -375,6 +375,18 @@ def _parse_args():
                     help='Phase-2 stop: tolerated mask flicker as a fraction of '
                          'total detections, sustained mask_tol_iters times '
                          '(default 1e-3; prototype code stopped at 5e-2)')
+    cf = p.add_argument_group('CFHT/UNIONS integration')
+    cf.add_argument('--use_cfht', action='store_true',
+                    help='Step 4d: cross-match HST catalogs against the local '
+                         'CFHT/UNIONS store, then include the matched CFHT '
+                         'detectors as jointly-solved images in BP3M')
+    cf.add_argument('--cfht_dir', type=str,
+                    default='/bootes_raid6/users/kmckinnon/bp3m/CFHT/UNIONS',
+                    help='CFHT/UNIONS store root (default: bootes UNIONS)')
+    cf.add_argument('--cfht_prior_inflate', type=float, default=10.0,
+                    help='CFHT image-prior widths = this x the bulk posterior '
+                         'sigmas (posterior widths double-count the shared '
+                         'Gaia stars; default 10)')
     bp.add_argument('--prefit_clean_sigma', type=float, default=10.0,
                     help='Phase 0.5 rejection sigma (loose on purpose: residuals '
                          'at frozen r still contain the alignment error; default 10)')
@@ -1160,6 +1172,20 @@ def main():
             prior_sigma_skew=args.prior_sigma_skew,
             init_resid_max=args.xmatch_init_resid_max,
         )
+
+    # ── Step 4d: CFHT/UNIONS cross-matching (optional) ───────────────────────
+    if args.use_cfht and not args.skip_crossmatch:
+        from bp3m.pipeline.cross_match_cfht import run_cross_match_cfht
+        _ra0, _dec0, _sw0, _sh0 = args.pointings[0]
+        run_cross_match_cfht(
+            output_dir=output_dir, field_name=field,
+            cfht_dir=args.cfht_dir,
+            ra=_ra0, dec=_dec0,
+            radius_deg=max(_sw0, _sh0),
+            gaia_csv=gaia_csv_path,
+            force=args.force_rematch if hasattr(args, 'force_rematch')
+            else False)
+
     elif getattr(args, 'force_validate', False):
         from bp3m.pipeline.cross_match import _validate_catalog_if_needed
         print("\n" + "─"*50)
@@ -1567,6 +1593,9 @@ def main():
                 bp3m_min_stars=args.bp3m_min_stars,
                 prefit_clean_iters=args.prefit_clean_iters,
                 prefit_clean_sigma=args.prefit_clean_sigma,
+                use_cfht=args.use_cfht,
+                cfht_dir=args.cfht_dir,
+                cfht_prior_inflate=args.cfht_prior_inflate,
                 mask_tol_frac=args.bp3m_mask_tol_frac,
                 checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
                 use_influence_clip=not args.no_influence_clip,
@@ -1660,6 +1689,9 @@ def main():
                 bp3m_min_stars=args.bp3m_min_stars,
                 prefit_clean_iters=args.prefit_clean_iters,
                 prefit_clean_sigma=args.prefit_clean_sigma,
+                use_cfht=args.use_cfht,
+                cfht_dir=args.cfht_dir,
+                cfht_prior_inflate=args.cfht_prior_inflate,
                 mask_tol_frac=args.bp3m_mask_tol_frac,
                 checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
                 use_influence_clip=not args.no_influence_clip,
