@@ -411,6 +411,56 @@ def n_r_from_poly_order(poly_order):
     return (poly_order + 1) * (poly_order + 2)
 
 
+def build_U_matrices(dt_yr, plx_ra_star, plx_dec):
+    """Vectorized build_U_matrix over n detections → (n, 2, 5).
+
+    Produces bit-identical values to stacking build_U_matrix per row.
+    """
+    dt_yr = np.asarray(dt_yr, float)
+    n = dt_yr.shape[0]
+    U = np.zeros((n, 2, 5))
+    U[:, 0, 0] = 1.0
+    U[:, 1, 1] = 1.0
+    U[:, 0, 2] = dt_yr
+    U[:, 1, 3] = dt_yr
+    U[:, 0, 4] = plx_ra_star
+    U[:, 1, 4] = plx_dec
+    return U
+
+
+def build_X_matrices(x_hst, y_hst, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
+                     poly_order=1):
+    """Vectorized build_X_matrix over n detections → (n, 2, N_R).
+
+    Same column layout and 1/2048^(k-1) scaling as build_X_matrix;
+    bit-identical values to stacking it per row.
+    """
+    x_hst = np.asarray(x_hst, float)
+    y_hst = np.asarray(y_hst, float)
+    n = x_hst.shape[0]
+    n_r = n_r_from_poly_order(poly_order)
+    X = np.zeros((n, 2, n_r))
+    X[:, 0, 0] = x_hst
+    X[:, 0, 1] = y_hst
+    X[:, 0, 4] = dxs_dra0
+    X[:, 0, 5] = dxs_ddec0
+    X[:, 1, 2] = x_hst
+    X[:, 1, 3] = y_hst
+    X[:, 1, 4] = dys_dra0
+    X[:, 1, 5] = dys_ddec0
+    _S = 2048.0
+    col = 6
+    for deg in range(2, poly_order + 1):
+        scale = _S ** (deg - 1)
+        for j in range(deg + 1):
+            X[:, 0, col] = x_hst ** (deg - j) * y_hst ** j / scale
+            col += 1
+        for j in range(deg + 1):
+            X[:, 1, col] = x_hst ** (deg - j) * y_hst ** j / scale
+            col += 1
+    return X
+
+
 def build_X_matrix(x_hst, y_hst, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
                    poly_order=1):
     """

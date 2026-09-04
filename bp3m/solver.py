@@ -38,6 +38,7 @@ from typing import Optional
 from .astro_utils import (
     plane_project, plane_project_jacobian, plane_project_tangent_derivs,
     get_parallax_factors, build_U_matrix, build_X_matrix,
+    build_U_matrices, build_X_matrices,
     epoch_distortion_basis, epoch_distortion_n_shape, epoch_distortion_pairs,
     hst_position_cov, rotation_matrix_from_abcd, gaia_cov_to_survey_cov,
     abcd_from_rotation_pixscale_skew, n_r_from_poly_order, compute_poly_jacobian,
@@ -881,9 +882,7 @@ class BP3MSolver:
             d_plx_ra,  d_plx_dec  = get_parallax_factors(ra_g, dec_g, tele_xyz)
 
             # U matrix for each star: (n, 2, 5)
-            U_arr = np.zeros((n, 2, N_V))
-            for k in range(n):
-                U_arr[k] = build_U_matrix(dt_yr[k], d_plx_ra[k], d_plx_dec[k])
+            U_arr = build_U_matrices(dt_yr, d_plx_ra, d_plx_dec)
 
             # JU = J @ U: (n, 2, 5)
             JU = np.einsum('nij,njk->nik', J, U_arr)
@@ -911,13 +910,9 @@ class BP3MSolver:
                 good_for_fitting &= self.gaia_trustworthy[sidx]
 
             # X matrix: (n, 2, N_R)
-            X_mat = np.zeros((n, 2, self.N_R))
-            for k in range(n):
-                X_mat[k] = build_X_matrix(
-                    X_c[k], Y_c[k],
-                    dxs_dra0[k], dxs_ddec0[k],
-                    dys_dra0[k], dys_ddec0[k],
-                    poly_order=self.poly_order)
+            X_mat = build_X_matrices(
+                X_c, Y_c, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
+                poly_order=self.poly_order)
 
             # HST position covariance C_hst: (n, 2, 2)
             x_err  = df["x_hst_err"].to_numpy(float)
@@ -1133,7 +1128,6 @@ class BP3MSolver:
             self.gaia_n_hst_used[sidx[use_align | use_astrom]] += 1
 
             pscale   = meta["orig_pixel_scale"]
-            hst_time = Time(meta["hst_time_mjd"], format="mjd")
 
             # ── Accumulate tangent-point correction into ra0_current ──────────
             # r_j[4] = Δα0 in mas where Δα0 = (ra0_current - ra0_true)*3.6e6,
@@ -1165,6 +1159,7 @@ class BP3MSolver:
             # dtdb calls per image per solve pass otherwise.
             dt_yr = d.get("dt_yr_cache")
             if dt_yr is None:
+                hst_time = Time(meta["hst_time_mjd"], format="mjd")
                 t_g   = self.gaia_time[sidx]
                 dt_yr = (hst_time - t_g).to(u.year).value
                 d["dt_yr_cache"] = dt_yr
@@ -1190,21 +1185,15 @@ class BP3MSolver:
             d_plx_ra, d_plx_dec = get_parallax_factors(ra_g_up, dec_g_up, tele_xyz)
 
             # ── Rebuild U and JU ─────────────────────────────────────────────
-            U_arr = np.zeros((n, 2, N_V))
-            for k in range(n):
-                U_arr[k] = build_U_matrix(dt_yr[k], d_plx_ra[k], d_plx_dec[k])
+            U_arr = build_U_matrices(dt_yr, d_plx_ra, d_plx_dec)
             JU = np.einsum('nij,njk->nik', J, U_arr)
 
             # ── Rebuild X_mat ────────────────────────────────────────────────
             X_c = d["X_c"]   # unchanged — detector positions don't move
             Y_c = d["Y_c"]
-            X_mat = np.zeros((n, 2, self.N_R))
-            for k in range(n):
-                X_mat[k] = build_X_matrix(
-                    X_c[k], Y_c[k],
-                    dxs_dra0[k], dxs_ddec0[k],
-                    dys_dra0[k], dys_ddec0[k],
-                    poly_order=self.poly_order)
+            X_mat = build_X_matrices(
+                X_c, Y_c, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
+                poly_order=self.poly_order)
 
             d["xys"]  = xys
             d["JU"]   = JU
@@ -1368,7 +1357,7 @@ class BP3MSolver:
         # J: (n, 2, 2),  C_hst: (n, 2, 2)
         return np.einsum('nij,njk,nlk->nil', J, C_hst, J)
 
-    def _solve_one_pass(self, r_current, z_weights=None):
+    def _solve_one_pass(self, r_current, z_weights=None, need_cov=True):
         """
         Single pass of the linear solver, working in RESIDUAL coordinates to
         avoid catastrophic cancellation.
@@ -1675,12 +1664,25 @@ class BP3MSolver:
         d_diag     = np.sqrt(np.maximum(np.abs(np.diag(Cr_inv)), 1e-30))
         d_inv      = 1.0 / d_diag
         Cr_inv_sc  = d_inv[:, None] * Cr_inv * d_inv[None, :]
-        try:
-            C_r_sc = np.linalg.inv(Cr_inv_sc)
-        except np.linalg.LinAlgError:
-            C_r_sc = np.linalg.pinv(Cr_inv_sc)
-        C_r     = d_inv[:, None] * C_r_sc * d_inv[None, :]
-        delta_r = C_r @ rhs
+        if need_cov:
+            try:
+                C_r_sc = np.linalg.inv(Cr_inv_sc)
+            except np.linalg.LinAlgError:
+                C_r_sc = np.linalg.pinv(Cr_inv_sc)
+            C_r     = d_inv[:, None] * C_r_sc * d_inv[None, :]
+            delta_r = C_r @ rhs
+        else:
+            # Intermediate inner passes only need Δr: a Cholesky solve avoids
+            # forming the full (6·n_img + n_D)² inverse. The covariance comes
+            # from one need_cov pass at the converged point (_inner_converge).
+            C_r = None
+            rhs_sc = d_inv * rhs
+            try:
+                c_fac = linalg.cho_factor(Cr_inv_sc, check_finite=False)
+                delta_r = d_inv * linalg.cho_solve(c_fac, rhs_sc,
+                                                   check_finite=False)
+            except (linalg.LinAlgError, ValueError):
+                delta_r = d_inv * (np.linalg.pinv(Cr_inv_sc) @ rhs_sc)
         r_hat   = r_current + delta_r
 
         # for j_idx, img in enumerate(self.image_names):
@@ -1963,9 +1965,25 @@ class BP3MSolver:
                       for j, img in enumerate(self.image_names)}
 
         def _inner_converge(r_hat, label, z_weights=None):
-            """Iterate _solve_one_pass until max|Δr| < tol. Returns updated r_hat etc."""
+            """Iterate _solve_one_pass until max|Δr| < tol. Returns updated r_hat etc.
+
+            Intermediate passes solve for Δr only (need_cov=False: Cholesky
+            solve, no explicit inverse); one covariance-bearing pass runs at
+            the converged point so the returned C_r matches r_hat.
+            """
+            def _final(r_hat):
+                r_new, C_r_i, a_i, K_i, CvT_i = self._solve_one_pass(
+                    r_hat, z_weights=z_weights)
+                for _dimg in self._align_demoted:
+                    _bl = _img_block[_dimg]
+                    r_new[_bl] = r_hat[_bl]
+                self._update_R(r_new)
+                self._update_geometry(r_new, a_i)
+                return r_new, C_r_i, a_i, K_i, CvT_i
+
             for it_i in range(500):
-                r_new, C_r_i, a_i, K_i, CvT_i = self._solve_one_pass(r_hat, z_weights=z_weights)
+                r_new, _, a_i, K_i, CvT_i = self._solve_one_pass(
+                    r_hat, z_weights=z_weights, need_cov=False)
                 for _dimg in self._align_demoted:
                     _bl = _img_block[_dimg]
                     r_new[_bl] = r_hat[_bl]     # frozen: no update, no Δr
@@ -1983,11 +2001,11 @@ class BP3MSolver:
                     print(f"  {label}: converged in {it_i+1} inner steps "
                           f"(max|Δr| = {max_str})")
                     print(f"    params: {stats_str}")
-                    return r_hat, C_r_i, a_i, K_i, CvT_i
+                    return _final(r_hat)
             max_str, stats_str = _delta_summary(diff)
             print(f"  {label}: WARNING — did not converge (max|Δr| = {max_str})")
             print(f"    params: {stats_str}")
-            return r_hat, C_r_i, a_i, K_i, CvT_i
+            return _final(r_hat)
 
         # ── Disable alignment prior if requested ─────────────────────────────
         if no_align_prior:
