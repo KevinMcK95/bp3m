@@ -268,7 +268,11 @@ def load_master_v2(
     hst_idx_cols = [c for c in master.columns if c.startswith("hst_indices_")]
 
     # ── Real Gaia catalog ─────────────────────────────────────────────────────
-    gaia_files = sorted(glob.glob(str(gaia_dir / "*_gaia.csv")))
+    # Prefer the current run's sidecar file list over the glob (which would
+    # concatenate every historical Gaia query in the directory).
+    from bp3m.data_loader_flc import resolve_gaia_csvs
+    gaia_files, _ = resolve_gaia_csvs(gaia_dir.parent)
+    gaia_files = [str(f) for f in gaia_files]
     if not gaia_files:
         raise FileNotFoundError(f"No Gaia catalog files found in {gaia_dir}")
 

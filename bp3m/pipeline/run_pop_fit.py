@@ -2044,8 +2044,15 @@ def run_pop_fit(
         if _pct:
             print(f"  pop-fit: re-applying the run's pos_corr_table "
                   f"({Path(_pct).name} et al.) for position consistency")
+        # Mirror the v1 run's loader settings: same pos_err_floor (a floor-0.01
+        # run reloaded at the 0.05 default would inflate every position error)
+        # and the same Gaia CSV(s) when the v1 run_config records them (older
+        # configs fall back to the sidecar-aware resolver in the loader).
+        _floor = v1_cfg.get('pos_err_floor', 0.05)
+        _gcsv = v1_cfg.get('gaia_csv')
         imgs, stars_per_image, gaia_catalog = load_image_data_flc(
-            data_root, field_name, pos_corr_table=_pct)
+            data_root, field_name, pos_corr_table=_pct,
+            pos_err_floor=_floor, gaia_csv=_gcsv)
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable images found for '{field_name}'.")
 

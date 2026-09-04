@@ -4084,11 +4084,16 @@ def run_hst_crossmatch(
     if gaia_csv is None:
         gaia_dir = field_dir / 'Gaia'
         if gaia_dir.exists():
-            gaia_files = sorted(f for f in gaia_dir.glob('*_gaia.csv')
-                                if not f.name.startswith('._'))
+            # Prefer the current run's sidecar list over an alphabetical glob
+            # pick (which can select a stale historical query).
+            from bp3m.data_loader_flc import resolve_gaia_csvs
+            gaia_files, _from_sidecar = resolve_gaia_csvs(field_dir)
+            gaia_files = [f for f in gaia_files
+                          if not f.name.startswith('._')]
             if gaia_files:
                 gaia_csv = gaia_files[0]
-                print(f"  Using Gaia catalog: {gaia_csv.name}")
+                print(f"  Using Gaia catalog: {gaia_csv.name}"
+                      + (" (from sidecar)" if _from_sidecar else ""))
 
     # ── Gaia catalog consistency check ───────────────────────────────────────
     # Every Gaia source_id in det_df must exist in the local Gaia CSV.

@@ -459,6 +459,9 @@ def run_alignment(  # noqa: C901
             'epoch_dist_prior': (str(epoch_dist_prior)
                                  if epoch_dist_prior else None),
             'pos_err_floor': pos_err_floor,
+            'gaia_csv': ([str(p) for p in gaia_csv]
+                         if isinstance(gaia_csv, (list, tuple))
+                         else (str(gaia_csv) if gaia_csv is not None else None)),
             'test_hysteresis_delta': test_hysteresis_delta,
             'min_align_demote': min_align_demote,
             'indv_init_stats': _indv_init_stats,

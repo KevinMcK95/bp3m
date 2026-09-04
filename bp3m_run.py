@@ -754,7 +754,31 @@ def main():
         stem = _cache_stem(field, ra_i, dec_i, sw_i, sh_i,
                            args.min_gmag, args.max_gmag)
         p = _gaia_dir / f"{stem}.csv"
-        return p if p.exists() else None
+        if p.exists():
+            return p
+        # Exact cache-stem miss (older naming convention, different gmag
+        # limits, float formatting): match the pointing against the ra/dec
+        # encoded in existing *_gaia.csv names instead of returning None —
+        # a None here makes downstream loaders glob and concatenate EVERY
+        # historical Gaia file in the field.
+        import re as _re
+        _pats = (_re.compile(r'_ra_([\d.]+)_dec_([+-]?[\d.]+)_'),
+                 _re.compile(r'_ra([\d.]+)_dec([+-]?[\d.]+)_'))
+        best, best_dist = None, 1e-3   # deg tolerance on the pointing centre
+        for f in sorted(_gaia_dir.glob("*_gaia.csv"),
+                        key=lambda q: q.stat().st_mtime, reverse=True):
+            for pat in _pats:
+                m = pat.search(f.name)
+                if m:
+                    dist = max(abs(float(m.group(1)) - ra_i),
+                               abs(float(m.group(2)) - dec_i))
+                    if dist < best_dist:
+                        best, best_dist = f, dist
+                    break
+        if best is not None:
+            print(f"  Gaia CSV cache-stem miss — matched by pointing: "
+                  f"{best.name}")
+        return best
 
     # ── Step 1: Download Gaia (one query per pointing) ────────────────────────
     gaia_df = None

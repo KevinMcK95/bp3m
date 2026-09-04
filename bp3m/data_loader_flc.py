@@ -59,6 +59,30 @@ _MAX_SAT_FRAC: float = 0.25
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def resolve_gaia_csvs(field_path):
+    """Gaia CSV paths for a field, plus whether they came from the sidecar.
+
+    Prefers Gaia/{field}_gaia_files.json — written by bp3m_run with exactly
+    the current pointings' files — over the *_gaia.csv glob, which loads and
+    concatenates every historical Gaia query in the directory (slow for big
+    fields, and can mix stale queries into the catalog). Falls back to the
+    glob when the sidecar is missing, empty, or stale.
+    """
+    field_path = Path(field_path)
+    gaia_dir = field_path / "Gaia"
+    sidecar = gaia_dir / f"{field_path.name}_gaia_files.json"
+    if sidecar.exists():
+        try:
+            paths = [Path(p) for p in json.loads(sidecar.read_text())]
+            paths = [p for p in paths if p.exists()]
+            if paths:
+                return paths, True
+        except (json.JSONDecodeError, OSError):
+            pass
+    return ([Path(f) for f in sorted(glob.glob(str(gaia_dir / "*_gaia.csv")))],
+            False)
+
+
 def _get_filter(h0) -> str:
     """Return the science filter name, handling ACS (FILTER1/2) and WFC3 (FILTER)."""
     filt = h0.get("FILTER", "")
@@ -619,16 +643,32 @@ def load_image_data_flc(data_root, field_name: str,
         raise FileNotFoundError(f"HST image directory not found: {hst_root}")
 
     # ── Gaia catalog ──────────────────────────────────────────────────────────
+    # Only the gaia_cols subset (below) survives into gaia_catalog, so restrict
+    # (resolver for the no-explicit-path case is module-level: resolve_gaia_csvs)
+    # parsing to those columns — Gaia archive CSVs are ~100 columns wide and
+    # parse time dominates dense-field loads otherwise.
+    _gaia_usecols = {
+        "SOURCE_ID", "source_id", "ra", "dec", "ra_error", "dec_error",
+        "ra_dec_corr", "ra_parallax_corr", "ra_pmra_corr", "ra_pmdec_corr",
+        "dec_parallax_corr", "dec_pmra_corr", "dec_pmdec_corr",
+        "parallax", "parallax_error", "parallax_pmra_corr",
+        "parallax_pmdec_corr", "pmra", "pmra_error", "pmra_pmdec_corr",
+        "pmdec", "pmdec_error", "ref_epoch", "ruwe", "pseudocolour",
+        "gmag", "gmag_error", "bpmag", "bpmag_error", "rpmag", "rpmag_error",
+        "bp_rp", "bp_rp_error",
+    }
+
+    def _read_gaia_csv(path):
+        return pd.read_csv(path, usecols=lambda c: c in _gaia_usecols) \
+                 .rename(columns={"SOURCE_ID": "source_id"})
+
     if gaia_csv is not None:
         if isinstance(gaia_csv, (list, tuple)):
             gaia_paths = [Path(p) for p in gaia_csv]
             missing = [p for p in gaia_paths if not p.exists()]
             if missing:
                 raise FileNotFoundError(f"Gaia CSV(s) not found: {missing}")
-            gaia_frames = [
-                pd.read_csv(p).rename(columns={"SOURCE_ID": "source_id"})
-                for p in gaia_paths
-            ]
+            gaia_frames = [_read_gaia_csv(p) for p in gaia_paths]
             gaia_raw = (pd.concat(gaia_frames, ignore_index=True)
                         .drop_duplicates("source_id"))
             print(f"Loading {len(gaia_paths)} Gaia catalogs "
@@ -640,18 +680,18 @@ def load_image_data_flc(data_root, field_name: str,
             print(f"Loading Gaia catalog: {gaia_csv.name}", flush=True)
             import time as _time
             _t0 = _time.time()
-            gaia_raw = pd.read_csv(gaia_csv).rename(columns={"SOURCE_ID": "source_id"})
+            gaia_raw = _read_gaia_csv(gaia_csv)
             print(f"  {len(gaia_raw)} rows in {_time.time()-_t0:.1f}s", flush=True)
     else:
-        gaia_files = sorted(glob.glob(str(gaia_dir / "*_gaia.csv")))
+        gaia_files, _from_sidecar = resolve_gaia_csvs(field_path)
         if not gaia_files:
             raise FileNotFoundError(f"No Gaia catalog files found in {gaia_dir}")
-        if len(gaia_files) > 1:
+        if _from_sidecar:
+            print(f"Loading {len(gaia_files)} Gaia CSV(s) from the "
+                  f"{field_name}_gaia_files.json sidecar.")
+        elif len(gaia_files) > 1:
             print(f"Loading {len(gaia_files)} Gaia CSV files (concatenated).")
-        gaia_frames = [
-            pd.read_csv(f).rename(columns={"SOURCE_ID": "source_id"})
-            for f in gaia_files
-        ]
+        gaia_frames = [_read_gaia_csv(f) for f in gaia_files]
         gaia_raw = pd.concat(gaia_frames, ignore_index=True).drop_duplicates("source_id")
 
     gaia_cols = [
@@ -817,13 +857,22 @@ def load_image_data_flc(data_root, field_name: str,
                 return set()
             return {s.strip() for s in str(raw).split(",") if s.strip()}
 
-        # Build (gaia_source_id, img_name) → trusted bool
+        # Build (gaia_source_id, img_name) → trusted bool.
+        # zip over pre-extracted columns instead of iterrows: identical per-row
+        # values without a pandas Series per row (iterrows dominated dense-field
+        # load time).
         trust_lookup: dict[tuple[str, str], bool] = {}
-        for _, row in xm.iterrows():
-            sid      = str(row["gaia_source_id"])
-            img_list = [s.strip() for s in str(row["image_list"]).split(",") if s.strip()]
+        _col = lambda name, default: (xm[name].to_numpy() if name in xm.columns
+                                      else np.full(len(xm), default, object))
+        for sid_raw, il_raw, out_raw, n_trust_raw, any_trust_raw, star_raw in zip(
+                xm["gaia_source_id"].to_numpy(), xm["image_list"].to_numpy(),
+                _col("outlier_images", ""), xm["n_trustworthy"].to_numpy(),
+                xm["any_trustworthy"].to_numpy(),
+                _col("is_star_any_image", True)):
+            sid      = str(sid_raw)
+            img_list = [s.strip() for s in str(il_raw).split(",") if s.strip()]
 
-            outlier_set  = _parse_imglist(row.get("outlier_images", ""))
+            outlier_set  = _parse_imglist(out_raw)
             # Per-image non-star flags are unreliable: a faint star can fail the
             # PSF-fit quality criterion in one exposure but pass in another.
             # The global is_star_any_image=False check (above) is the conservative
@@ -831,9 +880,9 @@ def load_image_data_flc(data_root, field_name: str,
             # where ~30% of detections get misclassified in individual exposures.
             excluded_set = outlier_set
 
-            n_trust   = int(row["n_trustworthy"])
-            any_trust = bool(row["any_trustworthy"])
-            is_star_any = bool(row["is_star_any_image"]) if has_star_cols else True
+            n_trust   = int(n_trust_raw)
+            any_trust = bool(any_trust_raw)
+            is_star_any = bool(star_raw) if has_star_cols else True
 
             # Global exclusion: never trustworthy OR non-star in every image.
             # n_trust == 0 means the star was an outlier in every image it appeared
