@@ -464,7 +464,8 @@ def _save_offset_histogram(best, image_name, out_dir):
 
 def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, discovery_max_offset=50,
                       seed_quality_mask=None, debug_verbose=False,
-                      sigma_rot_deg=None, sigma_scale=None):
+                      sigma_rot_deg=None, sigma_scale=None,
+                      forced=None):
     """
     Tier-walks qfit x mag limits to find a physically plausible 4P similarity seed.
 
@@ -482,6 +483,13 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
         seed_idx = field_idx[np.argsort(gaia_f['err'][near])[:n_subset]]
     else:
         seed_idx = field_idx
+    # Forced anchors (previously-matched Gaia-common stars): ALWAYS part of
+    # the seed sample and of every q/mag tier — trustworthy pairs vote on
+    # offsets alongside whatever new (possibly faint) candidates each tier
+    # admits. forced = (h_indices_into_hst_d, g_indices_into_gaia_f).
+    _fh, _fg = (None, None) if forced is None else forced
+    if _fg is not None and len(_fg):
+        seed_idx = np.unique(np.concatenate([seed_idx, np.asarray(_fg)]))
 
     xg_s = gaia_f['xguess'][seed_idx]
     yg_s = gaia_f['yguess'][seed_idx]
@@ -507,6 +515,8 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                 h_mask = curr_q_mag_lims & (hst_d['qfit'] >= 0.0) & (hst_d['chi2'] < 5.0)
             if np.sum(h_mask) < 3:
                 h_mask = curr_q_mag_lims & (hst_d['qfit'] >= 0.0) & (hst_d['chi2'] < 10.0)
+            if _fh is not None and len(_fh):
+                h_mask = h_mask.copy(); h_mask[np.asarray(_fh)] = True
             if np.sum(h_mask) < 3:
                 continue
             h_idx_tier = np.where(h_mask)[0]
@@ -517,6 +527,8 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                 hist_keep = np.ones(len(xg_s), dtype=bool)
                 if np.sum(gaia_f['has_pms'][seed_idx]) >= 3:
                     hist_keep = gaia_f['has_pms'][seed_idx].copy()
+            if _fg is not None and len(_fg):
+                hist_keep = hist_keep | np.isin(seed_idx, np.asarray(_fg))
             if np.sum(hist_keep) < 3:
                 continue
 

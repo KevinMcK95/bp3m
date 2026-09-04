@@ -278,13 +278,19 @@ def build_cfht_ext_df(cfht_dir, expnum, exts, gaia_lookup, fill,
         d['cfht_mjd'] = float(t['mjd'])
         # Gaia astrometry for the Gaia-matched sources
         if len(mg):
+            d = d.merge(mg[['src_index', 'gaia_source_id']],
+                        on='src_index', how='left')
             gm = mg[['src_index', 'gaia_source_id']].merge(
-                gaia_lookup, on='gaia_source_id', how='left')
+                gaia_lookup.rename(columns={'ra': 'gaia_ra',
+                                            'dec': 'gaia_dec'}),
+                on='gaia_source_id', how='left')
             d = d.merge(gm.drop(columns=['gaia_source_id']),
                         on='src_index', how='left')
         else:
+            d['gaia_source_id'] = ''
             for c in ('pmra', 'pmdec', 'parallax', 'pmra_error',
-                      'pmdec_error', 'parallax_error', 'bp_rp', 'gmag'):
+                      'pmdec_error', 'parallax_error', 'bp_rp', 'gmag',
+                      'rpmag', 'gaia_ra', 'gaia_dec'):
                 d[c] = np.nan
         frames.append(d)
     if not frames:
@@ -337,6 +343,7 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
     import re as _re
     _lam_hst = float((_re.findall(r'F(\d+)', _filt) or ['606'])[0])
     _lam_cfht = 640.0
+    mjd_hst = float(_hdr.get('EXPSTART', 0.0))
     if _lam_hst < _lam_cfht:
         _c_sign, _c_lbl = -1.0, f'HST {_filt} − r_CFHT'
     else:
@@ -354,6 +361,7 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
     pad = 30.0 / 3600.0
     n_total = 0
     parts = []
+    diag_all, field_all = [], []
     for expnum in dets.expnum.astype(int):
         fp_key = ('fp', expnum)
         if fp_key not in det_cache:
@@ -372,8 +380,16 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
                                    gaia_lookup, fill, det_cache)
         if ext_df is None or not len(ext_df):
             continue
+        # forced anchors: Gaia stars matched on BOTH sides
+        _fp = None
+        if len(hmg):
+            _j = hmg[['hst_index', 'gaia_source_id']].merge(
+                ext_df[['source_id', 'gaia_source_id']].dropna(),
+                on='gaia_source_id')
+            if len(_j):
+                _fp = _j[['hst_index', 'source_id']].to_numpy()
         try:
-            process_single_image_delve(
+            diag_ret = process_single_image_delve(
                 hst, ext_df, label='cfht', mag_col='mag',
                 out_suffix=f'_{expnum}',
                 sigma_rot_deg=sigma_rot_deg, sigma_scale=sigma_scale,
@@ -381,10 +397,19 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
                 discovery_max_offset=discovery_max_offset,
                 max_mag_diff=max_mag_diff, init_resid_max=init_resid_max,
                 gaia_cmd=True, color_hst_label=_c_lbl,
-                color_hst_sign=_c_sign)
+                color_hst_sign=_c_sign,
+                make_plots=False, return_diag=True,
+                forced_pairs=_fp)
         except Exception as exc:
             parts.append((expnum, None, str(exc)))
             continue
+        if diag_ret is not None:
+            dd, fdf = diag_ret
+            dd = dd.assign(cfht_expnum=expnum,
+                           cfht_mjd=float(ext_df.cfht_mjd.iloc[0]))
+            diag_all.append(dd)
+            if fdf is not None:
+                field_all.append(fdf.assign(cfht_expnum=expnum))
         mcsv = img_dir / f'matched_cfht_{expnum}.csv'
         if mcsv.exists():
             m = pd.read_csv(mcsv)
@@ -406,9 +431,19 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
         else:
             parts.append((expnum, None, 'no matches'))
     good = [m for _, m, e in parts if m is not None]
+    union = None
     if good:
         union = pd.concat(good, ignore_index=True)
         union.to_csv(img_dir / 'matched_cfht.csv', index=False)
+    if make_plots and diag_all:
+        try:
+            _plot_union_diagnostics(
+                img_dir, name, pd.concat(diag_all, ignore_index=True),
+                pd.concat(field_all, ignore_index=True) if field_all else None,
+                union, ht, hst_mjd=mjd_hst, gaia_lookup=gaia_lookup,
+                det_cache=det_cache, color_label=_c_lbl, color_sign=_c_sign)
+        except Exception as exc:
+            import traceback; traceback.print_exc()
     errs = '; '.join(f'{e}:{err}' for e, m, err in parts if err)
     return name, n_total, (errs or None)
 
@@ -437,8 +472,9 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
                  if isinstance(gaia_csv, (list, tuple)) else [Path(gaia_csv)])
     else:
         paths, _ = resolve_gaia_csvs(field_dir)
-    use = ('SOURCE_ID', 'source_id', 'pmra', 'pmdec', 'parallax', 'bp_rp',
-           'gmag', 'pmra_error', 'pmdec_error', 'parallax_error')
+    use = ('SOURCE_ID', 'source_id', 'ra', 'dec', 'pmra', 'pmdec',
+           'parallax', 'bp_rp', 'gmag', 'rpmag',
+           'pmra_error', 'pmdec_error', 'parallax_error')
     gl = pd.concat([pd.read_csv(p, usecols=lambda c: c in use)
                     .rename(columns={'SOURCE_ID': 'source_id'})
                     for p in paths]).drop_duplicates('source_id')
@@ -467,3 +503,161 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
     print(f'  Step 4d done: {n_ok}/{len(todo)} images matched '
           f'({time.time()-t0:.0f}s)')
     return results
+
+
+def _plot_union_diagnostics(img_dir, name, diag, field, union, ht,
+                            hst_mjd, gaia_lookup, det_cache,
+                            color_label, color_sign):
+    """Single 10-panel figure per HST image, concatenating ALL exposures.
+
+    Panel spec (user, 2026-09-04):
+      (0,0) sky offsets from the HST image centre (arcsec) — every CFHT
+            exposure lands in its true location
+      (0,1) PM VPD: Gaia PMs for 5p; Gaia+CFHT PM estimates for matched 2p
+      (1,0) Gaia CMD (G vs BP−RP)
+      (1,1) HST vs CFHT−HST CMD (full HST depth on y)
+      (2,0) dx,dy residuals   (2,1) residual vs CFHT mag
+      (3,0) sigma histogram   (3,1) residual vs HST mag
+      (4,0) colour-colour: CFHT−HST vs Gaia G−RP
+      (4,1) per-exposure summary
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    m = diag[diag.is_matched]
+    r = diag[~diag.is_matched]
+    fig, axes = plt.subplots(5, 2, figsize=(14, 26))
+    fig.suptitle(f'CFHT Match Diagnostics (all exposures): {name}',
+                 fontsize=16)
+    cosd = np.cos(np.radians(ht['dec_cen']))
+
+    # (0,0) sky offsets
+    ax = axes[0, 0]
+    def _sky(df, **kw):
+        if len(df):
+            ax.scatter((df.ra - ht['ra_cen']) * cosd * 3600.0,
+                       (df.dec - ht['dec_cen']) * 3600.0, **kw)
+    if field is not None:
+        # field positions: propagated ra/dec not kept; use matched frame cols
+        pass
+    _sky(r, c='red', s=5, alpha=0.25, label='Rejected')
+    _sky(m[m.hst_is_star < 0.5], c='orange', s=12, alpha=0.7,
+         label='Matched non-star')
+    _sky(m[m.hst_is_star >= 0.5], c='blue', s=10, alpha=0.7,
+         label='Matched star')
+    ax.set_xlabel('ΔRA·cosδ from HST centre (arcsec)')
+    ax.set_ylabel('ΔDec (arcsec)')
+    ax.set_title('Sky offsets (all CFHT exposures)')
+    ax.legend(fontsize=7); ax.set_aspect('equal', adjustable='datalim')
+
+    # (0,1) PM VPD: 5p Gaia; 2p Gaia+CFHT estimate
+    ax = axes[0, 1]
+    if union is not None and len(union):
+        u = union.copy()
+        u['gaia_source_id'] = u.gaia_source_id.astype(str)
+        gl = gaia_lookup.rename(columns={'ra': 'gaia_ra',
+                                          'dec': 'gaia_dec'})
+        j = u[u.gaia_source_id != ''].merge(gl, on='gaia_source_id',
+                                            how='left')
+        is5p = j.pmra.notna()
+        ax.scatter(j.loc[is5p, 'pmra'], j.loc[is5p, 'pmdec'], s=8,
+                   c='blue', alpha=0.6, label='5p (Gaia)')
+        # 2p: PM from (CFHT position at t_cfht − Gaia position at 2016)/dt
+        j2 = j[~is5p & j.gaia_ra.notna()] if 'gaia_ra' in j else j.iloc[:0]
+        if len(j2):
+            from astropy.time import Time
+            dt = Time(j2.cfht_mjd.to_numpy(), format='mjd').jyear - 2016.0
+            ok = np.abs(dt) > 0.5
+            pm_ra = ((j2.cfht_ra_prop - j2.gaia_ra) * cosd * 3.6e6
+                     / np.where(ok, dt, np.nan))
+            pm_de = ((j2.cfht_dec_prop - j2.gaia_dec) * 3.6e6
+                     / np.where(ok, dt, np.nan))
+            ax.scatter(pm_ra, pm_de, s=14, c='green', alpha=0.7, marker='^',
+                       label='2p (Gaia+CFHT)')
+    ax.set_xlabel('PMRA (mas/yr)'); ax.set_ylabel('PMDec (mas/yr)')
+    ax.set_title('Proper motions'); ax.legend(fontsize=7)
+
+    # (1,0) Gaia CMD
+    ax = axes[1, 0]
+    if field is not None and 'gmag' in field.columns:
+        v = field.gmag.notna() & field.bp_rp.notna()
+        ax.scatter(field.loc[v, 'bp_rp'], field.loc[v, 'gmag'], c='grey',
+                   s=3, alpha=0.3, label='CFHT field (Gaia)')
+    for src, col, lbl in ((r, 'red', 'Rejected'),
+                          (m, 'blue', 'Matched')):
+        if len(src) and 'gaia_bp_rp' in src.columns:
+            v = src.gaia_bp_rp.notna() & src.gaia_gmag.notna()
+            ax.scatter(src.loc[v, 'gaia_bp_rp'], src.loc[v, 'gaia_gmag'],
+                       c=col, s=10, alpha=0.6 if col != 'red' else 0.15,
+                       label=lbl)
+    ax.invert_yaxis()
+    ax.set_xlabel('BP − RP (Gaia)'); ax.set_ylabel('G (Gaia)')
+    ax.set_title('Gaia CMD'); ax.legend(fontsize=7)
+
+    # (1,1) HST vs CFHT−HST (full HST depth)
+    ax = axes[1, 1]
+    for src, col, lbl in ((r, 'red', 'Rejected'), (m, 'blue', 'Matched')):
+        if len(src):
+            ax.scatter(src.color_hst, src.hst_mag, c=col, s=8,
+                       alpha=0.5 if col != 'red' else 0.15, label=lbl)
+    ax.invert_yaxis()
+    ax.set_xlabel('CFHT − HST (mag, zp-corrected)')
+    ax.set_ylabel('HST instrumental mag')
+    ax.set_title('HST × CFHT CMD'); ax.legend(fontsize=7)
+
+    # (2,0) residuals
+    ax = axes[2, 0]
+    if len(r):
+        ax.scatter(r.dx, r.dy, c='red', s=6, alpha=0.2)
+    ax.scatter(m.dx, m.dy, c='blue', s=8, alpha=0.6)
+    ax.axhline(0, c='k', ls='--', lw=0.5); ax.axvline(0, c='k', ls='--', lw=0.5)
+    if len(m):
+        lim = max(1e-3, 3 * max(m.dx.abs().median(), m.dy.abs().median()) * 5)
+        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+    ax.set_xlabel('dx (HST px)'); ax.set_ylabel('dy (HST px)')
+    ax.set_title('Match residuals')
+
+    # (2,1) residual vs CFHT mag
+    ax = axes[2, 1]
+    ax.scatter(m.mag, np.hypot(m.dx, m.dy), s=8, alpha=0.5)
+    ax.set_xlabel('CFHT mag'); ax.set_ylabel('|residual| (px)')
+    ax.set_title('Residual vs CFHT mag')
+
+    # (3,0) sigma histogram
+    ax = axes[3, 0]
+    if len(m):
+        ax.hist(m.sigma.clip(0, 10), bins=40, histtype='step', label='matched')
+    if len(r):
+        ax.hist(r.sigma.clip(0, 10), bins=40, histtype='step', color='red',
+                label='rejected')
+    ax.set_xlabel('match sigma'); ax.legend(fontsize=7)
+    ax.set_title('Mahalanobis distribution')
+
+    # (3,1) residual vs HST mag
+    ax = axes[3, 1]
+    ax.scatter(m.hst_mag, np.hypot(m.dx, m.dy), s=8, alpha=0.5)
+    ax.set_xlabel('HST instrumental mag'); ax.set_ylabel('|residual| (px)')
+    ax.set_title('Residual vs HST mag')
+
+    # (4,0) colour-colour: CFHT−HST vs Gaia G−RP
+    ax = axes[4, 0]
+    if 'gaia_rpmag' in m.columns:
+        v = m.gaia_gmag.notna() & m.gaia_rpmag.notna()
+        ax.scatter((m.gaia_gmag - m.gaia_rpmag)[v], m.color_hst[v], s=10,
+                   alpha=0.6)
+    ax.set_xlabel('G − RP (Gaia)'); ax.set_ylabel('CFHT − HST (mag)')
+    ax.set_title('Colour-colour')
+
+    # (4,1) per-exposure summary
+    ax = axes[4, 1]; ax.axis('off')
+    lines = [f'HST mjd {hst_mjd:.1f}']
+    for e, g in m.groupby('cfht_expnum'):
+        dt = (hst_mjd - g.cfht_mjd.iloc[0]) / 365.25
+        lines.append(f'exp {e}: {len(g)} matches, dt={dt:+.1f} yr, '
+                     f'med|res|={np.hypot(g.dx, g.dy).median():.3f} px')
+    ax.text(0.02, 0.98, '\n'.join(lines), va='top', family='monospace',
+            fontsize=9, transform=ax.transAxes)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.savefig(img_dir / 'diagnostic_plots_cfht.png', dpi=120)
+    plt.close(fig)

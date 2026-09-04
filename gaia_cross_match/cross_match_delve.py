@@ -184,7 +184,7 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
     """
     L = label.upper()
     fig, axes = plt.subplots(5, 2, figsize=(14, 24/4*5))
-    fig.suptitle(f"DELVE Match Diagnostics: {image_name}", fontsize=18)
+    fig.suptitle(f"{L} Match Diagnostics: {image_name}", fontsize=18)
 
     all_df = pd.concat([matched_df, rejected_df], ignore_index=True)
     has_sc = 'hst_is_star' in matched_df.columns
@@ -394,6 +394,9 @@ def process_single_image_delve(
     gaia_cmd: bool = False,
     color_hst_label: "str | None" = None,
     color_hst_sign: float = 1.0,
+    make_plots: bool = True,
+    return_diag: bool = False,
+    forced_pairs=None,
     min_matches: int = 3,
     max_mag_diff: float = 5.0,
     scale_sweep: bool = False,
@@ -424,6 +427,7 @@ def process_single_image_delve(
     _sigma_sc  = sigma_scale   if sigma_scale   is not None else SIGMA_SCALE
     _sigma_sk  = sigma_skew    if sigma_skew    is not None else SIGMA_SKEW
 
+    _P = label + '_'
     try:
         print(f'--- {label.upper()} cross-match: {image_name} ---')
         params = get_hst_params(hst['flc'], catalog_file=hst['catalog'])
@@ -555,7 +559,7 @@ def process_single_image_delve(
 
         n_stars = is_star.sum()
         print(f'  HST: {len(x_hst)} sources, {n_stars} star candidates; '
-              f'DELVE in field: {in_fld.sum():,}')
+              f'{label.upper()} in field: {in_fld.sum():,}')
 
         # Scale-adjusted guess positions for seed
         inv_sc = 1.0 / params['initial_scale']
@@ -592,9 +596,51 @@ def process_single_image_delve(
             ('all DELVE / all HST',   _all_dlv, hst_data_all_disc, False),
         ]
         best, used_tier, _stars_only = None, None, True
+        # ── FORCED ANCHORS (previously-matched Gaia-common stars) ────────────
+        # These pairs are ALWAYS admitted through the q/mag discovery gates
+        # and force-included in the final match — but the tier walk itself
+        # runs unchanged, so new (possibly faint) sources still vote. With
+        # zero anchors this reduces exactly to the standard discovery flow.
+        _forced_h = _forced_g = None
+        if forced_pairs is not None and len(forced_pairs):
+            _inv_orig = {int(o): i for i, o in enumerate(_orig_idx)}
+            _sid_in = delve_df['source_id'].values[np.where(in_fld)[0]]
+            _sid_map = {int(sid): i for i, sid in enumerate(_sid_in)}
+            fh, fg = [], []
+            for ho, sid in np.asarray(forced_pairs):
+                hi = _inv_orig.get(int(ho)); gi = _sid_map.get(int(sid))
+                if hi is not None and gi is not None:
+                    fh.append(hi); fg.append(gi)
+            if fh:
+                _forced_h = np.array(fh); _forced_g = np.array(fg)
+                print(f'  Forced anchors: {len(fh)} Gaia-common pairs '
+                      f'(always pass discovery gates)')
+        # per-tier HST-local anchor indices (the star tier subsets the arrays;
+        # anchors not classified as stars are appended so they are never lost)
+        _tier_maps = {}
+        if _forced_h is not None:
+            _extra = _forced_h[~np.isin(_forced_h, star_indices)]
+            _star_map = np.concatenate([star_indices, _extra])
+            if len(_extra):
+                for k in ('x', 'y', 'mag', 'C', 'qfit', 'chi2'):
+                    hst_data_star[k] = np.concatenate(
+                        [hst_data_star[k],
+                         (x_hst if k == 'x' else
+                          y_hst if k == 'y' else
+                          mag_hst if k == 'mag' else
+                          C_pix_hst if k == 'C' else
+                          hst_cat['qfit'].astype(float) if k == 'qfit' else
+                          hst_cat['chi2'].astype(float))[_extra]])
+            _pos = {int(v): i for i, v in enumerate(_star_map)}
+            _tier_maps[True] = (np.array([_pos[int(h)] for h in _forced_h]),
+                                _star_map)
+            _tier_maps[False] = (_forced_h, None)
+        
         for _label, _seed_mask, _hst_d, _so in _disc_tiers:
             print(f'  Trying 4P discovery [{_label}] '
-                  f'({_seed_mask.sum()} DELVE, {len(_hst_d["x"])} HST)...')
+                  f'({_seed_mask.sum()} {label.upper()}, {len(_hst_d["x"])} HST)...')
+            _forced_tier = (_tier_maps.get(_so, (None, None))[0]
+                            if _forced_h is not None else None)
             best = _run_4p_discovery(
                 _hst_d, delve_field, params, max_mag_diff,
                 scale_sweep=scale_sweep,
@@ -603,6 +649,8 @@ def process_single_image_delve(
                 debug_verbose=True,
                 sigma_rot_deg=_sigma_rot,
                 sigma_scale=_sigma_sc,
+                forced=((_forced_tier, _forced_g)
+                        if _forced_tier is not None else None),
             )
             if best is not None:
                 used_tier, _stars_only = _label, _so
@@ -619,17 +667,22 @@ def process_single_image_delve(
         # (avoids touching offset_histogram.png which belongs to the Gaia match)
         if best.get('offset_hist') is not None:
             ds_str = f"ds={best.get('best_ds', 0.0):+.4f}"
-            title  = (f'{image_name}  |  DELVE  best tier q<{best["q"]} '
+            title  = (f'{image_name}  |  {label.upper()}  best tier q<{best["q"]} '
                       f'm<{best["m"]:.1f}  {ds_str}')
-            _plot_offset_histogram(
-                best['offset_hist'], best['offset_xed'], best['offset_yed'],
-                best.get('offset_peaks', []), title,
-                os.path.join(hst['root'], f'offset_histogram_{label}{out_suffix}.png'),
-            )
+            if make_plots:
+                _plot_offset_histogram(
+                    best['offset_hist'], best['offset_xed'], best['offset_yed'],
+                    best.get('offset_peaks', []), title,
+                    os.path.join(hst['root'],
+                                 f'offset_histogram_{label}{out_suffix}.png'),
+                )
 
         # ── Affine refinement (all sources) ───────────────────────────────────
         if _stars_only:
-            best_all = {**best, 'h_v': star_indices[best['h_v']]}
+            _smap = (_tier_maps.get(True, (None, None))[1]
+                     if _forced_h is not None else None)
+            _smap = star_indices if _smap is None else _smap
+            best_all = {**best, 'h_v': _smap[best['h_v']]}
         else:
             best_all = best
 
@@ -669,16 +722,28 @@ def process_single_image_delve(
         costs_v  += ((mag_diffs - zp) / 1.0)**2
         costs_v[np.abs(mag_diffs - zp) > max_mag_diff] = np.inf
 
-        all_mdf = (pd.DataFrame({'h': h_v, 'g': g_v, 's': sigs_v, 'c': costs_v,
-                                  'dx': dx_v, 'dy': dy_v, 'mag_diff': mag_diffs,
-                                  'cxx': C_total[:, 0, 0], 'cyy': C_total[:, 1, 1]})
-                   .sort_values('c').drop_duplicates('g'))
+        all_mdf = pd.DataFrame({'h': h_v, 'g': g_v, 's': sigs_v, 'c': costs_v,
+                                 'dx': dx_v, 'dy': dy_v, 'mag_diff': mag_diffs,
+                                 'cxx': C_total[:, 0, 0], 'cyy': C_total[:, 1, 1]})
+        if _forced_h is not None:
+            _fdx = x_d_in[_forced_g] - xh_g[_forced_h]
+            _fdy = y_d_in[_forced_g] - yh_g[_forced_h]
+            _fC = (C_d_in[_forced_g]
+                   + np.einsum('ij,njk,lk->nil', M,
+                               C_pix_hst[_forced_h], M) + resid_cov)
+            forced_rows = pd.DataFrame({
+                'h': _forced_h, 'g': _forced_g,
+                's': 0.0, 'c': -1e9, 'dx': _fdx, 'dy': _fdy,
+                'mag_diff': zp,
+                'cxx': _fC[:, 0, 0], 'cyy': _fC[:, 1, 1]})
+            all_mdf = pd.concat([forced_rows, all_mdf], ignore_index=True)
+        all_mdf = all_mdf.sort_values('c').drop_duplicates('g')
         final_mdf = (all_mdf.drop_duplicates('h')
                      [(all_mdf.drop_duplicates('h')['s'] < 5.0) &
                       (np.abs(all_mdf.drop_duplicates('h')['mag_diff'] - zp) < max_mag_diff)])
 
         h_final, g_final = final_mdf['h'].values, final_mdf['g'].values
-        print(f'  Final DELVE matches: {len(h_final)}')
+        print(f'  Final {label.upper()} matches: {len(h_final)}')
         if len(h_final) == 0:
             print(f'Finished {image_name}: no final {label.upper()} matches.', file=orig_stdout)
             return
@@ -703,6 +768,8 @@ def process_single_image_delve(
             'hst_is_star': is_star[all_mdf['h'].values],
             'gaia_gmag': _col_in('gmag')[all_mdf['g'].values],
             'gaia_bp_rp': _col_in('bp_rp')[all_mdf['g'].values],
+            'gaia_rpmag': _col_in('rpmag')[all_mdf['g'].values],
+            'has_gaia': _col_in('has_gaia', 0.0)[all_mdf['g'].values],
         })
         diag_df['color_hst'] = diag_df['mag'] - diag_df['hst_mag'] - zp
         # g−r color (DELVE DES, analogous to Gaia BP-RP)
@@ -715,13 +782,16 @@ def process_single_image_delve(
         is_m = diag_df.apply(
             lambda r: (int(r.h_idx), int(r.g_idx)) in final_keys, axis=1)
 
-        _save_diagnostic_plots_delve(hst['root'], image_name,
-                                      diag_df[is_m], diag_df[~is_m],
-                                      delve_field_df=delve_field_df,
-                                      label=label, out_suffix=out_suffix,
-                                      gaia_cmd=gaia_cmd,
-                                      color_hst_label=color_hst_label,
-                                      color_hst_sign=color_hst_sign)
+        if make_plots:
+            _save_diagnostic_plots_delve(hst['root'], image_name,
+                                         diag_df[is_m], diag_df[~is_m],
+                                         delve_field_df=delve_field_df,
+                                         label=label, out_suffix=out_suffix,
+                                         gaia_cmd=gaia_cmd,
+                                         color_hst_label=color_hst_label,
+                                         color_hst_sign=color_hst_sign)
+        _diag_ret = (diag_df.assign(is_matched=is_m),
+                     delve_field_df) if return_diag else None
 
         # ── Save matched_delve.csv ────────────────────────────────────────────
         fm = diag_df[is_m]
@@ -738,58 +808,55 @@ def process_single_image_delve(
         if mag_ab_hst is not None:
             output['hst_mag_ab']    = mag_ab_hst[fm['h_idx'].values]
         output['hst_is_star']       = is_star[fm['h_idx'].values]
-        output[f'{label}_source_id']   = delve_df['source_id'].values[dlv_global_idx]
-        output[f'{label}_ra_prop']     = ra_d_in[fm['g_idx'].values]
-        output[f'{label}_dec_prop']    = dec_d_in[fm['g_idx'].values]
-        output[f'{label}_rmag']        = mag_d_in[fm['g_idx'].values]
-        output[f'{label}_gmag']        = gmag_d_in[fm['g_idx'].values]
-        output[f'{label}_imag']        = imag_d_in[fm['g_idx'].values]
-        output[f'{label}_zmag']        = zmag_d_in[fm['g_idx'].values]
-        output[f'{label}_pmra']               = pmra_d_in[fm['g_idx'].values]
-        output[f'{label}_pmdec']              = pmdec_d_in[fm['g_idx'].values]
-        output['delve_pmra_error']         = pmra_error_d_in[fm['g_idx'].values]
-        output['delve_pmdec_error']        = pmdec_error_d_in[fm['g_idx'].values]
-        output['delve_parallax']           = parallax_d_in[fm['g_idx'].values]
-        output['delve_parallax_error']     = parallax_error_d_in[fm['g_idx'].values]
-        output['delve_ra_error']           = ra_error_d_in[fm['g_idx'].values]
-        output['delve_dec_error']          = dec_error_d_in[fm['g_idx'].values]
+        output[_P + 'source_id']   = delve_df['source_id'].values[dlv_global_idx]
+        output[_P + 'ra_prop']     = ra_d_in[fm['g_idx'].values]
+        output[_P + 'dec_prop']    = dec_d_in[fm['g_idx'].values]
+        output[_P + 'rmag']        = mag_d_in[fm['g_idx'].values]
+        output[_P + 'gmag']        = gmag_d_in[fm['g_idx'].values]
+        output[_P + 'imag']        = imag_d_in[fm['g_idx'].values]
+        output[_P + 'zmag']        = zmag_d_in[fm['g_idx'].values]
+        output[_P + 'pmra']               = pmra_d_in[fm['g_idx'].values]
+        output[_P + 'pmdec']              = pmdec_d_in[fm['g_idx'].values]
+        output[_P + 'pmra_error']         = pmra_error_d_in[fm['g_idx'].values]
+        output[_P + 'pmdec_error']        = pmdec_error_d_in[fm['g_idx'].values]
+        output[_P + 'parallax']           = parallax_d_in[fm['g_idx'].values]
+        output[_P + 'parallax_error']     = parallax_error_d_in[fm['g_idx'].values]
+        output[_P + 'ra_error']           = ra_error_d_in[fm['g_idx'].values]
+        output[_P + 'dec_error']          = dec_error_d_in[fm['g_idx'].values]
         # Catalog position at 2016.0 (same reference epoch as Gaia DR3)
-        output['delve_ra_cat']             = ra_cat_d_in[fm['g_idx'].values]
-        output['delve_dec_cat']            = dec_cat_d_in[fm['g_idx'].values]
+        output[_P + 'ra_cat']             = ra_cat_d_in[fm['g_idx'].values]
+        output[_P + 'dec_cat']            = dec_cat_d_in[fm['g_idx'].values]
         # Full 5×5 DELVE correlation terms for the Gaia-DELVE consistency test
-        output['delve_corr_ra_dec']        = corr_ra_dec_d_in[fm['g_idx'].values]
-        output['delve_corr_ra_plx']        = corr_ra_plx_d_in[fm['g_idx'].values]
-        output['delve_corr_ra_pmra']       = corr_ra_pmra_d_in[fm['g_idx'].values]
-        output['delve_corr_ra_pmdec']      = corr_ra_pmdec_d_in[fm['g_idx'].values]
-        output['delve_corr_dec_plx']       = corr_dec_plx_d_in[fm['g_idx'].values]
-        output['delve_corr_dec_pmra']      = corr_dec_pmra_d_in[fm['g_idx'].values]
-        output['delve_corr_dec_pmdec']     = corr_dec_pmdec_d_in[fm['g_idx'].values]
-        output['delve_corr_plx_pmra']      = corr_plx_pmra_d_in[fm['g_idx'].values]
-        output['delve_corr_plx_pmdec']     = corr_plx_pmdec_d_in[fm['g_idx'].values]
-        output['delve_corr_pmra_pmdec']    = corr_pmra_pmdec_d_in[fm['g_idx'].values]
+        output[_P + 'corr_ra_dec']        = corr_ra_dec_d_in[fm['g_idx'].values]
+        output[_P + 'corr_ra_plx']        = corr_ra_plx_d_in[fm['g_idx'].values]
+        output[_P + 'corr_ra_pmra']       = corr_ra_pmra_d_in[fm['g_idx'].values]
+        output[_P + 'corr_ra_pmdec']      = corr_ra_pmdec_d_in[fm['g_idx'].values]
+        output[_P + 'corr_dec_plx']       = corr_dec_plx_d_in[fm['g_idx'].values]
+        output[_P + 'corr_dec_pmra']      = corr_dec_pmra_d_in[fm['g_idx'].values]
+        output[_P + 'corr_dec_pmdec']     = corr_dec_pmdec_d_in[fm['g_idx'].values]
+        output[_P + 'corr_plx_pmra']      = corr_plx_pmra_d_in[fm['g_idx'].values]
+        output[_P + 'corr_plx_pmdec']     = corr_plx_pmdec_d_in[fm['g_idx'].values]
+        output[_P + 'corr_pmra_pmdec']    = corr_pmra_pmdec_d_in[fm['g_idx'].values]
         if 'mtype' in delve_df.columns:
-            output['delve_mtype']   = delve_df['mtype'].values[dlv_global_idx]
+            output[_P + 'mtype']   = delve_df['mtype'].values[dlv_global_idx]
         if 'healpix_pixel' in delve_df.columns:
-            output['delve_healpix'] = delve_df['healpix_pixel'].values[dlv_global_idx]
-        output['residual_mag']      = output[f'{label}_rmag'] - (output['hst_mag_st_gdc'] + zp)
+            output[_P + 'healpix'] = delve_df['healpix_pixel'].values[dlv_global_idx]
+        output['residual_mag']      = output[_P + 'rmag'] - (output['hst_mag_st_gdc'] + zp)
         output['residual_x']        = fm['dx'].values
         output['residual_y']        = fm['dy'].values
         output['residual_sigma']    = fm['sigma'].values
 
         # Nullify DELVE astrometric data for entries without a complete, valid
         # 5×5 covariance (any sigma NaN or ≤ 0).  Photometry columns are kept.
-        _sig_cols = ['delve_ra_error', 'delve_dec_error', 'delve_pmra_error',
-                     'delve_pmdec_error', 'delve_parallax_error']
-        _astrom_cols = [
-            'delve_pmra', 'delve_pmdec', 'delve_pmra_error', 'delve_pmdec_error',
-            'delve_parallax', 'delve_parallax_error',
-            'delve_ra_error', 'delve_dec_error',
-            'delve_ra_cat', 'delve_dec_cat',
-            'delve_corr_ra_dec', 'delve_corr_ra_plx', 'delve_corr_ra_pmra',
-            'delve_corr_ra_pmdec', 'delve_corr_dec_plx', 'delve_corr_dec_pmra',
-            'delve_corr_dec_pmdec', 'delve_corr_plx_pmra', 'delve_corr_plx_pmdec',
-            'delve_corr_pmra_pmdec',
-        ]
+        _sig_cols = [_P + c for c in ('ra_error', 'dec_error', 'pmra_error',
+                     'pmdec_error', 'parallax_error')]
+        _astrom_cols = [_P + c for c in (
+            'pmra', 'pmdec', 'pmra_error', 'pmdec_error',
+            'parallax', 'parallax_error', 'ra_error', 'dec_error',
+            'ra_cat', 'dec_cat',
+            'corr_ra_dec', 'corr_ra_plx', 'corr_ra_pmra', 'corr_ra_pmdec',
+            'corr_dec_plx', 'corr_dec_pmra', 'corr_dec_pmdec',
+            'corr_plx_pmra', 'corr_plx_pmdec', 'corr_pmra_pmdec')]
         _valid_5d = np.ones(len(output), dtype=bool)
         for _c in _sig_cols:
             if _c in output.colnames:
@@ -822,8 +889,11 @@ def process_single_image_delve(
         trans_out.write(os.path.join(hst['root'], 'transformation_delve.csv'),
                         format='ascii.csv', overwrite=True)
 
-        print(f'Finished {image_name}: {len(fm)} DELVE matches in '
+        print(f'Finished {image_name}: {len(fm)} {label.upper()} matches in '
               f'{time.time()-start_time:.1f}s.', file=orig_stdout)
+        if return_diag:
+            sys.stdout = orig_stdout
+            return _diag_ret
 
     except Exception as exc:
         import traceback
