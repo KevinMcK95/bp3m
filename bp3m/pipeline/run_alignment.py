@@ -295,6 +295,29 @@ def run_alignment(  # noqa: C901
                 _f['Gaia_time'] = _T_c(_mean_mjd, format='mjd').jyear
                 gaia_catalog = _pd_c.concat([gaia_catalog, _f],
                                             ignore_index=True)
+            # per-star provenance tier (for plots + stellar_astrometry):
+            # gaia_hst / gaia_cfht_hst / gaia_cfht / cfht_hst
+            _cfht_ids = set()
+            for _df in cstars.values():
+                _cfht_ids.update(_df.Gaia_id.tolist())
+            _hst_ids = set()
+            for _nm, _df in filtered_spi.items():
+                if _nm not in cstars:
+                    _hst_ids.update(_df.Gaia_id.tolist())
+            _gid = gaia_catalog['Gaia_id'].to_numpy()
+            _in_c = np.isin(_gid, list(_cfht_ids))
+            _in_h = np.isin(_gid, list(_hst_ids))
+            _tier = np.where(_gid < 0, 'cfht_hst',
+                     np.where(_in_c & _in_h, 'gaia_cfht_hst',
+                      np.where(_in_c, 'gaia_cfht', 'gaia_hst')))
+            gaia_catalog['cfht_tier'] = _tier
+            # median CFHT magnitude per star (deep-CMD support for faint tier)
+            _cm2 = _cm.copy()
+            _cm2['star_id'] = _cm2.star_id.astype(np.int64)
+            _cmag = (_cm2.groupby('star_id').cfht_rmag.median()
+                     if 'cfht_rmag' in _cm2.columns else None)
+            if _cmag is not None:
+                gaia_catalog['cfht_rmag'] = gaia_catalog.Gaia_id.map(_cmag)
             image_names = sorted(filtered_spi.keys())
             star_id_to_idx, image_names, star_in_image = build_index_maps(
                 filtered_spi, gaia_catalog)

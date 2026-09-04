@@ -995,6 +995,57 @@ def make_plots(solver, images, gaia_catalog,
     # because DELVE-only stars (negative Gaia_id) have gmag=NaN and would
     # be excluded entirely if we reused the Gaia `ok` mask.
     _ok_delve_base = bp3m_converged & np.isfinite(pm_size)
+    # ── CFHT tier figure (--use_cfht): sky + PM VPD + CMDs coloured by
+    # provenance: gaia_hst / gaia_cfht_hst / gaia_cfht / cfht_hst ────────────
+    if 'cfht_tier' in _gc.columns:
+        try:
+            _tiers_arr = _gc['cfht_tier'].astype(str).to_numpy()
+            _t_colors = {'gaia_hst': 'tab:blue', 'gaia_cfht_hst': 'tab:green',
+                         'gaia_cfht': 'tab:purple', 'cfht_hst': 'tab:orange'}
+            _cmag_arr = (pd.to_numeric(_gc['cfht_rmag'], errors='coerce')
+                         .to_numpy(float) if 'cfht_rmag' in _gc.columns
+                         else np.full(len(_gc), np.nan))
+            figt, axt = plt.subplots(2, 2, figsize=(13, 11))
+            for _t, _c in _t_colors.items():
+                _m = (_tiers_arr == _t) & bp3m_converged
+                if not _m.any():
+                    continue
+                _lbl = f'{_t} ({int(_m.sum())})'
+                axt[0, 0].scatter(ra[_m], dec[_m], s=6, c=_c, alpha=0.6,
+                                  label=_lbl)
+                axt[0, 1].scatter(pmra_bp3m[_m], pmdec_bp3m[_m], s=6, c=_c,
+                                  alpha=0.6, label=_lbl)
+                _g_ok = _m & np.isfinite(gmag) & np.isfinite(bp_rp)
+                axt[1, 0].scatter(bp_rp[_g_ok], gmag[_g_ok], s=6, c=_c,
+                                  alpha=0.6, label=_lbl)
+                _c_ok = _m & np.isfinite(_cmag_arr)
+                axt[1, 1].scatter((_cmag_arr - gmag)[_c_ok]
+                                  if np.isfinite(gmag[_c_ok]).any()
+                                  else np.zeros(_c_ok.sum()),
+                                  _cmag_arr[_c_ok], s=6, c=_c, alpha=0.6,
+                                  label=_lbl)
+            axt[0, 0].set_xlabel('RA (deg)'); axt[0, 0].set_ylabel('Dec (deg)')
+            axt[0, 0].set_title('Sky — provenance tiers')
+            axt[0, 1].set_xlabel('PMRA (mas/yr)')
+            axt[0, 1].set_ylabel('PMDec (mas/yr)')
+            axt[0, 1].set_title('BP3M proper motions')
+            axt[1, 0].invert_yaxis()
+            axt[1, 0].set_xlabel('BP − RP (Gaia)')
+            axt[1, 0].set_ylabel('G (Gaia)')
+            axt[1, 0].set_title('Gaia CMD')
+            axt[1, 1].invert_yaxis()
+            axt[1, 1].set_xlabel('CFHT r − Gaia G (mag)')
+            axt[1, 1].set_ylabel('CFHT r (mag)')
+            axt[1, 1].set_title('CFHT CMD (full match depth)')
+            for _ax in axt.ravel():
+                _ax.legend(fontsize=7)
+            figt.suptitle('HST x CFHT provenance tiers')
+            figt.tight_layout(rect=(0, 0, 1, 0.97))
+            figt.savefig(plot_dir / 'sky_cmd_pm_cfht_tiers.png', dpi=130)
+            plt.close(figt)
+        except Exception as _e:
+            print(f'  sky_cmd_pm_cfht_tiers.png failed: {_e}')
+
     _DELVE_COLORS = [
         ('delve_gmag', 'delve_rmag', 'DELVE g − r (mag)', 'DELVE r (mag)', 'sky_cmd_pm_delve_gr.png'),
         ('delve_rmag', 'delve_imag', 'DELVE r − i (mag)', 'DELVE i (mag)', 'sky_cmd_pm_delve_ri.png'),
