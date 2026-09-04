@@ -56,7 +56,21 @@ def build_gaia_field(gaia_df: pd.DataFrame, meta: ImageMeta,
     margin : float
         Footprint padding [mas].
     """
-    ra_prop, dec_prop, Ct = propagate_gaia_with_cov(gaia_df, meta.mjd)
+    # 2p stars (no Gaia PM/plx) are propagated at the field-typical
+    # astrometry of the 5p population, NOT at 0 PM — same fix as bp3m's
+    # HST xmatch (Omega_Cen: 23% of 2p matched wrong at PM=0 vs 2% at the
+    # systemic PM). Mode-of-the-PM-field via field_typical_astrometry.
+    fill = None
+    if 'pmra' in gaia_df.columns:
+        _ok5 = gaia_df['pmra'].notna() & gaia_df['pmdec'].notna()
+        if _ok5.sum() >= 30:
+            from bp3m.astro_utils import field_typical_astrometry
+            fill = field_typical_astrometry(
+                gaia_df.loc[_ok5, 'pmra'], gaia_df.loc[_ok5, 'pmdec'],
+                plx=(gaia_df.loc[_ok5, 'parallax']
+                     if 'parallax' in gaia_df.columns else None))
+    ra_prop, dec_prop, Ct = propagate_gaia_with_cov(gaia_df, meta.mjd,
+                                                    fill_pm_plx=fill)
     C = Ct[:, 0:2, 0:2].copy()
     err = np.power(np.maximum(np.linalg.det(C), 1e-30), 0.25)
     xi, eta = gnomonic(ra_prop, dec_prop, meta.ra0, meta.dec0)
