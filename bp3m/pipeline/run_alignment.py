@@ -919,6 +919,23 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
         _pd.DataFrame(_rows).to_csv(output_dir / "epoch_distortion.csv", index=False)
         print(f"  Saved: epoch_distortion.csv  ({len(solver.ed_groups)} chip-groups, "
               f"order {solver._ed_order}), C_epoch_distortion.npy")
+        # Persist the D prior ACTUALLY applied per group (default zero-centred
+        # diagonal, or the set_epoch_dist_prior() recentred values), so a
+        # cross-field information-space combiner can subtract each field's
+        # prior exactly once instead of once per field. Row order matches
+        # ed_groups / epoch_distortion.csv; units are pixels (coeff space).
+        _pm = np.zeros((len(solver.ed_groups), solver.ED_K))
+        _pp = np.zeros_like(_pm)
+        for _g, _grp in enumerate(solver.ed_groups):
+            if _grp.get('prior_prec') is not None:
+                _pm[_g] = _grp['prior_mean']
+                _pp[_g] = _grp['prior_prec']
+            else:
+                _sig0 = solver._img_data[_grp['images'][0]]["ed_sigma_px"]
+                _pp[_g] = _sig0 ** -2.0
+        np.savez(output_dir / "epoch_distortion_prior.npz",
+                 prior_mean_px=_pm, prior_prec_px=_pp)
+        print(f"  Saved: epoch_distortion_prior.npz")
         # Linear-deviation aggregation: per-group inverse-variance-weighted
         # mean of each image's fitted-vs-header linear terms.  D itself starts
         # at degree 2 (deg 0-1 are alignment-degenerate), so the group-level
