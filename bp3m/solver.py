@@ -1625,26 +1625,45 @@ class BP3MSolver:
             except np.linalg.LinAlgError:
                 w_e, Q_e = np.linalg.eigh(C_vT)
                 L_chol = Q_e * np.sqrt(np.clip(w_e, 1e-30, None))[:, None, :]
-            data_l, rows_l, cols_l = [], [], []
+            # Accumulate B~ in bounded chunks (int32 indices, csr-summed) so
+            # dense many-image fields don't spike transient memory: one giant
+            # COO concat at 200+ dense images costs ~10 GB and risks the
+            # per-user OOM kill.
+            _shape = (5 * C_vT.shape[0], n_s)
+            B_til = None
+            data_l, rows_l, cols_l, _budget = [], [], [], 0
+
+            def _flush_B(B_prev):
+                B_part = _sp.csr_matrix(
+                    (np.concatenate(data_l),
+                     (np.concatenate(rows_l), np.concatenate(cols_l))),
+                    shape=_shape)
+                data_l.clear(); rows_l.clear(); cols_l.clear()
+                return B_part if B_prev is None else B_prev + B_part
+
             for sidx_o, K_o, cols_o in _schur_obs:
                 n_o, _, W_o = K_o.shape
                 if n_o == 0:
                     continue
                 # (L^T K): row block of B~ for each observation
                 ltk = np.einsum('nji,njw->niw', L_chol[sidx_o], K_o)
-                r_b = (5 * sidx_o.astype(np.int64))[:, None, None] \
-                    + np.arange(5)[None, :, None]
+                r_b = (5 * sidx_o.astype(np.int32))[:, None, None] \
+                    + np.arange(5, dtype=np.int32)[None, :, None]
                 data_l.append(ltk.ravel())
-                rows_l.append(np.broadcast_to(r_b, (n_o, 5, W_o)).ravel())
+                rows_l.append(np.broadcast_to(r_b, (n_o, 5, W_o))
+                              .ravel().astype(np.int32, copy=False))
                 cols_l.append(np.broadcast_to(
-                    cols_o[None, None, :], (n_o, 5, W_o)).ravel())
+                    cols_o.astype(np.int32)[None, None, :],
+                    (n_o, 5, W_o)).ravel().astype(np.int32, copy=False))
+                _budget += n_o * 5 * W_o
+                if _budget >= 30_000_000:
+                    B_til = _flush_B(B_til)
+                    _budget = 0
             if data_l:
-                B_til = _sp.csr_matrix(
-                    (np.concatenate(data_l),
-                     (np.concatenate(rows_l), np.concatenate(cols_l))),
-                    shape=(5 * C_vT.shape[0], n_s))
-                del data_l, rows_l, cols_l
+                B_til = _flush_B(B_til)
+            if B_til is not None:
                 Cr_inv -= (B_til.T @ B_til).toarray()
+                del B_til
 
         # ── Hi/lo chip coupling prior: rhs pull toward partner's current iterate ─
         for hi_idx, lo_idx in self._chip_pairs:
