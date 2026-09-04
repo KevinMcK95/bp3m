@@ -162,8 +162,13 @@ def _propagate_delve(df: pd.DataFrame, target_mjd: float
 def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
                                   matched_df: pd.DataFrame,
                                   rejected_df: pd.DataFrame,
-                                  delve_field_df: "pd.DataFrame | None" = None) -> None:
-    """10-panel diagnostic figure for the DELVE cross-match.
+                                  delve_field_df: "pd.DataFrame | None" = None,
+                                  label: str = 'delve',
+                                  out_suffix: str = '',
+                                  gaia_cmd: bool = False,
+                                  color_hst_label: str = None,
+                                  color_hst_sign: float = 1.0) -> None:
+    """10-panel diagnostic figure for the external-catalog cross-match.
 
     Layout mirrors save_diagnostic_plots() from cross_match.py exactly:
       (0,0) Field map          (0,1) DELVE PM VPD
@@ -177,6 +182,7 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
     delve_field_df : full in-field DELVE source table (r_mag, g_mag columns);
                      drawn as grey background population in CMD panels.
     """
+    L = label.upper()
     fig, axes = plt.subplots(5, 2, figsize=(14, 24/4*5))
     fig.suptitle(f"DELVE Match Diagnostics: {image_name}", fontsize=18)
 
@@ -204,7 +210,7 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
     ax = axes[0, 0]
     if delve_field_df is not None:
         ax.scatter(delve_field_df['x'], delve_field_df['y'],
-                   c='grey', s=2, alpha=0.2, label='DELVE field', zorder=1)
+                   c='grey', s=2, alpha=0.2, label=f'{L} field', zorder=1)
     if len(all_df):
         lc = [[(r.x, r.y), (r.hx, r.hy)] for r in all_df.itertuples()]
         ax.add_collection(LineCollection(lc, colors='grey', alpha=0.15, linewidths=0.5, zorder=2))
@@ -215,50 +221,78 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
         ax.scatter(m_nonstars['x'], m_nonstars['y'], c='orange', alpha=0.8, s=14, label='Matched non-star', zorder=5)
     if len(m_stars):
         ax.scatter(m_stars['x'], m_stars['y'], c='blue', alpha=0.8, s=12, label='Matched star', zorder=5)
-    ax.set_xlabel('X_DELVE (pixels)'); ax.set_ylabel('Y_DELVE (pixels)')
+    ax.set_xlabel(f'X_{L} (pixels)'); ax.set_ylabel(f'Y_{L} (pixels)')
     ax.set_title('Field Map (Pixels)'); ax.legend(fontsize=7)
 
     # 2. DELVE PM VPD
     ax = axes[0, 1]
     if delve_field_df is not None:
         ax.scatter(delve_field_df['pmra'], delve_field_df['pmdec'],
-                   c='grey', s=2, alpha=0.2, label='DELVE field', zorder=1)
+                   c='grey', s=2, alpha=0.2, label=f'{L} field', zorder=1)
     if len(rejected_df):
         ax.scatter(rejected_df['pmra'], rejected_df['pmdec'],
                    c='red', s=5, alpha=0.4, label='Rejected', zorder=3)
     _scatter_matched(ax, 'pmra', 'pmdec')
     ax.set_xlabel('PMRA (mas/yr)'); ax.set_ylabel('PMDec (mas/yr)')
-    ax.set_title('DELVE Proper Motions'); ax.legend(fontsize=7)
+    ax.set_title(f'{L} Proper Motions'); ax.legend(fontsize=7)
 
-    # 3. DELVE CMD (r vs g−r) — full field population as background
+    # 3. CMD — Gaia G vs BP−RP when gaia_cmd, else r vs g−r
     ax = axes[1, 0]
-    if delve_field_df is not None and 'g_mag' in delve_field_df.columns:
+    if gaia_cmd:
+        if delve_field_df is not None and 'gmag' in delve_field_df.columns:
+            v = delve_field_df['gmag'].notna() & delve_field_df['bp_rp'].notna()
+            ax.scatter(delve_field_df.loc[v, 'bp_rp'],
+                       delve_field_df.loc[v, 'gmag'],
+                       c='grey', s=3, alpha=0.3, label=f'{L} field (Gaia)',
+                       zorder=1)
+        for src, col, lbl in [(rejected_df, 'red', 'Rejected'),
+                              (m_nonstars, 'orange', 'Matched non-star'),
+                              (m_stars, 'blue', 'Matched star')]:
+            if len(src) and 'gaia_bp_rp' in src.columns:
+                v = src['gaia_bp_rp'].notna() & src['gaia_gmag'].notna()
+                ax.scatter(src.loc[v, 'gaia_bp_rp'], src.loc[v, 'gaia_gmag'],
+                           c=col, alpha=0.6 if col != 'red' else 0.15,
+                           s=12 if col != 'red' else 5, label=lbl, zorder=2)
+        ax.invert_yaxis()
+        ax.set_xlabel('BP − RP (Gaia, mag)'); ax.set_ylabel('G (Gaia, mag)')
+        ax.set_title('Gaia Color-Magnitude Diagram'); ax.legend(fontsize=7)
+    elif delve_field_df is not None and 'g_mag' in delve_field_df.columns:
         valid = ((delve_field_df['r_mag'] > -90) & (delve_field_df['r_mag'] < 50) &
                  (delve_field_df['g_mag'] > -90) & (delve_field_df['g_mag'] < 50))
         pop = delve_field_df[valid]
         if len(pop):
             gr_pop = pop['g_mag'].values - pop['r_mag'].values
-            ax.scatter(gr_pop, pop['r_mag'].values, c='grey', s=3, alpha=0.3, label='DELVE field', zorder=1)
-    for src, col, lbl in [(rejected_df, 'red', 'Rejected'),
+            ax.scatter(gr_pop, pop['r_mag'].values, c='grey', s=3, alpha=0.3, label=f'{L} field', zorder=1)
+    for src, col, lbl in ([] if gaia_cmd else
+                          [(rejected_df, 'red', 'Rejected'),
                            (m_nonstars, 'orange', 'Matched non-star'),
-                           (m_stars, 'blue', 'Matched star')]:
+                           (m_stars, 'blue', 'Matched star')]):
         if len(src) and 'color' in src.columns:
             valid = (src['color'] > -10) & (src['color'] < 10)
             ax.scatter(src.loc[valid, 'color'], src.loc[valid, 'mag'],
                        c=col, alpha=0.6 if col != 'red' else 0.15, s=12 if col != 'red' else 5,
                        label=lbl, zorder=2)
-    ax.invert_yaxis()
-    ax.set_xlabel('g − r (DES, mag)'); ax.set_ylabel('r_DELVE (mag)')
-    ax.set_title('DELVE Color-Magnitude Diagram'); ax.legend(fontsize=7)
+    if not gaia_cmd:
+        ax.invert_yaxis()
+        ax.set_xlabel('g − r (DES, mag)'); ax.set_ylabel(f'r_{L} (mag)')
+        ax.set_title(f'{L} Color-Magnitude Diagram'); ax.legend(fontsize=7)
 
     # 4. DELVE vs HST CMD (r vs r − HST)
     ax = axes[1, 1]
-    if len(rejected_df):
-        ax.scatter(rejected_df['color_hst'], rejected_df['mag'], c='red', alpha=0.15, s=5, label='Rejected')
-    _scatter_matched(ax, 'color_hst', 'mag')
+    _clbl = color_hst_label or f'r_{L} − HST'
+    _ycol = 'gaia_gmag' if (gaia_cmd and 'gaia_gmag' in matched_df.columns) else 'mag'
+    _ylbl = 'G (Gaia, mag)' if _ycol == 'gaia_gmag' else f'{L} mag'
+    for src, col, lbl in [(rejected_df, 'red', 'Rejected'),
+                          (m_nonstars, 'orange', 'Matched non-star'),
+                          (m_stars, 'blue', 'Matched star')]:
+        if len(src):
+            yv = src[_ycol] if _ycol in src.columns else src['mag']
+            ax.scatter(color_hst_sign * src['color_hst'], yv, c=col,
+                       alpha=0.6 if col != 'red' else 0.15,
+                       s=12 if col != 'red' else 5, label=lbl)
     ax.invert_yaxis()
-    ax.set_xlabel('r_DELVE − HST (mag)'); ax.set_ylabel('r_DELVE (mag)')
-    ax.set_title('DELVE r − HST Color-Magnitude'); ax.legend(fontsize=7)
+    ax.set_xlabel(f'{_clbl} (mag)'); ax.set_ylabel(_ylbl)
+    ax.set_title(f'HST × {L} Color-Magnitude'); ax.legend(fontsize=7)
 
     # 5. XY residuals
     ax = axes[2, 0]
@@ -295,8 +329,8 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
             ax.scatter(sub['mag'], np.sqrt(sub['dx']**2 + sub['dy']**2),
                        c=col, s=10, alpha=0.5, label=lbl)
     ax.set_yscale('log')
-    ax.set_xlabel('r_DELVE Magnitude'); ax.set_ylabel('Residual Size (pixels)')
-    ax.set_title('Residual Magnitude vs DELVE r Mag'); ax.legend(fontsize=7)
+    ax.set_xlabel(f'r_{L} Magnitude'); ax.set_ylabel('Residual Size (pixels)')
+    ax.set_title(f'Residual Magnitude vs {L} r Mag'); ax.legend(fontsize=7)
     if mag_lims: ax.set_xlim(*mag_lims)
 
     # 8. Sigma histogram
@@ -320,8 +354,8 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
         if len(sub):
             ax.scatter(sub['mag'], sub['sigma'], c=col, s=10, alpha=0.5, label=lbl)
     ax.axhline(5, color='red', ls='--', label='Threshold (5σ)')
-    ax.set_xlabel('r_DELVE Magnitude'); ax.set_ylabel('Residual Sigma')
-    ax.set_title('Sigma vs DELVE r Magnitude'); ax.legend(fontsize=7)
+    ax.set_xlabel(f'r_{L} Magnitude'); ax.set_ylabel('Residual Sigma')
+    ax.set_title(f'Sigma vs {L} r Magnitude'); ax.legend(fontsize=7)
     if mag_lims: ax.set_xlim(*mag_lims)
 
     # 10. Color-color (g−r vs r−HST)
@@ -339,14 +373,14 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
                 ax.scatter(src.loc[v, 'color'], src.loc[v, 'color_hst'],
                            c=col, alpha=0.6, s=12, label=lbl)
         ax.invert_yaxis()
-        ax.set_xlabel('g − r (DES, mag)'); ax.set_ylabel('r_DELVE − HST (mag)')
+        ax.set_xlabel('g − r (DES, mag)'); ax.set_ylabel(f'r_{L} − HST (mag)')
         ax.set_title('Color-Color Diagram'); ax.legend(fontsize=7)
     else:
         ax.text(0.5, 0.5, 'g-r not available', ha='center', va='center')
         ax.set_title('Color-Color Placeholder')
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(os.path.join(out_dir, 'diagnostic_plots_delve.png'), dpi=150)
+    plt.savefig(os.path.join(out_dir, f'diagnostic_plots_{label}{out_suffix}.png'), dpi=150)
     plt.close()
 
 
@@ -354,6 +388,12 @@ def process_single_image_delve(
     hst: dict,
     delve_df: pd.DataFrame,
     hst_pix_floor: float = 0.5,
+    label: str = 'delve',
+    mag_col: str = 'r_mag',
+    out_suffix: str = '',
+    gaia_cmd: bool = False,
+    color_hst_label: "str | None" = None,
+    color_hst_sign: float = 1.0,
     min_matches: int = 3,
     max_mag_diff: float = 5.0,
     scale_sweep: bool = False,
@@ -375,17 +415,17 @@ def process_single_image_delve(
     """
     start_time = time.time()
     image_name   = os.path.basename(hst['flc']).replace('_flc.fits', '')
-    log_file     = os.path.join(hst['root'], 'processing_log_delve.txt')
+    log_file     = os.path.join(hst['root'], f'processing_log_{label}{out_suffix}.txt')
     orig_stdout  = sys.stdout
     sys.stdout   = FileLogger(log_file)
-    print(f'Starting DELVE cross-match for {image_name}...', file=orig_stdout)
+    print(f'Starting {label.upper()} cross-match for {image_name}...', file=orig_stdout)
 
     _sigma_rot = sigma_rot_deg if sigma_rot_deg is not None else SIGMA_ROT_DEG
     _sigma_sc  = sigma_scale   if sigma_scale   is not None else SIGMA_SCALE
     _sigma_sk  = sigma_skew    if sigma_skew    is not None else SIGMA_SKEW
 
     try:
-        print(f'--- DELVE cross-match: {image_name} ---')
+        print(f'--- {label.upper()} cross-match: {image_name} ---')
         params = get_hst_params(hst['flc'], catalog_file=hst['catalog'])
         if params is None:
             print(f'Finished {image_name}: failed to load HST params.', file=orig_stdout)
@@ -426,12 +466,12 @@ def process_single_image_delve(
         in_fld = ((np.abs(x_dlv - params['x_cen']) <= margin) &
                   (np.abs(y_dlv - params['y_cen']) <= margin))
         if not np.any(in_fld):
-            print(f'Finished {image_name}: no DELVE sources in field.', file=orig_stdout)
+            print(f'Finished {image_name}: no {label.upper()} sources in field.', file=orig_stdout)
             return
 
         x_d_in  = x_dlv[in_fld];    y_d_in  = y_dlv[in_fld]
         C_d_in  = C_pix_dlv[in_fld]; err_d_in = dlv_err_total[in_fld]
-        mag_d_in  = delve_df['r_mag'].values[in_fld]
+        mag_d_in  = delve_df[mag_col].values[in_fld]
         gmag_d_in = (delve_df['g_mag'].values[in_fld]
                      if 'g_mag' in delve_df.columns
                      else np.full(int(in_fld.sum()), np.nan))
@@ -570,7 +610,7 @@ def process_single_image_delve(
             print(f'  4P failed [{_label}] — trying next tier...')
 
         if best is None:
-            print(f'Finished {image_name}: DELVE 4P discovery failed.', file=orig_stdout)
+            print(f'Finished {image_name}: {label.upper()} 4P discovery failed.', file=orig_stdout)
             return
         print(f'  4P succeeded [{used_tier}]: Q<{best["q"]}, Mag<{best["m"]:.1f} '
               f'({best["n_match"]} matches)')
@@ -584,7 +624,7 @@ def process_single_image_delve(
             _plot_offset_histogram(
                 best['offset_hist'], best['offset_xed'], best['offset_yed'],
                 best.get('offset_peaks', []), title,
-                os.path.join(hst['root'], 'offset_histogram_delve.png'),
+                os.path.join(hst['root'], f'offset_histogram_{label}{out_suffix}.png'),
             )
 
         # ── Affine refinement (all sources) ───────────────────────────────────
@@ -640,7 +680,7 @@ def process_single_image_delve(
         h_final, g_final = final_mdf['h'].values, final_mdf['g'].values
         print(f'  Final DELVE matches: {len(h_final)}')
         if len(h_final) == 0:
-            print(f'Finished {image_name}: no final DELVE matches.', file=orig_stdout)
+            print(f'Finished {image_name}: no final {label.upper()} matches.', file=orig_stdout)
             return
 
         # ── Build diagnostic DataFrame ────────────────────────────────────────
@@ -661,6 +701,8 @@ def process_single_image_delve(
             'pmra': pmra_d_in[all_mdf['g']],
             'pmdec': pmdec_d_in[all_mdf['g']],
             'hst_is_star': is_star[all_mdf['h'].values],
+            'gaia_gmag': _col_in('gmag')[all_mdf['g'].values],
+            'gaia_bp_rp': _col_in('bp_rp')[all_mdf['g'].values],
         })
         diag_df['color_hst'] = diag_df['mag'] - diag_df['hst_mag'] - zp
         # g−r color (DELVE DES, analogous to Gaia BP-RP)
@@ -675,7 +717,11 @@ def process_single_image_delve(
 
         _save_diagnostic_plots_delve(hst['root'], image_name,
                                       diag_df[is_m], diag_df[~is_m],
-                                      delve_field_df=delve_field_df)
+                                      delve_field_df=delve_field_df,
+                                      label=label, out_suffix=out_suffix,
+                                      gaia_cmd=gaia_cmd,
+                                      color_hst_label=color_hst_label,
+                                      color_hst_sign=color_hst_sign)
 
         # ── Save matched_delve.csv ────────────────────────────────────────────
         fm = diag_df[is_m]
@@ -692,15 +738,15 @@ def process_single_image_delve(
         if mag_ab_hst is not None:
             output['hst_mag_ab']    = mag_ab_hst[fm['h_idx'].values]
         output['hst_is_star']       = is_star[fm['h_idx'].values]
-        output['delve_source_id']   = delve_df['source_id'].values[dlv_global_idx]
-        output['delve_ra_prop']     = ra_d_in[fm['g_idx'].values]
-        output['delve_dec_prop']    = dec_d_in[fm['g_idx'].values]
-        output['delve_rmag']        = mag_d_in[fm['g_idx'].values]
-        output['delve_gmag']        = gmag_d_in[fm['g_idx'].values]
-        output['delve_imag']        = imag_d_in[fm['g_idx'].values]
-        output['delve_zmag']        = zmag_d_in[fm['g_idx'].values]
-        output['delve_pmra']               = pmra_d_in[fm['g_idx'].values]
-        output['delve_pmdec']              = pmdec_d_in[fm['g_idx'].values]
+        output[f'{label}_source_id']   = delve_df['source_id'].values[dlv_global_idx]
+        output[f'{label}_ra_prop']     = ra_d_in[fm['g_idx'].values]
+        output[f'{label}_dec_prop']    = dec_d_in[fm['g_idx'].values]
+        output[f'{label}_rmag']        = mag_d_in[fm['g_idx'].values]
+        output[f'{label}_gmag']        = gmag_d_in[fm['g_idx'].values]
+        output[f'{label}_imag']        = imag_d_in[fm['g_idx'].values]
+        output[f'{label}_zmag']        = zmag_d_in[fm['g_idx'].values]
+        output[f'{label}_pmra']               = pmra_d_in[fm['g_idx'].values]
+        output[f'{label}_pmdec']              = pmdec_d_in[fm['g_idx'].values]
         output['delve_pmra_error']         = pmra_error_d_in[fm['g_idx'].values]
         output['delve_pmdec_error']        = pmdec_error_d_in[fm['g_idx'].values]
         output['delve_parallax']           = parallax_d_in[fm['g_idx'].values]
@@ -725,7 +771,7 @@ def process_single_image_delve(
             output['delve_mtype']   = delve_df['mtype'].values[dlv_global_idx]
         if 'healpix_pixel' in delve_df.columns:
             output['delve_healpix'] = delve_df['healpix_pixel'].values[dlv_global_idx]
-        output['residual_mag']      = output['delve_rmag'] - (output['hst_mag_st_gdc'] + zp)
+        output['residual_mag']      = output[f'{label}_rmag'] - (output['hst_mag_st_gdc'] + zp)
         output['residual_x']        = fm['dx'].values
         output['residual_y']        = fm['dy'].values
         output['residual_sigma']    = fm['sigma'].values
@@ -755,7 +801,7 @@ def process_single_image_delve(
                 if _c in output.colnames:
                     output[_c][~_valid_5d] = np.nan
 
-        out_csv = os.path.join(hst['root'], 'matched_delve.csv')
+        out_csv = os.path.join(hst['root'], f'matched_{label}{out_suffix}.csv')
         output.write(out_csv, format='ascii.csv', overwrite=True)
 
         # Save transformation parameters (mirrors transformation.csv from Gaia match)

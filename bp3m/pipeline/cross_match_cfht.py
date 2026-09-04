@@ -239,296 +239,187 @@ def _hst_frame_check(cat, mg, t):
     return float(np.nanmedian(d)), len(j)
 
 
-# ── Matching core ────────────────────────────────────────────────────────────
+# ── Matching via the shared gaia_cross_match machinery ──────────────────────
+#
+# Per (HST image, CFHT exposure): build an external-catalog DataFrame in the
+# DELVE schema and call process_single_image_delve(label='cfht',
+# out_suffix=f'_{expnum}') — the SAME iterative 4p->6p relative-alignment
+# fits, sigma-clipping, magnitude/colour diagnostics, 10-panel figure and
+# processing log as the Gaia/DELVE cross-matches. Gaia-matched CFHT sources
+# carry their own Gaia PM/plx (+errors); non-Gaia sources carry the
+# field-typical fill with SIGMA_FILL_PM errors, so the match covariance
+# widens with dt in the standard way. CFHT positions are apparent at the
+# CFHT epoch: the per-source parallax displacement at t_cfht is subtracted
+# (barycentric-ising them) so the machinery's plx*p(t_hst) term then models
+# the parallax difference between BOTH epochs.
 
-def _parallax_shift(ra, dec, mjd_from, mjd_to, plx_mas):
-    """Apparent shift (dra*cosd, ddec) [mas] between two epochs for a source
-    of the given parallax."""
+SIGMA_CFHT_POS_MAS = 20.0   # per-source CFHT centroid floor (ra/dec_error)
+
+
+def build_cfht_ext_df(cfht_dir, expnum, exts, gaia_lookup, fill,
+                      det_cache) -> "pd.DataFrame | None":
+    """External-catalog rows (DELVE schema) for one exposure's detectors."""
     from astropy.time import Time
-    fr_r, fr_d = get_parallax_factors(
-        ra, dec, get_tele_position(Time(mjd_from, format='mjd'), curr_id='earth'))
-    to_r, to_d = get_parallax_factors(
-        ra, dec, get_tele_position(Time(mjd_to, format='mjd'), curr_id='earth'))
-    return (to_r - fr_r) * plx_mas, (to_d - fr_d) * plx_mas
+    frames = []
+    for ext in exts:
+        key = (int(expnum), int(ext))
+        if key not in det_cache:
+            try:
+                det_cache[key] = load_cfht_detector(cfht_dir, expnum, ext)
+            except Exception:
+                det_cache[key] = None
+        if det_cache[key] is None:
+            continue
+        src, mg, t = det_cache[key]
+        d = src[['ra_al', 'dec_al', 'mag', 'magerr', 'src_index']].copy()
+        d = d.rename(columns={'ra_al': 'ra', 'dec_al': 'dec'})
+        d['source_id'] = (int(expnum) * 10**8 + int(ext) * 10**6
+                          + d.src_index.astype(np.int64))
+        d['cfht_mjd'] = float(t['mjd'])
+        # Gaia astrometry for the Gaia-matched sources
+        if len(mg):
+            gm = mg[['src_index', 'gaia_source_id']].merge(
+                gaia_lookup, on='gaia_source_id', how='left')
+            d = d.merge(gm.drop(columns=['gaia_source_id']),
+                        on='src_index', how='left')
+        else:
+            for c in ('pmra', 'pmdec', 'parallax', 'pmra_error',
+                      'pmdec_error', 'parallax_error', 'bp_rp', 'gmag'):
+                d[c] = np.nan
+        frames.append(d)
+    if not frames:
+        return None
+    df = pd.concat(frames, ignore_index=True)
+    has_gaia = df['pmra'].notna()
+    df['has_gaia'] = has_gaia
+    df['pmra'] = df.pmra.fillna(fill['pmra'])
+    df['pmdec'] = df.pmdec.fillna(fill['pmdec'])
+    df['parallax'] = df.parallax.fillna(fill['plx'])
+    df['pmra_error'] = df.get('pmra_error', pd.Series(np.nan, df.index)) \
+        .fillna(SIGMA_FILL_PM)
+    df['pmdec_error'] = df.get('pmdec_error', pd.Series(np.nan, df.index)) \
+        .fillna(SIGMA_FILL_PM)
+    df['parallax_error'] = df.get('parallax_error',
+                                  pd.Series(np.nan, df.index)).fillna(1.0)
+    df['ra_error'] = SIGMA_CFHT_POS_MAS
+    df['dec_error'] = SIGMA_CFHT_POS_MAS
+    df['ref_epoch'] = Time(df.cfht_mjd.iloc[0], format='mjd').jyear
+    # Barycentric-ise the apparent CFHT positions: subtract the parallax
+    # displacement AT THE CFHT EPOCH (per-source plx).
+    p_ra, p_de = get_parallax_factors(
+        df.ra.to_numpy(), df.dec.to_numpy(),
+        get_tele_position(Time(df.cfht_mjd.iloc[0], format='mjd'),
+                          curr_id='earth'))
+    cosd = np.cos(np.radians(df.dec.to_numpy()))
+    df['ra'] = df.ra - df.parallax.to_numpy() * p_ra / MAS_PER_DEG / cosd
+    df['dec'] = df.dec - df.parallax.to_numpy() * p_de / MAS_PER_DEG
+    return df
 
 
-def match_one_pair(hst, det, fill, log):
-    """Match one (HST image, CFHT detector) pair. Returns rows (list of dict).
-
-    hst: dict(cat, mg, t, mjd, name); det: dict(src, mg, t, expnum, ext).
-    """
-    cat, hmg, ht = hst['cat'], hst['mg'], hst['t']
-    src, cmg, ct = det['src'], det['mg'], det['t']
-    dt_yr = (hst['mjd'] - ct['mjd']) / 365.25
-    cosd = np.cos(np.radians(ht['ra_cen'] * 0 + ht['dec_cen']))
-
-    # ── tier 1: common-Gaia anchor ──────────────────────────────────────────
-    if not len(cmg) or not len(hmg):
-        return [], None
-    common = hmg.merge(cmg, on='gaia_source_id', suffixes=('_h', '_c'))
-    if len(common) < 5:
-        log(f"    det {det['expnum']}/{det['ext']:02d}: only {len(common)} "
-            f"common Gaia stars — skipped")
-        return [], None
-
-    # CFHT-side aligned positions of the common stars: from src via src_index
-    c_pos = src.set_index('src_index').loc[
-        common.src_index.to_numpy(), ['ra_al', 'dec_al', 'mag']]
-    h_pos = cat.set_index('hst_index').loc[
-        common.hst_index.to_numpy(), ['ra_al', 'dec_al']]
-
-    # Per-star propagation CFHT epoch -> HST epoch with its own Gaia PM/plx
-    # (from the field Gaia catalog — the matched tables don't carry PMs);
-    # 2p stars fall back to the field-typical fill.
-    gl = hst['gaia_lookup']
-    common = common.merge(gl, on='gaia_source_id', how='left')
-    pm_ra = common['pmra'].fillna(fill['pmra']).to_numpy()
-    pm_de = common['pmdec'].fillna(fill['pmdec']).to_numpy()
-    plx = common['parallax'].fillna(fill['plx']).to_numpy()
-    ra_c, de_c = c_pos.ra_al.to_numpy(), c_pos.dec_al.to_numpy()
-    p_ra, p_de = _parallax_shift(ra_c, de_c, ct['mjd'], hst['mjd'], plx)
-    ra_prop = ra_c + (pm_ra * dt_yr + p_ra) / MAS_PER_DEG / cosd
-    de_prop = de_c + (pm_de * dt_yr + p_de) / MAS_PER_DEG
-
-    dxi = (h_pos.ra_al.to_numpy() - ra_prop) * cosd * MAS_PER_DEG
-    deta = (h_pos.dec_al.to_numpy() - de_prop) * MAS_PER_DEG
-    off_xi, off_eta = float(np.median(dxi)), float(np.median(deta))
-    mad = float(np.median(np.hypot(dxi - off_xi, deta - off_eta))) * 1.4826
-
-    # colour zeropoint: HST instrumental (st) mag - CFHT mag
-    hmag = hmg.set_index('hst_index').loc[
-        common.hst_index.to_numpy(), 'hst_mag_st_gdc'].to_numpy()
-    cmag = c_pos.mag.to_numpy()
-    ok = np.isfinite(hmag) & np.isfinite(cmag)
-    zp = float(np.median((hmag - cmag)[ok])) if ok.sum() else np.nan
-    zp_scatter = (float(np.median(np.abs((hmag - cmag)[ok]
-                                         - zp))) * 1.4826 if ok.sum() else np.nan)
-    zp_slope = 0.0
-    if 'bp_rp' in common.columns and ok.sum() >= 8:
-        cc = common['bp_rp'].to_numpy()[ok]
-        good = np.isfinite(cc)
-        if good.sum() >= 8:
-            zp_slope = float(np.polyfit(cc[good],
-                                        (hmag - cmag)[ok][good], 1)[0])
-
-    anchor = dict(n_common=len(common), off_xi=off_xi, off_eta=off_eta,
-                  mad_mas=mad, zp=zp, zp_scatter=zp_scatter,
-                  zp_slope=zp_slope, dt_yr=dt_yr)
-    log(f"    det {det['expnum']}/{det['ext']:02d}: {len(common)} common "
-        f"Gaia, offset ({off_xi:+.1f},{off_eta:+.1f}) mas, mad {mad:.1f}, "
-        f"zp {zp:+.2f}±{zp_scatter:.2f} (slope {zp_slope:+.3f}), "
-        f"dt {dt_yr:+.1f} yr")
-
-    rows = []
-    for i in range(len(common)):
-        rows.append(dict(
-            hst_index=int(common.hst_index.iloc[i]),
-            cfht_expnum=det['expnum'], cfht_ext=det['ext'],
-            cfht_src_index=int(common.src_index.iloc[i]),
-            cfht_mjd=ct['mjd'], dt_yr=dt_yr,
-            gaia_source_id=common.gaia_source_id.iloc[i],
-            tier='anchor',
-            sep_mas=float(np.hypot(dxi[i] - off_xi, deta[i] - off_eta)),
-            cfht_mag=float(cmag[i]),
-            cfht_ra_hst_epoch=float(ra_prop[i]),
-            cfht_dec_hst_epoch=float(de_prop[i]),
-            sigma_tot_mas=mad))
-
-    # ── tier 2: faint / non-Gaia matching ───────────────────────────────────
-    h_faint = cat[~cat.hst_index.isin(hmg.hst_index)]
-    c_faint = src[~src.src_index.isin(cmg.src_index if len(cmg) else [])]
-    
-    if not len(h_faint) or not len(c_faint):
-        return rows, anchor
-
-    p_ra_f, p_de_f = _parallax_shift(
-        c_faint.ra_al.to_numpy(), c_faint.dec_al.to_numpy(),
-        ct['mjd'], hst['mjd'], fill['plx'])
-    ra_f = (c_faint.ra_al.to_numpy()
-            + (fill['pmra'] * dt_yr + p_ra_f + off_xi) / MAS_PER_DEG / cosd)
-    de_f = (c_faint.dec_al.to_numpy()
-            + (fill['pmdec'] * dt_yr + p_de_f + off_eta) / MAS_PER_DEG)
-
-    sig = np.sqrt(SIGMA_HST_MAS**2 + SIGMA_CFHT_MAS**2 + mad**2
-                  + (SIGMA_FILL_PM * abs(dt_yr))**2)
-    gate_deg = K_SIGMA_GATE * sig / MAS_PER_DEG
-
-    from scipy.spatial import cKDTree
-    tree = cKDTree(np.c_[ra_f * cosd, de_f])
-    q = np.c_[h_faint.ra_al.to_numpy() * cosd, h_faint.dec_al.to_numpy()]
-    dist, idx = tree.query(q, distance_upper_bound=gate_deg)
-    okm = np.isfinite(dist) & (dist < gate_deg)
-    # magnitude gate through the anchor zeropoint
-    hm = h_faint['mag'].to_numpy() + (ht.get('zp', 0.0) * 0.0)
-    hst_st = h_faint['mag'].to_numpy()  # instrumental; zp maps st->cfht
-    n_pos = int(okm.sum())
-    taken = {}
-    for qi in np.where(okm)[0]:
-        ci = idx[qi]
-        dmag = np.nan
-        if np.isfinite(zp):
-            # hst_mag_st_gdc = mag + (st offset); catalog 'mag' is
-            # instrumental — the st offset is absorbed into zp via anchors,
-            # so compare (mag_st - cfht_mag) to zp with a wide gate.
-            dmag = (hst_st[qi] + _st_offset(hmg)) - \
-                   c_faint['mag'].to_numpy()[ci]
-            if np.isfinite(dmag) and abs(dmag - zp) > MAG_GATE:
-                continue
-        key = int(c_faint.src_index.to_numpy()[ci])
-        cand = (float(dist[qi] * MAS_PER_DEG), qi, ci, dmag)
-        if key not in taken or cand < taken[key]:
-            taken[key] = cand
-    for key, (sep, qi, ci, dmag) in taken.items():
-        rows.append(dict(
-            hst_index=int(h_faint.hst_index.to_numpy()[qi]),
-            cfht_expnum=det['expnum'], cfht_ext=det['ext'],
-            cfht_src_index=key, cfht_mjd=ct['mjd'], dt_yr=dt_yr,
-            gaia_source_id='', tier='faint',
-            sep_mas=sep, cfht_mag=float(c_faint['mag'].to_numpy()[ci]),
-            cfht_ra_hst_epoch=float(ra_f[ci]),
-            cfht_dec_hst_epoch=float(de_f[ci]),
-            sigma_tot_mas=float(sig)))
-    log(f"      faint: {len(taken)} matches of {len(h_faint)} HST x "
-        f"{len(c_faint)} CFHT candidates (gate {K_SIGMA_GATE:.0f}x"
-        f"{sig:.0f} mas, {n_pos} positional)")
-    return rows, anchor
-
-
-def _st_offset(hmg):
-    """Median (hst_mag_st_gdc - hst_mag_gdc): converts catalog instrumental
-    mags to the st system the anchors' zeropoint was fit in."""
-    if 'hst_mag_st_gdc' in hmg and 'hst_mag_gdc' in hmg:
-        return float(np.nanmedian(hmg.hst_mag_st_gdc - hmg.hst_mag_gdc))
-    return 0.0
-
-
-# ── Per-image worker + orchestrator ─────────────────────────────────────────
-
-def _plot_diagnostics(rows_df, anchors, out_png):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(2, 2, figsize=(11, 9))
-    a = rows_df[rows_df.tier == 'anchor']
-    f = rows_df[rows_df.tier == 'faint']
-    ax[0, 0].hist([a.sep_mas, f.sep_mas], bins=40,
-                  label=[f'anchor ({len(a)})', f'faint ({len(f)})'],
-                  stacked=False, histtype='step')
-    ax[0, 0].set_xlabel('separation [mas]'); ax[0, 0].legend()
-    ax[0, 1].scatter(f.cfht_mag, f.sep_mas, s=4, alpha=0.4)
-    ax[0, 1].set_xlabel('CFHT mag'); ax[0, 1].set_ylabel('sep [mas]')
-    if anchors:
-        ad = pd.DataFrame(anchors)
-        ax[1, 0].errorbar(ad.off_xi, ad.off_eta, xerr=ad.mad_mas,
-                          yerr=ad.mad_mas, fmt='o', ms=4, alpha=0.7)
-        ax[1, 0].set_xlabel('offset xi [mas]'); ax[1, 0].set_ylabel('offset eta [mas]')
-        ax[1, 0].set_title('per-detector anchor offsets')
-        ax[1, 1].scatter(ad.dt_yr, ad.zp, s=16)
-        ax[1, 1].set_xlabel('dt [yr]'); ax[1, 1].set_ylabel('mag zeropoint')
-    fig.suptitle(out_png.parent.name)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=110)
-    plt.close(fig)
-
-
-def match_one_image(img_dir: Path, dets: pd.DataFrame, cfht_dir: Path,
-                    gaia_lookup: pd.DataFrame, fill: dict,
-                    det_cache: dict, make_plots=True):
-    """Cross-match one HST image against all overlapping CFHT detectors."""
-    from astropy.io import fits
+def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
+                    make_plots=True,
+                    sigma_rot_deg=0.01, sigma_scale=1e-3, sigma_skew=1e-3,
+                    discovery_max_offset=10, max_mag_diff=5.0,
+                    init_resid_max=5.0):
+    """Cross-match one HST image against each overlapping CFHT exposure via
+    the shared single-image machinery; union the per-exposure tables into
+    matched_cfht.csv."""
+    from gaia_cross_match.cross_match_delve import process_single_image_delve
     img_dir = Path(img_dir)
     name = img_dir.name
-    logf = open(img_dir / 'processing_log_cfht.txt', 'w')
-
-    def log(msg):
-        print(msg, file=logf, flush=True)
-
+    hst = dict(root=str(img_dir), flc=str(img_dir / f'{name}_flc.fits'),
+               catalog=str(img_dir / f'{name}_flc_catalog.fits'))
+    # HST filter wavelength -> blue-minus-red colour ordering vs CFHT r(~640nm)
+    from astropy.io import fits as _fits
+    _hdr = _fits.getheader(hst['flc'], 0)
+    _filt = next((str(_hdr.get(k, '')) for k in ('FILTER', 'FILTER1', 'FILTER2')
+                  if str(_hdr.get(k, '')).startswith('F')), 'F606W')
+    import re as _re
+    _lam_hst = float((_re.findall(r'F(\d+)', _filt) or ['606'])[0])
+    _lam_cfht = 640.0
+    if _lam_hst < _lam_cfht:
+        _c_sign, _c_lbl = -1.0, f'HST {_filt} − r_CFHT'
+    else:
+        _c_sign, _c_lbl = 1.0, f'r_CFHT − HST {_filt}'
+    # footprint selection (per-detector catalog bounding boxes)
     try:
         cat, hmg, ht, gdc_mode = load_hst_image(img_dir)
         chk_mas, n_chk = _hst_frame_check(cat, hmg, ht)
-        mjd = float(fits.getheader(img_dir / f'{name}_flc.fits', 0)['EXPSTART'])
-        log(f'{name}: {len(cat)} detections, {len(hmg)} Gaia-matched, '
-            f'gdc_mode={gdc_mode}, frame check {chk_mas:.1f} mas '
-            f'(n={n_chk}), mjd {mjd:.2f}')
-        if chk_mas > 60.0:
-            log('  FRAME CHECK FAILED (>60 mas) — aborting this image')
-            return name, 0, 'frame check failed'
-        # HST footprint from the aligned detections; overlap against the
-        # per-detector CATALOG footprints (the roll-up ra0/dec0 are
-        # exposure-level, useless for detector selection).
-        h_ra_lo, h_ra_hi = cat.ra_al.min(), cat.ra_al.max()
-        h_de_lo, h_de_hi = cat.dec_al.min(), cat.dec_al.max()
-        pad = 30.0 / 3600.0
-        near = []
-        for expnum in dets.expnum.astype(int):
-            fp_key = ('fp', expnum)
-            if fp_key not in det_cache:
-                try:
-                    det_cache[fp_key] = detector_footprints(cfht_dir, expnum)
-                except Exception as e:
-                    log(f'  exp {expnum}: footprint load failed ({e})')
-                    det_cache[fp_key] = None
-            fp = det_cache[fp_key]
-            if fp is None:
-                continue
-            hit = fp[(fp.ra_min - pad < h_ra_hi) & (fp.ra_max + pad > h_ra_lo)
-                     & (fp.dec_min - pad < h_de_hi)
-                     & (fp.dec_max + pad > h_de_lo)]
-            near.extend((expnum, int(e)) for e in hit.ext)
-        log(f'  {len(near)} overlapping CFHT detectors '
-            f'(of {len(dets)} candidate exposures)')
-        hst = dict(cat=cat, mg=hmg, t=ht, mjd=mjd, name=name,
-                   gaia_lookup=gaia_lookup)
-        all_rows, anchors = [], []
-        for key in near:
-            if key not in det_cache:
-                try:
-                    det_cache[key] = load_cfht_detector(
-                        cfht_dir, key[0], key[1])
-                except Exception as e:
-                    log(f'    det {key}: load failed ({e})')
-                    det_cache[key] = None
-            if det_cache[key] is None:
-                continue
-            src, cmg, ct = det_cache[key]
-            rows, anchor = match_one_pair(
-                hst, dict(src=src, mg=cmg, t=ct,
-                          expnum=key[0], ext=key[1]), fill, log)
-            all_rows.extend(rows)
-            if anchor:
-                anchor.update(expnum=key[0], ext=key[1])
-                anchors.append(anchor)
-        if not all_rows:
-            log('  no matches')
-            return name, 0, None
-        df = pd.DataFrame(all_rows)
-        df.to_csv(img_dir / 'matched_cfht.csv', index=False)
-        n_faint = int((df.tier == 'faint').sum())
-        log(f'  TOTAL: {len(df)} matches ({n_faint} faint/non-Gaia) across '
-            f'{df.cfht_expnum.nunique()} exposures')
-        if make_plots:
-            try:
-                _plot_diagnostics(df, anchors,
-                                  img_dir / 'diagnostic_plots_cfht.png')
-            except Exception as e:
-                log(f'  plot failed: {e}')
-        return name, len(df), None
     except Exception as exc:
-        import traceback
-        log(traceback.format_exc())
-        return name, 0, str(exc)
-    finally:
-        logf.close()
+        return name, 0, f'HST load failed: {exc}'
+    if chk_mas > 60.0:
+        return name, 0, f'HST frame check failed ({chk_mas:.0f} mas)'
+    h_ra_lo, h_ra_hi = cat.ra_al.min(), cat.ra_al.max()
+    h_de_lo, h_de_hi = cat.dec_al.min(), cat.dec_al.max()
+    pad = 30.0 / 3600.0
+    n_total = 0
+    parts = []
+    for expnum in dets.expnum.astype(int):
+        fp_key = ('fp', expnum)
+        if fp_key not in det_cache:
+            try:
+                det_cache[fp_key] = detector_footprints(cfht_dir, expnum)
+            except Exception:
+                det_cache[fp_key] = None
+        fp = det_cache[fp_key]
+        if fp is None:
+            continue
+        hit = fp[(fp.ra_min - pad < h_ra_hi) & (fp.ra_max + pad > h_ra_lo)
+                 & (fp.dec_min - pad < h_de_hi) & (fp.dec_max + pad > h_de_lo)]
+        if not len(hit):
+            continue
+        ext_df = build_cfht_ext_df(cfht_dir, expnum, list(hit.ext),
+                                   gaia_lookup, fill, det_cache)
+        if ext_df is None or not len(ext_df):
+            continue
+        try:
+            process_single_image_delve(
+                hst, ext_df, label='cfht', mag_col='mag',
+                out_suffix=f'_{expnum}',
+                sigma_rot_deg=sigma_rot_deg, sigma_scale=sigma_scale,
+                sigma_skew=sigma_skew,
+                discovery_max_offset=discovery_max_offset,
+                max_mag_diff=max_mag_diff, init_resid_max=init_resid_max,
+                gaia_cmd=True, color_hst_label=_c_lbl,
+                color_hst_sign=_c_sign)
+        except Exception as exc:
+            parts.append((expnum, None, str(exc)))
+            continue
+        mcsv = img_dir / f'matched_cfht_{expnum}.csv'
+        if mcsv.exists():
+            m = pd.read_csv(mcsv)
+            m['cfht_expnum'] = expnum
+            sid = m['cfht_source_id'].astype(np.int64)
+            m['cfht_ext'] = (sid // 10**6) % 100
+            m['cfht_src_index'] = sid % 10**6
+            m['cfht_mjd'] = float(ext_df.cfht_mjd.iloc[0])
+            gaia_ids = {}
+            for key in {( int(expnum), int(e)) for e in m['cfht_ext']}:
+                dc = det_cache.get(key)
+                if dc is not None and len(dc[1]):
+                    gaia_ids.update(dict(zip(dc[1].src_index,
+                                             dc[1].gaia_source_id)))
+            m['gaia_source_id'] = [gaia_ids.get(int(i), '')
+                                   for i in m['cfht_src_index']]
+            parts.append((expnum, m, None))
+            n_total += len(m)
+        else:
+            parts.append((expnum, None, 'no matches'))
+    good = [m for _, m, e in parts if m is not None]
+    if good:
+        union = pd.concat(good, ignore_index=True)
+        union.to_csv(img_dir / 'matched_cfht.csv', index=False)
+    errs = '; '.join(f'{e}:{err}' for e, m, err in parts if err)
+    return name, n_total, (errs or None)
 
 
 def run_cross_match_cfht(output_dir, field_name, cfht_dir,
                          ra, dec, radius_deg, gaia_csv=None,
                          make_plots=True, force=False):
-    """Step 4d driver: HST x CFHT/UNIONS cross-match for every PSF-fit image.
-
-    Serial over images with a shared detector cache (each CFHT detector is
-    loaded once per field, not once per image).
-    """
+    """Step 4d driver: HST x CFHT/UNIONS cross-match for every PSF-fit image,
+    via the shared gaia_cross_match single-image machinery (DELVE-parity
+    outputs: per-exposure matched_cfht_<exp>.csv + 10-panel diagnostics +
+    processing logs, plus a union matched_cfht.csv per image)."""
     t0 = time.time()
     field_dir = Path(output_dir) / field_name
     hst_root = field_dir / 'HST' / 'mastDownload' / 'HST'
@@ -538,8 +429,7 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
     if not len(dets):
         print('  no CFHT/UNIONS coverage for this field — skipping')
         return []
-    print(f'  {len(dets)} candidate CFHT exposures within '
-          f'{radius_deg + MEGACAM_HALF_DEG:.2f} deg')
+    print(f'  {len(dets)} candidate CFHT exposures')
 
     from bp3m.data_loader_flc import resolve_gaia_csvs
     if gaia_csv is not None:
@@ -547,13 +437,13 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
                  if isinstance(gaia_csv, (list, tuple)) else [Path(gaia_csv)])
     else:
         paths, _ = resolve_gaia_csvs(field_dir)
-    gl = pd.concat([
-        pd.read_csv(p, usecols=lambda c: c in
-                    ('SOURCE_ID', 'source_id', 'pmra', 'pmdec',
-                     'parallax', 'bp_rp'))
-        .rename(columns={'SOURCE_ID': 'source_id'}) for p in paths]) \
-        .drop_duplicates('source_id')
+    use = ('SOURCE_ID', 'source_id', 'pmra', 'pmdec', 'parallax', 'bp_rp',
+           'gmag', 'pmra_error', 'pmdec_error', 'parallax_error')
+    gl = pd.concat([pd.read_csv(p, usecols=lambda c: c in use)
+                    .rename(columns={'SOURCE_ID': 'source_id'})
+                    for p in paths]).drop_duplicates('source_id')
     gl['gaia_source_id'] = gl['source_id'].astype(str)
+    gl = gl.drop(columns=['source_id'])
     fill = field_typical_astrometry(gl.pmra.dropna(), gl.pmdec.dropna(),
                                     plx=gl.parallax.dropna())
     print(f"  2p/faint propagation fill: pm=({fill['pmra']:+.2f},"
@@ -568,12 +458,12 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
     det_cache: dict = {}
     results = []
     for i, d in enumerate(todo, 1):
-        nm, n, err = match_one_image(d, dets, cfht_dir, gl, fill,
-                                     det_cache, make_plots=make_plots)
-        status = f'{n} matches' if err is None else f'FAILED: {err}'
+        nm, n, err = match_one_image(d, dets, cfht_dir, gl, fill, det_cache,
+                                     make_plots=make_plots)
+        status = f'{n} matches' + (f'  [{err}]' if err else '')
         print(f'  [{i:3d}/{len(todo)}] {nm}: {status}')
         results.append((nm, n, err))
-    n_ok = sum(1 for _, n, e in results if e is None and n > 0)
+    n_ok = sum(1 for _, n, e in results if n > 0)
     print(f'  Step 4d done: {n_ok}/{len(todo)} images matched '
           f'({time.time()-t0:.0f}s)')
     return results
