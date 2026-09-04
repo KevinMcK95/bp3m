@@ -1160,8 +1160,14 @@ class BP3MSolver:
             ra_g_up  = ra_g_orig  + v_hat[sidx, 0] / (cos_dec * RAD2MAS)  # degrees
             dec_g_up = dec_g_orig + v_hat[sidx, 1] / RAD2MAS              # degrees
 
-            t_g   = self.gaia_time[sidx]
-            dt_yr = (hst_time - t_g).to(u.year).value
+            # dt_yr depends only on the (fixed) image and Gaia epochs — cache
+            # it: the astropy Time arithmetic (TDB conversion) costs ~2 erfa
+            # dtdb calls per image per solve pass otherwise.
+            dt_yr = d.get("dt_yr_cache")
+            if dt_yr is None:
+                t_g   = self.gaia_time[sidx]
+                dt_yr = (hst_time - t_g).to(u.year).value
+                d["dt_yr_cache"] = dt_yr
 
             # ── Recompute projected Gaia positions at current tangent point ───
             # xys, J, and tangent-point derivatives are all evaluated at ra0_current
@@ -1543,6 +1549,17 @@ class BP3MSolver:
         Cr_inv = H_rr.copy()
         rhs    = np.zeros(n_s)
 
+        # Star-major Schur assembly (default): the diagonal K^T C_vT K and all
+        # image-pair fill-in blocks together equal B~^T B~ with B~ the sparse
+        # matrix whose 5-row block per star holds the Cholesky-whitened K
+        # blocks scattered into each image's columns. One sparse product
+        # replaces the O(n_img^2) pair loop with its per-pair intersect1d —
+        # mathematically identical. Set BP3M_SCHUR_PAIR_MAJOR=1 to restore the
+        # legacy pair-major loop (A/B validation).
+        import os as _os
+        _pair_major = bool(int(_os.environ.get('BP3M_SCHUR_PAIR_MAJOR', '0')))
+        _schur_obs = []   # (sidx, K, cols) per image, star-major path
+
         # Epoch-D prior rhs: pull toward the prior mean from the current iterate
         if self.n_ed:
             for g, grp in enumerate(self.ed_groups):
@@ -1576,12 +1593,15 @@ class BP3MSolver:
             K    = K_img[img][use]
 
             rhs[cols] += XCs_xresid[img].sum(axis=0)
+            rhs[cols] += np.einsum('nji,nj->i', K, a_align[sidx])
+
+            if not _pair_major:
+                _schur_obs.append((sidx, K, cols))
+                continue
 
             CvT_K    = np.einsum('nij,njk->nik', C_vT[sidx], K)
             KT_CvT_K = np.einsum('nji,njk->ik',  K, CvT_K)
             Cr_inv[np.ix_(cols, cols)] -= KT_CvT_K
-
-            rhs[cols] += np.einsum('nji,nj->i', K, a_align[sidx])
 
             for j2_idx, img2 in enumerate(self.image_names):
                 if j2_idx <= j_idx:
@@ -1607,6 +1627,35 @@ class BP3MSolver:
                 cols2 = _cols_of(j2_idx, img2)
                 Cr_inv[np.ix_(cols,  cols2)] -= block
                 Cr_inv[np.ix_(cols2, cols)]  -= block.T
+
+        # ── Star-major Schur fill-in: Cr_inv -= B~^T B~ ──────────────────────
+        if not _pair_major and _schur_obs:
+            from scipy import sparse as _sp
+            try:
+                L_chol = np.linalg.cholesky(C_vT)          # C_vT = L L^T
+            except np.linalg.LinAlgError:
+                w_e, Q_e = np.linalg.eigh(C_vT)
+                L_chol = Q_e * np.sqrt(np.clip(w_e, 1e-30, None))[:, None, :]
+            data_l, rows_l, cols_l = [], [], []
+            for sidx_o, K_o, cols_o in _schur_obs:
+                n_o, _, W_o = K_o.shape
+                if n_o == 0:
+                    continue
+                # (L^T K): row block of B~ for each observation
+                ltk = np.einsum('nji,njw->niw', L_chol[sidx_o], K_o)
+                r_b = (5 * sidx_o.astype(np.int64))[:, None, None] \
+                    + np.arange(5)[None, :, None]
+                data_l.append(ltk.ravel())
+                rows_l.append(np.broadcast_to(r_b, (n_o, 5, W_o)).ravel())
+                cols_l.append(np.broadcast_to(
+                    cols_o[None, None, :], (n_o, 5, W_o)).ravel())
+            if data_l:
+                B_til = _sp.csr_matrix(
+                    (np.concatenate(data_l),
+                     (np.concatenate(rows_l), np.concatenate(cols_l))),
+                    shape=(5 * C_vT.shape[0], n_s))
+                del data_l, rows_l, cols_l
+                Cr_inv -= (B_til.T @ B_til).toarray()
 
         # ── Hi/lo chip coupling prior: rhs pull toward partner's current iterate ─
         for hi_idx, lo_idx in self._chip_pairs:
