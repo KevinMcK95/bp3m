@@ -374,6 +374,7 @@ def _build_delve_only_stars_df(
     delve_id_to_gaia_id: dict,
     pos_err_floor: float = _MIN_POS_ERR_PX,
     delve_use_for_align: bool = False,
+    pos_corr=None, meta=None,
 ) -> pd.DataFrame | None:
     """
     Build a stars_df for DELVE-only detections (hst_index not in matched_gaia.csv).
@@ -1058,7 +1059,8 @@ def load_image_data_flc(data_root, field_name: str,
 
             delve_only_stars = _build_delve_only_stars_df(
                 img_dir, img_name, gaia_hst_idx, delve_id_to_gaia_id, pos_err_floor,
-                delve_use_for_align=delve_use_for_align)
+                delve_use_for_align=delve_use_for_align,
+                pos_corr=_pos_corr, meta=images.get(img_name))
             if delve_only_stars is not None and len(delve_only_stars):
                 # Keep only sources that made it into gaia_catalog
                 valid_ids = set(gaia_catalog['Gaia_id'].values)
