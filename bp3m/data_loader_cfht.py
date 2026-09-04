@@ -176,6 +176,7 @@ def build_cfht_images(field_dir, cfht_dir, matches: pd.DataFrame,
             'xy_hst_corr': 0.0,
             'mag': sel.mag.to_numpy(), 'mag_err': sel.magerr.to_numpy(),
             'q_hst': 0.05, 'use_for_alignment': True,
+            'use_for_fit': True,
             'use_for_align_init_flag': True,
             'provenance': tier,
         })

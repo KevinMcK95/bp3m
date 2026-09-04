@@ -261,6 +261,7 @@ def run_alignment(  # noqa: C901
                                            build_cfht_images)
         from bp3m.data_loader_cfht import (assign_faint_star_ids,
                                            build_fallback_hst_images)
+        import pandas as _pd_c
         _cm = collect_cfht_matches(data_root / field_name)
         if len(_cm):
             _cm = assign_faint_star_ids(_cm)
@@ -269,6 +270,39 @@ def run_alignment(  # noqa: C901
                 cfht_prior_inflate=cfht_prior_inflate)
             imgs.update(cimgs)
             filtered_spi.update(cstars)
+            # Faint HST+CFHT stars: append their HST detections to the
+            # NORMAL HST images' stars_df (they are absent from matched_gaia)
+            # so each faint star is constrained by both instruments' epochs.
+            from bp3m.data_loader_flc import _build_stars_df as _bsd
+            _hst_root = data_root / field_name / 'HST' / 'mastDownload' / 'HST'
+            _n_app = 0
+            for _img_nm, _g in _cm[~_cm.is_gaia].groupby('hst_image'):
+                _base = [n for n in filtered_spi
+                         if n == _img_nm or n.startswith(_img_nm + '_')]
+                if not _base:
+                    continue
+                _ov = (_g.drop_duplicates('hst_index')
+                       [['hst_index', 'star_id']]
+                       .rename(columns={'star_id': 'gaia_source_id'}))
+                _extra = _bsd(_hst_root / _img_nm, _img_nm, None,
+                              pos_err_floor, meta=imgs.get(_base[0]),
+                              match_override=_ov)
+                if _extra is None or not len(_extra):
+                    continue
+                for _bn in _base:
+                    _spi_df = filtered_spi[_bn]
+                    # respect the CCD split: keep extras in this half's Y range
+                    _ymin, _ymax = (_spi_df.Y.min() - 300,
+                                    _spi_df.Y.max() + 300)
+                    _e = _extra[(_extra.Y >= _ymin) & (_extra.Y <= _ymax)]
+                    _e = _e[~_e.Gaia_id.isin(_spi_df.Gaia_id)]
+                    if len(_e):
+                        filtered_spi[_bn] = _pd_c.concat(
+                            [_spi_df, _e], ignore_index=True)
+                        _n_app += len(_e)
+            print(f'  use_cfht: {_n_app} faint-star HST detections appended '
+                  f'to HST images')
+
             # HST images whose Gaia xmatch failed but that match CFHT:
             # brought back onto the frame via transformation_cfht_<exp>.csv
             fimgs, fstars = build_fallback_hst_images(
@@ -280,7 +314,6 @@ def run_alignment(  # noqa: C901
                 print(f'  use_cfht: {len(fimgs)} Gaia-less HST images '
                       f'recovered via CFHT relative alignments')
             if len(faint_cat):
-                import pandas as _pd_c
                 from astropy.time import Time as _T_c
                 _mean_mjd = float(np.mean([m['hst_time_mjd']
                                            for m in cimgs.values()]))                     if cimgs else 57000.0
@@ -292,6 +325,9 @@ def run_alignment(  # noqa: C901
                 _f['dec'] = faint_cat.dec.to_numpy()
                 _f['ra_error'] = 1000.0
                 _f['dec_error'] = 1000.0
+                for _cc in _f.columns:
+                    if 'corr' in _cc:
+                        _f[_cc] = 0.0
                 _f['Gaia_time'] = _T_c(_mean_mjd, format='mjd').jyear
                 gaia_catalog = _pd_c.concat([gaia_catalog, _f],
                                             ignore_index=True)
