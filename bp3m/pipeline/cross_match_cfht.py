@@ -433,9 +433,13 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
             parts.append((expnum, None, 'no matches'))
     good = [m for _, m, e in parts if m is not None]
     union = None
+    n_gaia = n_faint = 0
     if good:
         union = pd.concat(good, ignore_index=True)
         union.to_csv(img_dir / 'matched_cfht.csv', index=False)
+        _g = union.gaia_source_id.notna() & \
+            (union.gaia_source_id.astype(str).str.len() > 3)
+        n_gaia, n_faint = int(_g.sum()), int((~_g).sum())
     if make_plots and diag_all:
         try:
             _plot_union_diagnostics(
@@ -446,7 +450,8 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
         except Exception as exc:
             import traceback; traceback.print_exc()
     errs = '; '.join(f'{e}:{err}' for e, m, err in parts if err)
-    return name, n_total, (errs or None)
+    n_exp = sum(1 for _, m, e in parts if m is not None)
+    return name, n_total, n_gaia, n_faint, n_exp, (errs or None)
 
 
 def run_cross_match_cfht(output_dir, field_name, cfht_dir,
@@ -495,10 +500,12 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
     det_cache: dict = {}
     results = []
     for i, d in enumerate(todo, 1):
-        nm, n, err = match_one_image(d, dets, cfht_dir, gl, fill, det_cache,
-                                     make_plots=make_plots)
-        status = f'{n} matches' + (f'  [{err}]' if err else '')
-        print(f'  [{i:3d}/{len(todo)}] {nm}: {status}')
+        nm, n, n_g, n_f, n_e, err = match_one_image(
+            d, dets, cfht_dir, gl, fill, det_cache, make_plots=make_plots)
+        status = (f'{n} matches ({n_g} Gaia, {n_f} faint) '
+                  f'across {n_e} CFHT exposures'
+                  + (f'  [{err}]' if err else ''))
+        print(f'  [{i:3d}/{len(todo)}] {nm}: {status}', flush=True)
         results.append((nm, n, err))
     n_ok = sum(1 for _, n, e in results if n > 0)
     print(f'  Step 4d done: {n_ok}/{len(todo)} images matched '
