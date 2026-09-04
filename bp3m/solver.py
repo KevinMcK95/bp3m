@@ -2283,15 +2283,24 @@ class BP3MSolver:
                 # data now judged bad (must refit); a RE-ADMISSION means the
                 # solution was fit WITHOUT the detection and it now agrees —
                 # refitting can only move the solution within its error bars.
+                # All stop/transition decisions count 5p/6p detections ONLY:
+                # 2p stars have no prior PM, so their cross-matches are far
+                # likelier to be random pairings (Omega_Cen: 51% outlier rate
+                # vs 14% for 5p) and their mask flicker says nothing about
+                # convergence of the solution. 2p detections still get fit
+                # and tested — they just don't gate stopping.
                 _n_new_rej = 0
                 _n_readmit = 0
+                _n_chg5 = 0
                 for _img_d, _d in self._img_data.items():
                     if _d is None or _img_d not in _snap_use_pre:
                         continue
                     _pre_d = _snap_use_pre[_img_d]
                     _post_d = _d["use_for_fit"]
-                    _n_new_rej += int((_pre_d & ~_post_d).sum())
-                    _n_readmit += int((~_pre_d & _post_d).sum())
+                    _m5 = ~self.gaia_2p[_d["sidx"]]
+                    _n_new_rej += int((_pre_d & ~_post_d & _m5).sum())
+                    _n_readmit += int((~_pre_d & _post_d & _m5).sum())
+                    _n_chg5 += int(((_pre_d != _post_d) & _m5).sum())
 
                 # ── demote/promote starving chips (see note above) ────────
                 # Decisions only; the masks themselves are managed inside
@@ -2317,6 +2326,9 @@ class BP3MSolver:
 
                 n_global_changed = int(np.sum(ok_star_prev != ok_star_new))
                 n_total_changed  = n_global_changed + n_use_changed
+                # 5p-only star-level churn for the stop rules (see note above)
+                _n_glob5 = int(np.sum((ok_star_prev != ok_star_new)
+                                      & ~self.gaia_2p))
 
                 # Track consecutive stability of tests 1-3 (before test-4).
                 if n_global_changed == 0 and n_use_changed == 0:
@@ -2416,15 +2428,15 @@ class BP3MSolver:
                     # budget cap so Phase B is always reached. Phase B (below)
                     # keeps the strict criteria and the freeze-mask final
                     # solve, so the reported solution is unaffected.
-                    _tot_changed = n_global_changed + n_use_changed + n_inf_new
+                    _tot_changed = _n_glob5 + _n_chg5 + n_inf_new
                     _readmit_tol = max(_mask_tol,
                                        int(round(0.005 * _n_det_tot)))
                     if (it_outer >= min_outer
-                            and n_global_changed == 0 and n_inf_new == 0
+                            and _n_glob5 == 0 and n_inf_new == 0
                             and _n_new_rej == 0
                             and 0 < _n_readmit <= _readmit_tol):
                         print(f"  Re-admissions only ({_n_readmit} <= "
-                              f"{_readmit_tol}, no new rejections) — "
+                              f"{_readmit_tol}, no new rejections, 5p) — "
                               f"Phase A done.")
                         _converged_now = True
                     if it_outer >= min_outer and _tot_changed <= _mask_tol:
@@ -2451,9 +2463,9 @@ class BP3MSolver:
                             if _d is not None and "influence_excl" in _d:
                                 _d["influence_excl"][:] = False
                 else:
-                    _stable_124 = (n_global_changed == 0 and n_inf_new == 0)
-                    if _stable_124 and n_use_changed == 0 and it_outer >= min_outer:
-                        print(f"  Tests 1-4 stable — stopping.")
+                    _stable_124 = (_n_glob5 == 0 and n_inf_new == 0)
+                    if _stable_124 and _n_chg5 == 0 and it_outer >= min_outer:
+                        print(f"  Tests 1-4 stable (5p) — stopping.")
                         break
                     # Re-admissions-only stop (prototype rule): no new
                     # rejections means no contamination is being removed;
@@ -2466,14 +2478,14 @@ class BP3MSolver:
                             and _n_new_rej == 0
                             and 0 < _n_readmit <= _readmit_tol):
                         print(f"  Re-admissions only ({_n_readmit} <= "
-                              f"{_readmit_tol}, no new rejections) — "
+                              f"{_readmit_tol}, no new rejections, 5p) — "
                               f"stopping.")
                         break
-                    if _stable_124 and it_outer >= min_outer and n_use_changed <= _mask_tol:
+                    if _stable_124 and it_outer >= min_outer and _n_chg5 <= _mask_tol:
                         _n_tol_stable += 1
                         if _n_tol_stable >= mask_tol_iters:
-                            print(f"  Tests 1-2/4 stable and test-3 flicker "
-                                  f"{n_use_changed} <= {_mask_tol} for "
+                            print(f"  Tests 1-2/4 stable and 5p test-3 "
+                                  f"flicker {_n_chg5} <= {_mask_tol} for "
                                   f"{mask_tol_iters} iters — stopping.")
                             break
                     else:
