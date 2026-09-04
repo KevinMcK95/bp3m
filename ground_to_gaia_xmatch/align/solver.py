@@ -764,7 +764,7 @@ class AlignmentSolver:
                     * self._img_data[img]['C_src_orig'])
         return moved
 
-    def _solve_one_pass(self, r_current):
+    def _solve_one_pass(self, r_current, need_cov=True):
         """
         Single linear solve: marginalise over stellar astrometry analytically.
 
@@ -853,6 +853,7 @@ class AlignmentSolver:
         # ── Schur complement ─────────────────────────────────────────────────
         Cr_inv = H_rr.copy()
         rhs    = np.zeros(n_r)
+        _schur_obs = []   # (sidx, K, cols) per image — star-major assembly
 
         for j_idx, img in enumerate(self.image_names):
             d  = self._img_data.get(img)
@@ -870,41 +871,68 @@ class AlignmentSolver:
             K    = K_img[img][use]
 
             rhs[cs:cs+nr] += XCs_xresid[img].sum(axis=0)
-
-            CvT_K    = np.einsum('nij,njk->nik', C_vT[sidx], K)
-            KT_CvT_K = np.einsum('nji,njk->ik', K, CvT_K)
-            Cr_inv[cs:cs+nr, cs:cs+nr] -= KT_CvT_K
             rhs[cs:cs+nr] += np.einsum('nji,nj->i', K, a_align[sidx])
 
-            # Cross-image Schur blocks (shared stars between images)
-            for j2, img2 in enumerate(self.image_names):
-                if j2 <= j_idx:
+            # Star-major Schur assembly (ported from bp3m.BP3MSolver): the
+            # diagonal K^T C_vT K and every cross-image block are together
+            # B~^T B~ over Cholesky-whitened per-star row blocks — replaces
+            # the O(n_img^2) intersect1d pair loop, mathematically identical.
+            # (Also fixes the fork bug where the pair loop applied the 2p
+            # exclusion to only one side of each cross block.)
+            _schur_obs.append((sidx, K, np.arange(cs, cs + nr)))
+
+        if _schur_obs:
+            from scipy import sparse as _sp
+            try:
+                L_chol = np.linalg.cholesky(C_vT)
+            except np.linalg.LinAlgError:
+                w_e, Q_e = np.linalg.eigh(C_vT)
+                L_chol = Q_e * np.sqrt(np.clip(w_e, 1e-30, None))[:, None, :]
+            data_l, rows_l, cols_l = [], [], []
+            for sidx_o, K_o, cols_o in _schur_obs:
+                n_o = K_o.shape[0]
+                if n_o == 0:
                     continue
-                d2 = self._img_data.get(img2)
-                if d2 is None or K_img.get(img2) is None:
-                    continue
-                use2  = d2['use_for_fit']
-                sidx2 = d2['sidx'][use2]
-                K2    = K_img[img2][use2]
-                common, idx1, idx2 = np.intersect1d(sidx, sidx2, return_indices=True)
-                if len(common) == 0:
-                    continue
-                cs2 = j2 * nr
-                CvT_K2 = np.einsum('nij,njk->nik', C_vT[common], K2[idx2])
-                block  = np.einsum('nji,njk->ik', K[idx1], CvT_K2)
-                Cr_inv[cs:cs+nr,   cs2:cs2+nr] -= block
-                Cr_inv[cs2:cs2+nr, cs:cs+nr]   -= block.T
+                ltk = np.einsum('nji,njw->niw', L_chol[sidx_o], K_o)
+                r_b = (5 * sidx_o.astype(np.int32))[:, None, None] \
+                    + np.arange(5, dtype=np.int32)[None, :, None]
+                data_l.append(ltk.ravel())
+                rows_l.append(np.broadcast_to(r_b, (n_o, 5, nr))
+                              .ravel().astype(np.int32, copy=False))
+                cols_l.append(np.broadcast_to(
+                    cols_o.astype(np.int32)[None, None, :],
+                    (n_o, 5, nr)).ravel().astype(np.int32, copy=False))
+            if data_l:
+                B_til = _sp.csr_matrix(
+                    (np.concatenate(data_l),
+                     (np.concatenate(rows_l), np.concatenate(cols_l))),
+                    shape=(5 * C_vT.shape[0], n_r))
+                del data_l, rows_l, cols_l
+                Cr_inv -= (B_til.T @ B_til).toarray()
+                del B_til
 
         # ── Diagonal preconditioner + solve ─────────────────────────────────
         d_diag    = np.sqrt(np.maximum(np.abs(np.diag(Cr_inv)), 1e-30))
         d_inv     = 1.0 / d_diag
         Cr_inv_sc = d_inv[:, None] * Cr_inv * d_inv[None, :]
-        try:
-            C_r_sc = np.linalg.inv(Cr_inv_sc)
-        except np.linalg.LinAlgError:
-            C_r_sc = np.linalg.pinv(Cr_inv_sc)
-        C_r     = d_inv[:, None] * C_r_sc * d_inv[None, :]
-        delta_r = C_r @ rhs
+        if need_cov:
+            try:
+                C_r_sc = np.linalg.inv(Cr_inv_sc)
+            except np.linalg.LinAlgError:
+                C_r_sc = np.linalg.pinv(Cr_inv_sc)
+            C_r     = d_inv[:, None] * C_r_sc * d_inv[None, :]
+            delta_r = C_r @ rhs
+        else:
+            # Intermediate inner passes only need delta_r (ported from bp3m)
+            C_r = None
+            rhs_sc = d_inv * rhs
+            try:
+                from scipy import linalg as _sla
+                c_fac = _sla.cho_factor(Cr_inv_sc, check_finite=False)
+                delta_r = d_inv * _sla.cho_solve(c_fac, rhs_sc,
+                                                 check_finite=False)
+            except Exception:
+                delta_r = d_inv * (np.linalg.pinv(Cr_inv_sc) @ rhs_sc)
         r_hat   = r_current + delta_r
 
         return r_hat, C_r, a_all, K_img, C_vT
@@ -1532,20 +1560,31 @@ class AlignmentSolver:
         _pnames = ['A', 'B', 'C', 'D', 'dx', 'dy']
         nr = self.N_R
         def _inner_converge(r_hat, label):
-            for it in range(500):
-                r_new, C_r_i, a_i, K_i, CvT_i = self._solve_one_pass(r_hat)
+            # Intermediate passes skip the explicit covariance (cho_solve,
+            # need_cov=False); one covariance-bearing pass at the converged
+            # point returns consistent (r, C_r, a, K, C_vT). Inner cap 100 +
+            # divergence backtracking ported from bp3m.
+            delta_prev = np.inf
+            for it in range(100):
+                r_new, _, a_i, K_i, CvT_i = self._solve_one_pass(
+                    r_hat, need_cov=False)
                 diff  = np.abs(r_new - r_hat)
                 delta = float(np.max(diff))
+                if delta > 1.5 * delta_prev and delta > tol:
+                    r_new = r_hat + 0.5 * (r_new - r_hat)
+                    diff  = np.abs(r_new - r_hat)
+                    delta = float(np.max(diff))
+                delta_prev = delta
                 r_hat = r_new
                 if verbose and it % 10 == 0:
                     print(f"  {label} step {it+1}: max|Δr|={delta:.3e}")
                 if delta < tol:
                     if verbose:
                         print(f"  {label}: converged in {it+1} steps (max|Δr|={delta:.3e})")
-                    return r_hat, C_r_i, a_i, K_i, CvT_i
+                    return self._solve_one_pass(r_hat)
             if verbose:
                 print(f"  {label}: WARNING max|Δr|={delta:.3e} (did not converge)")
-            return r_hat, C_r_i, a_i, K_i, CvT_i
+            return self._solve_one_pass(r_hat)
 
         # min_outer: match bp3m — 4 when inflation is enabled, 2 otherwise
         _default_min = 4 if inflate_errors else 2
