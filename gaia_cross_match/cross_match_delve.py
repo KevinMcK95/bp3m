@@ -472,6 +472,7 @@ def process_single_image_delve(
     color_hst_label: "str | None" = None,
     color_hst_sign: float = 1.0,
     make_plots: bool = True,
+    make_offset_plots: "bool | None" = None,
     return_diag: bool = False,
     forced_pairs=None,
     min_matches: int = 3,
@@ -753,7 +754,8 @@ def process_single_image_delve(
             ds_str = f"ds={best.get('best_ds', 0.0):+.4f}"
             title  = (f'{image_name}  |  {label.upper()}  best tier q<{best["q"]} '
                       f'm<{best["m"]:.1f}  {ds_str}')
-            if make_plots:
+            if (make_plots if make_offset_plots is None
+                    else make_offset_plots):
                 _plot_offset_histogram(
                     best['offset_hist'], best['offset_xed'], best['offset_yed'],
                     best.get('offset_peaks', []), title,
@@ -809,22 +811,31 @@ def process_single_image_delve(
         all_mdf = pd.DataFrame({'h': h_v, 'g': g_v, 's': sigs_v, 'c': costs_v,
                                  'dx': dx_v, 'dy': dy_v, 'mag_diff': mag_diffs,
                                  'cxx': C_total[:, 0, 0], 'cyy': C_total[:, 1, 1]})
+        all_mdf['forced'] = False
         if _forced_h is not None:
             _fdx = x_d_in[_forced_g] - xh_g[_forced_h]
             _fdy = y_d_in[_forced_g] - yh_g[_forced_h]
             _fC = (C_d_in[_forced_g]
                    + np.einsum('ij,njk,lk->nil', M,
                                C_pix_hst[_forced_h], M) + resid_cov)
+            # HONEST statistics for forced anchors: real Mahalanobis sigma and
+            # magnitude difference. Forcing acts only through the cost ranking
+            # (dedup preference) and the 'forced' gate bypass below — never by
+            # faking the diagnostics.
+            _fs = compute_mahalanobis(_fdx, _fdy, _fC)
             forced_rows = pd.DataFrame({
                 'h': _forced_h, 'g': _forced_g,
-                's': 0.0, 'c': -1e9, 'dx': _fdx, 'dy': _fdy,
-                'mag_diff': zp,
-                'cxx': _fC[:, 0, 0], 'cyy': _fC[:, 1, 1]})
+                's': _fs, 'c': -1e9, 'dx': _fdx, 'dy': _fdy,
+                'mag_diff': mag_d_in[_forced_g] - mag_hst[_forced_h],
+                'cxx': _fC[:, 0, 0], 'cyy': _fC[:, 1, 1],
+                'forced': True})
             all_mdf = pd.concat([forced_rows, all_mdf], ignore_index=True)
         all_mdf = all_mdf.sort_values('c').drop_duplicates('g')
-        final_mdf = (all_mdf.drop_duplicates('h')
-                     [(all_mdf.drop_duplicates('h')['s'] < 5.0) &
-                      (np.abs(all_mdf.drop_duplicates('h')['mag_diff'] - zp) < max_mag_diff)])
+        _dd = all_mdf.drop_duplicates('h')
+        _keep = (((_dd['s'] < 5.0)
+                  & (np.abs(_dd['mag_diff'] - zp) < max_mag_diff))
+                 | _dd.get('forced', False))
+        final_mdf = _dd[_keep]
 
         h_final, g_final = final_mdf['h'].values, final_mdf['g'].values
         print(f'  Final {label.upper()} matches: {len(h_final)}')
@@ -970,7 +981,8 @@ def process_single_image_delve(
                                    params['ra_cen'], params['dec_cen'],
                                    params['x_cen'], params['y_cen'],
                                    params['pixel_scale'], params['orientat']]
-        trans_out.write(os.path.join(hst['root'], 'transformation_delve.csv'),
+        trans_out.write(os.path.join(hst['root'],
+                                     f'transformation_{label}{out_suffix}.csv'),
                         format='ascii.csv', overwrite=True)
 
         print(f'Finished {image_name}: {len(fm)} {label.upper()} matches in '

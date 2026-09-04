@@ -398,7 +398,8 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
                 max_mag_diff=max_mag_diff, init_resid_max=init_resid_max,
                 gaia_cmd=True, color_hst_label=_c_lbl,
                 color_hst_sign=_c_sign,
-                make_plots=False, return_diag=True,
+                make_plots=False, make_offset_plots=make_plots,
+                return_diag=True,
                 forced_pairs=_fp)
         except Exception as exc:
             parts.append((expnum, None, str(exc)))
