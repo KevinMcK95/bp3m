@@ -167,7 +167,10 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
                                   out_suffix: str = '',
                                   gaia_cmd: bool = False,
                                   color_hst_label: str = None,
-                                  color_hst_sign: float = 1.0) -> None:
+                                  color_hst_sign: float = 1.0,
+                                  sky_center=None,
+                                  pm2p_df=None,
+                                  cmd2_hst_axis: bool = False) -> None:
     """10-panel diagnostic figure for the external-catalog cross-match.
 
     Layout mirrors save_diagnostic_plots() from cross_match.py exactly:
@@ -206,35 +209,84 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
         mag_pad = (mag_max - mag_min) * 0.05
         mag_lims = (mag_min - mag_pad, mag_max + mag_pad)
 
-    # 1. Field map
+    # 1. Field map — pixel frame by default; sky offsets from the HST image
+    # centre (arcsec) when sky_center=(ra_cen, dec_cen) is given, so several
+    # external exposures land in their true relative locations.
     ax = axes[0, 0]
-    if delve_field_df is not None:
-        ax.scatter(delve_field_df['x'], delve_field_df['y'],
-                   c='grey', s=2, alpha=0.2, label=f'{L} field', zorder=1)
-    if len(all_df):
-        lc = [[(r.x, r.y), (r.hx, r.hy)] for r in all_df.itertuples()]
-        ax.add_collection(LineCollection(lc, colors='grey', alpha=0.15, linewidths=0.5, zorder=2))
-    ax.scatter(all_df['hx'], all_df['hy'], c='lightgrey', s=2, alpha=0.3, zorder=2)
-    if len(rejected_df):
-        ax.scatter(rejected_df['x'], rejected_df['y'], c='red', s=5, alpha=0.4, label='Rejected', zorder=3)
-    if len(m_nonstars):
-        ax.scatter(m_nonstars['x'], m_nonstars['y'], c='orange', alpha=0.8, s=14, label='Matched non-star', zorder=5)
-    if len(m_stars):
-        ax.scatter(m_stars['x'], m_stars['y'], c='blue', alpha=0.8, s=12, label='Matched star', zorder=5)
-    ax.set_xlabel(f'X_{L} (pixels)'); ax.set_ylabel(f'Y_{L} (pixels)')
-    ax.set_title('Field Map (Pixels)'); ax.legend(fontsize=7)
+    if sky_center is not None and 'ra' in (delve_field_df.columns
+                                           if delve_field_df is not None
+                                           else []):
+        _ra0, _de0 = sky_center
+        _cosd = np.cos(np.radians(_de0))
+        def _off(df):
+            return ((df['ra'] - _ra0) * _cosd * 3600.0,
+                    (df['dec'] - _de0) * 3600.0)
+        if delve_field_df is not None:
+            ox, oy = _off(delve_field_df)
+            ax.scatter(ox, oy, c='grey', s=2, alpha=0.2, label=f'{L} field',
+                       zorder=1)
+        if len(rejected_df) and 'ra' in rejected_df.columns:
+            ox, oy = _off(rejected_df)
+            ax.scatter(ox, oy, c='red', s=5, alpha=0.4, label='Rejected',
+                       zorder=3)
+        if len(m_nonstars) and 'ra' in m_nonstars.columns:
+            ox, oy = _off(m_nonstars)
+            ax.scatter(ox, oy, c='orange', alpha=0.8, s=14,
+                       label='Matched non-star', zorder=5)
+        if len(m_stars) and 'ra' in m_stars.columns:
+            ox, oy = _off(m_stars)
+            ax.scatter(ox, oy, c='blue', alpha=0.8, s=12,
+                       label='Matched star', zorder=5)
+        ax.set_xlabel('ΔRA·cosδ from HST centre (arcsec)')
+        ax.set_ylabel('ΔDec (arcsec)')
+        ax.set_title('Field Map (Sky offsets)'); ax.legend(fontsize=7)
+    else:
+        if delve_field_df is not None:
+            ax.scatter(delve_field_df['x'], delve_field_df['y'],
+                       c='grey', s=2, alpha=0.2, label=f'{L} field', zorder=1)
+        if len(all_df):
+            lc = [[(r.x, r.y), (r.hx, r.hy)] for r in all_df.itertuples()]
+            ax.add_collection(LineCollection(lc, colors='grey', alpha=0.15, linewidths=0.5, zorder=2))
+        ax.scatter(all_df['hx'], all_df['hy'], c='lightgrey', s=2, alpha=0.3, zorder=2)
+        if len(rejected_df):
+            ax.scatter(rejected_df['x'], rejected_df['y'], c='red', s=5, alpha=0.4, label='Rejected', zorder=3)
+        if len(m_nonstars):
+            ax.scatter(m_nonstars['x'], m_nonstars['y'], c='orange', alpha=0.8, s=14, label='Matched non-star', zorder=5)
+        if len(m_stars):
+            ax.scatter(m_stars['x'], m_stars['y'], c='blue', alpha=0.8, s=12, label='Matched star', zorder=5)
+        ax.set_xlabel(f'X_{L} (pixels)'); ax.set_ylabel(f'Y_{L} (pixels)')
+        ax.set_title('Field Map (Pixels)'); ax.legend(fontsize=7)
 
-    # 2. DELVE PM VPD
+    # 2. PM VPD — with gaia_cmd, only sources with REAL Gaia PMs are shown
+    # (fill-propagated 2p values are not PMs); matched 2p stars appear as
+    # Gaia+ext two-epoch PM estimates (pm2p_df) instead.
     ax = axes[0, 1]
+    def _pm_ok(df):
+        if not gaia_cmd or 'has_gaia' not in df.columns:
+            return np.ones(len(df), dtype=bool)
+        return df['has_gaia'].values > 0.5
     if delve_field_df is not None:
-        ax.scatter(delve_field_df['pmra'], delve_field_df['pmdec'],
+        _v = _pm_ok(delve_field_df)
+        ax.scatter(delve_field_df.loc[_v, 'pmra'],
+                   delve_field_df.loc[_v, 'pmdec'],
                    c='grey', s=2, alpha=0.2, label=f'{L} field', zorder=1)
     if len(rejected_df):
-        ax.scatter(rejected_df['pmra'], rejected_df['pmdec'],
+        _v = _pm_ok(rejected_df)
+        ax.scatter(rejected_df.loc[_v, 'pmra'], rejected_df.loc[_v, 'pmdec'],
                    c='red', s=5, alpha=0.4, label='Rejected', zorder=3)
-    _scatter_matched(ax, 'pmra', 'pmdec')
+    for src, col, sz, lbl in [(m_nonstars, 'orange', 14, 'Matched non-star'),
+                              (m_stars, 'blue', 12, 'Matched star')]:
+        if len(src):
+            _v = _pm_ok(src)
+            ax.scatter(src.loc[_v, 'pmra'], src.loc[_v, 'pmdec'], c=col,
+                       alpha=0.8, s=sz, label=lbl, zorder=5)
+    if pm2p_df is not None and len(pm2p_df):
+        ax.scatter(pm2p_df['pmra'], pm2p_df['pmdec'], c='green', marker='^',
+                   s=16, alpha=0.8, label=f'2p (Gaia+{L})', zorder=6)
     ax.set_xlabel('PMRA (mas/yr)'); ax.set_ylabel('PMDec (mas/yr)')
-    ax.set_title(f'{L} Proper Motions'); ax.legend(fontsize=7)
+    _t = 'Gaia (5p) + ' + f'Gaia+{L} (2p) Proper Motions' if gaia_cmd \
+        else f'{L} Proper Motions'
+    ax.set_title(_t); ax.legend(fontsize=7)
 
     # 3. CMD — Gaia G vs BP−RP when gaia_cmd, else r vs g−r
     ax = axes[1, 0]
@@ -280,8 +332,12 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
     # 4. DELVE vs HST CMD (r vs r − HST)
     ax = axes[1, 1]
     _clbl = color_hst_label or f'r_{L} − HST'
-    _ycol = 'gaia_gmag' if (gaia_cmd and 'gaia_gmag' in matched_df.columns) else 'mag'
-    _ylbl = 'G (Gaia, mag)' if _ycol == 'gaia_gmag' else f'{L} mag'
+    if cmd2_hst_axis and 'hst_mag' in matched_df.columns:
+        _ycol, _ylbl = 'hst_mag', 'HST instrumental mag'
+    elif gaia_cmd and 'gaia_gmag' in matched_df.columns:
+        _ycol, _ylbl = 'gaia_gmag', 'G (Gaia, mag)'
+    else:
+        _ycol, _ylbl = 'mag', f'{L} mag'
     for src, col, lbl in [(rejected_df, 'red', 'Rejected'),
                           (m_nonstars, 'orange', 'Matched non-star'),
                           (m_stars, 'blue', 'Matched star')]:
@@ -358,9 +414,30 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
     ax.set_title(f'Sigma vs {L} r Magnitude'); ax.legend(fontsize=7)
     if mag_lims: ax.set_xlim(*mag_lims)
 
-    # 10. Color-color (g−r vs r−HST)
+    # 10. Color-color — with gaia_cmd: ext−HST vs Gaia G−RP
     ax = axes[4, 1]
-    has_color = 'color' in matched_df.columns
+    if gaia_cmd and 'gaia_rpmag' in matched_df.columns:
+        if len(rejected_df) and 'gaia_rpmag' in rejected_df.columns:
+            _grp = rejected_df['gaia_gmag'] - rejected_df['gaia_rpmag']
+            _v = _grp.notna()
+            ax.scatter(_grp[_v],
+                       color_hst_sign * rejected_df.loc[_v, 'color_hst'],
+                       c='red', alpha=0.15, s=5, label='Rejected')
+        for src, col, lbl in [(m_nonstars, 'orange', 'Matched non-star'),
+                              (m_stars, 'blue', 'Matched star')]:
+            if len(src) and 'gaia_rpmag' in src.columns:
+                _grp = src['gaia_gmag'] - src['gaia_rpmag']
+                _v = _grp.notna()
+                ax.scatter(_grp[_v],
+                           color_hst_sign * src.loc[_v, 'color_hst'],
+                           c=col, alpha=0.6, s=12, label=lbl)
+        _clbl2 = color_hst_label or f'{L} − HST'
+        ax.set_xlabel('G − RP (Gaia, mag)')
+        ax.set_ylabel(f'{_clbl2} (mag)')
+        ax.set_title('Color-Color Diagram'); ax.legend(fontsize=7)
+        has_color = False
+    else:
+        has_color = 'color' in matched_df.columns
     if has_color:
         if len(rejected_df) and 'color' in rejected_df.columns:
             v = (rejected_df['color'] > -10) & (rejected_df['color'] < 10)
@@ -522,11 +599,16 @@ def process_single_image_delve(
         delve_field_df = pd.DataFrame({
             'x':     x_d_in,
             'y':     y_d_in,
+            'ra':    ra_d_in,
+            'dec':   dec_d_in,
             'pmra':  pmra_d_in,
             'pmdec': pmdec_d_in,
             'r_mag': mag_d_in,
             'g_mag': gmag_d_in,
         })
+        for _c in ('gmag', 'bp_rp', 'has_gaia', 'rpmag'):
+            delve_field_df[_c] = (delve_df[_c].values[in_fld]
+                                  if _c in delve_df.columns else np.nan)
 
         # ── Load HST catalog ──────────────────────────────────────────────────
         hst_cat = fits.getdata(hst['catalog'])
@@ -592,8 +674,10 @@ def process_single_image_delve(
         # Two tiers: HST star candidates first, then all HST sources as fallback.
         _all_dlv = np.ones(len(x_d_in), dtype=bool)
         _disc_tiers = [
-            ('all DELVE / HST stars', _all_dlv, hst_data_star,    True),
-            ('all DELVE / all HST',   _all_dlv, hst_data_all_disc, False),
+            (f'all {label.upper()} / HST stars', _all_dlv,
+             hst_data_star, True),
+            (f'all {label.upper()} / all HST', _all_dlv,
+             hst_data_all_disc, False),
         ]
         best, used_tier, _stars_only = None, None, True
         # ── FORCED ANCHORS (previously-matched Gaia-common stars) ────────────

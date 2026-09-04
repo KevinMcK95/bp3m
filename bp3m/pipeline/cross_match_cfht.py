@@ -508,156 +508,36 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
 def _plot_union_diagnostics(img_dir, name, diag, field, union, ht,
                             hst_mjd, gaia_lookup, det_cache,
                             color_label, color_sign):
-    """Single 10-panel figure per HST image, concatenating ALL exposures.
-
-    Panel spec (user, 2026-09-04):
-      (0,0) sky offsets from the HST image centre (arcsec) — every CFHT
-            exposure lands in its true location
-      (0,1) PM VPD: Gaia PMs for 5p; Gaia+CFHT PM estimates for matched 2p
-      (1,0) Gaia CMD (G vs BP−RP)
-      (1,1) HST vs CFHT−HST CMD (full HST depth on y)
-      (2,0) dx,dy residuals   (2,1) residual vs CFHT mag
-      (3,0) sigma histogram   (3,1) residual vs HST mag
-      (4,0) colour-colour: CFHT−HST vs Gaia G−RP
-      (4,1) per-exposure summary
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    """One figure per HST image concatenating ALL exposures — the SAME
+    10-panel figure as the DELVE/Gaia cross-matches (shared plot function),
+    with the CFHT panel substitutions: sky-offset field map, 5p Gaia +
+    2p Gaia+CFHT PM VPD, Gaia CMD, HST-depth HSTxCFHT CMD, and the
+    CFHT-HST vs Gaia G-RP colour-colour."""
+    from gaia_cross_match.cross_match_delve import _save_diagnostic_plots_delve
     m = diag[diag.is_matched]
     r = diag[~diag.is_matched]
-    fig, axes = plt.subplots(5, 2, figsize=(14, 26))
-    fig.suptitle(f'CFHT Match Diagnostics (all exposures): {name}',
-                 fontsize=16)
-    cosd = np.cos(np.radians(ht['dec_cen']))
-
-    # (0,0) sky offsets
-    ax = axes[0, 0]
-    def _sky(df, **kw):
-        if len(df):
-            ax.scatter((df.ra - ht['ra_cen']) * cosd * 3600.0,
-                       (df.dec - ht['dec_cen']) * 3600.0, **kw)
-    if field is not None:
-        # field positions: propagated ra/dec not kept; use matched frame cols
-        pass
-    _sky(r, c='red', s=5, alpha=0.25, label='Rejected')
-    _sky(m[m.hst_is_star < 0.5], c='orange', s=12, alpha=0.7,
-         label='Matched non-star')
-    _sky(m[m.hst_is_star >= 0.5], c='blue', s=10, alpha=0.7,
-         label='Matched star')
-    ax.set_xlabel('ΔRA·cosδ from HST centre (arcsec)')
-    ax.set_ylabel('ΔDec (arcsec)')
-    ax.set_title('Sky offsets (all CFHT exposures)')
-    ax.legend(fontsize=7); ax.set_aspect('equal', adjustable='datalim')
-
-    # (0,1) PM VPD: 5p Gaia; 2p Gaia+CFHT estimate
-    ax = axes[0, 1]
+    # 2p Gaia+CFHT PM estimates from the union table
+    pm2p = None
     if union is not None and len(union):
-        u = union.copy()
+        u = union[union.gaia_source_id.notna()].copy()
         u['gaia_source_id'] = u.gaia_source_id.astype(str)
-        gl = gaia_lookup.rename(columns={'ra': 'gaia_ra',
-                                          'dec': 'gaia_dec'})
-        j = u[u.gaia_source_id != ''].merge(gl, on='gaia_source_id',
-                                            how='left')
-        is5p = j.pmra.notna()
-        ax.scatter(j.loc[is5p, 'pmra'], j.loc[is5p, 'pmdec'], s=8,
-                   c='blue', alpha=0.6, label='5p (Gaia)')
-        # 2p: PM from (CFHT position at t_cfht − Gaia position at 2016)/dt
-        j2 = j[~is5p & j.gaia_ra.notna()] if 'gaia_ra' in j else j.iloc[:0]
+        gl = gaia_lookup.rename(columns={'ra': 'gaia_ra', 'dec': 'gaia_dec'})
+        j = u.merge(gl, on='gaia_source_id', how='left', suffixes=('', '_gl'))
+        j2 = j[j.pmra.isna() & j.gaia_ra.notna()]
         if len(j2):
             from astropy.time import Time
+            cosd = np.cos(np.radians(ht['dec_cen']))
             dt = Time(j2.cfht_mjd.to_numpy(), format='mjd').jyear - 2016.0
             ok = np.abs(dt) > 0.5
-            pm_ra = ((j2.cfht_ra_prop - j2.gaia_ra) * cosd * 3.6e6
-                     / np.where(ok, dt, np.nan))
-            pm_de = ((j2.cfht_dec_prop - j2.gaia_dec) * 3.6e6
-                     / np.where(ok, dt, np.nan))
-            ax.scatter(pm_ra, pm_de, s=14, c='green', alpha=0.7, marker='^',
-                       label='2p (Gaia+CFHT)')
-    ax.set_xlabel('PMRA (mas/yr)'); ax.set_ylabel('PMDec (mas/yr)')
-    ax.set_title('Proper motions'); ax.legend(fontsize=7)
-
-    # (1,0) Gaia CMD
-    ax = axes[1, 0]
-    if field is not None and 'gmag' in field.columns:
-        v = field.gmag.notna() & field.bp_rp.notna()
-        ax.scatter(field.loc[v, 'bp_rp'], field.loc[v, 'gmag'], c='grey',
-                   s=3, alpha=0.3, label='CFHT field (Gaia)')
-    for src, col, lbl in ((r, 'red', 'Rejected'),
-                          (m, 'blue', 'Matched')):
-        if len(src) and 'gaia_bp_rp' in src.columns:
-            v = src.gaia_bp_rp.notna() & src.gaia_gmag.notna()
-            ax.scatter(src.loc[v, 'gaia_bp_rp'], src.loc[v, 'gaia_gmag'],
-                       c=col, s=10, alpha=0.6 if col != 'red' else 0.15,
-                       label=lbl)
-    ax.invert_yaxis()
-    ax.set_xlabel('BP − RP (Gaia)'); ax.set_ylabel('G (Gaia)')
-    ax.set_title('Gaia CMD'); ax.legend(fontsize=7)
-
-    # (1,1) HST vs CFHT−HST (full HST depth)
-    ax = axes[1, 1]
-    for src, col, lbl in ((r, 'red', 'Rejected'), (m, 'blue', 'Matched')):
-        if len(src):
-            ax.scatter(src.color_hst, src.hst_mag, c=col, s=8,
-                       alpha=0.5 if col != 'red' else 0.15, label=lbl)
-    ax.invert_yaxis()
-    ax.set_xlabel('CFHT − HST (mag, zp-corrected)')
-    ax.set_ylabel('HST instrumental mag')
-    ax.set_title('HST × CFHT CMD'); ax.legend(fontsize=7)
-
-    # (2,0) residuals
-    ax = axes[2, 0]
-    if len(r):
-        ax.scatter(r.dx, r.dy, c='red', s=6, alpha=0.2)
-    ax.scatter(m.dx, m.dy, c='blue', s=8, alpha=0.6)
-    ax.axhline(0, c='k', ls='--', lw=0.5); ax.axvline(0, c='k', ls='--', lw=0.5)
-    if len(m):
-        lim = max(1e-3, 3 * max(m.dx.abs().median(), m.dy.abs().median()) * 5)
-        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
-    ax.set_xlabel('dx (HST px)'); ax.set_ylabel('dy (HST px)')
-    ax.set_title('Match residuals')
-
-    # (2,1) residual vs CFHT mag
-    ax = axes[2, 1]
-    ax.scatter(m.mag, np.hypot(m.dx, m.dy), s=8, alpha=0.5)
-    ax.set_xlabel('CFHT mag'); ax.set_ylabel('|residual| (px)')
-    ax.set_title('Residual vs CFHT mag')
-
-    # (3,0) sigma histogram
-    ax = axes[3, 0]
-    if len(m):
-        ax.hist(m.sigma.clip(0, 10), bins=40, histtype='step', label='matched')
-    if len(r):
-        ax.hist(r.sigma.clip(0, 10), bins=40, histtype='step', color='red',
-                label='rejected')
-    ax.set_xlabel('match sigma'); ax.legend(fontsize=7)
-    ax.set_title('Mahalanobis distribution')
-
-    # (3,1) residual vs HST mag
-    ax = axes[3, 1]
-    ax.scatter(m.hst_mag, np.hypot(m.dx, m.dy), s=8, alpha=0.5)
-    ax.set_xlabel('HST instrumental mag'); ax.set_ylabel('|residual| (px)')
-    ax.set_title('Residual vs HST mag')
-
-    # (4,0) colour-colour: CFHT−HST vs Gaia G−RP
-    ax = axes[4, 0]
-    if 'gaia_rpmag' in m.columns:
-        v = m.gaia_gmag.notna() & m.gaia_rpmag.notna()
-        ax.scatter((m.gaia_gmag - m.gaia_rpmag)[v], m.color_hst[v], s=10,
-                   alpha=0.6)
-    ax.set_xlabel('G − RP (Gaia)'); ax.set_ylabel('CFHT − HST (mag)')
-    ax.set_title('Colour-colour')
-
-    # (4,1) per-exposure summary
-    ax = axes[4, 1]; ax.axis('off')
-    lines = [f'HST mjd {hst_mjd:.1f}']
-    for e, g in m.groupby('cfht_expnum'):
-        dt = (hst_mjd - g.cfht_mjd.iloc[0]) / 365.25
-        lines.append(f'exp {e}: {len(g)} matches, dt={dt:+.1f} yr, '
-                     f'med|res|={np.hypot(g.dx, g.dy).median():.3f} px')
-    ax.text(0.02, 0.98, '\n'.join(lines), va='top', family='monospace',
-            fontsize=9, transform=ax.transAxes)
-
-    fig.tight_layout(rect=(0, 0, 1, 0.98))
-    fig.savefig(img_dir / 'diagnostic_plots_cfht.png', dpi=120)
-    plt.close(fig)
+            pm2p = pd.DataFrame({
+                'pmra': ((j2.cfht_ra_prop - j2.gaia_ra) * cosd * 3.6e6
+                         / np.where(ok, dt, np.nan)),
+                'pmdec': ((j2.cfht_dec_prop - j2.gaia_dec) * 3.6e6
+                          / np.where(ok, dt, np.nan))}).dropna()
+    _save_diagnostic_plots_delve(
+        str(img_dir), f'{name} (all exposures)', m, r,
+        delve_field_df=field, label='cfht', out_suffix='',
+        gaia_cmd=True, color_hst_label=color_label,
+        color_hst_sign=color_sign,
+        sky_center=(ht['ra_cen'], ht['dec_cen']),
+        pm2p_df=pm2p, cmd2_hst_axis=True)
