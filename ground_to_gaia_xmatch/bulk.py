@@ -189,6 +189,11 @@ def run_bulk(instrument_factory, field_root: Path, exposures,
         try:
             inst, tiers = instrument_factory(exp)
             n_matched = 0
+            # An exposure selected as todo BECAUSE of force/redo_before must
+            # redo its per-detector xmatch too — those dirs carry their own
+            # sentinels that would otherwise silently skip the stage (the
+            # align would refit on top of the STALE matches).
+            _stage_force = bool(force or redo_before is not None)
             if do_xmatch:
                 # Per-image detail is captured in each detector's
                 # processing_log.txt; at this scale it would bury the
@@ -197,7 +202,8 @@ def run_bulk(instrument_factory, field_root: Path, exposures,
                 _buf = _io.StringIO()
                 with contextlib.redirect_stdout(_buf):
                     df = xmatch_mod.run(inst, field_root, source_tiers=tiers,
-                                        make_plots=make_plots)
+                                        make_plots=make_plots,
+                                        force=_stage_force)
                 if len(df) and 'n_matched' in df.columns:
                     n_matched = int(df['n_matched'].fillna(0).sum())
             n_solved = 0
