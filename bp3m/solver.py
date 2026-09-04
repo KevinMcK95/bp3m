@@ -1742,7 +1742,7 @@ class BP3MSolver:
             two_phase_align=False,
             mask_tol_frac=1e-3, mask_tol_iters=3,
             hst_fit_sigma_mult=0.5,
-            prefilter=True, prefit_clean_iters=0,
+            prefilter=True, prefit_clean_iters=0, prefit_clean_sigma=10.0,
             chi2_threshold=None, alpha_scale_chi2=False,
             use_influence_clip=True,
             influence_k: float = 5.0,
@@ -2073,8 +2073,16 @@ class BP3MSolver:
         # at all. Bad detections then never contaminate the first joint
         # solution, and Phase 2 needs fewer outer loops.
         if prefit_clean_iters and clip_sigma is not None:
+            # LOOSE sigma: at frozen r the residuals still contain the
+            # uncorrected alignment error, so the production clip_sigma
+            # mass-rejects (Leo_I: 79% of detections at 4.5). Only remove
+            # the egregious outliers here; Phase 2 does the fine work.
+            _pc_sigma = max(float(prefit_clean_sigma), float(clip_sigma))
+            _pc_chi2 = (chi2_threshold * (_pc_sigma / clip_sigma) ** 2
+                        if chi2_threshold is not None else None)
             print(f' Phase 0.5: star-only cleaning at frozen r '
-                  f'(up to {prefit_clean_iters} iterations)')
+                  f'(up to {prefit_clean_iters} iterations, '
+                  f'sigma={_pc_sigma:.1f})')
             for _pc in range(prefit_clean_iters):
                 _, C_r_pc, a_pc, _, CvT_pc = self._solve_one_pass(r_hat)
                 _pre_masks = {
@@ -2083,10 +2091,10 @@ class BP3MSolver:
                                 d['use_for_fit']).copy())
                     for img, d in self._img_data.items() if d is not None}
                 clip_info, _, _ = self._update_use_for_fit(
-                    r_hat, a_pc, C_r_pc, CvT_pc, clip_sigma,
+                    r_hat, a_pc, C_r_pc, CvT_pc, _pc_sigma,
                     ok_star_prev=None, inflate_errors=False,
                     skip_star_tests=False,
-                    chi2_threshold=chi2_threshold,
+                    chi2_threshold=_pc_chi2,
                     alpha_scale_chi2=False)
                 # MONOTONE cleaning: detections may only be REMOVED while r is
                 # frozen — re-admissions are reverted (they get their rights

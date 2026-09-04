@@ -50,6 +50,9 @@ def run_alignment(  # noqa: C901
     min_align_demote: int = 5,
     epoch_dist_groupby: str = 'full',
     no_prefilter: bool = False,
+    prefit_clean_iters: int = 0,
+    prefit_clean_sigma: float = 10.0,
+    mask_tol_frac: float = 1e-3,
     no_plots: bool = False,
     images: list[str] | None = None,
     remove_images: list[str] | None = None,
@@ -430,6 +433,9 @@ def run_alignment(  # noqa: C901
         two_phase_align=two_phase_align,
         inflate_alpha_max=inflate_alpha_max,
         prefilter=not no_prefilter,
+        prefit_clean_iters=prefit_clean_iters,
+        prefit_clean_sigma=prefit_clean_sigma,
+        mask_tol_frac=mask_tol_frac,
         use_influence_clip=use_influence_clip,
         influence_k=influence_k,
         influence_floor_sr=influence_floor_sr,
@@ -461,6 +467,7 @@ def run_alignment(  # noqa: C901
             'epoch_dist_prior': (str(epoch_dist_prior)
                                  if epoch_dist_prior else None),
             'pos_err_floor': pos_err_floor,
+            'prefit_clean_iters': prefit_clean_iters,
             'gaia_csv': ([str(p) for p in gaia_csv]
                          if isinstance(gaia_csv, (list, tuple))
                          else (str(gaia_csv) if gaia_csv is not None else None)),

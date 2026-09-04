@@ -371,6 +371,18 @@ def _parse_args():
     bp.add_argument('--bp3m_min_stars', type=int, default=0,
                     help='Exclude images with fewer than this many Gaia cross-matched '
                          'stars from BP3M (default: 0 = keep all images)')
+    bp.add_argument('--bp3m_mask_tol_frac', type=float, default=1e-3,
+                    help='Phase-2 stop: tolerated mask flicker as a fraction of '
+                         'total detections, sustained mask_tol_iters times '
+                         '(default 1e-3; prototype code stopped at 5e-2)')
+    bp.add_argument('--prefit_clean_sigma', type=float, default=10.0,
+                    help='Phase 0.5 rejection sigma (loose on purpose: residuals '
+                         'at frozen r still contain the alignment error; default 10)')
+    bp.add_argument('--prefit_clean_iters', type=int, default=0,
+                    help='Phase 0.5: iterate stellar-astrometry solves + rejection '
+                         'tests at FROZEN r (initialization) this many times before '
+                         'the joint fit, removing obviously bad stars/detections '
+                         'early (default: 0 = off)')
     bp.add_argument('--n_processes_psf', type=int, default=2,
                     help='Worker count for the PSF-fitting (pypass) step '
                          'ONLY. pypass workers are RAM-heavy (~2-3 GB each; '
@@ -1553,6 +1565,9 @@ def main():
                 restrict_filters=args.restrict_filters,
                 restrict_instdet=args.restrict_instdet,
                 bp3m_min_stars=args.bp3m_min_stars,
+                prefit_clean_iters=args.prefit_clean_iters,
+                prefit_clean_sigma=args.prefit_clean_sigma,
+                mask_tol_frac=args.bp3m_mask_tol_frac,
                 checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
                 use_influence_clip=not args.no_influence_clip,
                 prior_sigma_rot_deg=args.prior_sigma_rot_deg,
@@ -1643,6 +1658,9 @@ def main():
                 restrict_filters=args.restrict_filters,
                 restrict_instdet=args.restrict_instdet,
                 bp3m_min_stars=args.bp3m_min_stars,
+                prefit_clean_iters=args.prefit_clean_iters,
+                prefit_clean_sigma=args.prefit_clean_sigma,
+                mask_tol_frac=args.bp3m_mask_tol_frac,
                 checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
                 use_influence_clip=not args.no_influence_clip,
                 prior_sigma_rot_deg=args.prior_sigma_rot_deg,
