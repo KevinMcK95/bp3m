@@ -186,6 +186,8 @@ def _save_diagnostic_plots_delve(out_dir: str, image_name: str,
                      drawn as grey background population in CMD panels.
     """
     L = label.upper()
+    if delve_field_df is not None and len(delve_field_df) > 5000:
+        delve_field_df = delve_field_df.sample(5000, random_state=0)
     fig, axes = plt.subplots(5, 2, figsize=(14, 24/4*5))
     fig.suptitle(f"{L} Match Diagnostics: {image_name}", fontsize=18)
 
@@ -508,7 +510,11 @@ def process_single_image_delve(
     _P = label + '_'
     try:
         print(f'--- {label.upper()} cross-match: {image_name} ---')
-        params = get_hst_params(hst['flc'], catalog_file=hst['catalog'])
+        params = hst.get('params_cache')
+        if params is None:
+            params = get_hst_params(hst['flc'], catalog_file=hst['catalog'])
+            if isinstance(hst, dict):
+                hst['params_cache'] = params
         if params is None:
             print(f'Finished {image_name}: failed to load HST params.', file=orig_stdout)
             return
