@@ -92,8 +92,16 @@ def main(argv=None):
                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--instrument', required=True, choices=['lsst', 'cfht'])
     p.add_argument('--field-root', required=True, type=Path)
-    p.add_argument('--n-workers', type=int, default=1)
+    p.add_argument('--n-workers', type=int, default=1,
+                   help='Static-partition mode: total workers across all '
+                        'invocations (pair with --worker-id; for multi-'
+                        'machine runs)')
     p.add_argument('--worker-id', type=int, default=0)
+    p.add_argument('--workers', type=int, default=0,
+                   help='Single-command mode: fork this many workers '
+                        'internally (no --worker-id bookkeeping). '
+                        'Equivalent to N invocations with '
+                        '--n-workers N --worker-id 0..N-1.')
     p.add_argument('--exposure', nargs='+', default=None,
                    help='Restrict to these exposures (e.g. to retry failures)')
     p.add_argument('--no-plots', action='store_true',
@@ -119,6 +127,37 @@ def main(argv=None):
 
     exps = ([int(e) for e in args.exposure] if args.exposure
             else all_exposures(args.instrument, args.field_root))
+    if args.workers and args.workers > 1:
+        # Fork the static partitions internally: one command, N processes.
+        # Each child is an ordinary worker (own slice, own manifest, own
+        # sentinel-based resume), so a killed run restarts the same way.
+        import multiprocessing as mp
+        ctx = mp.get_context('forkserver')
+        procs = []
+        for w in range(args.workers):
+            sub = [a for a in (argv if argv is not None else __import__('sys').argv[1:])]
+            # strip any --workers and add the per-child partition args
+            out = []
+            skip = False
+            for a in sub:
+                if skip:
+                    skip = False
+                    continue
+                if a == '--workers':
+                    skip = True
+                    continue
+                if a.startswith('--workers='):
+                    continue
+                out.append(a)
+            out += ['--n-workers', str(args.workers), '--worker-id', str(w)]
+            procs.append(ctx.Process(target=main, args=(out,)))
+            procs[-1].start()
+        rc = 0
+        for pr in procs:
+            pr.join()
+            rc |= pr.exitcode or 0
+        raise SystemExit(rc)
+
     _redo_before = None
     if args.redo_before is not None:
         try:
