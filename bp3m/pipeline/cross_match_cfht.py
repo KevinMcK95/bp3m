@@ -510,6 +510,11 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
     n_ok = sum(1 for _, n, e in results if n > 0)
     print(f'  Step 4d done: {n_ok}/{len(todo)} images matched '
           f'({time.time()-t0:.0f}s)')
+    if make_plots:
+        try:
+            make_cfht_validation_plots(output_dir, field_name)
+        except Exception as exc:
+            print(f'  CFHT validation plots failed: {exc}')
     return results
 
 
@@ -549,3 +554,40 @@ def _plot_union_diagnostics(img_dir, name, diag, field, union, ht,
         color_hst_sign=color_sign,
         sky_center=(ht['ra_cen'], ht['dec_cen']),
         pm2p_df=pm2p, cmd2_hst_axis=True)
+
+
+def make_cfht_validation_plots(output_dir, field_name):
+    """Field-level deep-CMD validation figures for the HST x CFHT match —
+    the CFHT analogues of plots_validate_delve_{cmds,cc}.png, produced by
+    the same validator plotting code (label='cfht'):
+        plots_validate_cfht_cmds.png — all pairwise HST+CFHT CMDs
+        plots_validate_cfht_cc.png   — all colour-colour triplets
+    Uses per-image HST st magnitudes and the union of matched_cfht tables,
+    so the CMDs reach the full (fainter-than-Gaia) match depth."""
+    from gaia_cross_match.validator import _plot_delve_photometry
+    from bp3m.data_loader_cfht import collect_cfht_matches
+    field_dir = Path(output_dir) / field_name
+    matches = collect_cfht_matches(field_dir)
+    if not len(matches):
+        print('  no matched_cfht tables — skipping CFHT validation plots')
+        return
+    summ = pd.read_csv(field_dir / 'HST' /
+                       'image_transformation_summaries.csv',
+                       usecols=['image_name', 'filter', 'instrument'])
+    fmap = dict(zip(summ.image_name, summ['filter'] + '/'
+                    + summ.instrument))
+    cat = pd.DataFrame({
+        'gaia_source_id': pd.to_numeric(matches.gaia_source_id,
+                                        errors='coerce'),
+        'delve_source_id': matches.cfht_source_id,
+        'delve_rmag': matches.cfht_rmag,
+        'filter_camera': matches.hst_image.map(fmap).fillna('UNK/UNK'),
+        'n_trustworthy': 1,
+        'mag_norm_wmean': matches.get('hst_mag_st_gdc',
+                                      matches.get('hst_mag_gdc')),
+    })
+    n_filters = cat.filter_camera.str.split('/').str[0].nunique()
+    _plot_delve_photometry(cat, None, str(Path(output_dir)), field_name,
+                           n_filters, label='cfht')
+    print(f'  CFHT validation figures: plots_validate_cfht_cmds/cc.png '
+          f'({len(cat)} match rows, {n_filters} HST filters)')

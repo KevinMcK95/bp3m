@@ -452,6 +452,16 @@ def _load_gaia_phot(data_dir, target):
 # DELVE photometry enrichment
 # ---------------------------------------------------------------------------
 
+def _ext_phot_cols(prefix='delve'):
+    return [f'{prefix}_{c}' for c in (
+        'rmag', 'gmag', 'imag', 'zmag', 'pmra', 'pmdec',
+        'pmra_error', 'pmdec_error', 'parallax', 'parallax_error',
+        'ra_error', 'dec_error', 'ra_cat', 'dec_cat',
+        'corr_ra_dec', 'corr_ra_plx', 'corr_ra_pmra', 'corr_ra_pmdec',
+        'corr_dec_plx', 'corr_dec_pmra', 'corr_dec_pmdec',
+        'corr_plx_pmra', 'corr_plx_pmdec', 'corr_pmra_pmdec')]
+
+
 _DELVE_PHOT_COLS = ['delve_rmag', 'delve_gmag', 'delve_imag', 'delve_zmag',
                     'delve_pmra', 'delve_pmdec',
                     'delve_pmra_error', 'delve_pmdec_error',
@@ -465,7 +475,7 @@ _DELVE_PHOT_COLS = ['delve_rmag', 'delve_gmag', 'delve_imag', 'delve_zmag',
 _DELVE_SENTINEL_LO, _DELVE_SENTINEL_HI = -90.0, 50.0
 
 
-def _mask_delve_sentinels(df):
+def _mask_delve_sentinels(df, prefix='delve'):
     """Replace DELVE photometric sentinel values (−99 / +99) with NaN in-place."""
     for col in _DELVE_PHOT_COLS:
         if col.endswith('mag') and col in df.columns:
@@ -474,7 +484,7 @@ def _mask_delve_sentinels(df):
     return df
 
 
-def _collect_delve_info(images):
+def _collect_delve_info(images, label='delve'):
     """
     Read matched_delve.csv + source_quality.csv per image and partition into:
 
@@ -486,11 +496,18 @@ def _collect_delve_info(images):
     gaia_linked, delve_only = [], []
 
     for name, d in images.items():
-        delve_path = os.path.join(d['image_dir'], 'matched_delve.csv')
+        delve_path = os.path.join(d['image_dir'], f'matched_{label}.csv')
         if not os.path.exists(delve_path):
             continue
 
-        delve = _mask_delve_sentinels(pd.read_csv(delve_path))
+        delve = pd.read_csv(delve_path)
+        if label != 'delve':
+            # normalise external-catalog columns to the delve_* schema so the
+            # aggregation/plot code below is label-agnostic
+            delve.columns = [c.replace(f'{label}_', 'delve_', 1)
+                             if c.startswith(f'{label}_') else c
+                             for c in delve.columns]
+        delve = _mask_delve_sentinels(delve)
         delve['image_name']    = name
         delve['filter_camera'] = d['filter_camera']
 
@@ -689,7 +706,9 @@ def build_global_catalog(images, target, data_dir):
 # Photometry CMD / colour-colour plots
 # ---------------------------------------------------------------------------
 
-def _plot_delve_photometry(cat, wide, data_dir, target, n_filters):
+def _plot_delve_photometry(cat, wide, data_dir, target, n_filters,
+                           label='delve'):
+    L = label.upper()
     """
     Produce DELVE+HST pairwise CMD and colour-colour plots using the same
     approach as the Gaia plots: all pairwise (HST+DELVE) CMDs and all
@@ -736,10 +755,10 @@ def _plot_delve_photometry(cat, wide, data_dir, target, n_filters):
     # The DELVEg/r/i/z band labels are registered in _plot_cmds/_plot_color_color's
     # _WL dict so they sort correctly relative to HST filters.
     _BAND_MAP = [
-        ('delve_gmag', 'DELVEg'),
-        ('delve_rmag', 'DELVEr'),
-        ('delve_imag', 'DELVEi'),
-        ('delve_zmag', 'DELVEz'),
+        ('delve_gmag', f'{L}g'),
+        ('delve_rmag', f'{L}r'),
+        ('delve_imag', f'{L}i'),
+        ('delve_zmag', f'{L}z'),
     ]
     added_bands = []
     for delve_col, band_label in _BAND_MAP:
@@ -764,21 +783,21 @@ def _plot_delve_photometry(cat, wide, data_dir, target, n_filters):
         return
 
     n_all = len(hst_fcols) + len(added_bands)
-    out_cmds = os.path.join(data_dir, target, 'plots_validate_delve_cmds.png')
+    out_cmds = os.path.join(data_dir, target, f'plots_validate_{label}_cmds.png')
     try:
         _plot_cmds(wide_d, None, out_cmds,
-                   title=f'{target}  —  DELVE+HST CMDs ({n_all} bands)')
-        print(f'  DELVE CMDs: {out_cmds}')
+                   title=f'{target}  —  {L}+HST CMDs ({n_all} bands)')
+        print(f'  {L} CMDs: {out_cmds}')
     except Exception as e:
-        print(f'  Warning: plots_validate_delve_cmds.png failed: {e}')
+        print(f'  Warning: plots_validate_{label}_cmds.png failed: {e}')
 
-    out_cc = os.path.join(data_dir, target, 'plots_validate_delve_cc.png')
+    out_cc = os.path.join(data_dir, target, f'plots_validate_{label}_cc.png')
     try:
         _plot_color_color(wide_d, None, out_cc,
-                          title=f'{target}  —  DELVE+HST colour-colour ({n_all} bands)')
-        print(f'  DELVE colour-colour: {out_cc}')
+                          title=f'{target}  —  {L}+HST colour-colour ({n_all} bands)')
+        print(f'  {L} colour-colour: {out_cc}')
     except Exception as e:
-        print(f'  Warning: plots_validate_delve_cc.png failed: {e}')
+        print(f'  Warning: plots_validate_{label}_cc.png failed: {e}')
 
 
 def plot_photometry_catalog(data_dir, target):
