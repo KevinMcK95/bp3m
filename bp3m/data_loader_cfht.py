@@ -204,6 +204,10 @@ def build_cfht_images(field_dir, cfht_dir, matches: pd.DataFrame,
             expnum=int(expnum), ext=int(ext),
             hst_time_mjd=post['mjd'],
             ra0=ra0_d, dec0=dec0_d,
+            # pseudo-pixels are already centered on the tangent point; the
+            # solver's pivot default (2048, 2048) would otherwise be absorbed
+            # by a 2048-px tangent-point walk
+            Xo=0.0, Yo=0.0,
             pixel_scale=CFHT_PSCALE_MAS,
             orig_pixel_scale=CFHT_PSCALE_MAS,
             orig_rot_deg=0.0,

@@ -270,6 +270,37 @@ def run_alignment(  # noqa: C901
                 cfht_prior_inflate=cfht_prior_inflate)
             imgs.update(cimgs)
             filtered_spi.update(cstars)
+            # Gaia stars observed ONLY by CFHT (tier gaia_cfht) were trimmed
+            # from gaia_catalog by the HST observed-star filter above; without
+            # their catalog rows the solver's isin(star_id_to_idx) mask
+            # silently drops most CFHT detections. Re-admit them.
+            _cids = set()
+            for _df in cstars.values():
+                _cids.update(_df.Gaia_id[_df.Gaia_id > 0].tolist())
+            _missing = _cids - set(gaia_catalog.Gaia_id)
+            if _missing:
+                # gaia_catalog (and gaia_catalog_full) were already trimmed
+                # to HST-observed stars inside load_image_data_flc, so the
+                # CFHT-only rows must come back from the Gaia CSVs directly.
+                from bp3m.data_loader_flc import resolve_gaia_csvs
+                _gfiles, _ = resolve_gaia_csvs(data_root / field_name)
+                _want = set(gaia_catalog.columns) | {'source_id', 'SOURCE_ID',
+                                                     'ref_epoch'}
+                _gadd = _pd_c.concat(
+                    [_pd_c.read_csv(_p, usecols=lambda c: c in _want)
+                          .rename(columns={'SOURCE_ID': 'source_id'})
+                     for _p in _gfiles], ignore_index=True)
+                _gadd = (_gadd[_gadd.source_id.isin(_missing)]
+                         .dropna(subset=['ra', 'dec'])
+                         .sort_values('source_id')
+                         .drop_duplicates('source_id')
+                         .rename(columns={'source_id': 'Gaia_id',
+                                          'ref_epoch': 'Gaia_time'})
+                         .reindex(columns=gaia_catalog.columns))
+                gaia_catalog = _pd_c.concat([gaia_catalog, _gadd],
+                                            ignore_index=True)
+                print(f'  use_cfht: {len(_gadd)} CFHT-only Gaia stars '
+                      f're-admitted to the star catalog')
             # Faint HST+CFHT stars: append their HST detections to the
             # NORMAL HST images' stars_df (they are absent from matched_gaia)
             # so each faint star is constrained by both instruments' epochs.
