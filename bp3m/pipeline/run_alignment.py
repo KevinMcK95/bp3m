@@ -329,6 +329,14 @@ def run_alignment(  # noqa: C901
                     if 'corr' in _cc:
                         _f[_cc] = 0.0
                 _f['Gaia_time'] = _T_c(_mean_mjd, format='mjd').jyear
+                # G-mag proxy from CFHT r (Michalik plx prior needs a finite
+                # magnitude; NaN would zero the parallax precision and can
+                # leave H_vv exactly singular for detection-poor faint stars)
+                if 'cfht_rmag' in _cm.columns:
+                    _fm = _cm.groupby(_cm.star_id.astype(np.int64)) \
+                             .cfht_rmag.median()
+                    _f['gmag'] = _f.Gaia_id.map(_fm)
+                _f['gmag'] = _f['gmag'].fillna(20.0)
                 gaia_catalog = _pd_c.concat([gaia_catalog, _f],
                                             ignore_index=True)
             # per-star provenance tier (for plots + stellar_astrometry):

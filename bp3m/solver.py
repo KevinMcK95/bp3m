@@ -1530,7 +1530,21 @@ class BP3MSolver:
             H_rr[lo_cs:lo_cs+nr, hi_cs:hi_cs+nr] -= C_cp
 
         # ── Invert H_vv → C_vT ────────────────────────────────────────────────
-        C_vT    = np.linalg.inv(H_vv)
+        try:
+            C_vT = np.linalg.inv(H_vv)
+        except np.linalg.LinAlgError:
+            # Identify the offending stars so contract bugs (rank-deficient
+            # priors, NaN magnitudes, detection-less stars) are debuggable.
+            _diag = np.abs(np.linalg.det(H_vv))
+            _bad = np.where(~np.isfinite(_diag) | (_diag < 1e-30))[0]
+            _ids = self.gaia_cat['Gaia_id'].to_numpy() if 'Gaia_id' in self.gaia_cat.columns else None
+            print(f"H_vv singular for {len(_bad)} star(s); first 20:")
+            for _i in _bad[:20]:
+                print(f"  idx={_i} id={_ids[_i] if _ids is not None else '?'} "
+                      f"2p={bool(self.gaia_2p[_i])} 5p={bool(self.gaia_5p[_i])} "
+                      f"g={self.gaia_g[_i]:.2f} n_det={self.gaia_n_hst_used[_i]} "
+                      f"Hdiag={np.diag(H_vv[_i])}")
+            raise
         a_align = np.einsum('nij,nj->ni', C_vT, h_align)  # for Schur complement rhs
         a       = np.einsum('nij,nj->ni', C_vT, h_all)    # returned stellar posteriors
 

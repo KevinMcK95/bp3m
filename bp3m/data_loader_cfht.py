@@ -148,8 +148,6 @@ def build_cfht_images(field_dir, cfht_dir, matches: pd.DataFrame,
         rows = grp.drop_duplicates('cfht_src_index')
         sel = src.set_index('src_index').loc[
             rows.cfht_src_index.to_numpy()]
-        xi, eta = gnomonic(sel.ra.to_numpy(), sel.dec.to_numpy(),
-                           post['ra0'], post['dec0'])
         # ALSO include the detector's other Gaia-matched sources (they are
         # measurements of stars already in the solve, even without an HST
         # counterpart in this field -> tier gaia_cfht)
@@ -158,19 +156,31 @@ def build_cfht_images(field_dir, cfht_dir, matches: pd.DataFrame,
         star_ids = rows.star_id.to_numpy()
         if len(extra):
             e_sel = src.set_index('src_index').loc[extra.src_index.to_numpy()]
-            xi_e, eta_e = gnomonic(e_sel.ra.to_numpy(), e_sel.dec.to_numpy(),
-                                   post['ra0'], post['dec0'])
-            xi = np.concatenate([xi, xi_e])
-            eta = np.concatenate([eta, eta_e])
             sel = pd.concat([sel, e_sel])
             star_ids = np.concatenate([
                 star_ids, extra.gaia_source_id.astype(np.int64).to_numpy()])
             tier = np.concatenate([tier, ['gaia_cfht'] * len(extra)])
         if len(sel) < min_stars:
             continue
+        # Pseudo-pixels from the ALIGNED sky positions (ra_al/dec_al: bulk
+        # posterior alignment already applied, still at the CFHT epoch) at a
+        # tangent point local to THIS detector.  The bulk ra0_final is the
+        # exposure-level tangent, 7-35 arcmin away from any one detector;
+        # projecting there and handing the solver the exposure tangent forced
+        # degree-scale delta_ra0 walks that the (tight) rotation/scale priors
+        # fought — mass rejections.  With aligned coords at a local tangent
+        # the initial transform is IDENTITY and the inflated bulk sigmas act
+        # as priors on small corrections around it.
+        ra0_d = float(np.median(sel.ra_al.to_numpy()))
+        dec0_d = float(np.median(sel.dec_al.to_numpy()))
+        xi, eta = gnomonic(sel.ra_al.to_numpy(), sel.dec_al.to_numpy(),
+                           ra0_d, dec0_d)
+        # solver data side is plane_project: x along -RA, y along +Dec —
+        # g2g gnomonic xi is east-positive, so negate xi for the pseudo-pixel
+        # X (identity fcm + positive-parity rotation prior then hold exactly)
         stars_df = pd.DataFrame({
             'Gaia_id': star_ids,
-            'X': xi / CFHT_PSCALE_MAS, 'Y': eta / CFHT_PSCALE_MAS,
+            'X': -xi / CFHT_PSCALE_MAS, 'Y': eta / CFHT_PSCALE_MAS,
             'x_hst_err': SIGMA_CFHT_POS_MAS / CFHT_PSCALE_MAS,
             'y_hst_err': SIGMA_CFHT_POS_MAS / CFHT_PSCALE_MAS,
             'xy_hst_corr': 0.0,
@@ -182,28 +192,26 @@ def build_cfht_images(field_dir, cfht_dir, matches: pd.DataFrame,
         })
         # duplicate star in one detector (should not happen) — keep first
         stars_df = stars_df.drop_duplicates('Gaia_id', keep='first')
-        A, B, C, D = post['abcd']
         sA, sB, sC, sD = [max(sg, 1e-7) * cfht_prior_inflate
                           for sg in post['sigma_abcd']]
         sdx, sdy = [max(sg, 1.0) * cfht_prior_inflate
                     for sg in post['sigma_pointing_mas']]
-        # prior mean in bp3m's (rot, scale) parameterisation from the bulk M;
-        # prior widths mapped from the inflated per-parameter sigmas
-        rot_deg = float(np.degrees(np.arctan2(B - C, A + D)))
-        scale = float(np.sqrt(max(A * D - B * C, 1e-12)))
+        # bulk alignment is already applied to ra_al/dec_al, so the initial
+        # transform is identity; the inflated bulk sigmas set the prior widths
+        # on the residual correction the joint solve may apply.
         images[name] = dict(
             instrument='CFHT', detector='MEGACAM', filter='r',
             expnum=int(expnum), ext=int(ext),
             hst_time_mjd=post['mjd'],
-            ra0=post['ra0'], dec0=post['dec0'],
+            ra0=ra0_d, dec0=dec0_d,
             pixel_scale=CFHT_PSCALE_MAS,
             orig_pixel_scale=CFHT_PSCALE_MAS,
-            orig_rot_deg=rot_deg,
-            initial_scale_ratio=scale,
-            pixel_scale_ratio=scale,
-            rotation_deg=rot_deg,
-            on_skew=0.5 * (A - D), off_skew=0.5 * (B + C),
-            fcm_abcd=np.array([A, B, C, D, 0.0, 0.0]),
+            orig_rot_deg=0.0,
+            initial_scale_ratio=1.0,
+            pixel_scale_ratio=1.0,
+            rotation_deg=0.0,
+            on_skew=0.0, off_skew=0.0,
+            fcm_abcd=np.array([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
             # solver prior hooks (_make_image_prior meta overrides)
             sigma_rot_deg=float(np.degrees(np.hypot(sB, sC))),
             sigma_scale=float(np.hypot(sA, sD)),
