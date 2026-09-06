@@ -393,6 +393,60 @@ def run_alignment(  # noqa: C901
                      if 'cfht_rmag' in _cm2.columns else None)
             if _cmag is not None:
                 gaia_catalog['cfht_rmag'] = gaia_catalog.Gaia_id.map(_cmag)
+            # per-star HST magnitude in the dominant HST filter_camera for the
+            # tier-figure HST vs HST-CFHT deep CMD, on the VALIDATOR's
+            # cross-image-normalised STMAG scale: mag_norm_wmean from
+            # cross_match_catalog.csv where available (Gaia-matched stars),
+            # else hst_mag_st_gdc + that image's cross_image_zp
+            # (source_quality.csv) medianed per star (faint stars).
+            if 'hst_mag_st_gdc' in _cm2.columns:
+                _fcmap = {}
+                for _n in _cm2.hst_image.unique():
+                    _mt = imgs.get(_n) or imgs.get(_n + '_hi') \
+                          or imgs.get(_n + '_lo')
+                    if _mt and str(_mt.get('filter', '')).startswith('F'):
+                        _fcmap[_n] = (f"{_mt['filter']}/{_mt['instrument']}"
+                                      f"/{_mt['detector']}")
+                _fc = _cm2.hst_image.map(_fcmap)
+                if _fc.notna().any():
+                    _dom_fc = _fc.value_counts().idxmax()
+                    _zps = {}
+                    for _n in [k for k, v in _fcmap.items() if v == _dom_fc]:
+                        _sqp = (_hst_root / _n / 'source_quality.csv')
+                        if _sqp.exists():
+                            try:
+                                _zps[_n] = float(_pd_c.read_csv(
+                                    _sqp, usecols=['cross_image_zp'],
+                                    nrows=1).cross_image_zp.iloc[0])
+                            except Exception:
+                                pass
+                    _sub = _cm2[_cm2.hst_image.isin(_zps)
+                                & _cm2.hst_mag_st_gdc.notna()].copy()
+                    if len(_sub):
+                        _sub['mag_norm'] = (_sub.hst_mag_st_gdc
+                                            + _sub.hst_image.map(_zps))
+                        _hm = _sub.groupby('star_id').mag_norm.median()
+                        gaia_catalog['hst_cfht_mag'] = \
+                            gaia_catalog.Gaia_id.map(_hm)
+                        _ccat = data_root / field_name / \
+                            'cross_match_catalog.csv'
+                        if _ccat.exists():
+                            _cc = _pd_c.read_csv(
+                                _ccat, usecols=['gaia_source_id',
+                                                'filter_camera',
+                                                'mag_norm_wmean'])
+                            _cc = _cc[(_cc.filter_camera == _dom_fc)
+                                      & _cc.mag_norm_wmean.notna()]
+                            _wm = _cc.drop_duplicates('gaia_source_id') \
+                                     .set_index(_cc.drop_duplicates(
+                                         'gaia_source_id')
+                                         .gaia_source_id.astype(np.int64)) \
+                                     .mag_norm_wmean
+                            gaia_catalog['hst_cfht_mag'] = \
+                                gaia_catalog.Gaia_id.map(_wm).fillna(
+                                    gaia_catalog['hst_cfht_mag'])
+                        gaia_catalog['hst_cfht_filter'] = \
+                            _dom_fc.split('/')[0]
             image_names = sorted(filtered_spi.keys())
             star_id_to_idx, image_names, star_in_image = build_index_maps(
                 filtered_spi, gaia_catalog)

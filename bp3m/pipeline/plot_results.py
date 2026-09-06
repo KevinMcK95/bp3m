@@ -387,6 +387,16 @@ def make_plots(solver, images, gaia_catalog,
     _gaia5p_delve_nq = _gaia_not_qso & has_delve_pm               # 5p Gaia+DELVE
     _gaia_only_nq    = _gaia_not_qso & ~has_delve_pm              # 5p Gaia only
 
+    # --use_cfht runs: negative Gaia_ids are faint HST+CFHT stars, not DELVE
+    # rows, and the interesting provenance split is the cfht_tier column
+    # (gaia_hst / gaia_cfht_hst / gaia_cfht / cfht_hst).  The PM 1:1,
+    # uncertainty and improvement panels below all switch to tier groups.
+    _cfht_mode = 'cfht_tier' in _gc.columns
+    if _cfht_mode:
+        _tier_pm = _gc['cfht_tier'].astype(str).to_numpy()
+        _TIER_C = {'gaia_hst': 'tab:blue', 'gaia_cfht_hst': 'tab:green',
+                   'gaia_cfht': 'tab:purple', 'cfht_hst': 'tab:orange'}
+
     for ax, gaia_pm, bp3m_pm_g, sig_g, sig_b_g, d_pm, d_sig, comp in zip(
             [ax_pmra, ax_pmdec],
             [pmra_gaia,   pmdec_gaia],
@@ -396,32 +406,46 @@ def make_plots(solver, images, gaia_catalog,
             [_d_pmra_val,   _d_pmdec_val],
             [_d_pmra_err,   _d_pmdec_err],
             [r"$\mu_{\alpha*}$",    r"$\mu_\delta$"]):
-        # DELVE-only stars (background, zorder=2)
-        _do_pm = _delve_only & np.isfinite(d_pm) & np.isfinite(d_sig) & (d_sig > 0)
-        if _do_pm.any():
-            ax.errorbar(d_pm[_do_pm], bp3m_pm_g[_do_pm],
-                        xerr=d_sig[_do_pm], yerr=sig_b_g[_do_pm],
-                        fmt='^', ms=4, lw=0.5, alpha=0.6, color='darkorange',
-                        label='DELVE only', zorder=2)
-        # Gaia+DELVE stars (middle, zorder=3)
-        if _gaia_delve_nq.any():
-            ax.errorbar(gaia_pm[_gaia_delve_nq], bp3m_pm_g[_gaia_delve_nq],
-                        xerr=sig_g[_gaia_delve_nq], yerr=sig_b_g[_gaia_delve_nq],
-                        fmt='o', ms=3, lw=0.5, alpha=0.6, color='steelblue',
-                        label='Gaia+DELVE', zorder=3)
-            # Overlay DELVE PM as diamond markers with DELVE error bars
-            _dm = _gaia_delve_nq & np.isfinite(d_pm)
-            if _dm.any():
-                ax.errorbar(d_pm[_dm], bp3m_pm_g[_dm],
-                            xerr=d_sig[_dm], yerr=sig_b_g[_dm],
-                            fmt='D', ms=4, lw=0.5, alpha=0.5, color='dodgerblue',
-                            label='DELVE PM (for Gaia+DELVE)', zorder=3)
-        # Gaia-only stars (foreground, zorder=4)
-        if _gaia_only_nq.any():
-            ax.errorbar(gaia_pm[_gaia_only_nq], bp3m_pm_g[_gaia_only_nq],
-                        xerr=sig_g[_gaia_only_nq], yerr=sig_b_g[_gaia_only_nq],
-                        fmt='o', ms=3, lw=0.5, alpha=0.5, color='grey',
-                        label='Gaia only', zorder=4)
+        if _cfht_mode:
+            # provenance-tier groups (Gaia-PM stars only; the faint cfht_hst
+            # tier has no prior PM, so it has no place on a 1:1 panel)
+            for _zt, _t in enumerate(('gaia_cfht', 'gaia_cfht_hst',
+                                      'gaia_hst')):
+                _tm = (_tier_pm == _t) & _gaia_not_qso
+                if _tm.any():
+                    ax.errorbar(gaia_pm[_tm], bp3m_pm_g[_tm],
+                                xerr=sig_g[_tm], yerr=sig_b_g[_tm],
+                                fmt='o', ms=3, lw=0.5, alpha=0.5,
+                                color=_TIER_C[_t],
+                                label=f'{_t} ({int(_tm.sum())})',
+                                zorder=2 + _zt)
+        else:
+            # DELVE-only stars (background, zorder=2)
+            _do_pm = _delve_only & np.isfinite(d_pm) & np.isfinite(d_sig) & (d_sig > 0)
+            if _do_pm.any():
+                ax.errorbar(d_pm[_do_pm], bp3m_pm_g[_do_pm],
+                            xerr=d_sig[_do_pm], yerr=sig_b_g[_do_pm],
+                            fmt='^', ms=4, lw=0.5, alpha=0.6, color='darkorange',
+                            label='DELVE only', zorder=2)
+            # Gaia+DELVE stars (middle, zorder=3)
+            if _gaia_delve_nq.any():
+                ax.errorbar(gaia_pm[_gaia_delve_nq], bp3m_pm_g[_gaia_delve_nq],
+                            xerr=sig_g[_gaia_delve_nq], yerr=sig_b_g[_gaia_delve_nq],
+                            fmt='o', ms=3, lw=0.5, alpha=0.6, color='steelblue',
+                            label='Gaia+DELVE', zorder=3)
+                # Overlay DELVE PM as diamond markers with DELVE error bars
+                _dm = _gaia_delve_nq & np.isfinite(d_pm)
+                if _dm.any():
+                    ax.errorbar(d_pm[_dm], bp3m_pm_g[_dm],
+                                xerr=d_sig[_dm], yerr=sig_b_g[_dm],
+                                fmt='D', ms=4, lw=0.5, alpha=0.5, color='dodgerblue',
+                                label='DELVE PM (for Gaia+DELVE)', zorder=3)
+            # Gaia-only stars (foreground, zorder=4)
+            if _gaia_only_nq.any():
+                ax.errorbar(gaia_pm[_gaia_only_nq], bp3m_pm_g[_gaia_only_nq],
+                            xerr=sig_g[_gaia_only_nq], yerr=sig_b_g[_gaia_only_nq],
+                            fmt='o', ms=3, lw=0.5, alpha=0.5, color='grey',
+                            label='Gaia only', zorder=4)
 
         # Axis limits from Gaia-prior stars only (DELVE-only can blow up the axes)
         gaia_x = np.concatenate([
@@ -453,28 +477,44 @@ def make_plots(solver, images, gaia_catalog,
         np.isfinite(_d_pmra_err) & (_d_pmra_err > 0) &
         np.isfinite(_d_pmdec_err) & (_d_pmdec_err > 0),
         np.sqrt(_d_pmra_err * _d_pmdec_err), np.nan)
-    _has_delve_unc = np.isfinite(_d_sig_pm) & _not_qso
-    if _has_delve_unc.any():
-        ax_unc.scatter(gmag[_has_delve_unc], _d_sig_pm[_has_delve_unc],
-                       s=6, alpha=0.6, color='dodgerblue', marker='D',
-                       label='DELVE prior', zorder=2)
-    if (_bp3m_gaia_conv_nq & ~has_delve_pm).any():
-        ax_unc.scatter(gmag[_bp3m_gaia_conv_nq & ~has_delve_pm],
-                       sig_pm_bp3m[_bp3m_gaia_conv_nq & ~has_delve_pm],
-                       s=6, alpha=0.85, color='mediumseagreen', label='BP3M Gaia only', zorder=3)
-    if (_bp3m_gaia_conv_nq & has_delve_pm).any():
-        ax_unc.scatter(gmag[_bp3m_gaia_conv_nq & has_delve_pm],
-                       sig_pm_bp3m[_bp3m_gaia_conv_nq & has_delve_pm],
-                       s=6, alpha=0.7, color='steelblue', label='BP3M Gaia+DELVE', zorder=3)
-    _bp3m_gaia2p_conv = bp3m_converged & (_gaia_ids > 0) & ~has_gaia
-    if _bp3m_gaia2p_conv.any():
-        ax_unc.scatter(gmag[_bp3m_gaia2p_conv], sig_pm_bp3m[_bp3m_gaia2p_conv],
-                       s=8, alpha=0.8, color='mediumpurple', marker='s',
-                       label='BP3M Gaia 2p', zorder=4)
-    if _bp3m_hst_conv.any():
-        ax_unc.scatter(gmag[_bp3m_hst_conv], sig_pm_bp3m[_bp3m_hst_conv],
-                       s=10, alpha=0.8, color='darkorange', marker='^',
-                       label='BP3M DELVE only', zorder=4)
+    if _cfht_mode:
+        for _zt, _t in enumerate(('gaia_cfht', 'gaia_cfht_hst', 'gaia_hst')):
+            _tm = bp3m_converged & (_tier_pm == _t) & _not_qso
+            if _tm.any():
+                ax_unc.scatter(gmag[_tm], sig_pm_bp3m[_tm], s=6, alpha=0.7,
+                               color=_TIER_C[_t],
+                               label=f'BP3M {_t} ({int(_tm.sum())})',
+                               zorder=3 + _zt)
+        _tm = bp3m_converged & (_tier_pm == 'cfht_hst')
+        if _tm.any():
+            # faint HST+CFHT stars: G is the CFHT-r proxy magnitude
+            ax_unc.scatter(gmag[_tm], sig_pm_bp3m[_tm], s=10, alpha=0.8,
+                           color=_TIER_C['cfht_hst'], marker='^',
+                           label=f'BP3M cfht_hst, faint ({int(_tm.sum())}; '
+                                 f'G = CFHT r proxy)', zorder=6)
+    else:
+        _has_delve_unc = np.isfinite(_d_sig_pm) & _not_qso
+        if _has_delve_unc.any():
+            ax_unc.scatter(gmag[_has_delve_unc], _d_sig_pm[_has_delve_unc],
+                           s=6, alpha=0.6, color='dodgerblue', marker='D',
+                           label='DELVE prior', zorder=2)
+        if (_bp3m_gaia_conv_nq & ~has_delve_pm).any():
+            ax_unc.scatter(gmag[_bp3m_gaia_conv_nq & ~has_delve_pm],
+                           sig_pm_bp3m[_bp3m_gaia_conv_nq & ~has_delve_pm],
+                           s=6, alpha=0.85, color='mediumseagreen', label='BP3M Gaia only', zorder=3)
+        if (_bp3m_gaia_conv_nq & has_delve_pm).any():
+            ax_unc.scatter(gmag[_bp3m_gaia_conv_nq & has_delve_pm],
+                           sig_pm_bp3m[_bp3m_gaia_conv_nq & has_delve_pm],
+                           s=6, alpha=0.7, color='steelblue', label='BP3M Gaia+DELVE', zorder=3)
+        _bp3m_gaia2p_conv = bp3m_converged & (_gaia_ids > 0) & ~has_gaia
+        if _bp3m_gaia2p_conv.any():
+            ax_unc.scatter(gmag[_bp3m_gaia2p_conv], sig_pm_bp3m[_bp3m_gaia2p_conv],
+                           s=8, alpha=0.8, color='mediumpurple', marker='s',
+                           label='BP3M Gaia 2p', zorder=4)
+        if _bp3m_hst_conv.any():
+            ax_unc.scatter(gmag[_bp3m_hst_conv], sig_pm_bp3m[_bp3m_hst_conv],
+                           s=10, alpha=0.8, color='darkorange', marker='^',
+                           label='BP3M DELVE only', zorder=4)
     ax_unc.set_xlabel("G [mag]")
     ax_unc.set_ylabel(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
     ax_unc.set_title(r"Geometric-mean PM uncertainty $(\det\,C_{\mu})^{1/4}$ vs magnitude")
@@ -483,24 +523,39 @@ def make_plots(solver, images, gaia_catalog,
     xlim = ax_unc.get_xlim()
     _style_ax(ax_unc)
 
-    ax_unc_improve.scatter(gmag[_gaia_only_nq], sig_pm_gaia[_gaia_only_nq]/sig_pm_bp3m[_gaia_only_nq],
-                   s=6, alpha=0.6, color='grey', label='Gaia only', zorder=2)
-    # 5p Gaia+DELVE improvement vs Gaia 5p prior (2p prior ~100 mas/yr would dominate axis)
-    if _gaia5p_delve_nq.any():
-        ax_unc_improve.scatter(gmag[_gaia5p_delve_nq],
-                               sig_pm_gaia[_gaia5p_delve_nq]/sig_pm_bp3m[_gaia5p_delve_nq],
-                               s=6, alpha=0.6, color='steelblue', label='Gaia+DELVE', zorder=3)
-    # DELVE-anchored: true DELVE-only + Gaia 2p+DELVE — improvement vs DELVE prior sigma
-    _gaia2p_delve = _has_real_gaia & ~has_gaia & has_delve_pm  # 2p Gaia + DELVE
-    _do_conv = (_delve_only | _gaia2p_delve) & bp3m_converged & np.isfinite(_d_sig_pm) & (_d_sig_pm > 0)
-    if _do_conv.any():
-        _delve_improve = _d_sig_pm[_do_conv] / sig_pm_bp3m[_do_conv]
-        ax_unc_improve.scatter(gmag[_do_conv], _delve_improve,
-                               s=10, alpha=0.7, color='darkorange', marker='^',
-                               label='DELVE-anchored', zorder=4)
+    if _cfht_mode:
+        # improvement vs the Gaia 5p prior, split by provenance tier
+        # (2p/faint diffuse priors ~100 mas/yr would dominate the axis)
+        for _zt, _t in enumerate(('gaia_cfht', 'gaia_cfht_hst', 'gaia_hst')):
+            _tm = (_tier_pm == _t) & _gaia_not_qso
+            if _tm.any():
+                ax_unc_improve.scatter(gmag[_tm],
+                                       sig_pm_gaia[_tm]/sig_pm_bp3m[_tm],
+                                       s=6, alpha=0.6, color=_TIER_C[_t],
+                                       label=f'{_t} ({int(_tm.sum())})',
+                                       zorder=2 + _zt)
+    else:
+        ax_unc_improve.scatter(gmag[_gaia_only_nq], sig_pm_gaia[_gaia_only_nq]/sig_pm_bp3m[_gaia_only_nq],
+                       s=6, alpha=0.6, color='grey', label='Gaia only', zorder=2)
+        # 5p Gaia+DELVE improvement vs Gaia 5p prior (2p prior ~100 mas/yr would dominate axis)
+        if _gaia5p_delve_nq.any():
+            ax_unc_improve.scatter(gmag[_gaia5p_delve_nq],
+                                   sig_pm_gaia[_gaia5p_delve_nq]/sig_pm_bp3m[_gaia5p_delve_nq],
+                                   s=6, alpha=0.6, color='steelblue', label='Gaia+DELVE', zorder=3)
+        # DELVE-anchored: true DELVE-only + Gaia 2p+DELVE — improvement vs DELVE prior sigma
+        _gaia2p_delve = _has_real_gaia & ~has_gaia & has_delve_pm  # 2p Gaia + DELVE
+        _do_conv = (_delve_only | _gaia2p_delve) & bp3m_converged & np.isfinite(_d_sig_pm) & (_d_sig_pm > 0)
+        if _do_conv.any():
+            _delve_improve = _d_sig_pm[_do_conv] / sig_pm_bp3m[_do_conv]
+            ax_unc_improve.scatter(gmag[_do_conv], _delve_improve,
+                                   s=10, alpha=0.7, color='darkorange', marker='^',
+                                   label='DELVE-anchored', zorder=4)
     ax_unc_improve.set_xlabel("G [mag]")
     ax_unc_improve.set_ylabel(r"PM Improvement Factor")
-    ax_unc_improve.set_title(r"PM uncertainty Improvement vs magnitude compared to prior (Gaia or DELVE)")
+    ax_unc_improve.set_title(
+        "PM uncertainty Improvement vs magnitude compared to the Gaia prior"
+        if _cfht_mode else
+        "PM uncertainty Improvement vs magnitude compared to prior (Gaia or DELVE)")
     ax_unc_improve.set_xlim(xlim)
     ax_unc_improve.axhline(1.0,c='k',lw=2,ls='--',zorder=-1e10)
     ax_unc_improve.legend(fontsize=7)
@@ -1005,6 +1060,22 @@ def make_plots(solver, images, gaia_catalog,
             _cmag_arr = (pd.to_numeric(_gc['cfht_rmag'], errors='coerce')
                          .to_numpy(float) if 'cfht_rmag' in _gc.columns
                          else np.full(len(_gc), np.nan))
+            # HST vs HST-CFHT deep CMD: blue-minus-red colour ordering set by
+            # the dominant HST filter's wavelength vs CFHT r (~640 nm)
+            _hmag_arr = (pd.to_numeric(_gc['hst_cfht_mag'], errors='coerce')
+                         .to_numpy(float) if 'hst_cfht_mag' in _gc.columns
+                         else np.full(len(_gc), np.nan))
+            _hfilt = (str(_gc['hst_cfht_filter'].dropna().iloc[0])
+                      if 'hst_cfht_filter' in _gc.columns
+                      and _gc['hst_cfht_filter'].notna().any() else 'F606W')
+            import re as _re_t
+            _lam_h = float((_re_t.findall(r'F(\d+)', _hfilt) or ['606'])[0])
+            if _lam_h < 640.0:
+                _col_arr = _hmag_arr - _cmag_arr
+                _col_lbl = f'HST {_hfilt} − r_CFHT (mag)'
+            else:
+                _col_arr = _cmag_arr - _hmag_arr
+                _col_lbl = f'r_CFHT − HST {_hfilt} (mag)'
             figt, axt = plt.subplots(2, 2, figsize=(13, 11))
             for _t, _c in _t_colors.items():
                 _m = (_tiers_arr == _t) & bp3m_converged
@@ -1018,12 +1089,11 @@ def make_plots(solver, images, gaia_catalog,
                 _g_ok = _m & np.isfinite(gmag) & np.isfinite(bp_rp)
                 axt[1, 0].scatter(bp_rp[_g_ok], gmag[_g_ok], s=6, c=_c,
                                   alpha=0.6, label=_lbl)
-                _c_ok = _m & np.isfinite(_cmag_arr)
-                axt[1, 1].scatter((_cmag_arr - gmag)[_c_ok]
-                                  if np.isfinite(gmag[_c_ok]).any()
-                                  else np.zeros(_c_ok.sum()),
-                                  _cmag_arr[_c_ok], s=6, c=_c, alpha=0.6,
-                                  label=_lbl)
+                _c_ok = _m & np.isfinite(_col_arr) & np.isfinite(_hmag_arr)
+                if _c_ok.any():
+                    axt[1, 1].scatter(_col_arr[_c_ok], _hmag_arr[_c_ok],
+                                      s=6, c=_c, alpha=0.6,
+                                      label=f'{_t} ({int(_c_ok.sum())})')
             axt[0, 0].set_xlabel('RA (deg)'); axt[0, 0].set_ylabel('Dec (deg)')
             axt[0, 0].set_title('Sky — provenance tiers')
             axt[0, 1].set_xlabel('PMRA (mas/yr)')
@@ -1034,9 +1104,9 @@ def make_plots(solver, images, gaia_catalog,
             axt[1, 0].set_ylabel('G (Gaia)')
             axt[1, 0].set_title('Gaia CMD')
             axt[1, 1].invert_yaxis()
-            axt[1, 1].set_xlabel('CFHT r − Gaia G (mag)')
-            axt[1, 1].set_ylabel('CFHT r (mag)')
-            axt[1, 1].set_title('CFHT CMD (full match depth)')
+            axt[1, 1].set_xlabel(_col_lbl)
+            axt[1, 1].set_ylabel(f'HST {_hfilt} (mag)')
+            axt[1, 1].set_title('HST x CFHT CMD (full match depth)')
             for _ax in axt.ravel():
                 _ax.legend(fontsize=7)
             figt.suptitle('HST x CFHT provenance tiers')
