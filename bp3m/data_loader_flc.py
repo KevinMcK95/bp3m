@@ -1182,7 +1182,10 @@ def load_image_data_flc(data_root, field_name: str,
               f"{n_delve_only_added} per-image detections added")
 
     # ── Write image summary CSV ───────────────────────────────────────────────
-    if summary_rows:
+    # Full loads only: a restricted load (per-image indv fits, resume passes)
+    # would clobber the field-level summary with a partial one — last writer
+    # wins, and downstream completeness checks then under-count the field.
+    if summary_rows and restrict_images is None:
         summary_df  = pd.DataFrame(summary_rows)
         summary_path = hst_root.parent.parent / "image_transformation_summaries.csv"
         summary_df.to_csv(summary_path, index=False)
