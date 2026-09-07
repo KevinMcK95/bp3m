@@ -1844,6 +1844,20 @@ def run_photometry(
         spline_filter(p, order=3, output=np.float64) for p in psf_cube
     ])
 
+    # ── Exact shared PSF-tile blender (JAX batch path) ────────────────────────
+    # Pre-cropped coefficient tile cube + per-star 16-weight contraction:
+    # bit-equivalent to per-star spatial interpolation at ~1/10 the flops and
+    # none of the per-star tile RAM.  PYPASS_TILE_CELL=-1 falls back to the
+    # legacy per-star interpolation path (A/B and debugging only).
+    import os as _os
+    from .tile_provider import ExactTileBlender
+    if float(_os.environ.get('PYPASS_TILE_CELL', 0)) < 0:
+        _tile_provider = None
+    else:
+        _tile_provider = ExactTileBlender(
+            psf_cube, psf_coeffs_cube, xs, ys, psf_scale, half_width,
+            x_offset=x_offset, y_offset=y_offset)
+
     # PSF peak value and 3×3 core patch (central PSF model, dx=dy=0).
     # Used in find_sources for the fmin pre-filter: the 3×3 patch enables a
     # noise-weighted matched-filter flux estimate over the core rather than a
@@ -1977,6 +1991,7 @@ def run_photometry(
                     sigma_clip_iter=sigma_clip_iter,
                     psf_cache=_psf_cache,
                     n_jobs=n_jobs,
+                    tile_provider=_tile_provider,
                 )
             else:
                 refit_stars(
@@ -2066,6 +2081,7 @@ def run_photometry(
                     x_offset=x_offset, y_offset=y_offset,
                     psf_coeffs_cube=psf_coeffs_cube,
                     n_jobs=n_jobs,
+                    tile_provider=_tile_provider,
                 )
                 _jax_res = fit_batch_jax(
                     _jax_inputs, gain=gain, tol=tol, max_iter=max_iter_fit,

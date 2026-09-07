@@ -333,6 +333,7 @@ def prepare_jax_inputs(
     psf_coeffs_cube: np.ndarray | None = None,
     restore_fluxes: np.ndarray | None = None,
     n_jobs: int = 1,
+    tile_provider=None,
 ) -> dict:
     """Batch all stars into fixed-shape NumPy arrays for the JAX kernel.
 
@@ -396,6 +397,59 @@ def prepare_jax_inputs(
     n_pix   = (2 * hw + 1) ** 2
     ts      = tile_side(hw, psf_scale)
     tr      = tile_radius(hw, psf_scale)
+
+    # ── Fast path: exact shared-cube tiles from an ExactTileBlender ──────────
+    # Per-star tiles become 16 contraction weights + indices over a
+    # pre-cropped (n_psf, ts, ts) coefficient cube — no per-star spatial
+    # interpolation, no per-star tile storage (LazyTiles materializes one
+    # fit_batch_jax chunk at a time).  Bit-equivalent to the legacy path.
+    if tile_provider is not None:
+        from .tile_provider import LazyTiles
+        W_t, K_t = tile_provider.weights(xs_stars, ys_stars)
+        lazy     = LazyTiles(tile_provider, W_t, K_t)
+        peaks    = tile_provider.peaks(W_t, K_t).astype(np.float32)
+
+        pixel_vals_out = np.empty((n_stars, n_pix), dtype=np.float64)
+        pixel_var_out  = np.empty((n_stars, n_pix), dtype=np.float64)
+        valid_out      = np.empty((n_stars, n_pix), dtype=bool)
+        dx0_out  = np.empty(n_stars, dtype=np.float64)
+        dy0_out  = np.empty(n_stars, dtype=np.float64)
+        flux0_out = np.empty(n_stars, dtype=np.float64)
+        sky0_out  = np.empty(n_stars, dtype=np.float64)
+        xi_out = np.empty(n_stars, dtype=np.int32)
+        yi_out = np.empty(n_stars, dtype=np.int32)
+
+        for i in range(n_stars):
+            x0 = float(xs_stars[i]); y0 = float(ys_stars[i])
+            sky = float(sky_estimates[i])
+            coeff_tile = lazy[i]
+            pv, pvar, valid, dx0, dy0, xi, yi = extract_pixel_window(
+                data, x0, y0, hw, mask, noise_map, gain, read_noise, sky)
+            rf = restore_fluxes[i] if restore_fluxes is not None else 0.0
+            if rf != 0.0:
+                P_r, _, _ = eval_psf_on_tile(coeff_tile, dx0, dy0, hw, psf_scale)
+                pv = pv.copy()
+                pv[valid] += rf * P_r[valid]
+            flux, sky_fit = flux_sky_init(coeff_tile, pv, valid, dx0, dy0,
+                                          hw, psf_scale, sky)
+            pixel_vals_out[i] = pv; pixel_var_out[i] = pvar
+            valid_out[i] = valid
+            dx0_out[i] = dx0; dy0_out[i] = dy0
+            flux0_out[i] = flux; sky0_out[i] = sky_fit
+            xi_out[i] = xi; yi_out[i] = yi
+
+        return dict(
+            psf_peak        = peaks,
+            psf_coeff_tiles = lazy,
+            pixel_vals      = pixel_vals_out,
+            pixel_var_rn    = pixel_var_out,
+            valid_masks     = valid_out,
+            dx0 = dx0_out, dy0 = dy0_out,
+            flux0 = flux0_out, sky0 = sky0_out,
+            xi = xi_out, yi = yi_out,
+            hw = hw, psf_scale = psf_scale, tile_radius = tr,
+            has_noise_map = noise_map is not None,
+        )
 
     psf_peak_out        = np.empty(n_stars,              dtype=np.float32)
     psf_coeff_tiles_out = np.empty((n_stars, ts, ts),   dtype=np.float64)

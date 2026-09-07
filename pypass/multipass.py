@@ -38,16 +38,26 @@ def _should_subtract(rec):
 
 def _psf_window(rec, cube, xs, ys, psf_scale, hw, ny, nx,
                 x_offset, y_offset, prefiltered, psf_cache=None,
-                hw_override=None):
-    """Return (P, y_lo, y_hi, x_lo, x_hi) for the PSF footprint of *rec*."""
+                hw_override=None, tile_provider=None):
+    """Return (P, y_lo, y_hi, x_lo, x_hi) for the PSF footprint of *rec*.
+
+    With *tile_provider*, the blended coefficient array comes from the
+    per-image quantized cell cache (one interpolation per cell) instead of a
+    fresh spatial interpolation per record.
+    """
     xi = int(round(rec.x)); yi = int(round(rec.y))
     _hw = hw_override if hw_override is not None else hw
     y_lo, y_hi, x_lo, x_hi, diy, dix = _window_offsets(xi, yi, _hw, ny, nx)
     dx = rec.x - xi; dy = rec.y - yi
-    local_psf = interpolate_psf(cube, xs, ys, rec.x + x_offset, rec.y + y_offset,
-                                _cache=psf_cache)
-    coeffs = local_psf if prefiltered else \
-             spline_filter(local_psf, order=3, output=np.float64)
+    if tile_provider is not None:
+        coeffs = tile_provider.full_coeffs(
+            tile_provider.index_one(rec.x, rec.y))
+    else:
+        local_psf = interpolate_psf(cube, xs, ys,
+                                    rec.x + x_offset, rec.y + y_offset,
+                                    _cache=psf_cache)
+        coeffs = local_psf if prefiltered else \
+                 spline_filter(local_psf, order=3, output=np.float64)
     P, _, _ = _eval_psf_grad_fast(coeffs, dx, dy, dix, diy, psf_scale)
     return P, y_lo, y_hi, x_lo, x_hi
 
@@ -110,7 +120,8 @@ def deduplicate_records(new_records, hmin, existing_records=None):
 
 def build_variance_image(records, psf_cube, xs, ys, psf_scale, shape,
                          gain, read_noise, x_offset=0.0, y_offset=0.0,
-                         noise_map=None, psf_coeffs_cube=None, psf_cache=None):
+                         noise_map=None, psf_coeffs_cube=None, psf_cache=None,
+                         tile_provider=None):
     """Build a pixel-wise variance image accumulating Poisson noise from all star models.
 
     var[y,x] = base_var[y,x] + Σ_i max(flux_i · P_i[y,x], 0) / gain
@@ -154,7 +165,7 @@ def build_variance_image(records, psf_cube, xs, ys, psf_scale, shape,
         P, y_lo, y_hi, x_lo, x_hi = _psf_window(
             rec, _cube, xs, ys, psf_scale, hw=0, ny=ny, nx=nx,
             x_offset=x_offset, y_offset=y_offset, prefiltered=prefiltered,
-            psf_cache=psf_cache, hw_override=shw)
+            psf_cache=psf_cache, hw_override=shw, tile_provider=tile_provider)
         if y_lo >= y_hi or x_lo >= x_hi:
             continue
         var_image[y_lo:y_hi, x_lo:x_hi] += np.maximum(rec.flux * P, 0.0) / gain
@@ -164,7 +175,7 @@ def build_variance_image(records, psf_cube, xs, ys, psf_scale, shape,
 
 def subtract_stars(residual, records, psf_cube, xs, ys, psf_scale, hw,
                    x_offset=0.0, y_offset=0.0,
-                   psf_coeffs_cube=None, psf_cache=None):
+                   psf_coeffs_cube=None, psf_cache=None, tile_provider=None):
     """Subtract PSF models of well-fit stars from *residual* in-place.
 
     Stars not passing _should_subtract (qfit≥2, chi2≥5, or not converged) are
@@ -183,13 +194,13 @@ def subtract_stars(residual, records, psf_cube, xs, ys, psf_scale, hw,
         P, y_lo, y_hi, x_lo, x_hi = _psf_window(
             rec, _cube, xs, ys, psf_scale, hw, ny, nx,
             x_offset, y_offset, prefiltered=prefiltered, psf_cache=psf_cache,
-            hw_override=shw)
+            hw_override=shw, tile_provider=tile_provider)
         residual[y_lo:y_hi, x_lo:x_hi] -= rec.flux * P
 
 
 def restore_stars(residual, records, psf_cube, xs, ys, psf_scale, hw,
                   x_offset=0.0, y_offset=0.0,
-                  psf_coeffs_cube=None, psf_cache=None):
+                  psf_coeffs_cube=None, psf_cache=None, tile_provider=None):
     """Add PSF models back to *residual* in-place (inverse of subtract_stars).
 
     Used after deduplication on a refit pass: removed duplicate records were
@@ -207,7 +218,7 @@ def restore_stars(residual, records, psf_cube, xs, ys, psf_scale, hw,
         P, y_lo, y_hi, x_lo, x_hi = _psf_window(
             rec, _cube, xs, ys, psf_scale, hw, ny, nx,
             x_offset, y_offset, prefiltered=prefiltered, psf_cache=psf_cache,
-            hw_override=shw)
+            hw_override=shw, tile_provider=tile_provider)
         residual[y_lo:y_hi, x_lo:x_hi] += rec.flux * P
 
 
@@ -314,7 +325,7 @@ def refit_stars_jax(residual, records, psf_cube, xs, ys, psf_scale, hw,
                     zero_point, max_iter, tol, psf_coeffs_cube=None,
                     sat_threshold=float('inf'), verbose=False,
                     sigma_clip=True, sigma_clip_sigma=4.0, sigma_clip_iter=2,
-                    psf_cache=None, n_jobs=1):
+                    psf_cache=None, n_jobs=1, tile_provider=None):
     """Re-fit all stars via leave-one-out batch fitting using JAX.
 
     Jacobi (parallel) equivalent of ``refit_stars``: each star's pixel window
@@ -354,6 +365,7 @@ def refit_stars_jax(residual, records, psf_cube, xs, ys, psf_scale, hw,
         psf_coeffs_cube=psf_coeffs_cube,
         restore_fluxes=restore_fluxes,
         n_jobs=n_jobs,
+        tile_provider=tile_provider,
     )
     jax_res = fit_batch_jax(inputs, gain=gain, tol=tol, max_iter=max_iter)
 
