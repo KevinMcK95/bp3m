@@ -776,9 +776,8 @@ def remeasure_psf_perturbation(
                 print(f"  [{img_i}/{n_images}] {field_name}  [{img_name}] PSF: BARE stdpsf (no stored δP found)")
                 psf_cube = stdpsf_cube
 
-            psf_coeffs_cube = np.array([
-                _spline_filter(p, order=3, output=np.float64) for p in psf_cube
-            ])
+            from pypass.hst1pass_scheme import prefilter_cube as _pfc
+            psf_coeffs_cube = _pfc(psf_cube)
 
             chips = get_chip_config_from_fits(str(img), instrume, detector)
 
@@ -1428,9 +1427,8 @@ def _fit_one_image(args):
                     psf_cube = psf_cube + psf_delta[np.newaxis, :, :]
 
             # Pre-compute spline-filter coefficients for subtract_stars.
-            psf_coeffs_cube = np.array([
-                _spline_filter_pert(p, order=3, output=np.float64) for p in psf_cube
-            ])
+            from pypass.hst1pass_scheme import prefilter_cube as _pfc
+            psf_coeffs_cube = _pfc(psf_cube)
 
             # Load on-disk catalog: non-converged stars already removed.
             _disk_table = _Table.read(str(out_catalog))

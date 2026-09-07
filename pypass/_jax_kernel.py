@@ -447,7 +447,8 @@ def prepare_jax_inputs(
             dx0 = dx0_out, dy0 = dy0_out,
             flux0 = flux0_out, sky0 = sky0_out,
             xi = xi_out, yi = yi_out,
-            hw = hw, psf_scale = psf_scale, tile_radius = tr,
+            hw = hw, psf_scale = psf_scale,
+            tile_radius = getattr(tile_provider, 'tr', tr),
             has_noise_map = noise_map is not None,
         )
 
@@ -749,7 +750,8 @@ def _sigma_clip_jax_results(
 _JAX_KERNEL_CACHE: dict = {}
 
 
-def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool):
+def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool,
+                      scheme: str = 'bspline', tr_override: int | None = None):
     """Build and return a JIT+vmap'd Newton solver specialised for (hw, psf_scale).
 
     The returned function has signature::
@@ -768,7 +770,8 @@ def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool):
 
     jax.config.update("jax_enable_x64", True)
 
-    tr_val       = tile_radius(hw, psf_scale)
+    tr_val       = (tr_override if tr_override is not None
+                    else tile_radius(hw, psf_scale))
     n_pix        = (2 * hw + 1) ** 2
     psf_scale_f  = float(psf_scale)
     center_idx   = n_pix // 2   # flat index of dix=0, diy=0 pixel
@@ -834,6 +837,57 @@ def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool):
         dPdx = dP_dxt * (-psf_scale_f)
         dPdy = dP_dyt * (-psf_scale_f)
         return P, dPdx, dPdy
+
+    def _rpsf_h1(tile, dx, dy):
+        """Anderson rpsf_phot on a raw tile (values only; JAX port)."""
+        offx = _dix - dx
+        offy = _diy - dy
+        rx = tr_val + offx * psf_scale_f
+        ry = tr_val + offy * psf_scale_f
+        ix = jnp.floor(rx).astype(jnp.int32)
+        iy = jnp.floor(ry).astype(jnp.int32)
+        fx = rx - ix
+        fy = ry - iy
+        dd = jnp.hypot(offx, offy)
+        ts = tile.shape[0]
+        ixc = jnp.clip(ix, 2, ts - 4)
+        iyc = jnp.clip(iy, 2, ts - 4)
+
+        def P(jx, jy):
+            return tile[iyc + jy, ixc + jx]
+
+        bl = ((1 - fx) * (1 - fy) * P(0, 0) + fx * (1 - fy) * P(1, 0)
+              + (1 - fx) * fy * P(0, 1) + fx * fy * P(1, 1))
+
+        def patch(jx, jy, u, v, esign, ex, ey):
+            A = P(jx, jy)
+            B = (P(jx + 1, jy) - P(jx - 1, jy)) / 2
+            C = (P(jx, jy + 1) - P(jx, jy - 1)) / 2
+            D = (P(jx + 1, jy) + P(jx - 1, jy) - 2 * A) / 2
+            F = (P(jx, jy + 1) + P(jx, jy - 1) - 2 * A) / 2
+            E = esign * (P(ex, ey) - A)
+            return A + B * u + C * v + D * u * u + E * u * v + F * v * v
+
+        V1 = patch(0, 0, fx,     fy,     +1.0, 1, 1)
+        V2 = patch(1, 0, fx - 1, fy,     -1.0, 0, 1)
+        V3 = patch(0, 1, fx,     fy - 1, -1.0, 1, 0)
+        V4 = patch(1, 1, fx - 1, fy - 1, +1.0, 0, 0)
+        qd = ((1 - fx) * (1 - fy) * V1 + fx * (1 - fy) * V2
+              + (1 - fx) * fy * V3 + fx * fy * V4)
+        return jnp.where(dd <= 4.0, qd, jnp.where(dd <= 12.0, bl, 0.0))
+
+    def _eval_psf_h1(tile, dx, dy):
+        """rpsf_phot values + one-supersample-pixel numeric gradients."""
+        h = 1.0 / psf_scale_f
+        P   = _rpsf_h1(tile, dx, dy)
+        Pxp = _rpsf_h1(tile, dx + h, dy)
+        Pxm = _rpsf_h1(tile, dx - h, dy)
+        Pyp = _rpsf_h1(tile, dx, dy + h)
+        Pym = _rpsf_h1(tile, dx, dy - h)
+        return P, (Pxp - Pxm) / (2 * h), (Pyp - Pym) / (2 * h)
+
+    if scheme == 'hst1pass':
+        _eval_psf = _eval_psf_h1
 
     def _atwa_and_atwr(A0, A1, A2, A3, w, r):
         """Build 4×4 weighted normal-equation matrix and 4-vector RHS.
@@ -1000,6 +1054,9 @@ def fit_batch_jax(
     has_nm    = inputs_dict.get('has_noise_map', False)
     n_stars   = len(inputs_dict['dx0'])
     n_devices = len(jax.devices())
+    from .hst1pass_scheme import psf_scheme as _ps
+    _scheme   = _ps()
+    _tr_kernel = inputs_dict.get('tile_radius', None)
 
     # Process stars in fixed-size chunks so the JAX compiled kernel shape is
     # always CHUNK_SIZE regardless of image star count.  Benefits:
@@ -1010,9 +1067,10 @@ def fit_batch_jax(
     # Dummy pad stars have all-zero valid_masks; outputs are trimmed to n_stars.
     CHUNK_SIZE = 10_000
 
-    cache_key = (hw, psf_scale, has_nm, n_devices)
+    cache_key = (hw, psf_scale, has_nm, n_devices, _scheme, _tr_kernel)
     if cache_key not in _JAX_KERNEL_CACHE:
-        _JAX_KERNEL_CACHE[cache_key] = _build_jax_kernel(hw, psf_scale, has_nm)
+        _JAX_KERNEL_CACHE[cache_key] = _build_jax_kernel(
+            hw, psf_scale, has_nm, scheme=_scheme, tr_override=_tr_kernel)
     _fn = _JAX_KERNEL_CACHE[cache_key]
 
     result_keys = ('flux','dx','dy','sky','cov','n_iter','converged',

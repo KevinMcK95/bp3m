@@ -29,6 +29,10 @@ CASES = {
         img='/home/jupyter-kmckinnon/data_bootes/bp3m/GaiaHub_results/M31/'
             'HST/mastDownload/HST/j6d508ngq/j6d508ngq_flc.fits',
         sci_ext=1, dq_ext=3, fmin=1000.0, prefix='ACSWFC'),
+    'numpy_small': dict(
+        img='/home/jupyter-kmckinnon/data_bootes/bp3m/GaiaHub_results/M31/'
+            'HST/mastDownload/HST/j6d508ngq/j6d508ngq_flc.fits',
+        sci_ext=1, dq_ext=3, fmin=20000.0, prefix='ACSWFC'),
     'sparse_numpy': dict(
         img='/home/jupyter-kmckinnon/data_bootes/bp3m/GaiaHub_results/AM_4/'
             'HST/mastDownload/HST/ib2d01ibq/ib2d01ibq_flc.fits',

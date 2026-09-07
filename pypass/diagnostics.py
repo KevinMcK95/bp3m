@@ -1172,10 +1172,9 @@ def plot_psf_residual_map(records, data, psf_cube, xs, ys, psf_scale, hw,
     ny, nx = data.shape
     win = 2 * hw + 1  # fit window size in detector pixels
 
-    # Prefilter PSF cube once
-    psf_coeffs_cube = np.array([
-        spline_filter(p, order=3, output=np.float64) for p in psf_cube
-    ])
+    # Prefilter PSF cube once (scheme-aware: raw under hst1pass)
+    from .hst1pass_scheme import prefilter_cube as _pfc
+    psf_coeffs_cube = _pfc(psf_cube)
 
     # Define tile boundaries
     x_edges = np.linspace(0, nx, n_grid + 1)
@@ -1398,10 +1397,9 @@ def plot_diagnostics(records, data, psf_cube, xs, ys, psf_scale, hw,
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h),
                              squeeze=False, layout='constrained')
 
-    # --- Prefilter PSF cube once ----------------------------------------------
-    psf_coeffs_cube = np.array([
-        spline_filter(p, order=3, output=np.float64) for p in psf_cube
-    ])
+    # --- Prefilter PSF cube once (scheme-aware) --------------------------------
+    from .hst1pass_scheme import prefilter_cube as _pfc
+    psf_coeffs_cube = _pfc(psf_cube)
     ny, nx = data.shape
 
     # --- Stamp rendering ------------------------------------------------------
@@ -1650,9 +1648,8 @@ def measure_psf_perturbation(
     n_psf2   = psf_size * psf_size
 
     if psf_coeffs_cube is None:
-        psf_coeffs_cube = np.array([
-            spline_filter(p, order=3, output=np.float64) for p in psf_cube
-        ])
+        from .hst1pass_scheme import prefilter_cube as _pfc
+        psf_coeffs_cube = _pfc(psf_cube)
 
     # ── PSF-pixel coordinate grids (reused in smoothing and constraints) ──────
     _yg_full, _xg_full = np.mgrid[0:psf_size, 0:psf_size]

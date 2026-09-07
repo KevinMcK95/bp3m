@@ -68,7 +68,14 @@ def _eval_psf_grad_fast(coeffs, dx, dy, dix, diy, psf_scale):
 
     Chooses the Numba path when available, otherwise falls back to
     scipy.ndimage.map_coordinates with prefilter=False.
+
+    Under PYPASS_PSF_SCHEME=hst1pass, *coeffs* is the RAW supersampled
+    raster and evaluation routes to Anderson's rpsf_phot scheme instead.
     """
+    from .hst1pass_scheme import psf_scheme, eval_psf_grad_hst1
+    if psf_scheme() == 'hst1pass':
+        return eval_psf_grad_hst1(coeffs, dx, dy, dix, diy, psf_scale,
+                                  center=(coeffs.shape[0] - 1) // 2)
     size = coeffs.shape[0]
     half_ss = size // 2
 
@@ -313,6 +320,24 @@ def interpolate_psf(psf_cube, xs, ys, x_det, y_det, _cache=None):
     if n_psf == 1:
         return psf_cube[0]
 
+    from .hst1pass_scheme import psf_scheme as _ps
+    if _ps() == 'hst1pass':
+        # Anderson scheme: bilinear between the 4 nearest fiducials with
+        # integer-pixel weights (cache key below is coarser than 1 px, so
+        # the same cache stays valid).
+        from .hst1pass_scheme import spatial_weights_h1
+        if _cache is not None:
+            _k1 = ('h1', int(round(x_det)), int(round(y_det)))
+            _hit = _cache.get(_k1)
+            if _hit is not None:
+                return _hit
+        W1, K1 = spatial_weights_h1(np.array([x_det]), np.array([y_det]),
+                                    xs, ys)
+        _res = np.einsum('f,fab->ab', W1[0], psf_cube[K1[0]])
+        if _cache is not None and len(_cache) < 8192:
+            _cache[_k1] = _res
+        return _res
+
     if _cache is not None:
         key = (int(x_det) // 5, int(y_det) // 5)
         hit = _cache.get(key)
@@ -373,7 +398,11 @@ def eval_psf_and_grad(psf, dx, dy, dix, diy, psf_scale):
     Pre-filters *psf* to cubic B-spline coefficients then delegates to the
     fast Numba or scipy path in ``_eval_psf_grad_fast``.
     """
-    coeffs = spline_filter(psf, order=3, output=np.float64)
+    from .hst1pass_scheme import psf_scheme as _ps
+    if _ps() == 'hst1pass':
+        coeffs = np.asarray(psf, dtype=np.float64)
+    else:
+        coeffs = spline_filter(psf, order=3, output=np.float64)
     return _eval_psf_grad_fast(coeffs, dx, dy, dix, diy, psf_scale)
 
 
@@ -493,6 +522,12 @@ def _jax_results_to_records(
 
             def _pv_at(dix_arr, diy_arr):
                 """Evaluate PSF tile at detector offsets (dix, diy) from (xi, yi)."""
+                from .hst1pass_scheme import psf_scheme as _ps2, rpsf_eval
+                if _ps2() == 'hst1pass':
+                    return rpsf_eval(_tile,
+                                     dix_arr.ravel() - dx_i,
+                                     diy_arr.ravel() - dy_i,
+                                     psf_scale, center=tr)
                 tile_xs = tr + (dix_arr.ravel() - dx_i) * psf_scale
                 tile_ys = tr + (diy_arr.ravel() - dy_i) * psf_scale
                 return _mc(_tile, [tile_ys, tile_xs],
@@ -617,7 +652,10 @@ def fit_star(data, x0, y0, psf_cube, xs, ys, psf_scale, hw,
     local_psf = interpolate_psf(_cube, xs, ys, x0 + x_offset, y0 + y_offset,
                                 _cache=psf_cache)
     if psf_coeffs_cube is None:
-        psf_coeffs = spline_filter(local_psf, order=3, output=np.float64)
+        from .hst1pass_scheme import psf_scheme as _ps
+        psf_coeffs = (np.asarray(local_psf, dtype=np.float64)
+                      if _ps() == 'hst1pass'
+                      else spline_filter(local_psf, order=3, output=np.float64))
     else:
         psf_coeffs = local_psf  # already prefiltered coefficients
 
@@ -1840,9 +1878,15 @@ def run_photometry(
     # bilinear combination — interpolate_psf on the coefficient cube gives
     # the correct coefficients for any detector position without per-star
     # recomputation.
-    psf_coeffs_cube = np.array([
-        spline_filter(p, order=3, output=np.float64) for p in psf_cube
-    ])
+    from .hst1pass_scheme import psf_scheme as _psf_scheme_fn
+    _scheme = _psf_scheme_fn()
+    if _scheme == 'hst1pass':
+        # Anderson scheme operates on RAW rasters — no spline prefiltering.
+        psf_coeffs_cube = np.asarray(psf_cube, dtype=np.float64)
+    else:
+        psf_coeffs_cube = np.array([
+            spline_filter(p, order=3, output=np.float64) for p in psf_cube
+        ])
 
     # ── Exact shared PSF-tile blender (JAX batch path) ────────────────────────
     # Pre-cropped coefficient tile cube + per-star 16-weight contraction:
@@ -1851,8 +1895,18 @@ def run_photometry(
     # legacy per-star interpolation path (A/B and debugging only).
     import os as _os
     from .tile_provider import ExactTileBlender
+    from .hst1pass_scheme import Hst1passBlender
     if float(_os.environ.get('PYPASS_TILE_CELL', 0)) < 0:
+        if _scheme == 'hst1pass':
+            raise RuntimeError(
+                'PYPASS_TILE_CELL=-1 (legacy per-star tiles) is not '
+                'supported with PYPASS_PSF_SCHEME=hst1pass — the legacy '
+                'tile margin cannot hold the quadratic-patch stencil.')
         _tile_provider = None
+    elif _scheme == 'hst1pass':
+        _tile_provider = Hst1passBlender(
+            psf_cube, psf_coeffs_cube, xs, ys, psf_scale, half_width,
+            x_offset=x_offset, y_offset=y_offset)
     else:
         _tile_provider = ExactTileBlender(
             psf_cube, psf_coeffs_cube, xs, ys, psf_scale, half_width,
@@ -1873,7 +1927,7 @@ def run_photometry(
 
     # Trigger Numba JIT in the main thread before parallel workers start so
     # all threads share the cached compiled code rather than racing to compile.
-    if _NUMBA:
+    if _NUMBA and _scheme != 'hst1pass':
         _dum_y = np.array([50.0], dtype=np.float64)
         _dum_x = np.array([50.0], dtype=np.float64)
         _P = np.empty(1); _G = np.empty(1)
