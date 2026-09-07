@@ -956,6 +956,7 @@ def run_photometry_fits(
     all_records = []
     residuals   = {}
     var_images  = {}
+    _dq_arrays: dict = {}   # per-chip raw DQ planes for post-fit DQ stats
     for sci_ext, dq_ext, y_offset in chips:
         with fits.open(image_path) as _hdul:
             _sci_hdr = _hdul[sci_ext].header
@@ -1032,6 +1033,7 @@ def run_photometry_fits(
                 with fits.open(image_path) as _dqh:
                     _dq_array = np.array(_dqh[dq_ext].data, dtype=np.int32)
                 mask = (_dq_array & ~np.int32(4)) != 0
+                _dq_arrays[sci_ext] = _dq_array
             except Exception:
                 pass
         _peak_mask = mask
@@ -1117,12 +1119,17 @@ def run_photometry_fits(
 
     # Compute per-star DQ flag summaries (1×1, 2×2, 3×3 windows).
     # Uses the raw DQ integer array so all flag bits are preserved.
+    # Each chip's records must be summarised against THAT chip's DQ plane.
+    # (A previous version reused the loop-leftover _dq_array — the LAST chip's
+    # plane — for every chip, silently corrupting dq_1x1/2x2/3x3 on the first
+    # chip of two-chip images.  Fit-time masks were always per-chip correct.)
     from .core import compute_dq_stats
     for sci_ext, dq_ext_i, _y_off in chips:
         _chip_recs = [r for r in all_records
                       if getattr(r, '_chip_ext', sci_ext) == sci_ext]
-        if _chip_recs and _dq_array is not None:
-            compute_dq_stats(_chip_recs, _dq_array, x_offset=x_offset)
+        _chip_dq = _dq_arrays.get(sci_ext)
+        if _chip_recs and _chip_dq is not None:
+            compute_dq_stats(_chip_recs, _chip_dq)
 
     # Apply GDC and WCS corrections
     _apply_gdc_wcs(all_records, gdc, image_path, chips, instrume, detector,
