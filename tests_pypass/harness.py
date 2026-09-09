@@ -37,6 +37,14 @@ CASES = {
         img='/home/jupyter-kmckinnon/data_bootes/bp3m/GaiaHub_results/AM_4/'
             'HST/mastDownload/HST/ib2d01ibq/ib2d01ibq_flc.fits',
         sci_ext=1, dq_ext=3, fmin=None, prefix='WFC3UV'),
+    # armB slow-pole image (89k sources): benchmark for the hst1pass mode.
+    # Run with PYPASS_PSF_SCHEME=hst1pass in the environment.  fmin pinned to
+    # the production value (fmin_thresh 70 -> 144 e-) so runs compare 1:1
+    # with the 2026-09-08 armB wall times.
+    'leoacs': dict(
+        img='/home/jupyter-kmckinnon/data_bootes/bp3m/GaiaHub_results/'
+            'Leo_I_schemeB/HST/mastDownload/HST/j9gz06krq/j9gz06krq_flc.fits',
+        sci_ext=1, dq_ext=3, fmin=144.0, prefix='ACSWFC'),
 }
 
 FIELDS = ('x', 'y', 'flux', 'flux_err', 'sky', 'qfit', 'chi2', 'psf_frac',
