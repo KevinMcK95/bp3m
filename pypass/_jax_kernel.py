@@ -197,6 +197,33 @@ def eval_psf_on_tile(
     return P, dPdx, dPdy
 
 
+def eval_psf_tile_routed(tile, dx, dy, hw, psf_scale, tr=None, scheme=None):
+    """(P, dPdx, dPdy) on a provider tile, routed by the active PSF scheme.
+
+    The NumPy post-fit steps (flux/sky init, restore-flux, sigma clipping)
+    must evaluate the model with the SAME scheme and tile geometry as the
+    fitting kernel.  In hst1pass mode tiles are raw rasters whose centre is
+    the provider's ``tr`` (= hw*scale + scale//2 + 4), not the B-spline
+    ``tile_radius`` — evaluating them with ``eval_psf_on_tile`` is both the
+    wrong interpolant and off-centre by (scale//2 + 3)/scale detector px.
+
+    bspline mode routes to ``eval_psf_on_tile`` unchanged.
+    """
+    if scheme is None:
+        from .hst1pass_scheme import psf_scheme
+        scheme = psf_scheme()
+    if scheme == 'hst1pass':
+        from .hst1pass_scheme import eval_psf_grad_hst1
+        diy_g, dix_g = np.mgrid[-hw:hw + 1, -hw:hw + 1]
+        c = (tile.shape[0] - 1) // 2 if tr is None else int(tr)
+        return eval_psf_grad_hst1(
+            tile, dx, dy,
+            dix_g.ravel().astype(np.float64),
+            diy_g.ravel().astype(np.float64),
+            psf_scale, center=c)
+    return eval_psf_on_tile(tile, dx, dy, hw, psf_scale)
+
+
 # ---------------------------------------------------------------------------
 # Pixel window extraction (single star)
 # ---------------------------------------------------------------------------
@@ -281,6 +308,8 @@ def flux_sky_init(
     hw: int,
     psf_scale: int,
     sky_annulus: float,
+    tr: int | None = None,
+    scheme: str | None = None,
 ) -> tuple[float, float]:
     """Initialise flux and sky via 2-parameter least-squares at fixed position.
 
@@ -291,7 +320,8 @@ def flux_sky_init(
     Falls back to ``(max(peak-sky, 1.0), sky_annulus)`` when fewer than 2
     valid pixels are available.
     """
-    P, _, _ = eval_psf_on_tile(tile, dx0, dy0, hw, psf_scale)
+    P, _, _ = eval_psf_tile_routed(tile, dx0, dy0, hw, psf_scale,
+                                   tr=tr, scheme=scheme)
     g = valid_mask
     n_good = int(g.sum())
 
@@ -405,9 +435,65 @@ def prepare_jax_inputs(
     # fit_batch_jax chunk at a time).  Bit-equivalent to the legacy path.
     if tile_provider is not None:
         from .tile_provider import LazyTiles
+        from .hst1pass_scheme import psf_scheme
+        _scheme = psf_scheme()
+        _tr_p   = getattr(tile_provider, 'tr', tr)
         W_t, K_t = tile_provider.weights(xs_stars, ys_stars)
         lazy     = LazyTiles(tile_provider, W_t, K_t)
         peaks    = tile_provider.peaks(W_t, K_t).astype(np.float32)
+
+        from ._batch_ops import (use_batch_ops, extract_pixel_windows_batch,
+                                 eval_psf_tiles_batch)
+        if use_batch_ops():
+            # Vectorized path: batched window extraction + batched PSF
+            # evaluation at the initial positions; the tiny 2-parameter
+            # lstsq stays per-star so flux0/sky0 are bit-identical to the
+            # reference (init differences would shift converged positions
+            # at the Newton-stopping-tolerance level).
+            pv_b, pvar_b, valid_b, dx0_b, dy0_b, xi_b, yi_b = \
+                extract_pixel_windows_batch(
+                    data, xs_stars, ys_stars, sky_estimates, hw,
+                    mask, noise_map, gain, read_noise)
+            flux0_b = np.empty(n_stars, dtype=np.float64)
+            sky0_b  = np.empty(n_stars, dtype=np.float64)
+            _CH = 4096
+            for a in range(0, n_stars, _CH):
+                b = min(a + _CH, n_stars)
+                _tiles = np.asarray(lazy[a:b], dtype=np.float64)
+                P0, _, _ = eval_psf_tiles_batch(
+                    _tiles, dx0_b[a:b], dy0_b[a:b], hw, psf_scale,
+                    _tr_p, _scheme, want_grad=False)
+                for j in range(b - a):
+                    i = a + j
+                    pvi = pv_b[i]
+                    g   = valid_b[i]
+                    rf = restore_fluxes[i] if restore_fluxes is not None else 0.0
+                    if rf != 0.0:
+                        pvi[g] += rf * P0[j][g]
+                    n_good = int(g.sum())
+                    if n_good >= 2:
+                        A2 = np.column_stack([P0[j][g], np.ones(n_good)])
+                        fs, *_ = np.linalg.lstsq(A2, pvi[g], rcond=None)
+                        flux0_b[i] = max(fs[0], 1.0)
+                        sky0_b[i]  = fs[1]
+                    else:
+                        peak = float(pvi[n_pix // 2]) - float(sky_estimates[i])
+                        flux0_b[i] = max(peak, 1.0)
+                        sky0_b[i]  = float(sky_estimates[i])
+
+            return dict(
+                psf_peak        = peaks,
+                psf_coeff_tiles = lazy,
+                pixel_vals      = pv_b,
+                pixel_var_rn    = pvar_b,
+                valid_masks     = valid_b,
+                dx0 = dx0_b, dy0 = dy0_b,
+                flux0 = flux0_b, sky0 = sky0_b,
+                xi = xi_b.astype(np.int32), yi = yi_b.astype(np.int32),
+                hw = hw, psf_scale = psf_scale,
+                tile_radius = _tr_p,
+                has_noise_map = noise_map is not None,
+            )
 
         pixel_vals_out = np.empty((n_stars, n_pix), dtype=np.float64)
         pixel_var_out  = np.empty((n_stars, n_pix), dtype=np.float64)
@@ -427,11 +513,14 @@ def prepare_jax_inputs(
                 data, x0, y0, hw, mask, noise_map, gain, read_noise, sky)
             rf = restore_fluxes[i] if restore_fluxes is not None else 0.0
             if rf != 0.0:
-                P_r, _, _ = eval_psf_on_tile(coeff_tile, dx0, dy0, hw, psf_scale)
+                P_r, _, _ = eval_psf_tile_routed(coeff_tile, dx0, dy0, hw,
+                                                 psf_scale, tr=_tr_p,
+                                                 scheme=_scheme)
                 pv = pv.copy()
                 pv[valid] += rf * P_r[valid]
             flux, sky_fit = flux_sky_init(coeff_tile, pv, valid, dx0, dy0,
-                                          hw, psf_scale, sky)
+                                          hw, psf_scale, sky,
+                                          tr=_tr_p, scheme=_scheme)
             pixel_vals_out[i] = pv; pixel_var_out[i] = pvar
             valid_out[i] = valid
             dx0_out[i] = dx0; dy0_out[i] = dy0
@@ -509,13 +598,17 @@ def prepare_jax_inputs(
         # Restore this star's flux into its pixel window (refit mode only).
         # residual image has all stars subtracted; adding back flux_k lets
         # the solver see an isolated star instead of a star-shaped hole.
+        # Legacy (no-provider) path is bspline-only: h1 mode always supplies a
+        # tile provider (PYPASS_TILE_CELL=-1 is blocked there), so these tiles
+        # are always B-spline coefficient tiles.
         rf = restore_fluxes[i] if restore_fluxes is not None else 0.0
         if rf != 0.0:
             P_restore, _, _ = eval_psf_on_tile(coeff_tile, dx0, dy0, hw, psf_scale)
             pv = pv.copy()
             pv[valid] += rf * P_restore[valid]
 
-        flux, sky_fit = flux_sky_init(coeff_tile, pv, valid, dx0, dy0, hw, psf_scale, sky)
+        flux, sky_fit = flux_sky_init(coeff_tile, pv, valid, dx0, dy0, hw,
+                                      psf_scale, sky, scheme='bspline')
 
         return tile[tr, tr], coeff_tile, pv, pvar, valid, dx0, dy0, flux, sky_fit, xi, yi
 
@@ -569,6 +662,28 @@ def _sigma_clip_jax_results(
 ) -> dict:
     """Apply post-convergence sigma clipping to JAX fit results.
 
+    Dispatches to the vectorized implementation (_batch_ops) unless
+    PYPASS_BATCH_OPS=0 selects the per-star reference below.
+    """
+    from ._batch_ops import use_batch_ops, sigma_clip_results_batch
+    if use_batch_ops():
+        from .hst1pass_scheme import psf_scheme
+        return sigma_clip_results_batch(
+            jax_res, inputs_dict, gain,
+            sigma_clip_sigma, sigma_clip_iter, scheme=psf_scheme())
+    return _sigma_clip_jax_results_ref(
+        jax_res, inputs_dict, gain, sigma_clip_sigma, sigma_clip_iter)
+
+
+def _sigma_clip_jax_results_ref(
+    jax_res: dict,
+    inputs_dict: dict,
+    gain: float,
+    sigma_clip_sigma: float,
+    sigma_clip_iter: int,
+) -> dict:
+    """Apply post-convergence sigma clipping to JAX fit results.
+
     Mirrors the sigma-clipping block in ``fit_star`` (core.py).  Runs in
     NumPy after ``fit_batch_jax`` returns, using the already-extracted pixel
     data from ``inputs_dict`` — no image reads required.
@@ -593,12 +708,15 @@ def _sigma_clip_jax_results(
     sigma_clip_sigma : clipping threshold in units of σ
     sigma_clip_iter  : maximum clipping rounds per star
     """
+    from .hst1pass_scheme import psf_scheme
     has_noise_map = inputs_dict.get('has_noise_map', False)
     hw        = inputs_dict['hw']
     psf_scale = inputs_dict['psf_scale']
     n_pix     = (2 * hw + 1) ** 2
     center    = n_pix // 2
     n_stars   = len(jax_res['flux'])
+    _scheme   = psf_scheme()
+    _tr       = inputs_dict.get('tile_radius', None)
 
     flux_arr        = jax_res['flux'].copy()
     dx_arr          = jax_res['dx'].copy()
@@ -623,7 +741,8 @@ def _sigma_clip_jax_results(
         sky  = float(sky_arr[i])
 
         for _ in range(sigma_clip_iter):
-            P, dPdx, dPdy = eval_psf_on_tile(tile, dx, dy, hw, psf_scale)
+            P, dPdx, dPdy = eval_psf_tile_routed(tile, dx, dy, hw, psf_scale,
+                                                 tr=_tr, scheme=_scheme)
 
             if has_noise_map:
                 var = np.maximum(pvar_rn, 1e-10)
@@ -669,7 +788,8 @@ def _sigma_clip_jax_results(
             valid = new_valid
 
         # --- Final evaluation at the post-clipping position ---
-        P, dPdx, dPdy = eval_psf_on_tile(tile, dx, dy, hw, psf_scale)
+        P, dPdx, dPdy = eval_psf_tile_routed(tile, dx, dy, hw, psf_scale,
+                                             tr=_tr, scheme=_scheme)
         if has_noise_map:
             var = np.maximum(pvar_rn, 1e-10)
         else:
@@ -838,10 +958,13 @@ def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool,
         dPdy = dP_dyt * (-psf_scale_f)
         return P, dPdx, dPdy
 
-    def _rpsf_h1(tile, dx, dy):
-        """Anderson rpsf_phot on a raw tile (values only; JAX port)."""
-        offx = _dix - dx
-        offy = _diy - dy
+    def _rpsf_h1_off(tile, offx, offy):
+        """Anderson rpsf_phot on a raw tile at explicit offsets (JAX port).
+
+        Broadcasts over any leading axes of offx/offy, so the value and the
+        four numeric-gradient evaluations run as ONE call with a (5, n_pix)
+        offset stack — one fused gather set instead of five graph branches.
+        """
         rx = tr_val + offx * psf_scale_f
         ry = tr_val + offy * psf_scale_f
         ix = jnp.floor(rx).astype(jnp.int32)
@@ -877,14 +1000,18 @@ def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool,
         return jnp.where(dd <= 4.0, qd, jnp.where(dd <= 12.0, bl, 0.0))
 
     def _eval_psf_h1(tile, dx, dy):
-        """rpsf_phot values + one-supersample-pixel numeric gradients."""
+        """rpsf_phot values + one-supersample-pixel numeric gradients.
+
+        Offsets carry the reference association order (dix - (dx ± h)), so
+        results are bit-identical to five separate evaluations.
+        """
         h = 1.0 / psf_scale_f
-        P   = _rpsf_h1(tile, dx, dy)
-        Pxp = _rpsf_h1(tile, dx + h, dy)
-        Pxm = _rpsf_h1(tile, dx - h, dy)
-        Pyp = _rpsf_h1(tile, dx, dy + h)
-        Pym = _rpsf_h1(tile, dx, dy - h)
-        return P, (Pxp - Pxm) / (2 * h), (Pyp - Pym) / (2 * h)
+        offx = jnp.stack([_dix - dx, _dix - (dx + h), _dix - (dx - h),
+                          _dix - dx, _dix - dx])
+        offy = jnp.stack([_diy - dy, _diy - dy, _diy - dy,
+                          _diy - (dy + h), _diy - (dy - h)])
+        V = _rpsf_h1_off(tile, offx, offy)        # (5, n_pix)
+        return V[0], (V[1] - V[2]) / (2 * h), (V[3] - V[4]) / (2 * h)
 
     if scheme == 'hst1pass':
         _eval_psf = _eval_psf_h1
@@ -1065,7 +1192,14 @@ def fit_batch_jax(
     #   2. Peak tile memory per call = CHUNK_SIZE × ts × ts × 8 bytes instead
     #      of n_stars × ts × ts × 8 (e.g. 77 MB vs 363 MB for 47k stars)
     # Dummy pad stars have all-zero valid_masks; outputs are trimmed to n_stars.
-    CHUNK_SIZE = 10_000
+    # hst1pass mode gets a smaller chunk: its kernel evaluates 5 offset sets
+    # per Newton iteration, so the XLA working set per star is several times
+    # the B-spline kernel's — smaller chunks cap peak RSS with negligible
+    # speed cost.  Override with PYPASS_JAX_CHUNK.
+    import os as _os
+    CHUNK_SIZE = int(_os.environ.get('PYPASS_JAX_CHUNK', '0') or 0)
+    if CHUNK_SIZE <= 0:
+        CHUNK_SIZE = 4096 if _scheme == 'hst1pass' else 10_000
 
     cache_key = (hw, psf_scale, has_nm, n_devices, _scheme, _tr_kernel)
     if cache_key not in _JAX_KERNEL_CACHE:

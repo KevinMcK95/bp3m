@@ -439,6 +439,29 @@ def _jax_results_to_records(
 ) -> list:
     """Convert fit_batch_jax output + prepare_jax_inputs dict into StarRecords.
 
+    Dispatches to the vectorized implementation (_batch_ops) unless
+    PYPASS_BATCH_OPS=0 selects the per-star reference below.
+    """
+    from ._batch_ops import use_batch_ops, records_from_jax_batch
+    if use_batch_ops():
+        from .hst1pass_scheme import psf_scheme
+        return records_from_jax_batch(
+            jax_res, inputs_dict, pass_number, gain, zero_point,
+            sat_threshold, scheme=psf_scheme(), star_record_cls=StarRecord)
+    return _jax_results_to_records_ref(
+        jax_res, inputs_dict, pass_number, gain, zero_point, sat_threshold)
+
+
+def _jax_results_to_records_ref(
+    jax_res: dict,
+    inputs_dict: dict,
+    pass_number: int,
+    gain: float,
+    zero_point: float,
+    sat_threshold: float,
+) -> list:
+    """Convert fit_batch_jax output + prepare_jax_inputs dict into StarRecords.
+
     All per-star fields that the NumPy path derives inside fit_star are
     computed here from the JAX result arrays and the pre-extracted pixel data.
     Fields filled later by the run_photometry driver (chi2_scale via
@@ -1295,19 +1318,16 @@ def compute_neighbor_stats(records, hw):
     K = min(n, 65)   # 64 neighbours + self
     dists, idxs = tree.query(xy, k=K)
 
+    # Among the K nearest (excluding self at column 0), the nearest one that
+    # has strictly higher flux — vectorized over stars.
+    neigh_flux = flux[idxs[:, 1:]]                   # (n, K-1)
+    brighter = neigh_flux > flux[:, None]
+    bd = np.where(brighter, dists[:, 1:], np.inf).min(axis=1)
+
     for i, rec in enumerate(records):
         rec.n_neighbors = int(counts[i]) - 1          # subtract self
-
         rec.dist_nearest = float(dists[i, 1]) if n >= 2 else np.inf
-
-        # Among the K nearest (excluding self at column 0), find the nearest
-        # one that has strictly higher flux.
-        neigh_flux = flux[idxs[i, 1:]]               # shape (K-1,)
-        neigh_dist = dists[i, 1:]
-        brighter = neigh_flux > flux[i]
-        rec.dist_nearest_brighter = (
-            float(neigh_dist[brighter].min()) if brighter.any() else np.inf
-        )
+        rec.dist_nearest_brighter = float(bd[i])
 
 
 # ---------------------------------------------------------------------------

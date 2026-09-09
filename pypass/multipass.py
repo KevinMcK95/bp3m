@@ -159,6 +159,22 @@ def build_variance_image(records, psf_cube, xs, ys, psf_scale, shape,
         var_base = max(median_sky, 0.0) / gain + (read_noise / gain) ** 2
         var_image = np.full((ny, nx), var_base, dtype=np.float64)
 
+    from ._batch_ops import use_batch_ops
+    if use_batch_ops():
+        from ._batch_ops import add_poisson_variance_batch
+        from .hst1pass_scheme import psf_scheme, prefilter_cube
+        _cube_b = _cube if prefiltered else prefilter_cube(psf_cube)
+        sel = [r for r in records if _should_subtract(r)]
+        if sel:
+            add_poisson_variance_batch(
+                var_image,
+                np.array([r.x for r in sel]),
+                np.array([r.y for r in sel]),
+                np.array([r.flux for r in sel]),
+                _cube_b, xs, ys, psf_scale, shw, x_offset, y_offset,
+                psf_scheme(), gain)
+        return np.maximum(var_image, 1e-10)
+
     for rec in records:
         if not _should_subtract(rec):
             continue
@@ -173,6 +189,27 @@ def build_variance_image(records, psf_cube, xs, ys, psf_scale, shape,
     return np.maximum(var_image, 1e-10)
 
 
+def _apply_records_batch(residual, records, psf_cube, xs, ys, psf_scale,
+                         x_offset, y_offset, psf_coeffs_cube, mode):
+    """Batched subtract/restore over records passing _should_subtract."""
+    from ._batch_ops import apply_star_models_batch
+    from .hst1pass_scheme import psf_scheme, prefilter_cube
+    _scheme = psf_scheme()
+    _cube = (psf_coeffs_cube if psf_coeffs_cube is not None
+             else prefilter_cube(psf_cube))   # scheme-aware (raw in h1 mode)
+    sel = [r for r in records if _should_subtract(r)]
+    if not sel:
+        return
+    shw = _sub_hw(_cube, psf_scale)
+    apply_star_models_batch(
+        residual,
+        np.array([r.x for r in sel]),
+        np.array([r.y for r in sel]),
+        np.array([r.flux for r in sel]),
+        _cube, xs, ys, psf_scale, shw, x_offset, y_offset,
+        _scheme, mode=mode)
+
+
 def subtract_stars(residual, records, psf_cube, xs, ys, psf_scale, hw,
                    x_offset=0.0, y_offset=0.0,
                    psf_coeffs_cube=None, psf_cache=None, tile_provider=None):
@@ -183,6 +220,12 @@ def subtract_stars(residual, records, psf_cube, xs, ys, psf_scale, hw,
     Pass psf_coeffs_cube (prefiltered B-spline coefficients) to skip the
     per-call spline_filter overhead.
     """
+    from ._batch_ops import use_batch_ops
+    if use_batch_ops():
+        _apply_records_batch(residual, records, psf_cube, xs, ys, psf_scale,
+                             x_offset, y_offset, psf_coeffs_cube,
+                             mode='subtract')
+        return
     ny, nx = residual.shape
     _cube = psf_coeffs_cube if psf_coeffs_cube is not None else psf_cube
     prefiltered = psf_coeffs_cube is not None
@@ -207,6 +250,11 @@ def restore_stars(residual, records, psf_cube, xs, ys, psf_scale, hw,
     already subtracted by refit_stars' leave-one-out loop, so their flux must
     be restored to keep the residual consistent.
     """
+    from ._batch_ops import use_batch_ops
+    if use_batch_ops():
+        _apply_records_batch(residual, records, psf_cube, xs, ys, psf_scale,
+                             x_offset, y_offset, psf_coeffs_cube, mode='add')
+        return
     ny, nx = residual.shape
     _cube = psf_coeffs_cube if psf_coeffs_cube is not None else psf_cube
     prefiltered = psf_coeffs_cube is not None
@@ -400,6 +448,21 @@ def refit_stars_jax(residual, records, psf_cube, xs, ys, psf_scale, hw,
         new_rec.dist_nearest         = old_rec.dist_nearest
         new_rec.dist_nearest_brighter = old_rec.dist_nearest_brighter
 
+    from ._batch_ops import use_batch_ops
+    if use_batch_ops():
+        # All residual updates are additive, so restoring every old model and
+        # subtracting every new one in two batched sweeps is equivalent to
+        # the interleaved per-star order (fp summation order aside).
+        old_sel = [r for i, r in enumerate(records) if was_subtracted[i]]
+        restore_stars(residual, old_sel, psf_cube, xs, ys, psf_scale, hw,
+                      x_offset, y_offset, psf_coeffs_cube=psf_coeffs_cube)
+        subtract_stars(residual, new_records, psf_cube, xs, ys, psf_scale,
+                       hw, x_offset, y_offset,
+                       psf_coeffs_cube=psf_coeffs_cube)
+        records[:] = new_records
+        return records
+
+    for i, (old_rec, new_rec) in enumerate(zip(records, new_records)):
         # Update residual using the full PSF footprint (shw).
         P_old, y_lo, y_hi, x_lo, x_hi = _psf_window(
             old_rec, _cube, xs, ys, psf_scale, hw, ny, nx,
