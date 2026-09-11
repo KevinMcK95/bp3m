@@ -33,6 +33,20 @@ def use_batch_ops() -> bool:
     return os.environ.get('PYPASS_BATCH_OPS', '1').strip() != '0'
 
 
+def use_batch_imgops() -> bool:
+    """Image-plane batch ops (subtract/restore/variance) — OFF by default.
+
+    Profiling 2026-09-11 (85.5k-star chip, production fmin): the batched
+    full-footprint blending costs 770 s of a 1009 s run — 7 sweeps x 85k
+    stars x 16-tile blends of full 101x101 rasters is ~780 GB of memory
+    traffic, far slower than the legacy cached per-record path it
+    replaced.  Set PYPASS_BATCH_IMGOPS=1 to re-enable for development;
+    the proper fix is cell-grouped blending (shared tile per spatial
+    cell), not per-star blends.
+    """
+    return os.environ.get('PYPASS_BATCH_IMGOPS', '0').strip() == '1'
+
+
 _WIN_GRIDS: dict = {}
 
 

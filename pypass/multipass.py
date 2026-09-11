@@ -159,7 +159,7 @@ def build_variance_image(records, psf_cube, xs, ys, psf_scale, shape,
         var_base = max(median_sky, 0.0) / gain + (read_noise / gain) ** 2
         var_image = np.full((ny, nx), var_base, dtype=np.float64)
 
-    from ._batch_ops import use_batch_ops
+    from ._batch_ops import use_batch_imgops as use_batch_ops
     if use_batch_ops():
         from ._batch_ops import add_poisson_variance_batch
         from .hst1pass_scheme import psf_scheme, prefilter_cube
@@ -220,7 +220,7 @@ def subtract_stars(residual, records, psf_cube, xs, ys, psf_scale, hw,
     Pass psf_coeffs_cube (prefiltered B-spline coefficients) to skip the
     per-call spline_filter overhead.
     """
-    from ._batch_ops import use_batch_ops
+    from ._batch_ops import use_batch_imgops as use_batch_ops
     if use_batch_ops():
         _apply_records_batch(residual, records, psf_cube, xs, ys, psf_scale,
                              x_offset, y_offset, psf_coeffs_cube,
@@ -250,7 +250,7 @@ def restore_stars(residual, records, psf_cube, xs, ys, psf_scale, hw,
     already subtracted by refit_stars' leave-one-out loop, so their flux must
     be restored to keep the residual consistent.
     """
-    from ._batch_ops import use_batch_ops
+    from ._batch_ops import use_batch_imgops as use_batch_ops
     if use_batch_ops():
         _apply_records_batch(residual, records, psf_cube, xs, ys, psf_scale,
                              x_offset, y_offset, psf_coeffs_cube, mode='add')
@@ -448,7 +448,7 @@ def refit_stars_jax(residual, records, psf_cube, xs, ys, psf_scale, hw,
         new_rec.dist_nearest         = old_rec.dist_nearest
         new_rec.dist_nearest_brighter = old_rec.dist_nearest_brighter
 
-    from ._batch_ops import use_batch_ops
+    from ._batch_ops import use_batch_imgops as use_batch_ops
     if use_batch_ops():
         # All residual updates are additive, so restoring every old model and
         # subtracting every new one in two batched sweeps is equivalent to
