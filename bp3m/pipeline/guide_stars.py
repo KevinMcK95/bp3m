@@ -301,12 +301,41 @@ def _fetch_vizier_cone(catalog: str, id_col: str,
                         "Vmag", "Fmag", "jmag", "Pmag"],
                row_limit=100000,
                column_filters=col_filters)
+    V.TIMEOUT = 120
     coord = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
+
+    def _query():
+        return V.query_region(coord, radius=radius_deg * u.deg,
+                              catalog=catalog)
+
     delay = 5
     for attempt in range(retries):
         try:
-            result = V.query_region(coord, radius=radius_deg * u.deg,
-                                    catalog=catalog)
+            # astroquery's TIMEOUT only bounds individual socket reads: a
+            # server that trickles bytes can hang query_region for hours
+            # (observed 2026-09-12 during a VizieR/GSC outage).  Run the
+            # query in a daemon thread with a hard wall-clock cap; on
+            # expiry treat it as a failed fetch so the caller's catalog
+            # fallback chain proceeds.
+            import threading, queue as _q
+
+            def _safe(fn):
+                try:
+                    return ('ok', fn())
+                except Exception as exc:      # noqa: BLE001
+                    return ('err', exc)
+
+            _out: _q.Queue = _q.Queue(maxsize=1)
+            _t = threading.Thread(target=lambda: _out.put(_safe(_query)),
+                                  daemon=True)
+            _t.start()
+            try:
+                status, payload = _out.get(timeout=300)
+            except _q.Empty:
+                raise TimeoutError("hard 300s wall-clock timeout")
+            if status == 'err':
+                raise payload
+            result = payload
             break
         except Exception as e:
             if attempt < retries - 1:
