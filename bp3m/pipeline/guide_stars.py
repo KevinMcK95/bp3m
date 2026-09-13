@@ -69,6 +69,7 @@ _GSC242_URL = ("https://gsss.stsci.edu/webservices/vo/CatalogSearch.aspx"
                "&FORMAT=VOTable&CAT=GSC242")
 
 # FGS approximate field radius from V1 axis (degrees); 14 arcmin + margin
+_VIZIER_ROW_LIMIT = 100000
 _FGS_SEARCH_RADIUS_DEG = 0.50
 
 # Maximum radius for a single cluster cone search (degrees)
@@ -299,7 +300,7 @@ def _fetch_vizier_cone(catalog: str, id_col: str,
 
     V = Vizier(columns=[id_col, "RAJ2000", "DEJ2000",
                         "Vmag", "Fmag", "jmag", "Pmag"],
-               row_limit=100000,
+               row_limit=_VIZIER_ROW_LIMIT,
                column_filters=col_filters)
     V.TIMEOUT = 120
     coord = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
@@ -349,6 +350,59 @@ def _fetch_vizier_cone(catalog: str, id_col: str,
     if not result or len(result) == 0:
         return None
     return result[0].to_pandas()
+
+
+def _fetch_vizier_cone_adaptive(catalog: str, id_col: str,
+                                ra_center: float, dec_center: float,
+                                radius_deg: float,
+                                mag_limit: float | None = None,
+                                _depth: int = 0):
+    """Density-adaptive VizieR cone fetch.
+
+    Tries a single cone; if it times out/fails (None) OR saturates the row
+    limit (truncated → some guide stars missing), subdivides into a 2x2 grid
+    of smaller cones and recurses, deduping on ``id_col``.  A sparse field
+    costs one query; a dense field (bulge GC, M31 core) auto-tiles until each
+    sub-cone returns cleanly — avoiding the 100k-row cap and the multi-minute
+    timeouts it caused (2026-09-13).
+    """
+    _MAX_DEPTH = 3          # 1 → 4 → 16 → 64 sub-cones max
+    df = _fetch_vizier_cone(catalog, id_col, ra_center, dec_center,
+                            radius_deg, mag_limit=mag_limit)
+    # Subdivide ONLY on saturation (server responded but truncated at the row
+    # cap → a denser tiling recovers the missing stars).  A None result means
+    # a genuine timeout/failure; subdividing a down server just multiplies the
+    # cost, so fall through to the caller's catalog-fallback chain instead.
+    saturated = df is not None and len(df) >= _VIZIER_ROW_LIMIT
+    if not saturated or _depth >= _MAX_DEPTH:
+        if saturated:
+            print(f"    WARNING: {catalog} cone still saturated at max "
+                  f"tiling depth — guide-star recovery may be incomplete")
+        return df
+
+    import numpy as _np
+    print(f"    {catalog} cone saturated row limit (r={radius_deg:.3f}°) — "
+          f"subdividing into 2x2 (depth {_depth+1})")
+    half = radius_deg / 2.0
+    sub_r = half * 1.4143            # cover each quadrant's corners
+    cosd = max(_np.cos(_np.radians(dec_center)), 0.05)
+    parts = []
+    for dsign in (-1.0, 1.0):
+        for rsign in (-1.0, 1.0):
+            sub_ra = ra_center + rsign * half / cosd
+            sub_dec = dec_center + dsign * half
+            p = _fetch_vizier_cone_adaptive(
+                catalog, id_col, sub_ra, sub_dec, sub_r,
+                mag_limit=mag_limit, _depth=_depth + 1)
+            if p is not None and len(p):
+                parts.append(p)
+    if not parts:
+        return df                    # keep whatever the parent returned
+    import pandas as _pd
+    out = _pd.concat(parts, ignore_index=True)
+    if id_col in out.columns:
+        out = out.drop_duplicates(subset=[id_col])
+    return out
 
 
 def _gsc242_row_to_dict(tbl, row_idx: int) -> dict:
@@ -468,7 +522,7 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
 
             print(f"  Cluster {ci+1}/{n_cl}: VizieR I/305 (GSC 2.3.2) ...",
                   end=" ", flush=True)
-            df = _fetch_vizier_cone("I/305", "GSC2.3", ra_c, dec_c,
+            df = _fetch_vizier_cone_adaptive("I/305", "GSC2.3", ra_c, dec_c,
                                     radius_deg=r_c,
                                     mag_limit=_GUIDE_STAR_MAG_LIMIT)
             print(f"{len(df)} sources" if df is not None else "failed")
@@ -477,7 +531,7 @@ def resolve_gsc_positions(gs_df: pd.DataFrame) -> pd.DataFrame:
         if cl["has_numeric"]:
             print(f"  Cluster {ci+1}/{n_cl}: VizieR I/254 (GSC 1.x) ...",
                   end=" ", flush=True)
-            df = _fetch_vizier_cone("I/254", "GSC", ra_c, dec_c,
+            df = _fetch_vizier_cone_adaptive("I/254", "GSC", ra_c, dec_c,
                                     radius_deg=r_c,
                                     mag_limit=_GUIDE_STAR_MAG_LIMIT)
             print(f"{len(df)} sources" if df is not None else "failed")
