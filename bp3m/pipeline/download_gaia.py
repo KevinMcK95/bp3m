@@ -273,9 +273,30 @@ def _query_mag_bin(args):
     last_exc = None
     for attempt in range(_QUERY_RETRIES):
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
-                future = exe.submit(_submit_gaia_async, full_q, gaia_tap_server)
-                result = future.result(timeout=timeout)
+            # NOT ThreadPoolExecutor: its context-manager exit joins the
+            # worker (shutdown(wait=True)), so a hung TAP socket blocked
+            # here for hours AFTER the timeout fired (observed 2026-09-13).
+            # A daemon thread + queue enforces a true wall-clock cap.
+            import threading
+            import queue as _tq
+
+            _out: "_tq.Queue" = _tq.Queue(maxsize=1)
+
+            def _worker():
+                try:
+                    _out.put(('ok',
+                              _submit_gaia_async(full_q, gaia_tap_server)))
+                except Exception as exc:      # noqa: BLE001
+                    _out.put(('err', exc))
+
+            threading.Thread(target=_worker, daemon=True).start()
+            try:
+                _status, _payload = _out.get(timeout=timeout)
+            except _tq.Empty:
+                raise concurrent.futures.TimeoutError()
+            if _status == 'err':
+                raise _payload
+            result = _payload
             if cache_path is not None:
                 result.to_csv(cache_path, index=False)
             print(f"  Bin {n}/{n_total}: {len(result)} stars  "
