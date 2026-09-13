@@ -477,6 +477,11 @@ def _parse_args():
                      help='Root output directory (default: current directory)')
     ctl.add_argument('--n_processes', type=int, default=-1,
                      help='Number of cores to use (-1 = all available, default)')
+    ctl.add_argument('--gaia_tap_server', type=str, default=None,
+                    help='Alternate Gaia TAP mirror for catalogue downloads, '
+                         'e.g. https://gaia.ari.uni-heidelberg.de/ '
+                         '(faster and less 500-prone than ESA during load; '
+                         'default: ESA archive)')
     ctl.add_argument('--skip_download', action='store_true',
                      help='Skip Gaia and HST downloads (use existing files)')
     ctl.add_argument('--force_redownload_gaia', action='store_true',
@@ -827,6 +832,7 @@ def main():
                 query_timeout=args.gaia_timeout,
                 force_redownload=args.force_redownload_gaia,
                 quiet=args.quiet,
+                gaia_tap_server=args.gaia_tap_server,
             )
             _p_i = _gaia_csv_path_for(_ra_i, _dec_i, _sw_i, _sh_i)
             if _p_i is not None:
