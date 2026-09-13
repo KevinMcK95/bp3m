@@ -1685,6 +1685,19 @@ def run_psf_fitting(
         if not force_refit:
             ok, diffs = _params_cache_status(catalog, params_path, params_meta)
             if ok:
+                # Invalidate a catalog whose FLC was (re)downloaded after the
+                # catalog was written — e.g. MAST redelivered a reprocessed
+                # exposure during a download pass.  The catalog is written
+                # after the FLC is read, so FLC mtime > catalog mtime (beyond
+                # a small tolerance) means the image changed since fitting.
+                try:
+                    if img.stat().st_mtime > catalog.stat().st_mtime + 2.0:
+                        print(f"  {img.name}: FLC newer than catalog "
+                              f"(re-downloaded) — re-fitting")
+                        work.append(img)
+                        continue
+                except OSError:
+                    pass
                 skipped.append(img.name)
                 continue
             if catalog.exists():
