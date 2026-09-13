@@ -1239,7 +1239,9 @@ def _fit_one_image(args):
             params_path.unlink()
 
         table.write(str(out_catalog), overwrite=True)
-        params_path.write_text(json.dumps(params_meta, indent=2))
+        _meta_out = dict(params_meta)
+        _meta_out['image_fingerprint'] = _image_fingerprint(image_path)
+        params_path.write_text(json.dumps(_meta_out, indent=2))
 
         # Sky sanity check: warn if the median fitted sky is anomalously low.
         # A properly exposed science image always accumulates at least a few
@@ -1537,6 +1539,35 @@ def _fit_one_image(args):
         return str(image_path), 0, str(exc)
 
 
+def _image_fingerprint(img_path) -> dict | None:
+    """Identity of an FLC's *content*: byte size plus the pipeline stamps in
+    the primary header (DATE, PROCTIME, CAL_VER).
+
+    Two downloads of the same MAST delivery — e.g. the twin copies of one
+    exposure held by M31 and NGC_205 — share it; a redelivered, reprocessed
+    exposure does not.  Stored in psf_params.json so a catalog can be
+    validated against the image it was fitted on rather than against file
+    mtimes, which say nothing about content (a hardlinked catalog from a
+    twin field is always "older" than a freshly downloaded FLC).
+    """
+    try:
+        from astropy.io import fits as _fits
+        st = Path(img_path).stat()
+        h = _fits.getheader(str(img_path), 0)
+        return {'size': int(st.st_size), 'date': h.get('DATE'),
+                'proctime': h.get('PROCTIME'), 'cal_ver': h.get('CAL_VER')}
+    except Exception:
+        return None
+
+
+def _saved_fingerprint(params_path: Path) -> dict | None:
+    try:
+        fp = json.loads(params_path.read_text()).get('image_fingerprint')
+        return fp if isinstance(fp, dict) else None
+    except Exception:
+        return None
+
+
 def _params_cache_status(output_path: Path, params_path: Path,
                           current_params: dict) -> tuple[bool, list[str]]:
     """
@@ -1711,19 +1742,30 @@ def run_psf_fitting(
         if not force_refit:
             ok, diffs = _params_cache_status(catalog, params_path, params_meta)
             if ok:
-                # Invalidate a catalog whose FLC was (re)downloaded after the
-                # catalog was written — e.g. MAST redelivered a reprocessed
-                # exposure during a download pass.  The catalog is written
-                # after the FLC is read, so FLC mtime > catalog mtime (beyond
-                # a small tolerance) means the image changed since fitting.
-                try:
-                    if img.stat().st_mtime > catalog.stat().st_mtime + 2.0:
-                        print(f"  {img.name}: FLC newer than catalog "
-                              f"(re-downloaded) — re-fitting")
+                # Invalidate a catalog whose FLC content changed since the
+                # fit (MAST redelivered a reprocessed exposure).  Prefer the
+                # content fingerprint recorded at fit time; a hardlinked
+                # catalog from a twin field passes when the two FLC copies
+                # are the same delivery.  Sidecars written before the
+                # fingerprint existed fall back to the mtime test (catalog is
+                # written after the FLC is read, so a newer FLC means a
+                # re-download).
+                fp_saved = _saved_fingerprint(params_path)
+                if fp_saved is not None:
+                    if _image_fingerprint(img) != fp_saved:
+                        print(f"  {img.name}: FLC content changed since fit "
+                              f"(reprocessed delivery) — re-fitting")
                         work.append(img)
                         continue
-                except OSError:
-                    pass
+                else:
+                    try:
+                        if img.stat().st_mtime > catalog.stat().st_mtime + 2.0:
+                            print(f"  {img.name}: FLC newer than catalog and no "
+                                  f"fingerprint on record — re-fitting")
+                            work.append(img)
+                            continue
+                    except OSError:
+                        pass
                 skipped.append(img.name)
                 continue
             if catalog.exists():
