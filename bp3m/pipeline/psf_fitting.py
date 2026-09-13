@@ -1068,6 +1068,7 @@ def _image_worker(args):
 
                 current_delta = initial_delta
                 succeeded = False
+                last_err  = None
 
                 for iter_i in range(n_img_iter):
                     label = f"iter {iter_i + 1}/{n_img_iter}"
@@ -1078,8 +1079,22 @@ def _image_worker(args):
 
                     w = (img_path, catalog_path, lib_dir, params,
                          params_meta_disk, True, current_delta)
-                    path, n_stars, err = _fit_one_image(w)
+                    # A package reinstall while a run is live leaves the
+                    # module tree half-gone for a few seconds; a bare
+                    # import failure then costs 0 s per image, so four
+                    # workers can drain a whole queue in that window
+                    # (IC_1613, 2026-09-13: 119 images). Wait it out.
+                    for _attempt in range(4):
+                        path, n_stars, err = _fit_one_image(w)
+                        if err and _attempt < 3 and (
+                                'No module named' in err
+                                or 'cannot import name' in err):
+                            print(f"   import failure ({err}); retrying in 20 s")
+                            time.sleep(20)
+                            continue
+                        break
                     if err:
+                        last_err = err
                         print(f"   ERROR [{label}] {img_name}: {err}")
                         break
                     print(f"   [{label}] {img_name}: {n_stars} stars fitted")
@@ -1109,12 +1124,23 @@ def _image_worker(args):
                             print(f"   WARNING: no psf_delta.npy after {label} — stopping")
                             break
 
-            except Exception:
+            except Exception as _exc:
                 print(traceback.format_exc())
                 succeeded = False
+                last_err  = str(_exc)
             finally:
                 sys.stdout = _old_stdout
                 sys.stderr = _old_stderr
+
+        if not succeeded:
+            # Report as a failure, not as "Finished ... 0 stars": a fit that
+            # never ran must be visible in the run log and in the caller's
+            # failure summary so the image is re-queued.
+            elapsed = time.perf_counter() - t0
+            errmsg = last_err or 'no catalog written'
+            if _status_queue is not None:
+                _status_queue.put(('fail', img_name, errmsg, elapsed))
+            return (False, str(img_path), 0, 0, 0, elapsed, errmsg)
 
         # Extract summary stats.
         # n_found  : total initial detections above fmin (parsed from log;
@@ -1808,6 +1834,7 @@ def run_psf_fitting(
 
         _pending = set(_async_results)
         _done    = 0
+        _failed_imgs = []
 
         while _pending:
             # Drain status messages from workers.
@@ -1848,11 +1875,12 @@ def run_psf_fitting(
                     success, _, nf, nc, ns, elapsed, err = ar.get()
                     if success:
                         catalogs.append(catalog)
-                    elif err:
+                    else:
                         # Error already printed via queue; just log here.
-                        pass
+                        _failed_imgs.append((img.name, err or 'unknown'))
                 except Exception as _e:
                     print(f"[{_ts()}] FAILED    {img.name} — {_e}")
+                    _failed_imgs.append((img.name, str(_e)))
 
             if _pending:
                 import time as _time
@@ -1881,6 +1909,16 @@ def run_psf_fitting(
         _pool.join()
         _mgr.shutdown()
         print()
+        if _failed_imgs:
+            print(f"  WARNING: {len(_failed_imgs)} of {n_work} image(s) FAILED "
+                  f"PSF fitting (no catalog written; see psf_fitting_log.txt "
+                  f"in each image folder). They are re-fit on the next run.")
+            _by_err = {}
+            for _nm, _er in _failed_imgs:
+                _by_err.setdefault(_er.splitlines()[0][:120] if _er else '?', []).append(_nm)
+            for _er, _nms in _by_err.items():
+                print(f"    {len(_nms):4d}x  {_er}   e.g. {', '.join(_nms[:3])}")
+            print()
 
     # ── Serial mode: one image at a time (current behaviour) ─────────────────
     else:
