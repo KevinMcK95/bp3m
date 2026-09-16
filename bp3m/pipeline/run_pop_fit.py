@@ -1922,6 +1922,7 @@ def run_pop_fit(
     freeze_mu_pop_init: bool = False,
     poly_order: int | None = None,
     no_plots: bool = False,
+    plot_residuals: bool = False,
     fit_cte: bool = False,
     cte_mag_poly_order: int = 3,
     cte_spatial_order: int = 2,
@@ -3343,19 +3344,23 @@ def run_pop_fit(
             except Exception as _exc:
                 print(f"  WARNING: _plot_qso_diagnostics failed — {_exc}")
 
-        # ── Residual maps — last ───────────────────────────────────────────────
-        _plot_dir = output_pfr / 'plots' / 'residuals'
-        print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
-        try:
-            _plot_pop_residual_maps(
-                _plot_dir, image_names, solver,
-                r_before=r_bp3m,   v_before=v_bp3m,
-                r_after=r_current, v_after=v_mean,
-                C_vT_after=C_vT_final,
-                prefix='final',
-            )
-        except Exception as _exc:
-            print(f"  WARNING: residual maps failed — {_exc}")
+        # ── Residual maps — last; off by default (one figure per image is
+        # the slowest step of the run; enable with --plot_residuals) ───────────
+        if plot_residuals:
+            _plot_dir = output_pfr / 'plots' / 'residuals'
+            print(f"\n  Plotting before/after residual maps ({len(image_names)} images)...")
+            try:
+                _plot_pop_residual_maps(
+                    _plot_dir, image_names, solver,
+                    r_before=r_bp3m,   v_before=v_bp3m,
+                    r_after=r_current, v_after=v_mean,
+                    C_vT_after=C_vT_final,
+                    prefix='final',
+                )
+            except Exception as _exc:
+                print(f"  WARNING: residual maps failed — {_exc}")
+        else:
+            print("\n  Residual maps skipped (pass --plot_residuals to generate them).")
         solver._update_geometry(r_current, v_mean)
 
     # ── Optional CTE phase ────────────────────────────────────────────────────
@@ -3543,6 +3548,10 @@ def main(argv=None):
                         help='Polynomial order (default: read from BP3M_results/run_config.json)')
     parser.add_argument('--no_plots', action='store_true',
                         help='Skip diagnostic plot generation')
+    parser.add_argument('--plot_residuals', action='store_true',
+                        help='Also write the per-image before/after residual maps '
+                             '(plots/residuals/); off by default because it is '
+                             'the slowest step of the run')
     parser.add_argument('--fit_members_only', action='store_true',
                         help='When set, only identified members are used in the astrometric '
                              'fit from Phase 2 onwards; non-members are excluded from '
@@ -3720,6 +3729,7 @@ def main(argv=None):
         freeze_mu_pop_init=args.freeze_mu_pop_init,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
+        plot_residuals=args.plot_residuals,
         fit_cte=args.fit_cte,
         cte_mag_poly_order=args.cte_mag_poly_order,
         cte_spatial_order=args.cte_spatial_order,
