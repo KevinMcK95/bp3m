@@ -1827,7 +1827,7 @@ def _restrict_to_members(solver, image_names: list, member_sidx: np.ndarray) -> 
 
 
 def _promote_hst_members(solver, image_names: list, member_sidx: np.ndarray,
-                         hst_only_glob: np.ndarray) -> int:
+                         hst_only_glob: np.ndarray, all_hst: bool = False) -> int:
     """--hst_members_fit: HST-only MEMBER detections become fit detections.
 
     A member's PM is tied to mu_pop by the population prior, which makes it a
@@ -1836,6 +1836,9 @@ def _promote_hst_members(solver, image_names: list, member_sidx: np.ndarray,
     gives the joint (r, mu_pop) iteration two different objectives and no
     common fixed point.  HST-only stars that are NOT members stay (or become
     again) astrometry-only.  Idempotent; composes with _restrict_to_members.
+    all_hst=True (--hst_all_fit): EVERY HST-only detection (member or not)
+    becomes a fit detection; non-members keep their diffuse PM prior, so they
+    constrain the per-image geometry but not the frame's PM zero-point.
     Returns the number of newly promoted detections.
     """
     is_member = np.zeros(solver.n_stars, dtype=bool)
@@ -1850,8 +1853,11 @@ def _promote_hst_members(solver, image_names: list, member_sidx: np.ndarray,
         mem_img = is_member[sidx]
         use_fit = np.asarray(d['use_for_fit'], dtype=bool)
         use_ast = np.asarray(d.get('use_for_astrom', use_fit), dtype=bool)
-        promote = use_ast & hst_img & mem_img
-        new_fit = (use_fit & ~(hst_img & ~mem_img)) | promote
+        if all_hst:
+            new_fit = use_fit | (use_ast & hst_img)
+        else:
+            promote = use_ast & hst_img & mem_img
+            new_fit = (use_fit & ~(hst_img & ~mem_img)) | promote
         n_prom += int((new_fit & ~use_fit).sum())
         d['use_for_fit'] = new_fit
     return n_prom
@@ -1970,6 +1976,7 @@ def run_pop_fit(
     members_hst_only: bool = False,
     members_5p_only: bool = False,
     hst_members_fit: bool = False,
+    hst_all_fit: bool = False,
 ) -> Path:
     """
     Run population PM fitting.
@@ -2631,9 +2638,9 @@ def run_pop_fit(
         return float(_s[0]), float(_s[1])
 
     if hst_members_fit and n_iter_joint > 0:
-        _n_prom = _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
-        print(f"  --hst_members_fit: {_n_prom} HST-only member detections promoted to "
-              f"fit detections for the joint phases")
+        _n_prom = _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob, all_hst=hst_all_fit)
+        print(f"  --{'hst_all_fit' if hst_all_fit else 'hst_members_fit'}: {_n_prom} HST-only "
+              f"{'' if hst_all_fit else 'member '}detections promoted to fit detections for the joint phases")
     print(f"\n  Phase 2: joint solve ({n_iter_joint} iterations)...")
     C_shared_joint = None
     for jt_iter in range(n_iter_joint):
@@ -2655,7 +2662,7 @@ def run_pop_fit(
         if fit_members_only:
             _restrict_to_members(solver, image_names, member_sidx)
         if hst_members_fit:
-            _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
+            _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob, all_hst=hst_all_fit)
         _smu = _sigma_mu_of(C_shared_joint)
         print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
@@ -2698,7 +2705,7 @@ def run_pop_fit(
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
             if hst_members_fit:
-                _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
+                _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob, all_hst=hst_all_fit)
 
             for img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new in alpha_info:
                 tag = '  ← raised' if alpha_new > alpha_prev + 1e-4 else (
@@ -2813,7 +2820,7 @@ def run_pop_fit(
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
             if hst_members_fit:
-                _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
+                _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob, all_hst=hst_all_fit)
 
             n_use_img = sum(d['use_for_fit'].sum()
                             for d in (solver._img_data.get(img) for img in image_names)
@@ -2905,7 +2912,7 @@ def run_pop_fit(
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
             if hst_members_fit:
-                _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
+                _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob, all_hst=hst_all_fit)
 
             _smu = _sigma_mu_of(C_shared_joint_sw)
             print(f"    iter {sw_iter + 1}/{n_iter_phase4}: "
@@ -3270,7 +3277,7 @@ def run_pop_fit(
             'sigma_plx_tot': sigma_plx_tot,
             'mu_pop_prior_sigma': mu_pop_prior_sigma,
             'n_iter_mu': n_iter_mu, 'n_iter_joint': n_iter_joint,
-            'hst_members_fit': bool(hst_members_fit),
+            'hst_members_fit': bool(hst_members_fit), 'hst_all_fit': bool(hst_all_fit),
             'member_sigma_clip': member_sigma_clip,
             'mu_pop_ra': float(mu_pop_current[0]),
             'mu_pop_dec': float(mu_pop_current[1]),
@@ -3676,6 +3683,11 @@ def main(argv=None):
                              'references). Without this, HST-only members feed mu_pop '
                              'but not r, and the joint iteration has no consistent '
                              'fixed point (Pal5/E3 drift, 2026-09-16).')
+    parser.add_argument('--hst_all_fit', action='store_true',
+                        help='master_v2: let EVERY HST-only source (member or not) '
+                             'constrain the alignment in the joint phases, as the '
+                             'v2 alignment itself does; non-members keep the diffuse '
+                             'PM prior. Implies --hst_members_fit.')
     parser.add_argument('--det_chi2_threshold_v2', type=float, default=None,
                         help='master_v2: drop individual detections with '
                              'Phase-4 chi2 above this (e.g. 9.0)')
@@ -3800,7 +3812,8 @@ def main(argv=None):
         det_chi2_threshold_v2=args.det_chi2_threshold_v2,
         members_hst_only=args.members_hst_only,
         members_5p_only=args.members_5p_only,
-        hst_members_fit=args.hst_members_fit,
+        hst_members_fit=args.hst_members_fit or args.hst_all_fit,
+        hst_all_fit=args.hst_all_fit,
     )
 
     # Save the command only on successful completion so interrupted runs
