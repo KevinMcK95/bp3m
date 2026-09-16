@@ -167,6 +167,11 @@ def vet_qso_candidates(
         return None
     qso_df = pd.read_csv(_cand_path, dtype={'source_id': 'int64'})
     print(f"\n[QSO vetting] Starting with {len(qso_df)} Gaia qso_candidates")
+    if len(qso_df) == 0:
+        # SkyCoord.match_to_catalog_sky on an empty source list raises
+        # "index 0 is out of bounds"; nothing to vet, so stop here.
+        print("[QSO vetting] No qso_candidates in the field — skipping.")
+        return None
 
     # ── Load main Gaia CSV for astrometry ─────────────────────────────────────
     gaia_astro = _load_gaia_astrometry(gaia_dir)
