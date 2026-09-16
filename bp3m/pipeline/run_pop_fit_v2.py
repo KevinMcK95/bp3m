@@ -463,18 +463,19 @@ def main(argv=None):
         return _catalog_main(argv)
     from bp3m.pipeline.run_pop_fit import main as _joint_main
     extra = ['--use_master_v2']
-    # SAFE DEFAULT: keep the alignment FROZEN (mu-only Phase 1).  With
-    # HST-only-dominated membership the joint r+mu phases have a runaway
-    # mu_pop <-> alignment soft mode (Leo_I 2026-09-01: joint drifted to
-    # (-0.41,+0.23) while the Gaia PMs of the same members give
-    # (-0.06,-0.12)).  Pass --n_iter_joint/--n_iter_alpha explicitly to
-    # opt in to the joint phases regardless.
-    if not any(a.startswith('--n_iter_joint') for a in argv):
-        extra += ['--n_iter_joint', '0']
+    # Joint r+mu phases are ON by default, exactly as in bp3m-pop-fit, so the
+    # v1 and v2 fits are directly comparable (user 2026-09-16). The frozen-
+    # alignment mode that was the default 2026-09-02..16 (guarding against a
+    # mu_pop <-> alignment runaway seen with HST-only-dominated membership on
+    # Leo_I) is available with --frozen_alignment; watch the Phase 2/3 iteration
+    # log for a drifting mu_pop when the members are mostly HST-only.
+    if '--frozen_alignment' in argv:
+        argv.remove('--frozen_alignment')
+        if not any(a.startswith('--n_iter_joint') for a in argv):
+            extra += ['--n_iter_joint', '0']
         if not any(a.startswith('--n_iter_alpha') for a in argv):
             extra += ['--n_iter_alpha', '0']
-        print('bp3m-pop-fit-v2: alignment frozen (mu-only solve; '
-              'pass --n_iter_joint to enable joint phases)')
+        print('bp3m-pop-fit-v2: --frozen_alignment (mu-only Phase 1; joint phases off)')
     return _joint_main(argv + extra)
 
 
