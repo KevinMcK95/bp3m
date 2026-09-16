@@ -476,6 +476,14 @@ def main(argv=None):
         if not any(a.startswith('--n_iter_alpha') for a in argv):
             extra += ['--n_iter_alpha', '0']
         print('bp3m-pop-fit-v2: --frozen_alignment (mu-only Phase 1; joint phases off)')
+    else:
+        # In the joint phases HST-only MEMBERS must also constrain r (see
+        # run_pop_fit._promote_hst_members); --no_hst_members_fit reproduces
+        # the inconsistent (drifting) 2026-09-02 behaviour for tests.
+        if '--no_hst_members_fit' in argv:
+            argv.remove('--no_hst_members_fit')
+        elif '--hst_members_fit' not in argv:
+            extra += ['--hst_members_fit']
     return _joint_main(argv + extra)
 
 

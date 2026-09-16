@@ -1826,6 +1826,37 @@ def _restrict_to_members(solver, image_names: list, member_sidx: np.ndarray) -> 
         np.add.at(solver.gaia_n_hst_used, d['sidx'][use_any], 1)
 
 
+def _promote_hst_members(solver, image_names: list, member_sidx: np.ndarray,
+                         hst_only_glob: np.ndarray) -> int:
+    """--hst_members_fit: HST-only MEMBER detections become fit detections.
+
+    A member's PM is tied to mu_pop by the population prior, which makes it a
+    frame reference exactly like a Gaia star with a known PM; leaving these
+    detections astrometry-only while their PMs still feed the mu_pop update
+    gives the joint (r, mu_pop) iteration two different objectives and no
+    common fixed point.  HST-only stars that are NOT members stay (or become
+    again) astrometry-only.  Idempotent; composes with _restrict_to_members.
+    Returns the number of newly promoted detections.
+    """
+    is_member = np.zeros(solver.n_stars, dtype=bool)
+    is_member[member_sidx] = True
+    n_prom = 0
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        sidx = d['sidx']
+        hst_img = hst_only_glob[sidx]
+        mem_img = is_member[sidx]
+        use_fit = np.asarray(d['use_for_fit'], dtype=bool)
+        use_ast = np.asarray(d.get('use_for_astrom', use_fit), dtype=bool)
+        promote = use_ast & hst_img & mem_img
+        new_fit = (use_fit & ~(hst_img & ~mem_img)) | promote
+        n_prom += int((new_fit & ~use_fit).sum())
+        d['use_for_fit'] = new_fit
+    return n_prom
+
+
 # ── Main function ─────────────────────────────────────────────────────────────
 
 def _posthoc_sigma_int(bp3m_dir, output_pfr, mu):
@@ -1938,6 +1969,7 @@ def run_pop_fit(
     det_chi2_threshold_v2: float | None = None,
     members_hst_only: bool = False,
     members_5p_only: bool = False,
+    hst_members_fit: bool = False,
 ) -> Path:
     """
     Run population PM fitting.
@@ -2300,6 +2332,9 @@ def run_pop_fit(
     # ── Apply v1 use_for_fit / use_for_astrom flags ───────────────────────────
     print("\n  Applying v1 detection flags...")
     _apply_bp3m_flags(bp3m_dir, solver, image_names)
+    _hst_only_glob = gaia_catalog['Gaia_id'].to_numpy(np.int64) < 0
+    if hst_members_fit and not _hst_only_glob.any():
+        print("  --hst_members_fit: no HST-only stars in this star set — no effect")
 
     # ── Count HST detections per star ─────────────────────────────────────────
     _n_hst_det = np.zeros(solver.n_stars, dtype=int)
@@ -2595,6 +2630,10 @@ def run_pop_fit(
         _s = np.sqrt(np.diag(_C2))
         return float(_s[0]), float(_s[1])
 
+    if hst_members_fit and n_iter_joint > 0:
+        _n_prom = _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
+        print(f"  --hst_members_fit: {_n_prom} HST-only member detections promoted to "
+              f"fit detections for the joint phases")
     print(f"\n  Phase 2: joint solve ({n_iter_joint} iterations)...")
     C_shared_joint = None
     for jt_iter in range(n_iter_joint):
@@ -2615,6 +2654,8 @@ def run_pop_fit(
             max_sigma_free_pm=max_sigma_free_pm))
         if fit_members_only:
             _restrict_to_members(solver, image_names, member_sidx)
+        if hst_members_fit:
+            _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
         _smu = _sigma_mu_of(C_shared_joint)
         print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}±{_smu[0]:.4f}, "
@@ -2656,6 +2697,8 @@ def run_pop_fit(
                 max_sigma_free_pm=max_sigma_free_pm))
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
+            if hst_members_fit:
+                _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
 
             for img, n_use, n_tot, alpha_prev, alpha_raw, alpha_new in alpha_info:
                 tag = '  ← raised' if alpha_new > alpha_prev + 1e-4 else (
@@ -2769,6 +2812,8 @@ def run_pop_fit(
                 max_sigma_free_pm=max_sigma_free_pm))
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
+            if hst_members_fit:
+                _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
 
             n_use_img = sum(d['use_for_fit'].sum()
                             for d in (solver._img_data.get(img) for img in image_names)
@@ -2859,6 +2904,8 @@ def run_pop_fit(
                 max_sigma_free_pm=max_sigma_free_pm))
             if fit_members_only:
                 _restrict_to_members(solver, image_names, member_sidx)
+            if hst_members_fit:
+                _promote_hst_members(solver, image_names, member_sidx, _hst_only_glob)
 
             _smu = _sigma_mu_of(C_shared_joint_sw)
             print(f"    iter {sw_iter + 1}/{n_iter_phase4}: "
@@ -3223,6 +3270,7 @@ def run_pop_fit(
             'sigma_plx_tot': sigma_plx_tot,
             'mu_pop_prior_sigma': mu_pop_prior_sigma,
             'n_iter_mu': n_iter_mu, 'n_iter_joint': n_iter_joint,
+            'hst_members_fit': bool(hst_members_fit),
             'member_sigma_clip': member_sigma_clip,
             'mu_pop_ra': float(mu_pop_current[0]),
             'mu_pop_dec': float(mu_pop_current[1]),
@@ -3621,6 +3669,13 @@ def main(argv=None):
     parser.add_argument('--members_hst_only', action='store_true',
                         help='TEST: bar Gaia-matched stars from membership; '
                              'only HST-only stars inform mu_pop')
+    parser.add_argument('--hst_members_fit', action='store_true',
+                        help='master_v2: let HST-only MEMBER stars constrain the '
+                             'alignment in the joint phases (their PMs are tied to '
+                             'mu_pop by the population prior, so they are frame '
+                             'references). Without this, HST-only members feed mu_pop '
+                             'but not r, and the joint iteration has no consistent '
+                             'fixed point (Pal5/E3 drift, 2026-09-16).')
     parser.add_argument('--det_chi2_threshold_v2', type=float, default=None,
                         help='master_v2: drop individual detections with '
                              'Phase-4 chi2 above this (e.g. 9.0)')
@@ -3745,6 +3800,7 @@ def main(argv=None):
         det_chi2_threshold_v2=args.det_chi2_threshold_v2,
         members_hst_only=args.members_hst_only,
         members_5p_only=args.members_5p_only,
+        hst_members_fit=args.hst_members_fit,
     )
 
     # Save the command only on successful completion so interrupted runs
