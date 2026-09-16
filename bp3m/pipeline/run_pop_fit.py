@@ -2033,6 +2033,43 @@ def run_pop_fit(
     v1_prior_sigma_pair_skew     = _v1_hp.get('sigma_pair_skew',            None)
     v1_prior_sigma_pair_pointing = _v1_hp.get('sigma_pair_pointing_mas',    None)
 
+    # master_v2 consistency guard: the synthetic HST-only ids in BP3M_v2_results
+    # are -(row+1) of the master catalog the ALIGNMENT used; if the master on
+    # disk was rewritten afterwards (bp3m-v2 Step 3 without a closing
+    # alignment) the flags / warm start below would be applied to the wrong
+    # stars.  Compare positions of the shared synthetic ids.
+    if data_source == 'master_v2':
+        try:
+            _sa_chk = pd.read_csv(bp3m_dir / 'stellar_astrometry.csv',
+                                  dtype={'Gaia_id': np.int64}, usecols=['Gaia_id', 'ra', 'dec'])
+            _sa_chk = _sa_chk[_sa_chk['Gaia_id'] < 0]
+            _gc_ids = gaia_catalog['Gaia_id'].to_numpy(np.int64)
+            _pos = {int(g): k for k, g in enumerate(_gc_ids) if g < 0}
+            _idx = np.array([_pos.get(int(g), -1) for g in _sa_chk['Gaia_id']])
+            _ok = _idx >= 0
+            _rac = 'ra' if 'ra' in gaia_catalog.columns else 'ra0'
+            _dec = 'dec' if 'dec' in gaia_catalog.columns else 'dec0'
+            if _ok.sum() >= 20:
+                _ra_g = gaia_catalog[_rac].to_numpy(float)[_idx[_ok]]
+                _de_g = gaia_catalog[_dec].to_numpy(float)[_idx[_ok]]
+                _sep = np.hypot((_sa_chk['ra'].to_numpy(float)[_ok] - _ra_g)
+                                * np.cos(np.deg2rad(_de_g)) * 3.6e6,
+                                (_sa_chk['dec'].to_numpy(float)[_ok] - _de_g) * 3.6e6)
+                _bad = float(np.mean(_sep > 500.0))
+                print(f"  master_v2 id check: {int(_ok.sum())} shared HST-only ids, "
+                      f"median position offset {np.median(_sep):.0f} mas, "
+                      f"{100*_bad:.0f}% beyond 0.5 arcsec")
+                if _bad > 0.10:
+                    raise RuntimeError(
+                        f"BP3M_v2_results does not index the master_combined_v2.csv on disk "
+                        f"({100*_bad:.0f}% of shared HST-only ids point at different stars). "
+                        f"The master was re-crossmatched after the alignment. Re-align on the "
+                        f"current catalog first:  bp3m-v2 --name {field_name} --align_only")
+        except RuntimeError:
+            raise
+        except Exception as _exc:
+            print(f"  WARNING: master_v2 id check skipped ({_exc})")
+
     print("\n" + "─" * 60)
     print("BP3M pop-fit: population PM fitting")
     print("─" * 60)

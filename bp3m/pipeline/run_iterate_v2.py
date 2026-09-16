@@ -119,6 +119,17 @@ def main():
                         help='Minimum detections for a source to appear in the master catalog')
     parser.add_argument('--cross_filter_radius_mas', type=float, default=200.,
                         help='Match radius for cross-filter association (mas)')
+    parser.add_argument('--no_final_align', action='store_true',
+                        help='Do NOT run the closing alignment on the final master catalog. '
+                             'By default bp3m-v2 ends with an alignment so that BP3M_v2_results '
+                             'refers to the rows of the master_combined_v2.csv left on disk '
+                             '(the refinement crossmatch rewrites that file and re-indexes the '
+                             'HST-only sources; without the closing alignment the two disagree '
+                             'and bp3m-pop-fit-v2 / the selection notebook mis-identify stars).')
+    parser.add_argument('--align_only', action='store_true',
+                        help='Only run the alignment on the existing master_combined_v2.csv '
+                             '(no crossmatch before or after). Use it to bring an older '
+                             'BP3M_v2_results back in step with its master catalog.')
     parser.add_argument('--gaia_csv', default=None,
                         help='Gaia catalog CSV for Gaia recovery (auto-detected if not given)')
     parser.add_argument('--no_save_detections', action='store_true',
@@ -214,6 +225,11 @@ def main():
         exclude_2p_from_alignment     = args.exclude_2p_from_alignment,
     )
 
+    if args.align_only:
+        args.skip_initial_crossmatch = True
+        args.n_refine = 0
+        print("--align_only: aligning on the existing master_combined_v2.csv, no crossmatch")
+
     # ── Step 1: initial crossmatch ─────────────────────────────────────────────
     if not args.skip_initial_crossmatch:
         print(f"\n{'#'*60}")
@@ -248,6 +264,30 @@ def main():
         print(f"\n--- Step 3 (cycle {cycle}): master crossmatch (using BP3M_v2_results/) ---")
         run_hst_crossmatch(**crossmatch_kwargs, bp3m_results_dir=bp3m_v2_dir,
                            cycle_id=cycle)
+
+    # ── Closing alignment ─────────────────────────────────────────────────────
+    # Step 3 rewrote master_combined_v2.csv: its row set (and therefore the
+    # synthetic HST-only ids -(row+1)) differs from the catalog the last
+    # alignment used, and BP3M_v2_results would no longer index the master on
+    # disk (2026-09-16: every field affected; And_VII pop-fit exploded).  End
+    # with an alignment on the final catalog so the two always agree.
+    if (args.n_refine >= args.start_cycle and args.n_refine > 0 and not args.no_final_align) \
+            or args.align_only:
+        print(f"\n--- Closing alignment on the final master_combined_v2.csv ---")
+        run_alignment_v2(**bp3m_kwargs)
+    # provenance: hard-link the master the results refer to next to them
+    try:
+        import os as _os
+        _snap = bp3m_v2_dir / 'master_combined_v2_aligned.csv'
+        if _snap.exists() or _snap.is_symlink():
+            _snap.unlink()
+        try:
+            _os.link(xmatch_dir / 'master_combined_v2.csv', _snap)
+        except OSError:
+            import shutil as _shutil
+            _shutil.copy2(xmatch_dir / 'master_combined_v2.csv', _snap)
+    except Exception as _exc:
+        print(f"  WARNING: could not snapshot master_combined_v2.csv into BP3M_v2_results: {_exc}")
 
 
     # Save the command only on successful completion so interrupted runs
