@@ -202,7 +202,8 @@ def vet_qso_candidates(
     # ── Catalog match flag ────────────────────────────────────────────────────
     crf = qso_df.get('gaia_crf_source', pd.Series(False, index=qso_df.index))
     qso_df['catalog_match'] = (
-        qso_df['quaia_match'] | qso_df['milliquas_match'] | crf.fillna(False)
+        qso_df['quaia_match'].astype(bool) | qso_df['milliquas_match'].astype(bool)
+        | crf.fillna(False).astype(bool)
     )
     n_cat = qso_df['catalog_match'].sum()
     print(f"  Catalog match (Quaia OR MILLIQUAS OR CRF3): {n_cat} / {len(qso_df)}")
@@ -243,9 +244,14 @@ def _load_gaia_astrometry(gaia_dir: Path) -> "pd.DataFrame | None":
         return None
     dfs = [pd.read_csv(p, dtype={'source_id': 'int64'}) for p in paths]
     df  = pd.concat(dfs, ignore_index=True)
-    # Keep only potential QSOs to save memory during chi2 computation
+    # Keep only potential QSOs to save memory during chi2 computation.
+    # Older Gaia CSVs store this flag as 0/1 ints and newer ones as bools;
+    # concatenating them gives a non-bool Series, which pandas would use as
+    # COLUMN LABELS rather than a row mask ("None of [Index([0, 0, ...])]
+    # are in the [columns]"), so coerce to a plain boolean array first.
     if 'in_qso_candidates' in df.columns:
-        df = df[df['in_qso_candidates'].fillna(False)]
+        mask = df['in_qso_candidates'].fillna(False).astype(bool).to_numpy()
+        df = df[mask]
     return df
 
 
