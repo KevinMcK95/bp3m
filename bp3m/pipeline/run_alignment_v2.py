@@ -1382,6 +1382,7 @@ def run_alignment_v2(
             "mcmc_posteriors":   mcmc_posteriors,
             "clip_sigma":        clip_sigma,
             "poly_order":        poly_order,
+            "pos_err_floor":     pos_err_floor,
             "hst_enable_iter":   hst_enable_iter,
             "hst_max_pm_unc":    hst_max_pm_unc,
             "hst_max_per_image": hst_max_per_image,

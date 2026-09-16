@@ -61,7 +61,12 @@ def main():
     parser.add_argument('--clip_sigma', type=float, default=4.5,
                         help='MAD sigma for outlier rejection (0 = disabled)')
     parser.add_argument('--poly_order', type=int, default=None,
-                        help='Polynomial order for image transformation')
+                        help='Polynomial order for image transformation '
+                             '(default: the v1 run\'s value from BP3M_results/run_config.json)')
+    parser.add_argument('--pos_err_floor', type=float, default=None,
+                        help='Minimum per-detection positional uncertainty in pixels, '
+                             'added in quadrature (bp3m --bp3m_pos_err_floor). Default: '
+                             'the v1 run\'s value from BP3M_results/run_config.json, else 0.05')
     parser.add_argument('--hst_enable_iter', type=int, default=5,
                         help='Outer iteration at which HST-only sources are enabled')
     parser.add_argument('--hst_max_pm_unc', type=float, default=5.0,
@@ -137,17 +142,21 @@ def main():
     bp3m_v2_dir = field_dir / 'BP3M_v2_results'
     xmatch_dir  = field_dir / 'hst_xmatch'
 
-    # Default poly_order to whatever v1 used, if not explicitly specified
-    if args.poly_order is None:
-        _v1_cfg = bp3m_v1_dir / 'run_config.json'
-        if _v1_cfg.exists():
-            import json as _json
-            _v1_poly = _json.load(open(_v1_cfg)).get('poly_order', 1)
-            args.poly_order = _v1_poly
-            print(f"  poly_order not specified — using v1 value: {args.poly_order}")
-        else:
-            args.poly_order = 1
-            print(f"  poly_order not specified and no v1 run_config.json found — defaulting to 1")
+    # Default poly_order / pos_err_floor to whatever v1 used, if not explicitly
+    # specified, so the v2 solve sees the same per-detection error model.
+    _v1_cfg_path = bp3m_v1_dir / 'run_config.json'
+    _v1_cfg = {}
+    if _v1_cfg_path.exists():
+        import json as _json
+        _v1_cfg = _json.load(open(_v1_cfg_path))
+    for _key, _default in (('poly_order', 1), ('pos_err_floor', 0.05)):
+        if getattr(args, _key) is None:
+            if _key in _v1_cfg:
+                setattr(args, _key, _v1_cfg[_key])
+                print(f"  {_key} not specified — using v1 value: {getattr(args, _key)}")
+            else:
+                setattr(args, _key, _default)
+                print(f"  {_key} not specified and not in v1 run_config.json — defaulting to {_default}")
 
     crossmatch_kwargs = dict(
         field_dir                = field_dir,
@@ -172,6 +181,7 @@ def main():
         n_samples            = args.n_samples,
         clip_sigma           = args.clip_sigma,
         poly_order           = args.poly_order,
+        pos_err_floor        = args.pos_err_floor,
         use_sparse           = args.sparse,
         no_prefilter         = args.no_prefilter,
         hst_enable_iter      = args.hst_enable_iter,
