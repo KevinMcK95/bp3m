@@ -1749,7 +1749,9 @@ def main():
         print(f"Synthetic results: "
               f"{output_dir / field / syn_name / 'BP3M_results' / 'synthetic_comparison.csv'}")
     else:
-        print(f"Results: {output_dir / field / 'BP3M_results' / 'stellar_astrometry.csv'}")
+        _res_dir = (f"BP3M_results_{args.bp3m_results_suffix}"
+                    if getattr(args, 'bp3m_results_suffix', None) else 'BP3M_results')
+        print(f"Results: {output_dir / field / _res_dir / 'stellar_astrometry.csv'}")
     print("=" * 55)
 
 
