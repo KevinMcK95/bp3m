@@ -82,7 +82,8 @@ _INIT_RESID_CLIP_PX = 100.0
 
 def _make_image_prior(meta, poly_order=1,
                       sigma_rot_deg=None, sigma_scale=None,
-                      sigma_skew=None, sigma_pointing=None):
+                      sigma_skew=None, sigma_pointing=None,
+                      sigma_poly_px=None):
     """
     Return (r_prior_j, C_r_prior_inv_j) for image j.
 
@@ -90,7 +91,14 @@ def _make_image_prior(meta, poly_order=1,
     Prior:
       (a,b,c,d) — from header rotation/scale (strong prior)
       (Δα0,Δδ0) — sigma = sigma_pointing mas (loose; ~100 ACS WFC pixels)
-      poly terms — zero mean, flat prior (determined entirely by data)
+      poly terms — zero mean; flat prior unless sigma_poly_px is given, in
+                   which case each degree>=2 coefficient gets a Gaussian prior
+                   allowing ~sigma_poly_px of displacement at the detector edge
+                   (X_mat scales degree-k monomials by 2048**(k-1), so a
+                   coefficient c displaces ~c*2048 px there; sigma_c =
+                   sigma_poly_px/2048).  Without it poly_order>=3 is
+                   unconstrained in images with few well-spread stars
+                   (And_VII 2026-09-16: r diverged to 1e9).
 
     sigma_* override the module-level defaults from instrument_config.py.
     """
@@ -126,7 +134,11 @@ def _make_image_prior(meta, poly_order=1,
 
     C_r_prior_inv[4, 4] = sigma_pointing ** -2  # Δα0
     C_r_prior_inv[5, 5] = sigma_pointing ** -2  # Δδ0
-    # Indices 6+ (poly terms) remain zero — flat prior.
+    # Indices 6+ (poly terms): flat prior, or a weak Gaussian if requested.
+    if sigma_poly_px is not None and n_r > 6:
+        _sig_c = float(sigma_poly_px) / 2048.0
+        for k in range(6, n_r):
+            C_r_prior_inv[k, k] = _sig_c ** -2
 
     return r_prior, C_r_prior_inv
 
@@ -250,7 +262,7 @@ class BP3MSolver:
                  prior_sigma_skew=None, prior_sigma_pointing=None,
                  prior_sigma_pair_rot_deg=None, prior_sigma_pair_scale=None,
                  prior_sigma_pair_skew=None, prior_sigma_pair_pointing=None,
-                 use_pair_prior=False,
+                 use_pair_prior=False, prior_sigma_poly_px=None,
                  fit_epoch_distortion=False, epoch_dist_order=3,
                  epoch_gap_days=180.0, epoch_dist_sigma_mas=10.0,
                  epoch_breaks=None, epoch_dist_min_images=3,
@@ -280,6 +292,7 @@ class BP3MSolver:
         self._sigma_scale_cli         = prior_sigma_scale
         self._sigma_skew_cli          = prior_sigma_skew
         self._sigma_pointing_cli      = prior_sigma_pointing
+        self._sigma_poly_px_cli       = prior_sigma_poly_px
         self._sigma_pair_rot_deg_cli  = prior_sigma_pair_rot_deg
         self._sigma_pair_scale_cli    = prior_sigma_pair_scale
         self._sigma_pair_skew_cli     = prior_sigma_pair_skew
@@ -928,6 +941,7 @@ class BP3MSolver:
                 sigma_scale    = self._sigma_scale_cli,
                 sigma_skew     = self._sigma_skew_cli,
                 sigma_pointing = self._sigma_pointing_cli,
+                sigma_poly_px  = getattr(self, '_sigma_poly_px_cli', None),
             )
 
             # ── Build r_init (initial iterate) ───────────────────────────────

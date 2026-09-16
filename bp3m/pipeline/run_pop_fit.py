@@ -428,6 +428,24 @@ def _apply_bp3m_flags(
           + ("" if has_ufa else " (no use_for_astrom.npz — used use_for_fit)"))
 
 
+def _restrict_images(names, imgs, restrict_filters, restrict_instdet):
+    """--restrict_filters / --restrict_instdet (same semantics as bp3m)."""
+    out = list(names)
+    if restrict_filters:
+        keep = {f.upper() for f in restrict_filters}
+        out = [n for n in out if str(imgs[n].get('filter', '')).upper() in keep]
+    if restrict_instdet:
+        keep = {s.upper() for s in restrict_instdet}
+        out = [n for n in out if (str(imgs[n].get('instrument', ''))
+                                  + str(imgs[n].get('detector', ''))).upper() in keep]
+    if restrict_filters or restrict_instdet:
+        print(f"  image restriction: {len(out)}/{len(names)} images kept "
+              f"(filters={restrict_filters}, instdet={restrict_instdet})")
+        if not out:
+            raise RuntimeError("no images left after --restrict_filters/--restrict_instdet")
+    return out
+
+
 # ── Joint population solve ────────────────────────────────────────────────────
 
 def _joint_solve_pop(
@@ -1978,6 +1996,9 @@ def run_pop_fit(
     hst_members_fit: bool = False,
     hst_all_fit: bool = False,
     pos_corr_table: "str | None" = None,
+    poly_prior_px: "float | None" = None,
+    restrict_filters: "list[str] | None" = None,
+    restrict_instdet: "list[str] | None" = None,
 ) -> Path:
     """
     Run population PM fitting.
@@ -2082,6 +2103,10 @@ def run_pop_fit(
             filtered_spi = {n: d for n, d in filtered_spi.items()
                             if n in _xdf_names}
             imgs = {n: imgs[n] for n in filtered_spi}
+        if restrict_filters or restrict_instdet:
+            _keep = set(_restrict_images(sorted(filtered_spi), imgs, restrict_filters, restrict_instdet))
+            filtered_spi = {n: d for n, d in filtered_spi.items() if n in _keep}
+            imgs = {n: imgs[n] for n in filtered_spi}
         star_id_to_idx, image_names, star_in_image = build_index_maps(
             filtered_spi, gaia_catalog)
         print(f"  master_v2 star set: "
@@ -2117,6 +2142,7 @@ def run_pop_fit(
                 base = n[:-3] if n.endswith(('_hi', '_lo')) else n
                 v1_bases.add(base)
             image_names = [n for n in image_names if n in v1_bases]
+        image_names = _restrict_images(image_names, imgs, restrict_filters, restrict_instdet)
         if not image_names:
             raise RuntimeError(
                 "No images remain after filtering to v1 image set."
@@ -2268,6 +2294,7 @@ def run_pop_fit(
                         prior_sigma_scale=v1_prior_sigma_scale,
                         prior_sigma_skew=v1_prior_sigma_skew,
                         prior_sigma_pointing=v1_prior_sigma_pointing,
+                        prior_sigma_poly_px=poly_prior_px,
                         prior_sigma_pair_rot_deg=v1_prior_sigma_pair_rot_deg,
                         prior_sigma_pair_scale=v1_prior_sigma_pair_scale,
                         prior_sigma_pair_skew=v1_prior_sigma_pair_skew,
@@ -3325,6 +3352,7 @@ def run_pop_fit(
             'mu_pop_prior_sigma': mu_pop_prior_sigma,
             'n_iter_mu': n_iter_mu, 'n_iter_joint': n_iter_joint,
             'hst_members_fit': bool(hst_members_fit), 'hst_all_fit': bool(hst_all_fit),
+            'poly_prior_px': poly_prior_px, 'restrict_filters': restrict_filters, 'restrict_instdet': restrict_instdet,
             'member_sigma_clip': member_sigma_clip,
             'mu_pop_ra': float(mu_pop_current[0]),
             'mu_pop_dec': float(mu_pop_current[1]),
@@ -3735,6 +3763,14 @@ def main(argv=None):
                              'catalog load (bp3m --pos_corr_table). Default: the table list '
                              'recorded by the source bp3m / bp3m-v2 run; pass "none" to apply '
                              'no tables even if the source run used some.')
+    parser.add_argument('--poly_prior_px', type=float, default=None,
+                        help='Gaussian prior on the degree>=2 transformation terms: allowed '
+                             'displacement (px) at the detector edge per term (e.g. 0.3). '
+                             'Needed for --poly_order 3, which is otherwise unconstrained.')
+    parser.add_argument('--restrict_filters', type=str, nargs='+', default=None,
+                        help='Keep only images taken with these HST filters (e.g. F606W)')
+    parser.add_argument('--restrict_instdet', type=str, nargs='+', default=None,
+                        help='Keep only these instrument+detector combos (e.g. ACSWFC WFC3UVIS)')
     parser.add_argument('--hst_all_fit', action='store_true',
                         help='master_v2: let EVERY HST-only source (member or not) '
                              'constrain the alignment in the joint phases, as the '
@@ -3867,6 +3903,9 @@ def main(argv=None):
         hst_members_fit=args.hst_members_fit or args.hst_all_fit,
         hst_all_fit=args.hst_all_fit,
         pos_corr_table=args.pos_corr_table,
+        poly_prior_px=args.poly_prior_px,
+        restrict_filters=args.restrict_filters,
+        restrict_instdet=args.restrict_instdet,
     )
 
     # Save the command only on successful completion so interrupted runs
