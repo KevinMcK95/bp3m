@@ -67,6 +67,12 @@ def main():
                         help='Minimum per-detection positional uncertainty in pixels, '
                              'added in quadrature (bp3m --bp3m_pos_err_floor). Default: '
                              'the v1 run\'s value from BP3M_results/run_config.json, else 0.05')
+    parser.add_argument('--pos_corr_table', type=str, default=None,
+                        help='Comma-separated pseudo-GDC npz table(s) (bp3m --pos_corr_table), '
+                             'applied in memory at catalog load. Default: whatever the v1 run '
+                             'recorded in BP3M_results/run_config.json (possibly none)')
+    parser.add_argument('--no_pos_corr_table', action='store_true',
+                        help='Apply no pseudo-GDC tables even if the v1 run used some')
     parser.add_argument('--hst_enable_iter', type=int, default=5,
                         help='Outer iteration at which HST-only sources are enabled')
     parser.add_argument('--hst_max_pm_unc', type=float, default=5.0,
@@ -149,7 +155,7 @@ def main():
     if _v1_cfg_path.exists():
         import json as _json
         _v1_cfg = _json.load(open(_v1_cfg_path))
-    for _key, _default in (('poly_order', 1), ('pos_err_floor', 0.05)):
+    for _key, _default in (('poly_order', 1), ('pos_err_floor', 0.05), ('pos_corr_table', None)):
         if getattr(args, _key) is None:
             if _key in _v1_cfg:
                 setattr(args, _key, _v1_cfg[_key])
@@ -157,6 +163,14 @@ def main():
             else:
                 setattr(args, _key, _default)
                 print(f"  {_key} not specified and not in v1 run_config.json — defaulting to {_default}")
+    if args.no_pos_corr_table:
+        args.pos_corr_table = None
+        print("  --no_pos_corr_table: pseudo-GDC tables disabled")
+    elif args.pos_corr_table:
+        _missing = [t for t in str(args.pos_corr_table).split(',') if t.strip() and not Path(t.strip()).exists()]
+        if _missing:
+            print(f"Error: pos_corr_table file(s) not found: {_missing}")
+            sys.exit(1)
 
     crossmatch_kwargs = dict(
         field_dir                = field_dir,
@@ -182,6 +196,7 @@ def main():
         clip_sigma           = args.clip_sigma,
         poly_order           = args.poly_order,
         pos_err_floor        = args.pos_err_floor,
+        pos_corr_table       = args.pos_corr_table,
         use_sparse           = args.sparse,
         no_prefilter         = args.no_prefilter,
         hst_enable_iter      = args.hst_enable_iter,

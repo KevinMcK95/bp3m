@@ -198,6 +198,7 @@ def _load_fits_catalog(cat_path: Path) -> dict | None:
             "cov_xx": tbl["cov_xx_gdc"].astype(float),
             "cov_yy": tbl["cov_yy_gdc"].astype(float),
             "cov_xy": tbl["cov_xy_gdc"].astype(float),
+            "flux":    tbl["flux"].astype(float),
             "mag":     tbl["mag"].astype(float),
             "mag_gdc": tbl["mag_gdc"].astype(float),
             "qfit":   tbl["qfit"].astype(float),
@@ -215,6 +216,7 @@ def load_master_v2(
     hst_max_per_image: int = _HST_MAX_PER_IMAGE,
     pos_err_floor: float = _MIN_POS_ERR_PX,
     det_chi2_threshold: float | None = None,
+    pos_corr_table: "str | Path | None" = None,
 ) -> tuple[dict, dict, pd.DataFrame, np.ndarray]:
     """
     Load BP3M v2 inputs from {field_dir}/hst_xmatch/master_combined_v2.csv.
@@ -227,6 +229,10 @@ def load_master_v2(
     hst_min_detect : minimum detections after outlier removal + per-image cap
     hst_max_per_image : per-image cap on HST-only source count (ranked by sigma_pmra)
     pos_err_floor  : minimum positional uncertainty in pixels
+    pos_corr_table : comma-separated pseudo-GDC npz table(s) (bp3m
+        --pos_corr_table).  Applied IN MEMORY to the catalog positions of
+        matching inst/det/filter images exactly as data_loader_flc does for
+        the v1 solve; nothing on disk is modified.
     det_chi2_threshold : if set, exclude individual (star, image) detections whose
         per-detection chi2 from the Phase 4 fit exceeds this value.  Requires a
         ``det_chi2`` column in master_combined_v2.csv (written by
@@ -571,6 +577,13 @@ def load_master_v2(
     valid_sub_names = set(images.keys())
 
     # ── Epoch-distortion correction from the v1 fit (None if not fitted) ─────
+    _pos_corr = None
+    if pos_corr_table is not None:
+        from bp3m.pos_corr import PseudoGDCSet
+        _pos_corr = PseudoGDCSet(pos_corr_table)
+        print(f"  Pseudo-GDC corrections: {_pos_corr.summary}")
+    _n_pc_imgs = 0
+
     from bp3m.epoch_distortion import EpochDistortion
     _v1_dir = Path(data_root) / field_name / 'BP3M_results'
     _ed_obj = EpochDistortion.load(_v1_dir)
@@ -677,6 +690,7 @@ def load_master_v2(
         ok_sat      = np.zeros(n, dtype=bool)
         is_outlier  = np.zeros(n, dtype=bool)   # Phase 6-flagged outlier
         det_chi2_arr = np.full(n, np.nan)        # Phase 6 per-detection chi2
+        flux_arr    = np.full(n, np.nan)
 
         for k, r in enumerate(recs_img):
             ci = r["cat_idx"]
@@ -706,7 +720,26 @@ def load_master_v2(
             xy_cor[k]    = rho
             qfit_arr[k]  = fits_data["qfit"][ci]
             mag_arr[k]   = fits_data["mag"][ci]
+            flux_arr[k]  = fits_data["flux"][ci]
             ok_sat[k]    = (fits_data["n_sat"][ci] / window_area) < _MAX_SAT_FRAC
+
+        # Pseudo-GDC centroid correction (PSF-model bias), same tables and
+        # same in-memory application as the v1 loader (data_loader_flc): the
+        # bias is evaluated at the raw (x, y, flux) and subtracted from x_gdc.
+        if _pos_corr is not None:
+            _meta_pc = images.get(sub_name)
+            _fin = np.isfinite(X) & np.isfinite(Y)
+            if _meta_pc is not None and _fin.any():
+                _mjd = float(_meta_pc.get("hst_time_mjd", 0.0))
+                _ts = _pos_corr.match(_meta_pc.get("instrument", ""),
+                                      _meta_pc.get("detector", ""),
+                                      _meta_pc.get("filter", ""), _mjd)
+                if _ts:
+                    _n_pc_imgs += 1
+                for _t in (_ts or []):
+                    _bx, _by = _t.bias(X_orig[_fin], Y_orig[_fin], flux_arr[_fin], _mjd)
+                    X[_fin] = X[_fin] - _bx
+                    Y[_fin] = Y[_fin] - _by
 
         # Epoch-distortion correction from the v1 fit (x' = x + R^{-1} B d):
         # keeps the v2 solve consistent with a v1 fit that modelled X r + B d.
@@ -752,6 +785,8 @@ def load_master_v2(
         if len(df) > 0:
             stars_per_image[sub_name] = df
 
+    if _pos_corr is not None:
+        print(f"  Pseudo-GDC corrections applied to {_n_pc_imgs}/{len(stars_per_image)} sub-images")
     if skipped_fits:
         print(f"  Warning: FITS catalog missing for {len(skipped_fits)} sub-images "
               f"(skipped): {skipped_fits[:5]}{'...' if len(skipped_fits)>5 else ''}")

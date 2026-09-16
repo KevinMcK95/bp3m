@@ -669,6 +669,7 @@ def run_alignment_v2(
     hst_pm_sigma_diffuse: float = 100.0,
     bp3m_dir: Path | None = None,
     pos_err_floor: float = 0.05,
+    pos_corr_table: "str | Path | None" = None,
     det_chi2_threshold: float | None = None,
     use_soft_weights: bool = False,
     student_t_nu: float = 50.0,
@@ -700,6 +701,8 @@ def run_alignment_v2(
     verbose_tests : print per-iter breakdown of flagged dets by Gaia type (2p vs 5p/6p) and chip
     bp3m_dir      : override default bp3m location
     pos_err_floor : minimum positional uncertainty in pixels
+    pos_corr_table : comma-separated pseudo-GDC npz table(s), applied in memory
+        to matching images at catalog load (same as bp3m --pos_corr_table)
     det_chi2_threshold : if set, exclude (star, image) pairs whose per-detection
         chi2 from Phase 4 exceeds this value.  Requires det_chi2 column in
         master_combined_v2.csv.  Suggested: 9.0 (3σ).
@@ -736,6 +739,7 @@ def run_alignment_v2(
         hst_max_per_image=hst_max_per_image,
         pos_err_floor=pos_err_floor,
         det_chi2_threshold=det_chi2_threshold,
+        pos_corr_table=pos_corr_table,
     )
 
     if not images:
@@ -1383,6 +1387,7 @@ def run_alignment_v2(
             "clip_sigma":        clip_sigma,
             "poly_order":        poly_order,
             "pos_err_floor":     pos_err_floor,
+            "pos_corr_table":    (str(pos_corr_table) if pos_corr_table else None),
             "hst_enable_iter":   hst_enable_iter,
             "hst_max_pm_unc":    hst_max_pm_unc,
             "hst_max_per_image": hst_max_per_image,
