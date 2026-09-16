@@ -1977,6 +1977,7 @@ def run_pop_fit(
     members_5p_only: bool = False,
     hst_members_fit: bool = False,
     hst_all_fit: bool = False,
+    pos_corr_table: "str | None" = None,
 ) -> Path:
     """
     Run population PM fitting.
@@ -2021,6 +2022,13 @@ def run_pop_fit(
     min_stars_split_ccd = int(v1_cfg.get('min_stars_split_ccd', 20))
     if poly_order is None:
         poly_order = int(v1_cfg.get('poly_order', 1))
+    # pseudo-GDC tables: mirror the source run unless overridden on the CLI
+    if pos_corr_table is None:
+        pos_corr_table = v1_cfg.get('pos_corr_table')
+    elif str(pos_corr_table).lower() == 'none':
+        pos_corr_table = None
+    if pos_corr_table:
+        print(f"  pos_corr_table: {', '.join(Path(t).name for t in str(pos_corr_table).split(',') if t.strip())}")
 
     _v1_hp = v1_cfg.get('prior_hyperparams', {})
     v1_prior_sigma_rot_deg       = _v1_hp.get('sigma_rot_deg',           None)
@@ -2060,7 +2068,8 @@ def run_pop_fit(
             hst_max_pm_unc=hst_max_pm_unc,
             hst_min_detect=hst_min_detect,
             hst_max_per_image=hst_max_per_image,
-            det_chi2_threshold=det_chi2_threshold_v2)
+            det_chi2_threshold=det_chi2_threshold_v2,
+            pos_corr_table=pos_corr_table)
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable v2 images found for '{field_name}'.")
         # Keep only images the v2 fit actually solved (r_hat must exist).
@@ -2081,7 +2090,7 @@ def run_pop_fit(
     else:
         # ── Load data — mirrors run_alignment.py exactly ───────────────────────────
         print(f"\n  Loading bp3m input data for '{field_name}'...")
-        _pct = v1_cfg.get('pos_corr_table')
+        _pct = pos_corr_table
         if _pct:
             print(f"  pop-fit: re-applying the run's pos_corr_table "
                   f"({Path(_pct).name} et al.) for position consistency")
@@ -3721,6 +3730,11 @@ def main(argv=None):
                              'references). Without this, HST-only members feed mu_pop '
                              'but not r, and the joint iteration has no consistent '
                              'fixed point (Pal5/E3 drift, 2026-09-16).')
+    parser.add_argument('--pos_corr_table', type=str, default=None,
+                        help='Comma-separated pseudo-GDC npz table(s) applied in memory at '
+                             'catalog load (bp3m --pos_corr_table). Default: the table list '
+                             'recorded by the source bp3m / bp3m-v2 run; pass "none" to apply '
+                             'no tables even if the source run used some.')
     parser.add_argument('--hst_all_fit', action='store_true',
                         help='master_v2: let EVERY HST-only source (member or not) '
                              'constrain the alignment in the joint phases, as the '
@@ -3852,6 +3866,7 @@ def main(argv=None):
         members_5p_only=args.members_5p_only,
         hst_members_fit=args.hst_members_fit or args.hst_all_fit,
         hst_all_fit=args.hst_all_fit,
+        pos_corr_table=args.pos_corr_table,
     )
 
     # Save the command only on successful completion so interrupted runs
