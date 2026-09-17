@@ -1883,6 +1883,47 @@ def _resolve_member_seed(data_root, field_name, data_source, member_seed_csv,
     return found
 
 
+def _admit_seed_detections(solver, image_names: list, seed_sidx: np.ndarray,
+                           hst_only_glob: np.ndarray, as_fit: bool) -> tuple:
+    """Frozen user seed (2026-09-17): HST-only sources enter the solver as
+    synthetic 2p stars and the construction-time admission filter
+    (ruwe/q_hst/resid) rejects nearly all of them, so their detections are
+    neither fit nor astrometry detections, their PMs never leave the diffuse
+    prior, n_hst == 0 and they can never be members (NGC_185: 43,177 of 43,425
+    HST-only sources excluded; 4,248 of 40,244 seed stars counted as members
+    although 39,943 have >= 3 epochs over 11 yr).
+
+    Every detection of a seed star that passes the solver's hard ceiling
+    (use_for_fit_max: initial residual <= 100 px) becomes an astrometry
+    detection, so the star's PM is solved from its epochs and membership can
+    tie it to mu_pop; with the members-fit modes it also becomes a fit
+    detection so the member constrains the alignment across epochs.
+    Returns (n_new_astrom, n_new_fit)."""
+    is_seed = np.zeros(solver.n_stars, dtype=bool)
+    is_seed[np.asarray(seed_sidx, int)] = True
+    n_ast = n_fit = 0
+    for img in image_names:
+        d = solver._img_data.get(img)
+        if d is None:
+            continue
+        sidx = d['sidx']
+        sel = is_seed[sidx] & hst_only_glob[sidx]
+        if 'use_for_fit_max' in d:
+            sel &= np.asarray(d['use_for_fit_max'], dtype=bool)
+        if not sel.any():
+            continue
+        use_fit = np.asarray(d['use_for_fit'], dtype=bool)
+        use_ast = np.asarray(d.get('use_for_astrom', use_fit), dtype=bool)
+        new_ast = use_ast | sel
+        n_ast += int((new_ast & ~use_ast).sum())
+        d['use_for_astrom'] = new_ast
+        if as_fit:
+            new_fit = use_fit | sel
+            n_fit += int((new_fit & ~use_fit).sum())
+            d['use_for_fit'] = new_fit
+    return n_ast, n_fit
+
+
 def _promote_hst_members(solver, image_names: list, member_sidx: np.ndarray,
                          hst_only_glob: np.ndarray, all_hst: bool = False) -> int:
     """--hst_members_fit: HST-only MEMBER detections become fit detections.
@@ -2537,6 +2578,21 @@ def run_pop_fit(
         _seed_frozen_sidx = np.asarray(member_sidx, int).copy()
         print(f"  Freeze: membership restricted to the {len(_seed_frozen_sidx)} "
               f"seed stars (phases can remove, never add)")
+    if _seed_frozen_sidx is not None and _hst_only_glob.any():
+        _n_ast, _n_fit = _admit_seed_detections(
+            solver, image_names, _seed_frozen_sidx, _hst_only_glob,
+            as_fit=bool(hst_members_fit or hst_all_fit))
+        print(f"  Freeze: admitted {_n_ast} HST-only seed detections as astrometry"
+              f"{f' (+{_n_fit} as fit)' if _n_fit else ''} past the construction filter")
+        _n_hst_det = np.zeros(solver.n_stars, dtype=int)
+        for img in image_names:
+            d = solver._img_data.get(img)
+            if d is None:
+                continue
+            _use_a = d.get('use_for_astrom', d['use_for_fit'])
+            np.add.at(_n_hst_det, d['sidx'][_use_a], 1)
+        print(f"  Freeze: seed stars with >=1 astrometry detection: "
+              f"{int((_n_hst_det[_seed_frozen_sidx] >= 1).sum())}/{len(_seed_frozen_sidx)}")
 
     # --members_hst_only (TEST): forbid Gaia-matched stars from membership so
     # only HST-only stars inform mu_pop (they still contribute to their own
