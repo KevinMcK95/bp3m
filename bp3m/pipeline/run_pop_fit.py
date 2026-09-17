@@ -2569,6 +2569,13 @@ def run_pop_fit(
             _sidx = np.setdiff1d(_sidx, _no5p_sidx)
         return _sidx
 
+    if freeze_member_seed and np.isfinite(max_sigma_free_pm):
+        # A frozen user seed IS the membership evidence: the phases may still
+        # drop chi2 outliers against mu_pop, but must not drop members merely
+        # because their free PM is poorly constrained (few epochs).  Without
+        # this NGC_185 kept 2,294 of 40,244 seed members (2026-09-17).
+        print(f"  Freeze: max_sigma_free_pm {max_sigma_free_pm} -> inf (poorly-constrained seed members stay members)")
+        max_sigma_free_pm = np.inf
     member_sidx = _freeze_members(member_sidx)
     if members_hst_only or members_5p_only:
         print(f"  Initial members after Gaia bar: {len(member_sidx)}")
