@@ -353,9 +353,9 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
         cat, hmg, ht, gdc_mode = load_hst_image(img_dir)
         chk_mas, n_chk = _hst_frame_check(cat, hmg, ht)
     except Exception as exc:
-        return name, 0, f'HST load failed: {exc}'
+        return name, 0, 0, 0, 0, f'HST load failed: {exc}'
     if chk_mas > 60.0:
-        return name, 0, f'HST frame check failed ({chk_mas:.0f} mas)'
+        return name, 0, 0, 0, 0, f'HST frame check failed ({chk_mas:.0f} mas)'
     h_ra_lo, h_ra_hi = cat.ra_al.min(), cat.ra_al.max()
     h_de_lo, h_de_hi = cat.dec_al.min(), cat.dec_al.max()
     pad = 30.0 / 3600.0
