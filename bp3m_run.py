@@ -421,6 +421,11 @@ def _parse_args():
                     help='With --fit_indv_images_only: refit every image even '
                          'if cached results are current (same matched_gaia '
                          'md5 and fit parameters).')
+    bp.add_argument('--indv_results_name', type=str, default=None,
+                    help='With --fit_indv_images_only: write to this directory name '
+                         'instead of BP3M_indv_results (e.g. BP3M_indv_results_nosplit '
+                         'for a --no_split_ccd sweep that must not clobber the campaign '
+                         'results or their resume cache).')
     bp.add_argument('--fit_indv_images_only', action='store_true',
                     help='Run BP3M separately on each image and save results in '
                          'BP3M_indv_results/{image_name}/. Skips the joint multi-image fit.')
@@ -1388,7 +1393,7 @@ def main():
                 _indv_names = [n for n in _indv_names
                                if len(_spi_all[n]) >= args.bp3m_min_stars]
 
-            _indv_root = output_dir / field / "BP3M_indv_results"
+            _indv_root = output_dir / field / (args.indv_results_name or "BP3M_indv_results")
 
             def _indv_extra_cfg(_img_name):
                 """Record exact match provenance in each indv run_config so
