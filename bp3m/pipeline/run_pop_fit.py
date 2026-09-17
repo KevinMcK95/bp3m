@@ -1844,6 +1844,45 @@ def _restrict_to_members(solver, image_names: list, member_sidx: np.ndarray) -> 
         np.add.at(solver.gaia_n_hst_used, d['sidx'][use_any], 1)
 
 
+def _read_member_seed(path):
+    """Parse a notebook-07/08 member seed CSV.  Returns (ids, source_indices):
+    ids are Gaia source ids, or the deterministic synthetic id -(source_index+1)
+    for HST-only rows of a v2 seed; source_indices (v2 only) are the
+    master_combined_v2 rows, for the loader's cap exemption."""
+    _seed = pd.read_csv(Path(path), dtype={'gaia_source_id': np.int64})
+    if 'trusted' in _seed.columns:
+        _seed = _seed[_seed['trusted'].astype(bool)]
+    if 'source_index' in _seed.columns:
+        _sgid = (_seed['gaia_source_id'].to_numpy(np.int64)
+                 if 'gaia_source_id' in _seed.columns
+                 else np.zeros(len(_seed), np.int64))
+        _ssrc = pd.to_numeric(_seed['source_index'],
+                              errors='coerce').fillna(-1).astype(np.int64)
+        ids = [int(g) if g != 0 else int(-(si + 1)) for g, si in zip(_sgid, _ssrc)]
+        return ids, set(int(si) for si in _ssrc if si >= 0)
+    return [int(g) for g in _seed['gaia_source_id'].values], set()
+
+
+def _resolve_member_seed(data_root, field_name, data_source, member_seed_csv,
+                         use_member_seed, freeze_member_seed):
+    """--use_member_seed / --freeze_member_seed: auto-locate the CSV written by
+    notebook 07_member_selection (v1) / 08_member_selection_v2 (master_v2)."""
+    if member_seed_csv is not None or not (use_member_seed or freeze_member_seed):
+        return member_seed_csv
+    _seed_cands = ([data_root / field_name / 'member_seed_v2.csv',
+                    data_root / field_name / 'member_seed.csv']
+                   if data_source == 'master_v2'
+                   else [data_root / field_name / 'member_seed.csv'])
+    found = next((c for c in _seed_cands if c.exists()), None)
+    if found is None:
+        raise FileNotFoundError(
+            f"use_member_seed/freeze_member_seed: no seed found at "
+            f"{' or '.join(str(c) for c in _seed_cands)} — draw and save "
+            f"one with notebook 07_member_selection (v1) / "
+            f"08_member_selection_v2 (master_v2) first.")
+    return found
+
+
 def _promote_hst_members(solver, image_names: list, member_sidx: np.ndarray,
                          hst_only_glob: np.ndarray, all_hst: bool = False) -> int:
     """--hst_members_fit: HST-only MEMBER detections become fit detections.
@@ -2077,6 +2116,15 @@ def run_pop_fit(
     print(f"  poly_order={poly_order}  split_ccd={v1_split_ccd}  "
           f"v1 images={len(v1_image_names)}")
 
+    member_seed_csv = _resolve_member_seed(data_root, field_name, data_source,
+                                           member_seed_csv, use_member_seed,
+                                           freeze_member_seed)
+    _seed_priority = None
+    if member_seed_csv is not None and data_source == 'master_v2':
+        _, _seed_priority = _read_member_seed(member_seed_csv)
+        print(f"  Member seed {Path(member_seed_csv).name}: {len(_seed_priority)} "
+              f"master_v2 rows exempt from the HST-only sigma_pmra cut and per-image cap")
+
     if data_source == 'master_v2':
         # ── Load data from the v2 master catalog (incl. HST-only stars) ──────
         # load_master_v2 handles chip splitting and the epoch-distortion
@@ -2090,7 +2138,8 @@ def run_pop_fit(
             hst_min_detect=hst_min_detect,
             hst_max_per_image=hst_max_per_image,
             det_chi2_threshold=det_chi2_threshold_v2,
-            pos_corr_table=pos_corr_table)
+            pos_corr_table=pos_corr_table,
+            priority_source_indices=_seed_priority or None)
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable v2 images found for '{field_name}'.")
         # Keep only images the v2 fit actually solved (r_hat must exist).
@@ -2453,40 +2502,14 @@ def run_pop_fit(
         _mu_boot = _estimate_mu_pop(gaia_catalog)
 
     # ── Initial member selection using v1 PMs only ────────────────────────────
-    # --use_member_seed / --freeze_member_seed: auto-locate the CSV written by
-    # notebook 07_member_selection in the field directory.
-    if member_seed_csv is None and (use_member_seed or freeze_member_seed):
-        _seed_cands = ([data_root / field_name / 'member_seed_v2.csv',
-                        data_root / field_name / 'member_seed.csv']
-                       if data_source == 'master_v2'
-                       else [data_root / field_name / 'member_seed.csv'])
-        member_seed_csv = next((c for c in _seed_cands if c.exists()), None)
-        if member_seed_csv is None:
-            raise FileNotFoundError(
-                f"use_member_seed/freeze_member_seed: no seed found at "
-                f"{' or '.join(str(c) for c in _seed_cands)} — draw and save "
-                f"one with notebook 07_member_selection (v1) / "
-                f"08_member_selection_v2 (master_v2) first.")
+    member_seed_csv = _resolve_member_seed(data_root, field_name, data_source,
+                                           member_seed_csv, use_member_seed,
+                                           freeze_member_seed)
     if member_seed_csv is not None:
-        # Hand-drawn seed (e.g. from notebook 07_member_selection): replaces the
-        # sigma-clip initial selection. The phases still refine membership.
+        # Hand-drawn seed (notebook 07/08): replaces the sigma-clip initial
+        # selection. The phases still refine membership (frozen: remove only).
         _seed_path = Path(member_seed_csv)
-        _seed = pd.read_csv(_seed_path, dtype={'gaia_source_id': np.int64})
-        if 'trusted' in _seed.columns:
-            _seed = _seed[_seed['trusted'].astype(bool)]
-        if 'source_index' in _seed.columns:
-            # v2 seed (notebook 08): real Gaia id when present, else the
-            # deterministic synthetic id -(source_index + 1) used by
-            # load_master_v2 for HST-only sources.
-            _sgid = (_seed['gaia_source_id'].to_numpy(np.int64)
-                     if 'gaia_source_id' in _seed.columns
-                     else np.zeros(len(_seed), np.int64))
-            _ssrc = pd.to_numeric(_seed['source_index'],
-                                  errors='coerce').fillna(-1).astype(np.int64)
-            _seed_ids = [int(g) if g != 0 else int(-(si + 1))
-                         for g, si in zip(_sgid, _ssrc)]
-        else:
-            _seed_ids = [int(g) for g in _seed['gaia_source_id'].values]
+        _seed_ids, _ = _read_member_seed(_seed_path)
         _found    = [star_id_to_idx[g] for g in _seed_ids if g in star_id_to_idx]
         _n_miss   = len(_seed_ids) - len(_found)
         member_sidx = np.array(sorted(_found), dtype=int)

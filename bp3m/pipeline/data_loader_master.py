@@ -217,9 +217,17 @@ def load_master_v2(
     pos_err_floor: float = _MIN_POS_ERR_PX,
     det_chi2_threshold: float | None = None,
     pos_corr_table: "str | Path | None" = None,
+    priority_source_indices: "set[int] | None" = None,
 ) -> tuple[dict, dict, pd.DataFrame, np.ndarray]:
     """
     Load BP3M v2 inputs from {field_dir}/hst_xmatch/master_combined_v2.csv.
+
+    priority_source_indices : master_combined_v2 row indices (e.g. a user member
+        seed from notebook 08) that must survive the HST-only selection: they
+        bypass the sigma_pmra quality cut and the per-image top-N cap (the
+        sanity cuts |PM|<30 mas/yr, |plx|<5 mas and n_detect>=hst_min_detect
+        still apply).  2026-09-17: without this the cap silently dropped
+        ~90% of the And_VII / Leo_I / NGC_185 seed members.
 
     Parameters
     ----------
@@ -445,15 +453,21 @@ def load_master_v2(
     # cosmic rays) that would torque the transformation if included.
     _HST_MAX_PM_ABS    = 30.0   # mas/yr  — total PM magnitude
     _HST_MAX_PLX_ABS   =  5.0   # mas     — absolute parallax
+    _prio = set(int(i) for i in priority_source_indices) if priority_source_indices else set()
     eligible: list[dict] = []
+    n_prio_seen = n_prio_elig = 0
     for rec in source_records:
         if rec["has_gaia"]:
             eligible.append(rec)
-        elif (rec["sigma_pmra"] < hst_max_pm_unc and
+            continue
+        _is_prio = rec["source_index"] in _prio
+        n_prio_seen += _is_prio
+        if ((_is_prio or rec["sigma_pmra"] < hst_max_pm_unc) and
               rec["n_detect_fit"] >= hst_min_detect and
               rec.get("pm_abs_masyr", 0.0) <= _HST_MAX_PM_ABS and
               rec.get("parallax_xmatch_abs", 0.0) <= _HST_MAX_PLX_ABS):
             eligible.append(rec)
+            n_prio_elig += _is_prio
 
     n_elig_hst = sum(1 for r in eligible if not r["has_gaia"])
     print(f"  After global quality cut (σ_PM<{hst_max_pm_unc}, n≥{hst_min_detect}, "
@@ -475,6 +489,9 @@ def load_master_v2(
     for sub_name, candidates in img_hst_candidates.items():
         candidates.sort(key=lambda t: t[0])
         image_include[sub_name] = {src_i for _, src_i in candidates[:hst_max_per_image]}
+        if _prio:   # priority (seed) sources are exempt from the cap
+            image_include[sub_name] |= {src_i for _, src_i in candidates
+                                        if eligible[src_i]["source_index"] in _prio}
 
     # Apply cap: rebuild detection lists for HST-only sources
     valid_recs: list[dict] = []
@@ -494,6 +511,10 @@ def load_master_v2(
     n_valid_hst  = sum(1 for r in valid_recs if not r["has_gaia"])
     print(f"  After per-image cap (top-{hst_max_per_image}): "
           f"{n_valid_gaia} Gaia, {n_valid_hst} HST-only sources")
+    if _prio:
+        n_prio_kept = sum(1 for r in valid_recs if not r["has_gaia"] and r["source_index"] in _prio)
+        print(f"  Priority (seed) HST-only sources: {len(_prio)} requested, {n_prio_seen} in master, "
+              f"{n_prio_elig} pass sanity/n_detect, {n_prio_kept} kept (cap-exempt)")
 
     # ── Detection uniqueness: deduplicate (first-in-wins by quality order) ────
     # Sort valid_recs so that higher-quality sources claim their detections first.
