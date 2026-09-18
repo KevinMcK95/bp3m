@@ -38,6 +38,7 @@ class PosCorrModel:
             files = sorted(glob.glob(os.path.join(d, f'*_shared_{tag or "*"}.json')))
         if not files:
             raise FileNotFoundError(f'pos_corr_model: no model json found for {spec}')
+        # several models per inst/det (e.g. seeds of an ensemble) are averaged
         self.models = {}
         for jp in files:
             s = json.load(open(jp)); z = np.load(jp[:-5] + '.npz')
@@ -45,11 +46,11 @@ class PosCorrModel:
             s['params'] = [(np.asarray(z[f'w{i}'], np.float64), np.asarray(z[f'b{i}'], np.float64)) for i in range(nl)]
             s['scales'] = {k: tuple(v) for k, v in s.get('scales', {}).items()}
             s['path'] = jp
-            self.models[s['key']] = s
+            self.models.setdefault(s['key'], []).append(s)
 
     @property
     def summary(self):
-        return ', '.join(f"{k}({os.path.basename(v['path'])})" for k, v in self.models.items())
+        return ', '.join(f"{k}(x{len(v)}: {os.path.basename(v[0]['path'])}{'...' if len(v) > 1 else ''})" for k, v in self.models.items())
 
     def match(self, instrument: str, detector: str):
         return self.models.get(f'{instrument}/{detector}')
@@ -153,12 +154,17 @@ class PosCorrModel:
         return out
 
     def bias(self, tbl, hdr):
-        """(bias_x, bias_y) in GDC px for every catalog row; corrected = x_gdc - bias."""
-        s = self.match(str(hdr.get('INSTRUME')), str(hdr.get('DETECTOR')))
-        if s is None:
+        """(bias_x, bias_y) in GDC px for every catalog row; corrected = x_gdc - bias.
+        With several models for the inst/det (ensemble) the mean prediction is used."""
+        ms = self.match(str(hdr.get('INSTRUME')), str(hdr.get('DETECTOR')))
+        if not ms:
             return None
-        Z, Za = self._features(s, tbl, hdr)
-        f = self._mlp(s, Z) - self._mlp(s, Za)
+        acc = None
+        for s in ms:
+            Z, Za = self._features(s, tbl, hdr)
+            f = self._mlp(s, Z) - self._mlp(s, Za)
+            acc = f if acc is None else acc + f
+        f = acc / len(ms)
         return f[:, 0], f[:, 1]
 
 
