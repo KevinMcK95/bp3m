@@ -2076,6 +2076,7 @@ def run_pop_fit(
     hst_members_fit: bool = False,
     hst_all_fit: bool = False,
     pos_corr_table: "str | None" = None,
+    pos_corr_model: "str | None" = None,
     poly_prior_px: "float | None" = None,
     restrict_filters: "list[str] | None" = None,
     restrict_instdet: "list[str] | None" = None,
@@ -2130,6 +2131,12 @@ def run_pop_fit(
         pos_corr_table = None
     if pos_corr_table:
         print(f"  pos_corr_table: {', '.join(Path(t).name for t in str(pos_corr_table).split(',') if t.strip())}")
+    if pos_corr_model is None:
+        pos_corr_model = v1_cfg.get('pos_corr_model')
+    elif str(pos_corr_model).lower() == 'none':
+        pos_corr_model = None
+    if pos_corr_model:
+        print(f"  pos_corr_model: {pos_corr_model}")
 
     _v1_hp = v1_cfg.get('prior_hyperparams', {})
     v1_prior_sigma_rot_deg       = _v1_hp.get('sigma_rot_deg',           None)
@@ -2180,6 +2187,7 @@ def run_pop_fit(
             hst_max_per_image=hst_max_per_image,
             det_chi2_threshold=det_chi2_threshold_v2,
             pos_corr_table=pos_corr_table,
+            pos_corr_model=pos_corr_model,
             priority_source_indices=_seed_priority or None)
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable v2 images found for '{field_name}'.")
@@ -3849,6 +3857,8 @@ def main(argv=None):
                              'catalog load (bp3m --pos_corr_table). Default: the table list '
                              'recorded by the source bp3m / bp3m-v2 run; pass "none" to apply '
                              'no tables even if the source run used some.')
+    parser.add_argument('--pos_corr_model', type=str, default=None,
+                        help="learned GDC correction model (DIR[:TAG]); default: mirror the source run's run_config; 'none' disables")
     parser.add_argument('--poly_prior_px', type=float, default=None,
                         help='Gaussian prior on the degree>=2 transformation terms: allowed '
                              'displacement (px) at the detector edge per term (e.g. 0.3). '

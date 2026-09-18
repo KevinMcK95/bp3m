@@ -62,7 +62,7 @@ _MAX_SAT_FRAC: float = 0.25
 _LDR_STATE: dict = {}
 
 
-def _loader_pool_init(g2i, pos_err_floor, pos_corr_table, pin_blas=True):
+def _loader_pool_init(g2i, pos_err_floor, pos_corr_table, pin_blas=True, pos_corr_model=None):
     """Worker initializer for the parallel image loader (BLAS pinned to 1,
     per-worker PseudoGDCSet rebuilt from the table path). pin_blas=False when
     called in-process for the serial path — never pin the parent's BLAS."""
@@ -77,6 +77,11 @@ def _loader_pool_init(g2i, pos_err_floor, pos_corr_table, pin_blas=True):
         _LDR_STATE["pc"] = PseudoGDCSet(pos_corr_table)
     else:
         _LDR_STATE["pc"] = None
+    if pos_corr_model is not None:
+        from bp3m.pos_corr_model import PosCorrModel
+        _LDR_STATE["pcm"] = PosCorrModel(pos_corr_model)
+    else:
+        _LDR_STATE["pcm"] = None
 
 
 def _load_one_image(work):
@@ -88,7 +93,8 @@ def _load_one_image(work):
         return img_name, None, None, False
     pc = _LDR_STATE["pc"]
     stars_df = _build_stars_df(img_dir, img_name, _LDR_STATE["g2i"],
-                               _LDR_STATE["floor"], pos_corr=pc, meta=meta)
+                               _LDR_STATE["floor"], pos_corr=pc, meta=meta,
+                               pos_corr_model=_LDR_STATE.get("pcm"))
     matched = (pc is not None and stars_df is not None
                and pc.match(meta.get("instrument", ""),
                             meta.get("detector", ""),
@@ -303,7 +309,8 @@ def _build_stars_df(img_dir: Path, img_name: str,
                     gaia_float_to_int64: dict | None = None,
                     pos_err_floor: float = _MIN_POS_ERR_PX,
                     pos_corr=None, meta=None,
-                    match_override: "pd.DataFrame | None" = None
+                    match_override: "pd.DataFrame | None" = None,
+                    pos_corr_model=None,
                     ) -> pd.DataFrame | None:
     """
     Build the per-image source DataFrame expected by BP3MSolver.
@@ -349,6 +356,14 @@ def _build_stars_df(img_dir: Path, img_name: str,
                                    tbl["flux"].astype(float), _mjd)
                 cat_xgdc = cat_xgdc - _bx
                 cat_ygdc = cat_ygdc - _by
+        # Learned GDC-residual model (hst_dist_corr Stage 2): evaluated per
+        # detection from the catalog row + FLC header, in memory only.
+        if pos_corr_model is not None:
+            _hdr = pos_corr_model.read_header(img_dir / f"{img_name}_flc.fits")
+            _mb = pos_corr_model.bias(tbl, _hdr)
+            if _mb is not None:
+                cat_xgdc = cat_xgdc - _mb[0]
+                cat_ygdc = cat_ygdc - _mb[1]
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
@@ -446,6 +461,7 @@ def _build_delve_only_stars_df(
     delve_id_to_gaia_id: dict,
     pos_err_floor: float = _MIN_POS_ERR_PX,
     delve_use_for_align: bool = False,
+    pos_corr_model=None,
     pos_corr=None, meta=None,
 ) -> pd.DataFrame | None:
     """
@@ -488,6 +504,14 @@ def _build_delve_only_stars_df(
                                    tbl["flux"].astype(float), _mjd)
                 cat_xgdc = cat_xgdc - _bx
                 cat_ygdc = cat_ygdc - _by
+        # Learned GDC-residual model (hst_dist_corr Stage 2): evaluated per
+        # detection from the catalog row + FLC header, in memory only.
+        if pos_corr_model is not None:
+            _hdr = pos_corr_model.read_header(img_dir / f"{img_name}_flc.fits")
+            _mb = pos_corr_model.bias(tbl, _hdr)
+            if _mb is not None:
+                cat_xgdc = cat_xgdc - _mb[0]
+                cat_ygdc = cat_ygdc - _mb[1]
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
@@ -660,7 +684,8 @@ def load_image_data_flc(data_root, field_name: str,
                         use_delve: bool = False,
                         delve_use_for_align: bool = False,
                         pos_corr_table: "str | Path | None" = None,
-                        n_processes: int = 1):
+                        n_processes: int = 1,
+                        pos_corr_model: "str | None" = None):
     """
     Load BP3M inputs from the new FLC-based pipeline layout.
 
@@ -787,6 +812,9 @@ def load_image_data_flc(data_root, field_name: str,
         from bp3m.pos_corr import PseudoGDCSet
         _pos_corr = PseudoGDCSet(pos_corr_table)
         print(f"  Pseudo-GDC corrections: {_pos_corr.summary}")
+    if pos_corr_model is not None:
+        from bp3m.pos_corr_model import PosCorrModel
+        print(f"  Learned GDC correction (pos_corr_model): {PosCorrModel(pos_corr_model).summary}")
 
     skipped = []
     observed_gaia_ids: set = set()
@@ -804,11 +832,11 @@ def load_image_data_flc(data_root, field_name: str,
         _pool = ProcessPoolExecutor(
             max_workers=min(n_processes, len(_work)),
             mp_context=_ctx, initializer=_loader_pool_init,
-            initargs=(gaia_float_to_int64, pos_err_floor, pos_corr_table))
+            initargs=(gaia_float_to_int64, pos_err_floor, pos_corr_table, True, pos_corr_model))
         _results = _pool.map(_load_one_image, _work, chunksize=8)
     else:
         _pool = None
-        _loader_pool_init(gaia_float_to_int64, pos_err_floor, pos_corr_table,
+        _loader_pool_init(gaia_float_to_int64, pos_err_floor, pos_corr_table, pos_corr_model=pos_corr_model,
                           pin_blas=False)
         _results = map(_load_one_image, _work)
 
@@ -1166,6 +1194,7 @@ def load_image_data_flc(data_root, field_name: str,
             delve_only_stars = _build_delve_only_stars_df(
                 img_dir, img_name, gaia_hst_idx, delve_id_to_gaia_id, pos_err_floor,
                 delve_use_for_align=delve_use_for_align,
+                pos_corr_model=(_LDR_STATE.get('pcm') if _LDR_STATE.get('pcm') is not None else (PosCorrModel(pos_corr_model) if pos_corr_model else None)),
                 pos_corr=_pos_corr, meta=images.get(img_name))
             if delve_only_stars is not None and len(delve_only_stars):
                 # Keep only sources that made it into gaia_catalog

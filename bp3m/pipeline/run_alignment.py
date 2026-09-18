@@ -93,6 +93,7 @@ def run_alignment(  # noqa: C901
     use_delve: bool = False,
     delve_use_for_align: bool = False,
     pos_corr_table=None,
+    pos_corr_model=None,
     epoch_dist_prior=None,
     epoch_dist_prior_inflate: float = 2.0,
     n_processes: int = 1,
@@ -179,6 +180,7 @@ def run_alignment(  # noqa: C901
         gaia_csv=gaia_csv, use_delve=use_delve,
         delve_use_for_align=delve_use_for_align,
         pos_corr_table=pos_corr_table,
+        pos_corr_model=pos_corr_model,
         n_processes=n_processes)
     if imgs is None or len(imgs) == 0:
         raise RuntimeError(
@@ -338,7 +340,8 @@ def run_alignment(  # noqa: C901
             # brought back onto the frame via transformation_cfht_<exp>.csv
             fimgs, fstars = build_fallback_hst_images(
                 data_root / field_name, _cm,
-                pos_err_floor=pos_err_floor, pos_corr_table=pos_corr_table)
+                pos_err_floor=pos_err_floor, pos_corr_table=pos_corr_table,
+                pos_corr_model=pos_corr_model)
             if fimgs:
                 imgs.update(fimgs)
                 filtered_spi.update(fstars)
@@ -676,6 +679,7 @@ def run_alignment(  # noqa: C901
             **(extra_run_config or {}),
             'use_indv_outputs': use_indv_outputs,
             'pos_corr_table': (str(pos_corr_table) if pos_corr_table else None),
+            'pos_corr_model': (str(pos_corr_model) if pos_corr_model else None),
             'epoch_dist_prior': (str(epoch_dist_prior)
                                  if epoch_dist_prior else None),
             'pos_err_floor': pos_err_floor,

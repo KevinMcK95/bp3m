@@ -413,6 +413,9 @@ def _parse_args():
                          'stdpsf_builder/make_pseudo_gdc.py). Applied IN '
                          'MEMORY at catalog load to matching inst/det/filter '
                          'images; nothing on disk is modified.')
+    bp.add_argument('--pos_corr_model', type=str, default=None,
+                    help='Learned GDC-residual correction (hst_dist_corr ml models): DIR[:TAG] or comma-separated json paths; '
+                         'evaluated per detection at catalog load (see bp3m/pos_corr_model.py). Composes with --pos_corr_table.')
     bp.add_argument('--bp3m_results_suffix', type=str, default=None,
                     help='Write the joint-fit outputs to '
                          'BP3M_results_<suffix> instead of BP3M_results '
@@ -1722,6 +1725,7 @@ def main():
                 use_indv_outputs=args.use_indv_outputs,
                 bp3m_dir=_joint_bp3m_dir,
                 pos_corr_table=args.pos_corr_table,
+                pos_corr_model=args.pos_corr_model,
                 epoch_dist_prior=args.epoch_dist_prior,
                 epoch_dist_prior_inflate=args.epoch_dist_prior_inflate,
                 test_hysteresis_delta=args.test_hysteresis_delta,
