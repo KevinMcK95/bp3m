@@ -103,8 +103,10 @@ class PosCorrModel:
                 cols.append(np.clip(np.nan_to_num(z, nan=0.0, posinf=5, neginf=-5), -5, 5))
             E = np.column_stack(cols)
 
+        ychip = y_chip / 2048.0      # CTE transfer distance of the STAR: kept in the anchor row too (as in the trainer)
+
         def pack(xx, yy, ch4, dm):
-            cols = [(xx - 2048) / 2048, (yy - 1024) / 1024, ch4, dm / 5.0, np.full(n, t), np.full(n, pcte), yy / 2048.0, ph[:, 0], ph[:, 1], lsky, lexp]
+            cols = [(xx - 2048) / 2048, (yy - 1024) / 1024, ch4, dm / 5.0, np.full(n, t), np.full(n, pcte), ychip, ph[:, 0], ph[:, 1], lsky, lexp]
             if F is not None: cols.append(F)
             if E is not None: cols.append(E)
             return np.column_stack(cols)
