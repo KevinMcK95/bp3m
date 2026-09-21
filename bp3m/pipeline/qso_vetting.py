@@ -388,9 +388,10 @@ def _astrometric_cut(
     C[:, 0, 2] = C[:, 2, 0] = corr_rp * pmra_e * plx_e
     C[:, 1, 2] = C[:, 2, 1] = corr_dp * pdec_e * plx_e
 
-    # Scale by BP3M mult factor (1.05 for 5p, 1.22 for 6p)
+    # Scale by the BP3M mult factor (1.05 for 5p, 1.22 for 6p). These are SIGMA
+    # multipliers, so a covariance is scaled by their SQUARE.
     mult = np.where(is_6p[has_5p].values, _MULT['6p'], _MULT['5p'])
-    C = C * mult[:, None, None]
+    C = C * (mult ** 2)[:, None, None]
 
     # Add systematic noise floor in quadrature to diagonal
     C[:, 0, 0] += _PM_SYS  ** 2

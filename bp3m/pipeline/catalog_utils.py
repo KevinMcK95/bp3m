@@ -101,8 +101,8 @@ def build_gaia_cov(df):
 
     Order of axes: (Δα*, Δδ, μα*, μδ, ϖ)  (same as bp3m convention).
     Inflation matches bp3m/solver.py _cache_gaia() exactly:
-      - 6-param solutions (pseudocolour finite): C *= mult_6p
-      - 5-param solutions (pmra finite, pseudocolour NaN): C *= mult_5p
+      - 6-param solutions (pseudocolour finite): C *= mult_6p**2
+      - 5-param solutions (pmra finite, pseudocolour NaN): C *= mult_5p**2
       - systematic floor added to parallax and PM diagonal entries
 
     Parameters
@@ -149,14 +149,15 @@ def build_gaia_cov(df):
 
     C = sigmas[:, :, None] * corr * sigmas[:, None, :]
 
-    # Inflation (matches bp3m/solver.py exactly — multiplies covariance, not sigma²)
+    # Inflation (matches bp3m/solver.py): mult_* are SIGMA multipliers, so the
+    # covariance is scaled by their SQUARE.
     gaia_6p = np.isfinite(df['pseudocolour'].values)
     gaia_5p = np.isfinite(df['pmra'].values) & ~gaia_6p
     gaia_2p = ~gaia_5p & ~gaia_6p
 
-    C[gaia_6p] *= GAIA_SYS['mult_6p']
-    C[gaia_5p] *= GAIA_SYS['mult_5p']
-    C[gaia_2p] *= GAIA_SYS['mult_2p']
+    C[gaia_6p] *= GAIA_SYS['mult_6p'] ** 2
+    C[gaia_5p] *= GAIA_SYS['mult_5p'] ** 2
+    C[gaia_2p] *= GAIA_SYS['mult_2p'] ** 2
 
     # Systematic floor on PM and parallax
     floor = np.diag(np.array([0, 0,

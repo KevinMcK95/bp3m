@@ -5521,7 +5521,7 @@ def _plot_gaia_comparison(combined_df: pd.DataFrame, gaia_df: pd.DataFrame,
     # distribution (pm_xmatch − pm_gaia) / σ_Gaia_inflated is comparable to
     # N(0,1) rather than appearing too wide.
     # Inflation: C_inflated = mult * C_raw + diag(pm_sys_err²)
-    # → σ_inflated = sqrt(mult * σ_raw² + pm_sys_err²)
+    # → σ_inflated = sqrt(mult² σ_raw² + pm_sys_err²)   (mult is a SIGMA multiplier)
     # mult depends on astrometric solution type:
     #   6-param (has pseudocolour): mult_6p = 1.22
     #   5-param (has pmra_error)  : mult_5p = 1.05
@@ -5534,10 +5534,10 @@ def _plot_gaia_comparison(combined_df: pd.DataFrame, gaia_df: pd.DataFrame,
                                       GAIA_SYS_DICT['mult_2p']))
     _pm_sys2 = GAIA_SYS_DICT['pm_sys_err'] ** 2
     sig_pmra_g  = np.where(has_pm_g,
-                            np.sqrt(mult * sig_pmra_g_raw**2  + _pm_sys2),
+                            np.sqrt(mult**2 * sig_pmra_g_raw**2  + _pm_sys2),
                             sig_pmra_g_raw)
     sig_pmdec_g = np.where(has_pm_g,
-                            np.sqrt(mult * sig_pmdec_g_raw**2 + _pm_sys2),
+                            np.sqrt(mult**2 * sig_pmdec_g_raw**2 + _pm_sys2),
                             sig_pmdec_g_raw)
 
     # Gaia geometric mean PM uncertainty (inflated, matching BP3M)
