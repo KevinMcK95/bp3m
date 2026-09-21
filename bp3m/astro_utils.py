@@ -16,6 +16,17 @@ DEG2RAD = np.pi / 180.0
 #account for systematics in Gaia data
 #amount to inflate uncertainties by
 #might want to change to function of magnitude in the future
+#
+# mult_* are the Gaia EDR3 UNIT WEIGHT UNCERTAINTY factors: the published formal
+# uncertainties are underestimated, by ~5% for 5-parameter solutions and ~22% for
+# 6-parameter ones (a 6-parameter solution is one where pseudocolour was fitted, so
+# `np.isfinite(pseudocolour)` identifies them).
+#   Fabricius et al. 2021, A&A 649, A5 — "Gaia EDR3: Catalogue validation"
+#   https://ui.adsabs.harvard.edu/abs/2021A%26A...649A...5F/abstract
+# These are SIGMA multipliers, as in the original GaiaHub_bayesian scripts, which apply
+# them to gaia_*_error directly (`uwu_6p_mult`); a COVARIANCE is therefore scaled by
+# their SQUARE. Three call sites had been scaling covariances by mult rather than mult**2
+# and were corrected on 2026-09-21.
 GAIA_SYS_DICT = {
     'mult_6p':1.22,
     'mult_5p':1.05,
