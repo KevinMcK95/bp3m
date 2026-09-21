@@ -55,6 +55,41 @@ _UWU_M_5P = np.sqrt(_UWU_R_5P / 2.0)
 _UWU_M_6P = np.sqrt(_UWU_R_6P / 2.0)
 
 
+# Fabricius Fig. 19 (PARALLAX unit-weight uncertainty, plotted directly) for 5p and 6p, digitised
+# 2026-09-21. Three calibrators: LMC, QSO, dSph. They agree for 5p but NOT for 6p at the faint end,
+# where the crowded LMC field sits at 1.33 against 1.08 for isolated QSOs -- a crowding effect, and
+# our fields (globular clusters, dwarf cores) resemble the LMC far more than they resemble quasars.
+# Full curves live in bp3m/reference/fabricius_fig19_{5p,6p}.json.
+_PLX_UWU = {
+    ('5p', 'LMC'): ([10.75, 12.27, 13.24, 14.26, 15.31, 16.23, 17.27, 18.25, 19.28, 20.14],
+                    [1.627, 1.821, 1.434, 1.288, 1.320, 1.257, 1.185, 1.179, 1.145, 1.048]),
+    ('5p', 'QSO'): ([14.75, 15.80, 16.29, 17.30, 18.29, 19.23, 20.21],
+                    [1.392, 1.198, 1.034, 1.048, 1.059, 1.061, 1.048]),
+    ('6p', 'LMC'): ([15.88, 16.80, 17.25, 17.79, 18.31, 18.80, 19.28, 19.69, 20.17],
+                    [1.502, 1.473, 1.337, 1.399, 1.486, 1.413, 1.386, 1.355, 1.322]),
+    ('6p', 'QSO'): ([16.83, 17.32, 17.81, 18.30, 18.80, 19.27, 19.76, 20.24],
+                    [1.329, 1.331, 1.192, 1.180, 1.118, 1.118, 1.097, 1.066]),
+}
+
+
+def gaia_uwu_plx(gmag, is_6p, calibrator='LMC'):
+    """Per-source SIGMA multiplier for the Gaia PARALLAX uncertainty (Fabricius Fig. 19).
+
+    calibrator selects which of the paper's control samples to follow. 'LMC' is the crowded-field
+    one and the right default for our targets; 'QSO' is the isolated-source case and gives a
+    noticeably smaller factor for 6p solutions.
+    """
+    g = np.asarray(gmag, dtype=float)
+    six = np.asarray(is_6p, dtype=bool)
+    out = np.where(six, GAIA_SYS_DICT['mult_6p'], GAIA_SYS_DICT['mult_5p']).astype(float)
+    ok = np.isfinite(g)
+    for tag, sel in (('5p', ok & ~six), ('6p', ok & six)):
+        if sel.any():
+            gx, uy = _PLX_UWU[(tag, calibrator)]
+            out[sel] = np.interp(g[sel], gx, uy)
+    return out
+
+
 def gaia_uwu_pm(gmag, is_6p, is_5p=None):
     """Per-source SIGMA multiplier for Gaia position/proper-motion uncertainties.
 
