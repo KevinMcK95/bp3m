@@ -1106,6 +1106,34 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
     g['sigma_pmdec_bp3m_cond']    = np.sqrt(C_vT[:, 3, 3])
     g['sigma_parallax_bp3m_cond'] = np.sqrt(C_vT[:, 4, 4])
 
+    # ── Reported Gaia uncertainties = the ones BP3M actually used ────────────────
+    # (user 2026-09-21: the catalogue we report as trustworthy carries the inflated +
+    # floored Gaia errors, not the raw archive values.)  solver.C_survey is the 5x5
+    # Gaia covariance AFTER the sigma multipliers (mult_*^2, by solution type) and the
+    # Vasiliev & Baumgardt systematic floors, in the order (dRA*, dDec, pmra, pmdec, plx).
+    # The raw archive values are preserved as *_error_raw / *_corr_raw, and
+    # gaia_err_inflated marks the convention so downstream code cannot double-count.
+    _Cs = getattr(solver, 'C_survey', None)
+    if _Cs is not None and len(_Cs) == len(g):
+        _ORDER = [('ra_error', 0), ('dec_error', 1), ('pmra_error', 2),
+                  ('pmdec_error', 3), ('parallax_error', 4)]
+        _sig_s = np.sqrt(np.diagonal(_Cs, axis1=1, axis2=2))
+        for _c, _i in _ORDER:
+            if _c in g.columns:
+                g[_c + '_raw'] = g[_c].to_numpy()
+            g[_c] = _sig_s[:, _i]
+        # correlations change too: the floors are added to the diagonal only
+        _CORR = [('ra_dec_corr', 0, 1), ('ra_pmra_corr', 0, 2), ('ra_pmdec_corr', 0, 3),
+                 ('ra_parallax_corr', 0, 4), ('dec_pmra_corr', 1, 2), ('dec_pmdec_corr', 1, 3),
+                 ('dec_parallax_corr', 1, 4), ('pmra_pmdec_corr', 2, 3),
+                 ('parallax_pmra_corr', 2, 4), ('parallax_pmdec_corr', 3, 4)]
+        for _c, _i, _j in _CORR:
+            if _c in g.columns:
+                g[_c + '_raw'] = g[_c].to_numpy()
+            _den = _sig_s[:, _i] * _sig_s[:, _j]
+            g[_c] = np.where(_den > 0, _Cs[:, _i, _j] / _den, np.nan)
+        g['gaia_err_inflated'] = True
+
     g.to_csv(output_dir / "stellar_astrometry.csv", index=False)
 
     # 3. Full covariance arrays
