@@ -35,6 +35,66 @@ GAIA_SYS_DICT = {
     'pm_sys_err':0.026, #mas/yr, from E. Vasiliev and H. Baumgardt 2021, MNRAS 505, 5978–6002
 }
 
+# ── Magnitude-dependent Gaia unit-weight uncertainties ──────────────────────────
+# Fabricius et al. 2021, A&A 649, A5, Fig. 20: chi2 test of LQRF QSO PROPER MOTIONS against G,
+# for 5p and 6p solutions (digitised 2026-09-21). The plotted R_chi is the MEAN of a 2-dof chi2,
+# so its expectation is 2 and the sigma multiplier is sqrt(R_chi / 2). That normalisation is
+# confirmed by the faint end: it returns 1.056 for 5p, against the 1.05 the paper quotes.
+#
+# This supersedes the scalar mult_5p / mult_6p for POSITIONS and PROPER MOTIONS. Parallax keeps the
+# scalars until Fig. 19 (the parallax equivalent) is digitised too -- they are different quantities
+# and the 6p penalty is larger for parallax than for proper motion.
+#
+# Calibrated on QSOs over G = 16.3-20.6 only; outside that range the endpoint value is held, so the
+# bright end (G < 16.3), where our own residuals show the largest excess, is an EXTRAPOLATION.
+_UWU_G_5P = np.array([16.298, 16.814, 17.308, 17.802, 18.296, 18.783, 19.227, 19.721, 20.200, 20.594])
+_UWU_R_5P = np.array([3.1598, 2.7813, 2.5716, 2.2749, 2.2852, 2.2136, 2.2596, 2.2494, 2.2494, 2.1931])
+_UWU_G_6P = np.array([16.334, 16.885, 17.329, 17.816, 18.303, 18.804, 19.270, 19.757, 20.236, 20.630])
+_UWU_R_6P = np.array([4.2136, 4.4949, 4.6893, 3.7123, 3.1189, 2.8478, 2.6228, 2.6688, 2.4847, 2.3619])
+_UWU_M_5P = np.sqrt(_UWU_R_5P / 2.0)
+_UWU_M_6P = np.sqrt(_UWU_R_6P / 2.0)
+
+
+def gaia_uwu_pm(gmag, is_6p, is_5p=None):
+    """Per-source SIGMA multiplier for Gaia position/proper-motion uncertainties.
+
+    gmag   : (n,) Gaia G. Non-finite entries fall back to the scalar mult_5p / mult_6p.
+    is_6p  : (n,) bool, six-parameter solution (finite pseudocolour).
+    is_5p  : (n,) bool, five-parameter. Sources that are neither get mult_2p (= 1).
+
+    A covariance is scaled by the OUTER PRODUCT of these multipliers, not by one factor squared,
+    because the parallax row/column keeps its own scalar (see above).
+    """
+    g = np.asarray(gmag, dtype=float)
+    six = np.asarray(is_6p, dtype=bool)
+    five = np.asarray(is_5p, dtype=bool) if is_5p is not None else ~six
+    out = np.full(g.shape, GAIA_SYS_DICT['mult_2p'], dtype=float)
+    out[five] = GAIA_SYS_DICT['mult_5p']
+    out[six] = GAIA_SYS_DICT['mult_6p']
+    ok = np.isfinite(g)
+    if ok.any():
+        m5 = np.interp(g, _UWU_G_5P, _UWU_M_5P)      # np.interp clamps outside the range
+        m6 = np.interp(g, _UWU_G_6P, _UWU_M_6P)
+        out[ok & five] = m5[ok & five]
+        out[ok & six] = m6[ok & six]
+    return out
+
+
+def gaia_cov_scale_vector(gmag, is_6p, is_5p=None):
+    """(n, 5) sigma multipliers in the solver's parameter order (dRA*, dDec, pmra, pmdec, plx).
+
+    Positions and proper motions take the magnitude-dependent Fig. 20 factor; parallax keeps the
+    scalar. Scale a covariance as  C *= f[:, :, None] * f[:, None, :].
+    """
+    f_pm = gaia_uwu_pm(gmag, is_6p, is_5p)
+    six = np.asarray(is_6p, dtype=bool)
+    five = np.asarray(is_5p, dtype=bool) if is_5p is not None else ~six
+    f_plx = np.full(f_pm.shape, GAIA_SYS_DICT['mult_2p'], dtype=float)
+    f_plx[five] = GAIA_SYS_DICT['mult_5p']
+    f_plx[six] = GAIA_SYS_DICT['mult_6p']
+    return np.stack([f_pm, f_pm, f_pm, f_pm, f_plx], axis=1)
+
+
 def michalik_sigma_plx_prior(ra_deg, dec_deg, g_mag):
     """
     Michalik et al. (2015) magnitude- and direction-dependent parallax prior width.
