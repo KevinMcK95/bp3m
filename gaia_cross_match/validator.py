@@ -635,6 +635,11 @@ def build_global_catalog(images, target, data_dir):
             catalog['gaia_source_id'] = catalog['gaia_source_id'].astype(np.int64)
             catalog = catalog.merge(phot_df, on='gaia_source_id', how='left')
 
+    # DELVE-only rows below have no Gaia id, so the column has to hold missing values.
+    # pandas' nullable Int64 does that without the float64 upcast that silently rounds
+    # 19-digit source ids (float64 spacing is 512 at 5e18).
+    catalog['gaia_source_id'] = catalog['gaia_source_id'].astype('Int64')
+
     # ── DELVE enrichment ──────────────────────────────────────────────────────
     gaia_linked, delve_only = _collect_delve_info(images)
 
@@ -658,7 +663,9 @@ def build_global_catalog(images, target, data_dir):
             # NOTE: filter_camera and delve_source_id are groupby keys —
             # pandas 3.x excludes them from g; restored via reset_index() below.
             row = {
-                'gaia_source_id':        np.nan,
+                # pd.NA, not np.nan: a float NaN upcasts the int64 id column and to_csv
+                # then writes every Gaia id as '4.95e+18', rounding it to the nearest ~512.
+                'gaia_source_id':        pd.NA,
                 'n_images':              len(g),
                 'image_list':            ','.join(g['image_name'].tolist()),
                 'hst_index_list':        ','.join(g['hst_index'].astype(str).tolist()),
@@ -698,6 +705,9 @@ def build_global_catalog(images, target, data_dir):
         print(f'  DELVE: added {len(delve_only_cat)} DELVE-only source rows')
 
     out = os.path.join(data_dir, target, 'cross_match_catalog.csv')
+    # The concat above can land on object dtype; Int64 writes full integers and empty
+    # fields, never scientific notation.
+    catalog['gaia_source_id'] = catalog['gaia_source_id'].astype('Int64')
     catalog.to_csv(out, index=False)
     return out
 
