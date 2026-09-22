@@ -29,11 +29,17 @@ The joint model solves all three problems simultaneously.
 
 ### ACS/WFC Chip Geometry
 
-- Two chips: `_hi` (chip 1, extension 1) and `_lo` (chip 2, extension 4).
-- Parallel-register readout runs along +Y for `_hi` and along -Y for `_lo`.
-- Readout registers at outer chip edges:
-  - `_hi`: readout at raw row ≈ 2048 (gap edge); CTE trails toward increasing raw y
-  - `_lo`: readout at raw row ≈ 0 (gap edge); CTE trails toward increasing raw y
+- Two chips: `_hi` (WFC1, SCI,2 = FITS extension 4) and `_lo` (WFC2, SCI,1 = FITS extension 1).
+- Readout registers sit at the OUTER chip edges, so both chips read AWAY from the central gap
+  and the transfer distance is longest at the gap:
+  - `_hi`: readout at raw row ≈ 4096 (outer top edge); charge moves toward +y, trails toward −y
+  - `_lo`: readout at raw row ≈ 0 (outer bottom edge); charge moves toward −y, trails toward +y
+  - hence `yt = |y_raw − y_readout_raw| / 2048`, with `_HI_Y_READOUT_RAW = 4096`,
+    `_LO_Y_READOUT_RAW = 0` — matching the constants in run_alignment_cte.py.
+
+  (Corrected 2026-09-21: this section previously put the `_hi` readout at row 2048 on the gap edge,
+  had trails running toward increasing raw y on BOTH chips — impossible when the chips read in
+  opposite directions — and swapped the extension labels. The code was always right.)
 - In py1pass's unified global frame (0..~4096): lo chip occupies y_raw ∈ [8, 2039],
   hi chip occupies y_raw ∈ [2056, 4087]. Both chips read away from the gap.
 
