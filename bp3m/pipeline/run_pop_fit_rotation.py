@@ -58,6 +58,7 @@ NGC 300 HI kinematics: Puche et al. 1990; inclination: Westmeier et al. 2011
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -75,7 +76,8 @@ _ARCSEC2KPC = 4.84814e-6   # 1 arcsec at 1 kpc = 4.84814e-6 kpc
 # receding major axis (deg), i (deg).  Per-star lookups must therefore use the
 # elliptical radius sqrt(xi^2 + (eta/cos i)^2); see compute_rotation_offsets.
 
-# NGC 55 — Westmeier et al. 2013, Table 4
+# NGC 55 — Westmeier, Koribalski & Braun 2013, MNRAS 434, 3511, Table 4
+# (verified row by row against the published table, 2026-09-22)
 _NGC55_TRING = np.array([
     [150,   18.7, 110.3, 84.5],
     [250,   37.0, 109.9, 81.0],
@@ -98,7 +100,8 @@ _NGC55_TRING = np.array([
     [1950,  69.7,  93.4, 66.5],
 ])
 
-# NGC 300 — Westmeier et al. 2011, Table 2
+# NGC 300 — Westmeier, Braun & Koribalski 2011, MNRAS 410, 2217, Table 2
+# (verified row by row against the published table, 2026-09-22)
 _NGC300_TRING = np.array([
     [100,   43.3, 290.6, 39.9],
     [200,   66.5, 289.3, 40.5],
@@ -124,8 +127,12 @@ _NGC300_TRING = np.array([
 
 GALAXY_PARAMS: dict[str, dict] = {
     'NGC_55': dict(
-        ra_cen=3.7246, dec_cen=-39.1964,   # Westmeier+2013 Table 1 kinematic centre
-        d_kpc=1932.0,
+        # NOTE (2026-09-22): this is the OPTICAL centre (Table 1: 00h14m53.6s, -39d11'47.9").
+        # Westmeier+2013 fitted the ring centre with rotcur and found the DYNAMICAL centre
+        # 3.4+-1.0 arcmin east and 1.3+-0.3 arcmin south of it, i.e. ra=3.79645, dec=-39.21831.
+        # The rings are concentric about the dynamical centre, so that is what the model wants.
+        ra_cen=3.7246, dec_cen=-39.1964,
+        d_kpc=1932.0,                            # cf. 1.9 Mpc adopted by Westmeier+2013
         plx_pop=5.176e-4,                        # mas
         sigma_plx_tot=2.86e-5,                   # mas
         # Representative inner-disk values (for display / mu_pop.json only)
@@ -138,8 +145,10 @@ GALAXY_PARAMS: dict[str, dict] = {
         tilted_ring=_NGC55_TRING,                # full tilted-ring model; overrides pa_deg/inc_deg
     ),
     'NGC_300': dict(
-        ra_cen=13.7229, dec_cen=-37.6844,  # Westmeier+2011 Table 1 kinematic centre
-        d_kpc=2089.0,
+        # Optical core position, which Westmeier+2011 held FIXED in rotcur and state is
+        # consistent with the dynamical centre of the innermost rings (their footnote 2).
+        ra_cen=13.7229, dec_cen=-37.6844,
+        d_kpc=2089.0,                            # cf. 1.9 Mpc adopted by Westmeier+2011 (-9%)
         plx_pop=4.786e-4,
         sigma_plx_tot=1.323e-5,
         pa_deg=290.6,
@@ -158,9 +167,10 @@ GALAXY_PARAMS: dict[str, dict] = {
 # References
 # ----------
 # NGC 55 tilted-ring model:
-#   Westmeier, T., Brüns, C., & Kerp, J. 2013, MNRAS, 432, 3047 (Table 4)
+#   Westmeier, T., Koribalski, B. S., & Braun, R. 2013, MNRAS, 434, 3511 (Table 4)
+#   PA is the gipsy/rotcur convention: receding major axis, measured N through E.
 # NGC 300 tilted-ring model:
-#   Westmeier, T., Koribalski, B. S., & Braun, R. 2011, MNRAS, 410, 2217 (Table 2)
+#   Westmeier, T., Braun, R., & Koribalski, B. S. 2011, MNRAS, 410, 2217 (Table 2)
 #
 # Kinematic model geometry:
 #   van der Hulst, J. M., et al. 1992, AJ, 103, 1457
@@ -177,6 +187,21 @@ GALAXY_PARAMS: dict[str, dict] = {
 #   Δμ_dec  = (v_ξ cos PA − v_η sin PA) / (d_kpc · κ)
 #   κ = 4.74047  km/s per (mas/yr · kpc)
 
+
+
+_COPY_SUFFIX_RE = re.compile(r'_(fs_[A-Za-z0-9]+|sweep|copy|rot)$')
+
+
+def _galaxy_key(field_name: str) -> str:
+    """GALAXY_PARAMS key for a field directory.
+
+    Floor sweeps run on copies of the field (NGC_55_fs_mlp and the like) so the parent's
+    BP3M_results stays at the 0.05-floor run the membership was drawn from.  A copy is the
+    same galaxy, so a recognised copy suffix is stripped before the lookup.
+    """
+    if field_name in GALAXY_PARAMS:
+        return field_name
+    return _COPY_SUFFIX_RE.sub('', field_name)
 
 def compute_rotation_offsets(
     ra_deg: np.ndarray,
@@ -917,7 +942,7 @@ def run_pop_fit_rotation(
     )
     from bp3m.pipeline.qso_vetting import find_qso_anchors
 
-    gp = GALAXY_PARAMS.get(field_name)
+    gp = GALAXY_PARAMS.get(_galaxy_key(field_name))
     if gp is None:
         raise ValueError(
             f"Unknown field '{field_name}'. "
@@ -1347,13 +1372,25 @@ def run_pop_fit_rotation(
             sigma_pm, sigma_plx_tot, mu_pop_arg, plx_pop,
             solver._C_VG_inv_per_star, rot_ra, rot_dec)
 
+    # Freeze semantics, matching run_pop_fit: the phases may REMOVE stars from the
+    # seed-defined group but never add stars from outside it.  Without this the
+    # re-selection grew NGC_55 from the 1052 seed members to 1204 (2026-09-22).
+    _seed_frozen_sidx = (np.asarray(member_sidx, int).copy()
+                         if (freeze_member_seed and member_seed_csv is not None) else None)
+    if _seed_frozen_sidx is not None:
+        print(f"  Freeze: membership restricted to the {len(_seed_frozen_sidx)} "
+              f"seed stars (phases can remove, never add)")
+
     def _select_members(a_free_arg, mu_pop_arg, C_free_arg):
-        return _select_members_from_a_rot(
+        _sidx = _select_members_from_a_rot(
             a_free_arg, mu_pop_arg, _n_hst_det, C_free_arg,
             sigma_pm, rot_ra, rot_dec,
             sigma_clip=member_sigma_clip,
             max_sigma_free_pm=max_sigma_free_pm,
             pm_sys_floor=pm_sys_floor)
+        if _seed_frozen_sidx is not None:
+            _sidx = np.intersect1d(_sidx, _seed_frozen_sidx)
+        return _sidx
 
     # ── Phase 1: μ-only solve ─────────────────────────────────────────────────
     print(f"\n  Phase 1: μ-only solve ({n_iter_mu} iterations, r fixed)...")
@@ -1895,8 +1932,9 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('--name', required=True,
-                        choices=list(GALAXY_PARAMS),
-                        help='Target name')
+                        help='Field directory name. A sweep copy (e.g. NGC_55_fs_mlp) resolves '
+                             'to its parent galaxy; supported galaxies: '
+                             + ', '.join(GALAXY_PARAMS))
     parser.add_argument('--output_dir', type=str, default='.')
     parser.add_argument('--sigma_pm', type=float, default=None,
                         help='Residual PM dispersion (mas/yr) after rotation removed. '
