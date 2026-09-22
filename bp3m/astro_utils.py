@@ -127,18 +127,17 @@ def gaia_uwu_pm(gmag, is_6p, is_5p=None):
     return out
 
 
-def gaia_cov_scale_vector(gmag, is_6p, is_5p=None):
+def gaia_cov_scale_vector(gmag, is_6p, is_5p=None, calibrator='LMC'):
     """(n, 5) sigma multipliers in the solver's parameter order (dRA*, dDec, pmra, pmdec, plx).
 
-    Positions and proper motions take the magnitude-dependent Fig. 20 factor; parallax keeps the
-    scalar. Scale a covariance as  C *= f[:, :, None] * f[:, None, :].
+    Positions and proper motions take the Fig. 20 (proper-motion) curve, parallax the Fig. 19
+    (parallax) curve -- they are different measurements and differ most for 6p sources. Scale a
+    covariance as  C *= f[:, :, None] * f[:, None, :], so a cross term gets the product of the two.
+    calibrator picks Fig.19's control sample; 'LMC' is the crowded-field one and the right default
+    for our targets.
     """
     f_pm = gaia_uwu_pm(gmag, is_6p, is_5p)
-    six = np.asarray(is_6p, dtype=bool)
-    five = np.asarray(is_5p, dtype=bool) if is_5p is not None else ~six
-    f_plx = np.full(f_pm.shape, GAIA_SYS_DICT['mult_2p'], dtype=float)
-    f_plx[five] = GAIA_SYS_DICT['mult_5p']
-    f_plx[six] = GAIA_SYS_DICT['mult_6p']
+    f_plx = gaia_uwu_plx(gmag, is_6p, calibrator=calibrator)
     return np.stack([f_pm, f_pm, f_pm, f_pm, f_plx], axis=1)
 
 
