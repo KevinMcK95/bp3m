@@ -127,11 +127,11 @@ _NGC300_TRING = np.array([
 
 GALAXY_PARAMS: dict[str, dict] = {
     'NGC_55': dict(
-        # NOTE (2026-09-22): this is the OPTICAL centre (Table 1: 00h14m53.6s, -39d11'47.9").
-        # Westmeier+2013 fitted the ring centre with rotcur and found the DYNAMICAL centre
-        # 3.4+-1.0 arcmin east and 1.3+-0.3 arcmin south of it, i.e. ra=3.79645, dec=-39.21831.
-        # The rings are concentric about the dynamical centre, so that is what the model wants.
-        ra_cen=3.7246, dec_cen=-39.1964,
+        # DYNAMICAL centre.  NGC 55 has no point-like nucleus, so Westmeier+2013 fitted the
+        # ring centre with rotcur and found it 3.4+-1.0 arcmin E and 1.3+-0.3 arcmin S of the
+        # optical centre (Table 1: 00h14m53.6s, -39d11'47.9" = 3.72333, -39.19664).  The rings
+        # are concentric about the dynamical centre, so that is the origin the model needs.
+        ra_cen=3.79645, dec_cen=-39.21831,
         d_kpc=1932.0,                            # cf. 1.9 Mpc adopted by Westmeier+2013
         plx_pop=5.176e-4,                        # mas
         sigma_plx_tot=2.86e-5,                   # mas
@@ -303,7 +303,13 @@ def compute_rotation_offsets(
     dmu_ra  = v_east  / (d_kpc * kappa)
     dmu_dec = v_north / (d_kpc * kappa)
 
-    return dmu_ra, dmu_dec
+    # Near-side ambiguity.  A receding-side PA and an inclination fix the line-of-sight
+    # field but not the sense of rotation on the sky: the mirror disc (i -> 180-i, i.e.
+    # the other side nearer) gives an identical v_los and a transverse field of exactly
+    # the opposite sign.  Neither HI paper states which side of the disc is nearer, so the
+    # choice is exposed and can be decided by which sign the measured PMs prefer.
+    sign = float(gp.get('rot_sign', 1.0))
+    return sign * dmu_ra, sign * dmu_dec
 
 
 def compute_rotation_offsets_jacobian(
@@ -924,6 +930,8 @@ def run_pop_fit_rotation(
     member_seed_csv: "Path | str | None" = None,
     use_member_seed: bool = False,
     freeze_member_seed: bool = False,
+    d_kpc: "float | None" = None,
+    rotation_sign: float = 1.0,
 ) -> Path:
     """
     Run rotation-model pop-fit for NGC_55 or NGC_300.
@@ -948,6 +956,23 @@ def run_pop_fit_rotation(
             f"Unknown field '{field_name}'. "
             f"run_pop_fit_rotation only supports: {list(GALAXY_PARAMS)}"
         )
+
+    # gp is the shared module-level table, so take a copy before overriding anything on it.
+    gp = dict(gp)
+    gp['rot_sign'] = float(rotation_sign)
+    if d_kpc is not None:
+        # The distance enters twice: it converts the tabulated V_rot (km/s) into a PM, and it
+        # sets the parallax prior.  Keep them consistent, and keep the prior's FRACTIONAL width,
+        # since that encodes the distance uncertainty rather than an absolute parallax error.
+        _frac = gp['sigma_plx_tot'] / gp['plx_pop']
+        gp['d_kpc']         = float(d_kpc)
+        gp['plx_pop']       = 1.0 / float(d_kpc)          # mas, for d in kpc
+        gp['sigma_plx_tot'] = _frac * gp['plx_pop']
+        print(f"  d_kpc override: {d_kpc} kpc -> plx_pop={gp['plx_pop']:.4e} mas, "
+              f"sigma_plx_tot={gp['sigma_plx_tot']:.4e} mas ({_frac*100:.1f}% width kept)")
+    if rotation_sign != 1.0:
+        print(f"  rotation_sign={rotation_sign:+.0f}: the transverse rotation field is "
+              f"{'reversed' if rotation_sign < 0 else 'as tabulated'} (near-side choice)")
 
     if sigma_pm is None:
         sigma_pm = gp['sigma_pm_disp']
@@ -1545,6 +1570,37 @@ def run_pop_fit_rotation(
           f"θ={np.degrees(theta_current):+.3f}° ± {np.degrees(sigma_theta_final):.3f}°")
     print(f"  Final members: {len(member_sidx)}")
 
+    # ── Rotation-model goodness of fit ─────────────────────────────────────────
+    # The near-side choice reverses the whole transverse field, so the members' own PMs
+    # can decide it: compare the member chi2 about (mu_pop + rotation) with the chi2 about
+    # mu_pop alone.  Only the measurement covariance and the intrinsic dispersion enter —
+    # not pm_sys_floor, which exists to make member SELECTION forgiving and would swamp a
+    # rotation signal of order V/(4.74 d) ~ 10 uas/yr.
+    _chi2_rot = _chi2_norot = float('nan')
+    try:
+        _a_gof, _C_gof = _free_posterior(a_arr, C_vT, member_sidx, mu_pop_current)
+        _pm  = _a_gof[member_sidx, 2:4]
+        _Cpm = _C_gof[member_sidx, 2:4, 2:4].copy()
+        _Cpm[:, 0, 0] += sigma_pm ** 2
+        _Cpm[:, 1, 1] += sigma_pm ** 2
+        _Cinv = np.linalg.inv(_Cpm)
+        _exp_rot = np.column_stack([mu_pop_current[0] + rot_ra[member_sidx],
+                                    mu_pop_current[1] + rot_dec[member_sidx]])
+        _exp_flat = np.broadcast_to(mu_pop_current, _exp_rot.shape)
+        _good = np.all(np.isfinite(_pm), axis=1) & np.all(np.isfinite(_Cpm), axis=(1, 2))
+        for _tag, _exp in (('rot', _exp_rot), ('norot', _exp_flat)):
+            _d = (_pm - _exp)[_good]
+            _c = float(np.sum(np.einsum('ni,nij,nj->n', _d, _Cinv[_good], _d)) / (2 * _good.sum()))
+            if _tag == 'rot':
+                _chi2_rot = _c
+            else:
+                _chi2_norot = _c
+        print(f"  Rotation goodness of fit on {int(_good.sum())} members: "
+              f"chi2/2N = {_chi2_rot:.4f} with rotation, {_chi2_norot:.4f} without "
+              f"(delta = {_chi2_rot - _chi2_norot:+.4f}, sign={gp.get('rot_sign', 1.0):+.0f})")
+    except Exception as _gof_exc:
+        print(f"  WARNING: rotation goodness-of-fit diagnostic failed — {_gof_exc}")
+
     # ── Final posterior pass ───────────────────────────────────────────────────
     print("\n  Final posterior pass...")
     _, _, _, _, C_shared_final, C_vT_final, v_mean, _, K_img_final = _solve(
@@ -1803,6 +1859,11 @@ def run_pop_fit_rotation(
         'rotation_model':        'tilted_ring' if gp.get('tilted_ring') is not None else 'arctangent',
         'n_tilted_rings':        int(len(gp['tilted_ring'])) if gp.get('tilted_ring') is not None else None,
         'd_kpc':                 float(gp['d_kpc']),
+        'rot_sign':              float(gp.get('rot_sign', 1.0)),
+        'chi2_red_with_rotation':    None if not np.isfinite(_chi2_rot)   else float(_chi2_rot),
+        'chi2_red_without_rotation': None if not np.isfinite(_chi2_norot) else float(_chi2_norot),
+        'ra_cen':                float(gp['ra_cen']),
+        'dec_cen':               float(gp['dec_cen']),
         'fit_f':                 fit_f,
         'fit_theta':             fit_theta,
     }
@@ -1964,6 +2025,13 @@ def main():
     parser.add_argument('--lvd_dir',  type=str, default=None,
                         help='Path to LVD data/ directory (falls back to $BP3M_LVD_DIR '
                              'or ~/data_bootes/bp3m/local_volume_database/data/)')
+    parser.add_argument('--d_kpc', type=float, default=None,
+                        help='Distance (kpc); overrides GALAXY_PARAMS and rescales the parallax '
+                             'prior (plx_pop = 1/d_kpc, fractional width preserved)')
+    parser.add_argument('--rotation_sign', type=float, default=1.0, choices=[1.0, -1.0],
+                        help='Sense of rotation on the sky. The HI velocity field fixes the '
+                             'receding side but not which side of the disc is nearer, and the '
+                             'mirror disc gives a transverse field of the opposite sign.')
     parser.add_argument('--no_plots',       action='store_true')
     parser.add_argument('--no_qso_anchors', action='store_true',
                         help='Disable QSO secular-aberration anchor prior')
@@ -2016,6 +2084,8 @@ def main():
         member_seed_csv=args.member_seed_csv,
         use_member_seed=args.use_member_seed,
         freeze_member_seed=args.freeze_member_seed,
+        d_kpc=args.d_kpc,
+        rotation_sign=args.rotation_sign,
     )
 
     # Save the command only on successful completion so interrupted runs
