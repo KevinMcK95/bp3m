@@ -125,6 +125,25 @@ _NGC300_TRING = np.array([
     [2000,  82.7, 331.7, 43.3],
 ])
 
+# NGC 3109 — Carignan et al. 2013, ApJ 772, 15 (KAT-7 science verification), Table 10
+# (asymmetric-drift-corrected VC) with the paper's mean kinematic geometry, PA = 96 deg and
+# i = 61 deg, held constant: that study publishes the rotation curve as a table but the
+# per-ring PA/i only as figures, so there is no warp model to adopt.  The r=0 row makes the
+# interpolation rise linearly from the centre instead of clamping to the innermost ring --
+# it matters here, because the HST members sit at a median radius of ~2 arcmin, well inside
+# the first measured point at 240 arcsec.
+_NGC3109_TRING = np.array([
+    [0,     0.0, 96.0, 61.0],
+    [240,  31.0, 96.0, 61.0],
+    [480,  48.8, 96.0, 61.0],
+    [720,  60.2, 96.0, 61.0],
+    [960,  64.9, 96.0, 61.0],
+    [1200, 66.8, 96.0, 61.0],
+    [1440, 71.4, 96.0, 61.0],
+    [1680, 77.8, 96.0, 61.0],
+    [1920, 81.7, 96.0, 61.0],
+])
+
 GALAXY_PARAMS: dict[str, dict] = {
     'NGC_55': dict(
         # DYNAMICAL centre.  NGC 55 has no point-like nucleus, so Westmeier+2013 fitted the
@@ -158,6 +177,24 @@ GALAXY_PARAMS: dict[str, dict] = {
         sigma_theta_deg=10.0,
         mu_pop_init=(-0.0042, -0.0027),
         tilted_ring=_NGC300_TRING,
+    ),
+    'NGC_3109': dict(
+        # Optical centre (Carignan+2013 Table 1: 10h03m06.7s, -26d09'32"), which their
+        # tilted-ring fit found coincident with the rotation centre.
+        ra_cen=150.77792, dec_cen=-26.15889,
+        d_kpc=1300.0,                            # 1.30 +- 0.02 Mpc (Cepheids)
+        plx_pop=7.6923e-4,                       # mas = 1/d_kpc
+        sigma_plx_tot=1.18e-5,                   # 1.5% distance uncertainty
+        pa_deg=96.0,                             # HI kinematic mean
+        inc_deg=61.0,                            # HI kinematic; the photometric value is
+                                                 # 73.5 deg in I and 69.5 at 3.6 um -- a real
+                                                 # discrepancy the paper discusses, worth
+                                                 # testing as a variant
+        sigma_pm_disp=0.0024,                    # 15 km/s HI dispersion inside 3 arcmin
+        f0=1.0, sigma_f=0.20,
+        sigma_theta_deg=10.0,
+        mu_pop_init=(0.0, 0.0),
+        tilted_ring=_NGC3109_TRING,
     ),
 }
 
@@ -899,6 +936,82 @@ def _plot_sky_pm_members(output_dir, stellar_csv_path: "Path", mu_pop: np.ndarra
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
+
+
+def _posthoc_sigma_int_rot(bp3m_dir, output_pfr, mu, member_ids, rot_by_id):
+    """Post-hoc intrinsic PM dispersion for the rotation model (per axis).
+
+    Ported from run_pop_fit._posthoc_sigma_int, with one change that matters here: the
+    residual is taken about mu_pop PLUS each star's modelled rotation offset, so what is
+    measured is the scatter the rotation model fails to explain, not the rotation itself.
+
+    With alignment, members, mu_pop and the rotation field frozen, maximise the profile
+    likelihood  L(sigma) = prod_i N(pm_i - mu_pop - rot_i; 0, sigma_q_i^2 + sigma^2)
+    over the members, using the UNSHRUNK per-star PMs from the source bp3m solve — the
+    pop-fit member posteriors are shrunk toward mu_pop and would bias sigma low.
+    """
+    from scipy.optimize import minimize_scalar as _mins
+    try:
+        src = pd.read_csv(Path(bp3m_dir) / 'stellar_astrometry.csv',
+                          dtype={'Gaia_id': np.int64})
+    except FileNotFoundError:
+        return None
+    need = {'pmra_bp3m', 'pmdec_bp3m', 'sigma_pmra_bp3m', 'sigma_pmdec_bp3m',
+            'n_hst_used', 'prior_fallback'}
+    if not need.issubset(src.columns):
+        print(f"  sigma_int: source table is missing {sorted(need - set(src.columns))} — skipped")
+        return None
+    u = src[(src.n_hst_used > 0) & ~src.prior_fallback.astype(bool)]
+    m = u[u.Gaia_id.isin(member_ids)].copy()
+    if len(m) < 20:
+        print(f"  sigma_int: only {len(m)} usable members — skipped")
+        return None
+    _rot = np.array([rot_by_id.get(int(g), (0.0, 0.0)) for g in m['Gaia_id']], float)
+
+    out = {'n_members_used': int(len(m)),
+           'method': 'profile-MLE, frozen mu_pop/members/rotation, unshrunk PMs'}
+    _smad = lambda v: 1.4826 * np.median(np.abs(v - np.median(v)))
+    for _k, (ax, mu0) in enumerate((('ra', mu['mu_pop_ra_masyr']),
+                                    ('dec', mu['mu_pop_dec_masyr']))):
+        pm = m[f'pm{ax}_bp3m'].to_numpy(float)
+        sq = m[f'sigma_pm{ax}_bp3m'].to_numpy(float)
+        d  = pm - mu0 - _rot[:, _k]
+        good = np.isfinite(d) & np.isfinite(sq) & (sq > 0)
+        d, sq = d[good], sq[good]
+        s_mad = _smad(d)
+        dec_mad = float(np.sqrt(max(s_mad ** 2 - np.median(sq) ** 2, 0.0)))
+
+        def _nll(sig):
+            v = sq ** 2 + sig ** 2
+            return 0.5 * np.sum(d ** 2 / v + np.log(v))
+        res = _mins(_nll, bounds=(0.0, 1.0), method='bounded')
+        s_hat = float(res.x if res.x > 1e-4 else 0.0)
+        grid = np.linspace(0.0, 1.0, 2001)
+        ok = np.array([_nll(g) for g in grid]) <= res.fun + 0.5
+        lo, hi = (float(grid[ok][0]), float(grid[ok][-1])) if ok.any() else (s_hat, s_hat)
+        out[f'sigma_int_{ax}_masyr'] = s_hat
+        out[f'sigma_int_{ax}_68lo']  = lo
+        out[f'sigma_int_{ax}_68hi']  = hi
+        out[f'sigma_mad_{ax}']         = float(s_mad)
+        out[f'sigma_mad_deconv_{ax}']  = dec_mad
+        out[f'median_sigma_quoted_{ax}'] = float(np.median(sq))
+        out[f'n_used_{ax}'] = int(good.sum())
+        print(f"  sigma_int({ax}) about mu+rotation: MLE {s_hat*1e3:.1f} "
+              f"[68%: {lo*1e3:.1f}-{hi*1e3:.1f}] uas/yr  "
+              f"(MAD {s_mad*1e3:.1f}, deconv {dec_mad*1e3:.1f}, "
+              f"med sigma_q {np.median(sq)*1e3:.1f})")
+    _prior = mu.get('sigma_pm_masyr')
+    if _prior:
+        out['sigma_pm_prior_masyr'] = float(_prior)
+        print(f"  (the value ASSUMED for this run was {_prior*1e3:.1f} uas/yr — "
+              f"sigma_mu_pop scales with it)")
+    out['rot_sign'] = mu.get('rot_sign')
+    out['f_star_mult'] = mu.get('f_star_mult')
+    with open(Path(output_pfr) / 'sigma_int.json', 'w') as _f:
+        json.dump(out, _f, indent=2)
+    print("  Saved: sigma_int.json")
+    return out
+
 
 def run_pop_fit_rotation(
     output_dir: Path,
@@ -1869,6 +1982,16 @@ def run_pop_fit_rotation(
     }
     with open(output_pfr / 'mu_pop.json', 'w') as _f:
         json.dump(mu_result, _f, indent=2)
+
+    # Measured (rather than assumed) intrinsic dispersion about mu_pop + rotation.
+    try:
+        _gid_arr = gaia_catalog['Gaia_id'].to_numpy(np.int64)   # positional, like star_id_to_idx
+        _ids = {int(_gid_arr[i]) for i in member_sidx}
+        _rot_by_id = {int(_gid_arr[i]): (float(rot_ra[i]), float(rot_dec[i]))
+                      for i in member_sidx}
+        _posthoc_sigma_int_rot(bp3m_dir, output_pfr, mu_result, _ids, _rot_by_id)
+    except Exception as _si_exc:
+        print(f"  WARNING: sigma_int post-hoc failed — {_si_exc}")
 
     # run_config.json
     from bp3m.solver import _SIGMA_ROT_DEG, _SIGMA_SCALE, _SIGMA_SKEW, _SIGMA_POINTING
