@@ -416,6 +416,11 @@ def _parse_args():
     bp.add_argument('--pos_corr_model', type=str, default=None,
                     help='Learned GDC-residual correction (hst_dist_corr ml models): DIR[:TAG] or comma-separated json paths; '
                          'evaluated per detection at catalog load (see bp3m/pos_corr_model.py). Composes with --pos_corr_table.')
+    bp.add_argument('--gaia_uwu_mag', action='store_true',
+                    help='use the magnitude-dependent Gaia unit-weight uncertainties (Fabricius '
+                         '2021 Fig.19/20) instead of the scalar 1.05/1.22; parallax and '
+                         'position/PM take different curves, so the covariance scales by the outer '
+                         'product of the per-parameter sigma multipliers')
     bp.add_argument('--bp3m_results_suffix', type=str, default=None,
                     help='Write the joint-fit outputs to '
                          'BP3M_results_<suffix> instead of BP3M_results '
@@ -748,6 +753,10 @@ def _run_indv_one(img_name, run_kw, indv_root, extra_cfg):
 
 def main():
     args = _parse_args()
+    if getattr(args, 'gaia_uwu_mag', False):
+        from bp3m.astro_utils import set_gaia_uwu_mag
+        set_gaia_uwu_mag(True)
+        print('  Gaia uncertainties: magnitude-dependent UWU (Fabricius 2021 Fig.19/20)')
 
     # Wire --n_processes to thread limits.
     # In parallel image mode (default): workers set their own limits; the main

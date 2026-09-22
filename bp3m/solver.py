@@ -543,9 +543,19 @@ class BP3MSolver:
         #might want to change to function of magnitude in the future
         # mult_* are SIGMA multipliers (literature error underestimates), so the
         # covariance is inflated by their square — same as gaia_cross_match.
-        self.C_survey[self.gaia_6p] *= GAIA_SYS_DICT['mult_6p'] ** 2
-        self.C_survey[self.gaia_5p] *= GAIA_SYS_DICT['mult_5p'] ** 2
-        self.C_survey[self.gaia_2p] *= GAIA_SYS_DICT['mult_2p']
+        from .astro_utils import GAIA_UWU_MAG as _UWU_MAG
+        if _UWU_MAG:
+            # Magnitude-dependent unit-weight uncertainties (Fabricius et al. 2021, Fig. 19 for
+            # parallax and Fig. 20 for proper motion). These are SIGMA multipliers and differ
+            # between the parallax row/column and the rest, so the covariance is scaled by the
+            # OUTER PRODUCT of the per-parameter vector rather than by one factor squared.
+            from .astro_utils import gaia_cov_scale_vector
+            _f = gaia_cov_scale_vector(self.gaia_g, self.gaia_6p, self.gaia_5p)
+            self.C_survey *= _f[:, :, None] * _f[:, None, :]
+        else:
+            self.C_survey[self.gaia_6p] *= GAIA_SYS_DICT['mult_6p'] ** 2
+            self.C_survey[self.gaia_5p] *= GAIA_SYS_DICT['mult_5p'] ** 2
+            self.C_survey[self.gaia_2p] *= GAIA_SYS_DICT['mult_2p']
         self.C_survey += np.diag(np.array([0,0,
                             GAIA_SYS_DICT['pm_sys_err'],GAIA_SYS_DICT['pm_sys_err'],
                             GAIA_SYS_DICT['parallax_sys_err']])**2)

@@ -35,6 +35,18 @@ GAIA_SYS_DICT = {
     'pm_sys_err':0.026, #mas/yr, from E. Vasiliev and H. Baumgardt 2021, MNRAS 505, 5978–6002
 }
 
+# Global switch: when True the solver uses the magnitude-dependent Fabricius Fig.19/20 curves
+# instead of the scalar mult_5p / mult_6p. Default False so existing behaviour is unchanged; set by
+# bp3m --gaia_uwu_mag. Exploration first, adoption (and threading through the cross-match, catalogue
+# builder and QSO vetting) only once the science impact is measured.
+GAIA_UWU_MAG = False
+
+
+def set_gaia_uwu_mag(flag: bool) -> None:
+    global GAIA_UWU_MAG
+    GAIA_UWU_MAG = bool(flag)
+
+
 # ── Magnitude-dependent Gaia unit-weight uncertainties ──────────────────────────
 # Fabricius et al. 2021, A&A 649, A5, Fig. 20: chi2 test of LQRF QSO PROPER MOTIONS against G,
 # for 5p and 6p solutions (digitised 2026-09-21). The plotted R_chi is the MEAN of a 2-dof chi2,
