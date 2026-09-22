@@ -125,23 +125,73 @@ _NGC300_TRING = np.array([
     [2000,  82.7, 331.7, 43.3],
 ])
 
-# NGC 3109 — Carignan et al. 2013, ApJ 772, 15 (KAT-7 science verification), Table 10
-# (asymmetric-drift-corrected VC) with the paper's mean kinematic geometry, PA = 96 deg and
-# i = 61 deg, held constant: that study publishes the rotation curve as a table but the
-# per-ring PA/i only as figures, so there is no warp model to adopt.  The r=0 row makes the
-# interpolation rise linearly from the centre instead of clamping to the innermost ring --
-# it matters here, because the HST members sit at a median radius of ~2 arcmin, well inside
-# the first measured point at 240 arcsec.
+# NGC 3109 — Carignan et al. 2013, ApJ 772, 15 (KAT-7 science verification), Figure 8:
+# the tilted-ring model fitted to the robust-weighted VLA-ANGST data, whole galaxy.  That
+# figure is the only per-ring model from the high-resolution data — the KAT-7 panels are
+# beam-smeared at the radii the HST members occupy — so it was digitised (user, 2026-09-22;
+# points kept in bp3m/reference/carignan2013_ngc3109_fig8.json).
+#
+# V_rot here is the OBSERVED rotation velocity, not asymmetric-drift corrected: it tracks the
+# V0 column of the paper's Table 10 to ~1.5 km/s (240" 28.0 vs 29.2, 480" 45.5 vs 47.0,
+# 960" 63.9 vs 64.6), not the corrected V_C.  The stellar/HI ratio f absorbs that scaling.
+# PA and i are lightly median-smoothed, as the paper does with its own profiles.  The r=0 row
+# makes the interpolation rise linearly from the centre instead of clamping to the innermost
+# ring, which matters because the members sit at a median radius of ~2 arcmin.
+# Beyond the Holmberg radius (13.3 arcmin = 798") the warp makes both angles noisy.
 _NGC3109_TRING = np.array([
-    [0,     0.0, 96.0, 61.0],
-    [240,  31.0, 96.0, 61.0],
-    [480,  48.8, 96.0, 61.0],
-    [720,  60.2, 96.0, 61.0],
-    [960,  64.9, 96.0, 61.0],
-    [1200, 66.8, 96.0, 61.0],
-    [1440, 71.4, 96.0, 61.0],
-    [1680, 77.8, 96.0, 61.0],
-    [1920, 81.7, 96.0, 61.0],
+    [    0.0,   0.0,  92.97, 47.89],
+    [   19.3,   5.4,  92.97, 47.89],
+    [   40.4,   6.9,  85.62, 48.75],
+    [   59.6,   8.5,  84.07, 49.54],
+    [   78.9,  10.8,  84.39, 50.37],
+    [  100.0,  13.1,  88.31, 50.37],
+    [  119.3,  16.2,  93.39, 50.37],
+    [  138.6,  18.5,  96.50, 58.62],
+    [  159.6,  20.0,  97.63, 62.75],
+    [  180.7,  22.3,  97.63, 62.82],
+    [  200.0,  24.6,  97.63, 63.58],
+    [  219.3,  26.9,  97.63, 61.93],
+    [  240.4,  29.2,  97.63, 61.86],
+    [  259.6,  30.8,  98.47, 61.10],
+    [  278.9,  32.3,  98.47, 61.10],
+    [  300.0,  34.6,  97.63, 62.75],
+    [  319.3,  35.4,  96.78, 62.75],
+    [  340.4,  37.7,  96.78, 62.75],
+    [  359.6,  38.5,  96.78, 62.75],
+    [  378.9,  40.0,  96.78, 62.75],
+    [  400.0,  41.5,  96.78, 63.58],
+    [  419.3,  43.1,  97.63, 63.58],
+    [  440.4,  44.6,  97.63, 63.58],
+    [  459.6,  46.2,  97.63, 62.75],
+    [  478.9,  46.9,  99.32, 62.75],
+    [  500.0,  48.5,  99.32, 62.75],
+    [  519.3,  49.2, 100.17, 62.75],
+    [  540.4,  50.8, 101.02, 61.93],
+    [  559.6,  51.5, 101.02, 61.10],
+    [  578.9,  51.5, 101.02, 61.10],
+    [  600.0,  52.3, 101.86, 61.10],
+    [  619.3,  53.1, 101.86, 61.93],
+    [  640.4,  54.6, 101.86, 62.75],
+    [  659.6,  55.4, 101.86, 62.75],
+    [  680.7,  56.2, 100.17, 63.58],
+    [  700.0,  56.9, 100.17, 63.58],
+    [  719.3,  56.9, 100.17, 63.58],
+    [  740.4,  57.7, 100.17, 64.40],
+    [  759.6,  59.2, 101.02, 64.40],
+    [  778.9,  59.2, 100.24, 64.40],
+    [  800.0,  60.0, 101.02, 66.06],
+    [  819.3,  60.8,  98.47, 66.81],
+    [  840.4,  61.5,  98.47, 66.95],
+    [  859.6,  62.3,  97.63, 67.71],
+    [  878.9,  62.3,  97.63, 76.03],
+    [  900.0,  63.1,  98.47, 67.71],
+    [  919.3,  63.1, 100.39, 67.17],
+    [  940.4,  63.1, 102.49, 66.59],
+    [  959.6,  64.6, 104.41, 66.06],
+    [  980.7,  64.6, 104.41, 62.75],
+    [ 1000.0,  65.4, 104.41, 66.06],
+    [ 1019.3,  66.2, 104.41, 62.75],
+    [ 1040.4,  66.2, 100.17, 66.88],
 ])
 
 GALAXY_PARAMS: dict[str, dict] = {
@@ -185,11 +235,11 @@ GALAXY_PARAMS: dict[str, dict] = {
         d_kpc=1300.0,                            # 1.30 +- 0.02 Mpc (Cepheids)
         plx_pop=7.6923e-4,                       # mas = 1/d_kpc
         sigma_plx_tot=1.18e-5,                   # 1.5% distance uncertainty
-        pa_deg=96.0,                             # HI kinematic mean
-        inc_deg=61.0,                            # HI kinematic; the photometric value is
-                                                 # 73.5 deg in I and 69.5 at 3.6 um -- a real
-                                                 # discrepancy the paper discusses, worth
-                                                 # testing as a variant
+        pa_deg=93.0,                             # innermost digitised ring (display only)
+        inc_deg=47.9,                            # innermost digitised ring; the flat disc
+                                                 # beyond 240" sits at ~63 deg, and the
+                                                 # photometric value is 73.5 in I, 69.5 at
+                                                 # 3.6 um -- a discrepancy the paper discusses
         sigma_pm_disp=0.0024,                    # 15 km/s HI dispersion inside 3 arcmin
         f0=1.0, sigma_f=0.20,
         sigma_theta_deg=10.0,
