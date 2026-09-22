@@ -893,6 +893,12 @@ def run_pop_fit_rotation(
     no_plots: bool = False,
     use_qso_anchors: bool = True,
     qso_anchors_csv: "Path | str | list | None" = None,
+    bp3m_results_name: "str | None" = None,
+    pos_corr_table: "str | None" = None,
+    pos_corr_model: "str | None" = None,
+    member_seed_csv: "Path | str | None" = None,
+    use_member_seed: bool = False,
+    freeze_member_seed: bool = False,
 ) -> Path:
     """
     Run rotation-model pop-fit for NGC_55 or NGC_300.
@@ -907,7 +913,7 @@ def run_pop_fit_rotation(
     from bp3m.pipeline.run_pop_fit import (
         _load_bp3m_outputs, _apply_bp3m_flags,
         _select_initial_members, _estimate_mu_pop_v1, _estimate_mu_pop,
-        _compute_alpha_updates,
+        _compute_alpha_updates, _read_member_seed, _resolve_member_seed,
     )
     from bp3m.pipeline.qso_vetting import find_qso_anchors
 
@@ -945,8 +951,13 @@ def run_pop_fit_rotation(
 
     t_start    = time.time()
     data_root  = Path(output_dir)
-    bp3m_dir   = data_root / field_name / 'BP3M_results'
-    output_pfr = data_root / field_name / 'BP3M_pop_fit_rotation_results'
+    # Same convention as run_pop_fit: a suffixed source directory writes a suffixed output, so
+    # comparison runs (e.g. BP3M_results_gdcnew) do not overwrite one another.
+    bp3m_dir   = data_root / field_name / (bp3m_results_name or 'BP3M_results')
+    _sfx = ''
+    if bp3m_results_name and bp3m_results_name != 'BP3M_results':
+        _sfx = '_' + str(bp3m_results_name).replace('BP3M_results_', '')
+    output_pfr = data_root / field_name / f'BP3M_pop_fit_rotation_results{_sfx}'
     output_pfr.mkdir(parents=True, exist_ok=True)
 
     # ── Read v1 run_config ─────────────────────────────────────────────────────
@@ -957,6 +968,22 @@ def run_pop_fit_rotation(
         )
     with open(_cfg_path) as _f:
         v1_cfg = json.load(_f)
+
+    # Mirror the source run's position corrections unless overridden, so the rotation fit loads
+    # catalogues exactly the way the alignment did. 'none' disables. Ported from run_pop_fit
+    # 2026-09-22: without this the rotation fit silently ignored the learned GDC correction.
+    if pos_corr_table is None:
+        pos_corr_table = v1_cfg.get('pos_corr_table')
+    elif str(pos_corr_table).lower() == 'none':
+        pos_corr_table = None
+    if pos_corr_model is None:
+        pos_corr_model = v1_cfg.get('pos_corr_model')
+    elif str(pos_corr_model).lower() == 'none':
+        pos_corr_model = None
+    if pos_corr_table:
+        print(f"  pos_corr_table: {', '.join(Path(t).name for t in str(pos_corr_table).split(',') if t.strip())}")
+    if pos_corr_model:
+        print(f"  pos_corr_model: {pos_corr_model}")
 
     v1_image_names      = v1_cfg.get('image_names', [])
     v1_split_ccd        = bool(v1_cfg.get('split_ccd', True))
@@ -996,7 +1023,9 @@ def run_pop_fit_rotation(
 
     # ── Load data ──────────────────────────────────────────────────────────────
     print(f"\n  Loading bp3m input data for '{field_name}'...")
-    imgs, stars_per_image, gaia_catalog = load_image_data_flc(data_root, field_name)
+    imgs, stars_per_image, gaia_catalog = load_image_data_flc(
+        data_root, field_name,
+        pos_corr_table=pos_corr_table, pos_corr_model=pos_corr_model)
     if imgs is None or len(imgs) == 0:
         raise RuntimeError(f"No usable images found for '{field_name}'.")
 
@@ -1214,11 +1243,35 @@ def run_pop_fit_rotation(
 
     # ── Initial member selection ───────────────────────────────────────────────
     print("\n  Selecting initial members from v1 bp3m PMs...")
-    member_sidx = _select_initial_members(
-        _pmra_v1_only, _pmdec_v1_only,
-        _sig_pmra_init, _sig_pmdec_init, _corr_pm_init,
-        _mu_boot, member_sigma_clip, sigma_pm, pm_sys_floor)
-    print(f"  Initial members: {len(member_sidx)}")
+    # A hand-drawn member seed replaces the sigma-clip selection (the phases still refine
+    # membership; frozen means remove-only). Ported from run_pop_fit 2026-09-22 together with the
+    # September fixes that stopped seed members being dropped by the free-PM rule.
+    member_seed_csv = _resolve_member_seed(data_root, field_name, 'v1',
+                                           member_seed_csv, use_member_seed,
+                                           freeze_member_seed)
+    if member_seed_csv is not None:
+        _seed_path = Path(member_seed_csv)
+        _seed_ids, _ = _read_member_seed(_seed_path)
+        _found  = [star_id_to_idx[g] for g in _seed_ids if g in star_id_to_idx]
+        _n_miss = len(_seed_ids) - len(_found)
+        member_sidx = np.array(sorted(_found), dtype=int)
+        print(f"\n  Initial members from seed CSV {_seed_path.name}: {len(member_sidx)} matched"
+              + (f"  ({_n_miss} seed IDs not in this field's star list)" if _n_miss else ""))
+        if len(member_sidx) < 3:
+            raise RuntimeError(
+                f"member_seed_csv matched only {len(member_sidx)} stars — check the field.")
+        if freeze_member_seed:
+            # With a frozen seed the free-PM quality rule must not remove members: a seed star with
+            # a poorly constrained free PM is still a member by construction. The chi2 clip stays.
+            max_sigma_free_pm = float('inf')
+            print("  freeze_member_seed: seed membership is remove-only; "
+                  "max_sigma_free_pm disabled")
+    else:
+        member_sidx = _select_initial_members(
+            _pmra_v1_only, _pmdec_v1_only,
+            _sig_pmra_init, _sig_pmdec_init, _corr_pm_init,
+            _mu_boot, member_sigma_clip, sigma_pm, pm_sys_floor)
+        print(f"  Initial members: {len(member_sidx)}")
 
     # ── μ_pop prior ────────────────────────────────────────────────────────────
     _extra = sigma_pm ** 2 + pm_sys_floor ** 2
@@ -1876,11 +1929,27 @@ def main():
     parser.add_argument('--no_plots',       action='store_true')
     parser.add_argument('--no_qso_anchors', action='store_true',
                         help='Disable QSO secular-aberration anchor prior')
+    parser.add_argument('--member_seed_csv', type=str, default=None,
+                        help='CSV of Gaia IDs defining the initial members, replacing the '
+                             'sigma-clip selection')
+    parser.add_argument('--use_member_seed', action='store_true',
+                        help='auto-locate the member seed written for this field')
+    parser.add_argument('--freeze_member_seed', action='store_true',
+                        help='seed membership is remove-only: disables the free-PM quality cut so '
+                             'seed stars are not dropped for a poorly constrained free PM')
+    parser.add_argument('--bp3m_results_name', type=str, default=None,
+                        help="source results directory (default BP3M_results); a suffixed one "
+                             "writes a matching BP3M_pop_fit_rotation_results_<suffix>")
+    parser.add_argument('--pos_corr_table', type=str, default=None,
+                        help="pseudo-GDC table(s); default mirrors the source run, 'none' disables")
+    parser.add_argument('--pos_corr_model', type=str, default=None,
+                        help="learned GDC-residual model DIR[:TAG]; default mirrors the source run, "
+                             "'none' disables")
     parser.add_argument('--qso_anchors_csv', type=str, default=None, nargs='+')
 
     args = parser.parse_args()
 
-    run_pop_fit_rotation(
+    _out_pfr = run_pop_fit_rotation(
         output_dir=Path(args.output_dir).resolve(),
         field_name=args.name,
         sigma_pm=args.sigma_pm,
@@ -1903,14 +1972,21 @@ def main():
         no_plots=args.no_plots,
         use_qso_anchors=not args.no_qso_anchors,
         qso_anchors_csv=[Path(p) for p in args.qso_anchors_csv] if args.qso_anchors_csv else None,
+        bp3m_results_name=args.bp3m_results_name,
+        pos_corr_table=args.pos_corr_table,
+        pos_corr_model=args.pos_corr_model,
+        member_seed_csv=args.member_seed_csv,
+        use_member_seed=args.use_member_seed,
+        freeze_member_seed=args.freeze_member_seed,
     )
 
     # Save the command only on successful completion so interrupted runs
     # do not overwrite the record of the last successful invocation.
     import sys as _sys, shlex as _shlex
     from datetime import datetime as _datetime
-    _cmd_file = (Path(args.output_dir).resolve() / args.name
-                 / 'BP3M_pop_fit_rotation_results' / 'bp3m_pop_fit_rotation_command.txt')
+    # The run returns its own (possibly suffixed) output directory, so a --bp3m_results_name
+    # run records its command beside its own results instead of in the default directory.
+    _cmd_file = Path(_out_pfr) / 'bp3m_pop_fit_rotation_command.txt'
     _cmd_file.parent.mkdir(parents=True, exist_ok=True)
     _cmd_file.write_text(
         f"# {_datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"

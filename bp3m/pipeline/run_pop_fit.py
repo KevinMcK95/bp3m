@@ -3952,7 +3952,7 @@ def main(argv=None):
         except Exception:
             pass
 
-    run_pop_fit(
+    _out_pfr = run_pop_fit(
         bp3m_results_name=args.bp3m_results_name,
         output_dir=Path(args.output_dir).resolve(),
         field_name=args.name.replace(' ', '_'),
@@ -4008,10 +4008,9 @@ def main(argv=None):
     # do not overwrite the record of the last successful invocation.
     import sys as _sys, shlex as _shlex
     from datetime import datetime as _datetime
-    _pfr_name = ('BP3M_pop_fit_v2_results' if args.use_master_v2
-                 else 'BP3M_pop_fit_results')
-    _cmd_file = (Path(args.output_dir).resolve() / args.name.replace(' ', '_')
-                 / _pfr_name / 'bp3m_pop_fit_command.txt')
+    # The run returns its own (possibly suffixed) output directory, so a --bp3m_results_name
+    # run records its command beside its own results instead of in the default directory.
+    _cmd_file = Path(_out_pfr) / 'bp3m_pop_fit_command.txt'
     _cmd_file.parent.mkdir(parents=True, exist_ok=True)
     _cmd_file.write_text(
         f"# {_datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
