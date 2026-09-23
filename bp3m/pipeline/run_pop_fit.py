@@ -2077,6 +2077,7 @@ def run_pop_fit(
     hst_all_fit: bool = False,
     pos_corr_table: "str | None" = None,
     pos_corr_model: "str | None" = None,
+    pos_err_floor: "float | None" = None,
     poly_prior_px: "float | None" = None,
     restrict_filters: "list[str] | None" = None,
     restrict_instdet: "list[str] | None" = None,
@@ -2221,7 +2222,13 @@ def run_pop_fit(
         # run reloaded at the 0.05 default would inflate every position error)
         # and the same Gaia CSV(s) when the v1 run_config records them (older
         # configs fall back to the sidecar-aware resolver in the loader).
-        _floor = v1_cfg.get('pos_err_floor', 0.05)
+        # An explicit --pos_err_floor overrides the mirrored value: the pop fit re-solves
+        # the alignment jointly with the population prior, so the floor is a property of
+        # this solve, not of the v1 run that seeded it (user 2026-09-23).
+        _floor = pos_err_floor if pos_err_floor is not None else v1_cfg.get('pos_err_floor', 0.05)
+        if pos_err_floor is not None:
+            print(f"  pos_err_floor: {_floor} px (overrides the v1 run's "
+                  f"{v1_cfg.get('pos_err_floor', 0.05)})")
         _gcsv = v1_cfg.get('gaia_csv')
         imgs, stars_per_image, gaia_catalog = load_image_data_flc(
             data_root, field_name, pos_corr_table=_pct,
@@ -3447,6 +3454,7 @@ def run_pop_fit(
             'n_iter_mu': n_iter_mu, 'n_iter_joint': n_iter_joint,
             'hst_members_fit': bool(hst_members_fit), 'hst_all_fit': bool(hst_all_fit),
             'poly_prior_px': poly_prior_px, 'restrict_filters': restrict_filters, 'restrict_instdet': restrict_instdet,
+            'pos_err_floor_override': pos_err_floor,   # None = mirrored the v1 run's floor
             'member_sigma_clip': member_sigma_clip,
             'mu_pop_ra': float(mu_pop_current[0]),
             'mu_pop_dec': float(mu_pop_current[1]),
@@ -3857,6 +3865,9 @@ def main(argv=None):
                              'catalog load (bp3m --pos_corr_table). Default: the table list '
                              'recorded by the source bp3m / bp3m-v2 run; pass "none" to apply '
                              'no tables even if the source run used some.')
+    parser.add_argument('--pos_err_floor', type=float, default=None,
+                        help='position-error floor (px) for THIS solve; default mirrors the '
+                             'v1 run. Lets a 0.05-floor alignment be refit at e.g. 0.02.')
     parser.add_argument('--pos_corr_model', type=str, default=None,
                         help="learned GDC correction model (DIR[:TAG]); default: mirror the source run's run_config; 'none' disables")
     parser.add_argument('--poly_prior_px', type=float, default=None,
@@ -3999,6 +4010,7 @@ def main(argv=None):
         hst_members_fit=args.hst_members_fit or args.hst_all_fit,
         hst_all_fit=args.hst_all_fit,
         pos_corr_table=args.pos_corr_table,
+        pos_err_floor=args.pos_err_floor,
         poly_prior_px=args.poly_prior_px,
         restrict_filters=args.restrict_filters,
         restrict_instdet=args.restrict_instdet,
