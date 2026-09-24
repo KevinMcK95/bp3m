@@ -238,19 +238,27 @@ def main():
     if not args.no_gdcs:
         print("Downloading GDC files...")
         for inst in gdc_insts:
-            # ACSWFC GDCs live in a VINTAGE_2005 subdirectory
-            if inst == "ACSWFC":
-                url = f"{BASE_URL}/GDCs/STDGDCs/{inst}/VINTAGE_2005"
-            else:
-                url = f"{BASE_URL}/GDCs/STDGDCs/{inst}"
+            url = f"{BASE_URL}/GDCs/STDGDCs/{inst}"
             files = _list_fits(url)
             if not files:
                 print(f"  {inst}: no .fits files found at {url}")
                 continue
             dest_dir = lib_dir / "STDGDCs" / inst
             dest_dir.mkdir(parents=True, exist_ok=True)
-            for file_url in files:
-                fname = file_url.rsplit("/", 1)[-1]
+            # ACSWFC: use the current STDGDC_OFFICIAL_JFRAME_* tables, saved under the
+            # plain STDGDC_ACSWFC_<filter>.fits name pypass expects.  The plain-named
+            # top-level files are kept only for filters with no OFFICIAL table (F775W).
+            # Never the VINTAGE_2005/ subdirectory (the 2005 solution; used by mistake
+            # before 2026-09-24).
+            if inst == "ACSWFC":
+                off = {u.rsplit("/", 1)[-1].replace("STDGDC_OFFICIAL_JFRAME_", "STDGDC_"): u
+                       for u in files if "STDGDC_OFFICIAL_JFRAME_" in u}
+                plain = {u.rsplit("/", 1)[-1]: u for u in files
+                         if "/STDGDC_ACSWFC_" in u and u.rsplit("/", 1)[-1] not in off}
+                files = [(n, u) for n, u in {**plain, **off}.items()]
+            else:
+                files = [(u.rsplit("/", 1)[-1], u) for u in files]
+            for fname, file_url in files:
                 dest = dest_dir / fname
                 if dest.exists() and not args.force:
                     n_skip += 1
