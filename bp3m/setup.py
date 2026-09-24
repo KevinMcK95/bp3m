@@ -245,19 +245,19 @@ def main():
                 continue
             dest_dir = lib_dir / "STDGDCs" / inst
             dest_dir.mkdir(parents=True, exist_ok=True)
-            # ACSWFC: use the current STDGDC_OFFICIAL_JFRAME_* tables, saved under the
-            # plain STDGDC_ACSWFC_<filter>.fits name pypass expects.  The plain-named
-            # top-level files are kept only for filters with no OFFICIAL table (F775W).
-            # Never the VINTAGE_2005/ subdirectory (the 2005 solution; used by mistake
-            # before 2026-09-24).
-            if inst == "ACSWFC":
-                off = {u.rsplit("/", 1)[-1].replace("STDGDC_OFFICIAL_JFRAME_", "STDGDC_"): u
-                       for u in files if "STDGDC_OFFICIAL_JFRAME_" in u}
-                plain = {u.rsplit("/", 1)[-1]: u for u in files
-                         if "/STDGDC_ACSWFC_" in u and u.rsplit("/", 1)[-1] not in off}
-                files = [(n, u) for n, u in {**plain, **off}.items()]
-            else:
-                files = [(u.rsplit("/", 1)[-1], u) for u in files]
+            # Only the top-level listing: the STDGDC_OFFICIAL_JFRAME_* tables (which
+            # pypass.io.find_gdc prefers) plus the plain STDGDC_<det>_<filt> files for
+            # filters that have no OFFICIAL table (ACS/WFC F775W).  Never a VINTAGE_*
+            # subdirectory: ACS/WFC ran on VINTAGE_2005 by mistake until 2026-09-24.
+            names = {u.rsplit("/", 1)[-1]: u for u in files}
+            keep = {}
+            for n, u in names.items():
+                if "STDGDC_OFFICIAL_JFRAME_" in n:
+                    keep[n] = u
+                elif n.startswith("STDGDC_") and "OFFICIAL" not in n:
+                    if n.replace("STDGDC_", "STDGDC_OFFICIAL_JFRAME_", 1) not in names:
+                        keep[n] = u
+            files = sorted(keep.items())
             for fname, file_url in files:
                 dest = dest_dir / fname
                 if dest.exists() and not args.force:

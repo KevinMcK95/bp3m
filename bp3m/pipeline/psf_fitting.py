@@ -1230,7 +1230,8 @@ def _fit_one_image(args):
 
         table = catalog_to_table(records, params.get('zero_point', 0.0),
                                   sigma_floor_x=fx, sigma_floor_y=fy,
-                                  eps_flux=ff, floor_params=floor)
+                                  eps_flux=ff, floor_params=floor,
+                                  gdc_path=gdc_path)
 
         # Remove sidecar BEFORE writing the catalog so an interrupted write
         # leaves no stale sidecar that could mark a partial file as valid.

@@ -357,6 +357,20 @@ def _read_psf_positions(hdr, prefix, n):
 # GDC loading and application
 # ---------------------------------------------------------------------------
 
+def gdc_file_id(path):
+    """Short content id of a STDGDC file: sha1 of the primary header plus a
+    64 kB slice from the middle of the XGC map.  Recorded in every catalogue
+    (meta GDC_FILE / GDC_ID) so a table swap can never go unnoticed again
+    (the ACS/WFC VINTAGE_2005 mix-up, 2026-09-24)."""
+    import hashlib
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        h.update(f.read(2880 * 2))
+        f.seek(100_000_000)
+        h.update(f.read(65536))
+    return h.hexdigest()[:12]
+
+
 def load_stdgdc(path):
     """Load a STDGDC FITS file (Anderson geometric distortion correction).
 
@@ -608,12 +622,14 @@ def _apply_gdc_wcs(records, gdc, image_path, chips, instrume, detector, verbose=
             r._y_gdc = float(y_gdc[i])
             r._mc    = float(mc[i])
             r._cov_gdc = cov_g
+            r._J_gdc = J_gdc[i]
     else:
         for r in records:
             r._x_gdc = np.nan
             r._y_gdc = np.nan
             r._mc    = 0.0
             r._cov_gdc = None
+            r._J_gdc = None
 
     # Group records by chip for batch WCS transforms
     from collections import defaultdict
@@ -1146,7 +1162,8 @@ def run_photometry_fits(
 
 def catalog_to_table(records, zero_point=0.0,
                      sigma_floor_x=0.0, sigma_floor_y=0.0, eps_flux=0.0,
-                     floor_params=None):
+                     floor_params=None,
+                     gdc_path=None):
     """Convert a list of StarRecord to an astropy Table.
 
     Includes raw pixel positions (x, y), GDC-corrected J-frame positions
@@ -1168,6 +1185,7 @@ def catalog_to_table(records, zero_point=0.0,
              'sigma_x_model', 'sigma_y_model', 'sigma_f_model', 'chip_ext',
              'x_gdc', 'y_gdc', 'mag_gdc', 'mag_err_gdc',
              'cov_xx_gdc', 'cov_yy_gdc', 'cov_xy_gdc',
+             'jac_xx_gdc', 'jac_xy_gdc', 'jac_yx_gdc', 'jac_yy_gdc',
              'ra', 'dec', 'ra_err', 'dec_err',
              'cov_ra_ra', 'cov_dec_dec', 'cov_ra_dec',
              'mag_st', 'mag_ab', 'mag_st_gdc']
@@ -1183,7 +1201,7 @@ def catalog_to_table(records, zero_point=0.0,
                   [float, float, float] +           # concentration concentration_2x2 concentration_3x3
                   [int, int, int, bool] +           # n_conc_1x1 n_conc_2x2 n_conc_3x3 is_star_candidate
                   [float, float, float, int] +  # sigma_x/y/f_model chip_ext
-                  [float] * 14 +          # x_gdc y_gdc mag_gdc mag_err_gdc cov_gdc ra dec ra_err dec_err cov_radec
+                  [float] * 18 +          # x_gdc y_gdc mag_gdc mag_err_gdc cov_gdc jac_gdc ra dec ra_err dec_err cov_radec
                   [float] * 3)            # mag_st mag_ab mag_st_gdc
         return Table(names=_cols, dtype=dtypes)
 
@@ -1199,6 +1217,14 @@ def catalog_to_table(records, zero_point=0.0,
             cg = getattr(r, '_cov_gdc', None)
             if cg is not None and np.isfinite(cg).all():
                 out[k] = cg[i, j]
+        return out
+
+    def _jac_gdc(i, j):
+        out = np.full(len(records), np.nan)
+        for k, r in enumerate(records):
+            J = getattr(r, '_J_gdc', None)
+            if J is not None and np.isfinite(J).all():
+                out[k] = J[i, j]
         return out
 
     def _cov_radec(i, j):
@@ -1331,6 +1357,11 @@ def catalog_to_table(records, zero_point=0.0,
         'cov_xx_gdc':   _cov_gdc(0, 0) + _floor_xx,
         'cov_yy_gdc':   _cov_gdc(1, 1) + _floor_yy,
         'cov_xy_gdc':   _cov_gdc(0, 1),
+        # GDC Jacobian d(x_gdc, y_gdc)/d(x, y) (NaN when no GDC was applied)
+        'jac_xx_gdc':   _jac_gdc(0, 0),
+        'jac_xy_gdc':   _jac_gdc(0, 1),
+        'jac_yx_gdc':   _jac_gdc(1, 0),
+        'jac_yy_gdc':   _jac_gdc(1, 1),
         # WCS sky coordinates
         'ra':           _gattr('_ra'),
         'dec':          _gattr('_dec'),
@@ -1345,6 +1376,10 @@ def catalog_to_table(records, zero_point=0.0,
         'mag_st_gdc':   mag_st_gdc,
     })
     t.meta['ZP']            = zero_point
+    # GDC provenance (which table produced x_gdc/y_gdc/cov_*_gdc/jac_*_gdc)
+    if gdc_path is not None and os.path.exists(str(gdc_path)):
+        t.meta['GDC_FILE'] = os.path.basename(str(gdc_path))
+        t.meta['GDC_ID']   = gdc_file_id(str(gdc_path))
     t.meta['SIGMA_FLOOR_X'] = sigma_floor_x
     t.meta['SIGMA_FLOOR_Y'] = sigma_floor_y
     t.meta['EPS_FLUX']      = eps_flux
