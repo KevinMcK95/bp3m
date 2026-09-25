@@ -246,7 +246,7 @@ def build_cfht_images(field_dir, cfht_dir, matches: pd.DataFrame,
 
 def build_fallback_hst_images(field_dir, matches: pd.DataFrame,
                               pos_err_floor: float = 0.05,
-                              pos_corr_table=None):
+                              pos_corr_table=None, pos_corr_model=None):
     """HST images with CFHT matches but NO Gaia cross-match: initialize from
     transformation_cfht_<exp>.csv (same schema and Gaia-frame convention as
     transformation.csv — the CFHT side was pre-aligned by the bulk posterior,
@@ -258,6 +258,12 @@ def build_fallback_hst_images(field_dir, matches: pd.DataFrame,
     if pos_corr_table is not None:
         from bp3m.pos_corr import PseudoGDCSet
         pos_corr = PseudoGDCSet(pos_corr_table)
+    # learned GDC-residual correction, applied exactly as in the main FLC loader
+    # (run_alignment has passed it since a7fd22a; this signature never took it)
+    pcm = None
+    if pos_corr_model is not None:
+        from bp3m.pos_corr_model import PosCorrModel
+        pcm = PosCorrModel(pos_corr_model)
     field_dir = Path(field_dir)
     hst_root = field_dir / 'HST' / 'mastDownload' / 'HST'
     matches = (matches if 'star_id' in matches.columns
@@ -284,7 +290,8 @@ def build_fallback_hst_images(field_dir, matches: pd.DataFrame,
                     .rename(columns={'star_id': 'gaia_source_id'}))
         stars_df = _build_stars_df(d, img_name, None, pos_err_floor,
                                    pos_corr=pos_corr, meta=meta,
-                                   match_override=override)
+                                   match_override=override,
+                                   pos_corr_model=pcm)
         if stars_df is None or len(stars_df) < 5:
             continue
         images[img_name] = meta
