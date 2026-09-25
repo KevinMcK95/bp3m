@@ -61,6 +61,7 @@ py-modules = ["bp3m_run"]
 
 [tool.setuptools.packages.find]
 where = ["."]
+exclude = ["build*", "tests*", "tests_pypass*"]
 
 [tool.setuptools.package-data]
 "bp3m.notebooks" = ["*.ipynb"]
