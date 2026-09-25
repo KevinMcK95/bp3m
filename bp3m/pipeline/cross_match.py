@@ -72,6 +72,30 @@ def _write_xmatch_status(root: Path, status: str, params_meta: dict,
 XMATCH_ALGO_VERSION = 3
 
 
+def catalog_gdc_id(catalog_path) -> str | None:
+    """GDC_ID recorded in a pypass catalogue (table header), or None for
+    catalogues written before provenance was added (2026-09-24)."""
+    try:
+        from astropy.io import fits as _fits
+        v = _fits.getheader(str(catalog_path), 1).get('GDC_ID')
+        return str(v) if v else None
+    except Exception:
+        return None
+
+
+def _params_match(saved: dict | None, current: dict) -> bool:
+    """Cache-key comparison.  'gdc_id' (the distortion table the catalogue's
+    x_gdc/y_gdc came from) is part of the key, so a swapped table forces a
+    rematch; a sidecar written before the tag existed is compared without it
+    (the catalogue itself changes only through bp3m-fix-gdc, which removes
+    the cross-match products of every catalogue it changes)."""
+    saved = dict(saved or {})
+    cur = dict(current)
+    if 'gdc_id' not in saved:
+        cur.pop('gdc_id', None)
+    return saved == cur
+
+
 def _xmatch_cache_status(hst_root: Path, params_meta: dict
                           ) -> tuple[str, str]:
     """Return (action, reason) where action is 'skip' or 'run'.
@@ -87,7 +111,7 @@ def _xmatch_cache_status(hst_root: Path, params_meta: dict
             saved = json.loads(status_path.read_text())
         except Exception:
             return 'run', 'could not read xmatch_status.json'
-        if saved.get('params') != params_meta:
+        if not _params_match(saved.get('params'), params_meta):
             return 'run', 'params changed'
         st = saved.get('status', 'unknown')
         if st == 'success':
@@ -109,7 +133,8 @@ def _xmatch_cache_status(hst_root: Path, params_meta: dict
         saved = json.loads(params_path.read_text())
     except Exception:
         return 'run', 'could not read xmatch_params.json'
-    diffs = [k for k, v in params_meta.items() if saved.get(k) != v]
+    diffs = [k for k, v in params_meta.items() if saved.get(k) != v
+             and not (k == 'gdc_id' and 'gdc_id' not in saved)]
     if diffs:
         return 'run', f'params changed: {diffs}'
     return 'skip', 'matched_gaia.csv + matching xmatch_params.json (legacy cache)'
@@ -355,9 +380,11 @@ def run_cross_match(
                     dynamic_ncols=True):
         root = Path(hst['root'])
         name = root.name
+        # per-image key: which distortion table produced this catalogue
+        params_meta_img = dict(params_meta, gdc_id=catalog_gdc_id(hst['catalog']))
 
         if not force_rematch:
-            action, reason = _xmatch_cache_status(root, params_meta)
+            action, reason = _xmatch_cache_status(root, params_meta_img)
             if action == 'skip':
                 skipped.append(name)
                 continue
@@ -365,7 +392,7 @@ def run_cross_match(
         # Skip images without photometric calibration — their mag column is all
         # NaN so they cannot contribute to magnitude-based cross-matching.
         if not _has_mag_calibration(Path(hst['catalog'])):
-            _write_xmatch_status(root, 'skipped', params_meta,
+            _write_xmatch_status(root, 'skipped', params_meta_img,
                                   reason='no photometric calibration (PHOTFLAM/EXPTIME missing)')
             skipped_nophot.append(name)
             continue
@@ -378,7 +405,7 @@ def run_cross_match(
             'scale_sweep':          scale_sweep,
             'discovery_max_offset': discovery_max_offset,
             'use_resid_floor':      use_resid_floor,
-            'params_meta':          params_meta,
+            'params_meta':          params_meta_img,
             'prior_sigma_rot_deg':  prior_sigma_rot_deg,
             'prior_sigma_scale':    prior_sigma_scale,
             'prior_sigma_skew':     prior_sigma_skew,
