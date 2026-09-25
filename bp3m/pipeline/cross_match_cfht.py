@@ -20,7 +20,8 @@ pair:
      positional gate plus a magnitude gate through the anchor zeropoint.
   3. Output per HST image: matched_cfht.csv (anchor + faint rows),
      diagnostic_plots_cfht.png, processing_log_cfht.txt — mirroring the
-     DELVE outputs. A xmatch_cfht_status.json sidecar caches success.
+     DELVE outputs. A xmatch_cfht_status.json sidecar caches success and failure,
+     keyed on the catalogue's GDC_ID and the matched_gaia.csv md5.
 
 The HST side uses the GDC-corrected pixel frame; whether the flc_catalog
 x/y are already GDC-corrected is VERIFIED at runtime against the known
@@ -454,6 +455,54 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
     return name, n_total, n_gaia, n_faint, n_exp, (errs or None)
 
 
+def _cfht_cache_keys(img_dir):
+    """What a CFHT match of this image depends on: the distortion table behind the
+    HST catalogue (GDC_ID / GDC_FILE) and the Gaia cross-match it is anchored to."""
+    import hashlib, json as _json
+    from bp3m.pipeline.cross_match import catalog_gdc_id
+    name = img_dir.name
+    cat = img_dir / f'{name}_flc_catalog.fits'
+    gdc_file = None
+    try:
+        from astropy.io import fits as _fits
+        gdc_file = _fits.getheader(str(cat), 1).get('GDC_FILE')
+    except Exception:
+        pass
+    mg = img_dir / 'matched_gaia.csv'
+    md5 = hashlib.md5(mg.read_bytes()).hexdigest() if mg.exists() else None
+    return {'gdc_id': catalog_gdc_id(cat), 'matched_gaia_md5': md5}, gdc_file
+
+
+def _cfht_cache_status(img_dir, keys, gdc_file):
+    """('skip'|'run', reason).  Success AND failure are cached in
+    xmatch_cfht_status.json; either is redone when a key changes.  A legacy
+    matched_cfht.csv (no sidecar) is reused unless its catalogue was re-corrected
+    onto an OFFICIAL ACS/WFC table (it was then matched on VINTAGE_2005 positions)."""
+    import json as _json
+    sp = img_dir / 'xmatch_cfht_status.json'
+    if sp.exists():
+        try:
+            st = _json.loads(sp.read_text())
+        except Exception:
+            return 'run', 'unreadable status'
+        if st.get('keys') != keys:
+            return 'run', 'inputs changed'
+        return 'skip', f"previously {st.get('status')}"
+    if (img_dir / 'matched_cfht.csv').exists():
+        if 'OFFICIAL' in str(gdc_file or ''):
+            return 'run', 'legacy match on a re-corrected catalogue'
+        return 'skip', 'legacy match'
+    return 'run', 'never attempted'
+
+
+def _write_cfht_status(img_dir, keys, n, err):
+    import json as _json, datetime as _dt
+    (img_dir / 'xmatch_cfht_status.json').write_text(_json.dumps({
+        'status': 'success' if n > 0 else 'failed', 'n_matched': int(n),
+        'reason': err or '', 'keys': keys,
+        'timestamp': _dt.datetime.now().isoformat(timespec='seconds')}, indent=2))
+
+
 def run_cross_match_cfht(output_dir, field_name, cfht_dir,
                          ra, dec, radius_deg, gaia_csv=None,
                          make_plots=True, force=False):
@@ -494,14 +543,23 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
     img_dirs = [d for d in sorted(hst_root.iterdir())
                 if (d / 'matched_gaia.csv').exists()
                 and (d / 'transformation.csv').exists()]
-    todo = [d for d in img_dirs
-            if force or not (d / 'matched_cfht.csv').exists()]
-    print(f'  {len(img_dirs)} images with Gaia xmatch, {len(todo)} to do')
+    todo, why = [], {}
+    for d in img_dirs:
+        keys, gfile = _cfht_cache_keys(d)
+        act, reason = ('run', 'forced') if force else _cfht_cache_status(d, keys, gfile)
+        if act == 'run':
+            todo.append((d, keys)); why[reason] = why.get(reason, 0) + 1
+    print(f'  {len(img_dirs)} images with Gaia xmatch, {len(todo)} to do'
+          + (f"  ({', '.join(f'{v} {k}' for k, v in why.items())})" if why else ''))
     det_cache: dict = {}
     results = []
-    for i, d in enumerate(todo, 1):
+    for i, (d, keys) in enumerate(todo, 1):
+        # clear old products so a failed retry cannot re-read stale per-exposure matches
+        for _old in list(d.glob('matched_cfht*.csv')):
+            _old.unlink()
         nm, n, n_g, n_f, n_e, err = match_one_image(
             d, dets, cfht_dir, gl, fill, det_cache, make_plots=make_plots)
+        _write_cfht_status(d, keys, n, err)
         status = (f'{n} matches ({n_g} Gaia, {n_f} faint) '
                   f'across {n_e} CFHT exposures'
                   + (f'  [{err}]' if err else ''))
