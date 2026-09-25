@@ -150,7 +150,14 @@ def _parse_args():
 
     # ── PSF fitting ───────────────────────────────────────────────────────────
     psf = p.add_argument_group('PSF fitting (py1pass)')
-    _lib_default = _config_lib_dir() or str(Path.home() / 'GaiaHub-master' / 'lib')
+    # lib_dir comes from $BP3M_HOME/config.toml (written by bp3m-setup; here it points to
+    # /bootes_raid6/users/kmckinnon/bp3m_lib).  Without a config, fall back to where
+    # bp3m-setup installs the library -- never GaiaHub-master/lib (a different, mixed set).
+    _lib_default = _config_lib_dir()
+    if not _lib_default:
+        from bp3m.setup import DEFAULT_LIB_DIR as _setup_lib
+        _lib_default = str(_setup_lib)
+        print(f"WARNING: no lib_dir in $BP3M_HOME/config.toml; using {_lib_default}", file=sys.stderr)
     psf.add_argument('--lib_dir', type=str,
                      default=_lib_default,
                      help='Library directory containing STDPSFs/ and STDGDCs/ '

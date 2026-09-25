@@ -150,12 +150,18 @@ def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
             if len(parts) >= 3 and parts[-1] != 'vintage':
                 psf_filters.add(_normalise_filter(parts[2]))
 
-        # Collect filters with a GDC file
+        # Collect filters with a GDC file: plain STDGDC_<det>_<filt> and the
+        # STDGDC_OFFICIAL_JFRAME_<det>_<filt> tables pypass.io.find_gdc prefers.
+        # (Until 2026-09-25 the OFFICIAL names were skipped here, so once the ACS/WFC
+        # library held only OFFICIAL tables the MAST query asked for ACS/WFC F775W
+        # only -- the one filter still carrying a plain-named table.)
         gdc_filters: set[str] = set()
         for f in gdc_sub.glob("STDGDC_*.fits"):
             parts = f.stem.split('_')
-            if len(parts) >= 3 and 'OFFICIAL' not in parts and 'JFRAME' not in parts:
-                gdc_filters.add(_normalise_filter(parts[2]))
+            if 'VFRAME' in parts or parts[-1] == 'vintage':
+                continue
+            if len(parts) >= 3:
+                gdc_filters.add(_normalise_filter(parts[-1]))
 
         common = psf_filters & gdc_filters
         if common:
