@@ -27,6 +27,7 @@ from astropy.table import Table
 from astropy.time import Time
 import astropy.units as u
 from astroquery.mast import Observations
+from tqdm import tqdm   # module level: the force-redownload path used it before the local import (UnboundLocalError)
 
 
 # Instruments supported per telescope (MAST instrument_name values)
