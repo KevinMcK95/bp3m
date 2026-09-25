@@ -248,6 +248,14 @@ def run_alignment(  # noqa: C901
         from bp3m.data_loader_flc import split_images_by_ccd
         imgs, filtered_spi = split_images_by_ccd(
             imgs, filtered_spi, min_stars_per_ccd=min_stars_split_ccd)
+        # remove_images may also name single chips (e.g. j9gz04tsq_hi): those can
+        # only be matched after the split (exposure names are handled above)
+        if remove_images is not None:
+            _drop_chips = {n for n in remove_images if n.endswith(('_hi', '_lo'))}
+            if _drop_chips:
+                filtered_spi = {n: v for n, v in filtered_spi.items() if n not in _drop_chips}
+                imgs = {n: v for n, v in imgs.items() if n in filtered_spi}
+                print(f"  remove_images: {len(_drop_chips)} chip name(s) removed after the CCD split")
         image_names = sorted(filtered_spi.keys())
         star_id_to_idx, image_names, star_in_image = build_index_maps(
             filtered_spi, gaia_catalog)
@@ -683,6 +691,8 @@ def run_alignment(  # noqa: C901
             'epoch_dist_prior': (str(epoch_dist_prior)
                                  if epoch_dist_prior else None),
             'pos_err_floor': pos_err_floor,
+            'bp3m_min_stars': bp3m_min_stars,
+            'remove_images': (sorted(remove_images) if remove_images else None),
             'prefit_clean_iters': prefit_clean_iters,
             'gaia_csv': ([str(p) for p in gaia_csv]
                          if isinstance(gaia_csv, (list, tuple))
