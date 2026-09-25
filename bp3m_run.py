@@ -1420,7 +1420,13 @@ def main():
                     _cfg['matched_gaia_mtime'] = _m.stat().st_mtime
                 # distortion table behind the catalogue's x_gdc/y_gdc
                 from bp3m.pipeline.cross_match import catalog_gdc_id as _cgid
-                _cfg['gdc_id'] = _cgid(_m.parent / f'{_img_name}_flc_catalog.fits')
+                _cat = _m.parent / f'{_img_name}_flc_catalog.fits'
+                _cfg['gdc_id'] = _cgid(_cat)
+                try:
+                    from astropy.io import fits as _fits
+                    _cfg['gdc_file'] = _fits.getheader(str(_cat), 1).get('GDC_FILE')
+                except Exception:
+                    _cfg['gdc_file'] = None
                 return _cfg
             _run_kw = dict(
                 output_dir=output_dir, field_name=field,
@@ -1497,9 +1503,16 @@ def main():
                 _md5 = _cfg_map[_img].get('matched_gaia_md5')
                 if _md5 is None or _cfg.get('matched_gaia_md5') != _md5:
                     return False
-                # GDC table changed under the catalogue (bp3m-fix-gdc) -> refit;
-                # a run_config written before the tag existed is accepted
-                if 'gdc_id' in _cfg and _cfg['gdc_id'] != _cfg_map[_img].get('gdc_id'):
+                # GDC table changed under the catalogue (bp3m-fix-gdc) -> refit.
+                # A run_config written before the tag existed is accepted only
+                # if the catalogue was NOT re-corrected: every ACS/WFC catalogue
+                # moved to an OFFICIAL_JFRAME table was fitted on VINTAGE_2005
+                # positions (a new cross-match can give a byte-identical
+                # matched_gaia.csv, so the md5 alone does not catch it).
+                if 'gdc_id' in _cfg:
+                    if _cfg['gdc_id'] != _cfg_map[_img].get('gdc_id'):
+                        return False
+                elif 'OFFICIAL' in str(_cfg_map[_img].get('gdc_file') or ''):
                     return False
                 return all(_cfg.get(_k) == _v
                            for _k, _v in _want_params.items())
