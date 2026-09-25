@@ -201,24 +201,46 @@ def _worker(args):
     return str(cat), st, msg, time.time() - t0
 
 
-def find_catalogs(fields=None, all_fields=False, gh_root=GH_ROOT):
+def _field_catalogs(base):
+    """Catalogue paths under one field's HST/mastDownload/HST directory."""
+    cats = []
+    try:
+        with os.scandir(base) as it:
+            dirs = [e.path for e in it if e.is_dir()]
+    except OSError:
+        return cats
+    for d in dirs:
+        c = Path(d) / f'{os.path.basename(d)}_flc_catalog.fits'
+        if c.exists():
+            cats.append(c)
+    return cats
+
+
+def find_catalogs(fields=None, all_fields=False, gh_root=GH_ROOT, index=None, threads=16):
+    """Enumerate catalogues.  A single-threaded walk of ~1700 fields on the
+    NFS store takes hours; with `index` (the linker's obsid->dir index,
+    campaign_logs/linker_index.json) only the existence checks remain, and
+    both paths run in a thread pool."""
+    from concurrent.futures import ThreadPoolExecutor
     root = Path(gh_root)
+    if index:
+        idx = json.load(open(index))
+        want = set(fields or [])
+        dirs = [d for f, m in idx.items() if (all_fields or f in want)
+                and '_fs_' not in f and not f.startswith('Leo_I_scheme')
+                for d in m.values()]
+        def _one(d):
+            c = Path(d) / f'{os.path.basename(d)}_flc_catalog.fits'
+            return c if c.exists() else None
+        with ThreadPoolExecutor(threads) as ex:
+            return [c for c in ex.map(_one, dirs) if c is not None]
     if all_fields:
         with os.scandir(root) as it:
             fields = sorted(e.name for e in it if e.is_dir() and '_fs_' not in e.name
                             and not e.name.startswith('Leo_I_scheme'))
-    cats = []
-    for f in fields or []:
-        base = root / f / 'HST' / 'mastDownload' / 'HST'
-        if not base.is_dir():
-            continue
-        with os.scandir(base) as it:
-            for e in it:
-                if e.is_dir():
-                    c = Path(e.path) / f'{e.name}_flc_catalog.fits'
-                    if c.exists():
-                        cats.append(c)
-    return cats
+    bases = [root / f / 'HST' / 'mastDownload' / 'HST' for f in fields or []]
+    with ThreadPoolExecutor(threads) as ex:
+        return [c for cs in ex.map(_field_catalogs, bases) for c in cs]
 
 
 def main(argv=None):
@@ -227,6 +249,7 @@ def main(argv=None):
     ap.add_argument('--field', action='append', default=[])
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--gh_root', default=GH_ROOT)
+    ap.add_argument('--from_index', default=None, help='linker_index.json: enumerate from it instead of walking the store')
     ap.add_argument('--lib_dir', default=None)
     ap.add_argument('--out', default=None)
     ap.add_argument('--dry_run', action='store_true')
@@ -239,7 +262,8 @@ def main(argv=None):
     lib_dir = a.lib_dir or _default_lib_dir()
     if not lib_dir:
         sys.exit('no --lib_dir and no bp3m config lib_dir')
-    cats = [Path(c) for c in a.catalog] + find_catalogs(a.field, a.all, a.gh_root)
+    cats = [Path(c) for c in a.catalog] + find_catalogs(a.field, a.all, a.gh_root, index=a.from_index)
+    print(f'[{time.strftime("%m-%d %H:%M")}] {len(cats)} catalogue paths enumerated', flush=True)
     # dedupe hard links: one job per inode
     seen, uniq, n_links = set(), [], 0
     for c in cats:
