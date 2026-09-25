@@ -1013,13 +1013,28 @@ def _posthoc_sigma_int_rot(bp3m_dir, output_pfr, mu, member_ids, rot_by_id):
         return None
     u = src[(src.n_hst_used > 0) & ~src.prior_fallback.astype(bool)]
     m = u[u.Gaia_id.isin(member_ids)].copy()
+    # Per-star PMs/errors from THIS solve's diffuse-prior posteriors (its alignment and
+    # pos_err_floor), not the source run's -- same fix as run_pop_fit (2026-09-25).
+    _pm_src = 'source bp3m run (fallback)'
+    try:
+        pf = pd.read_csv(Path(output_pfr) / 'stellar_astrometry.csv', dtype={'Gaia_id': np.int64})
+        if {'pmra_bp3m_free', 'sigma_pmra_bp3m_free'}.issubset(pf.columns):
+            pf = pf[pf.Gaia_id.isin(set(m.Gaia_id))].set_index('Gaia_id')
+            m = m.set_index('Gaia_id').loc[pf.index].reset_index()
+            for ax in ('ra', 'dec'):
+                m[f'pm{ax}_bp3m'] = pf[f'pm{ax}_bp3m_free'].to_numpy()
+                m[f'sigma_pm{ax}_bp3m'] = pf[f'sigma_pm{ax}_bp3m_free'].to_numpy()
+            _pm_src = 'this pop-fit solve, diffuse-prior posteriors'
+    except FileNotFoundError:
+        pass
     if len(m) < 20:
         print(f"  sigma_int: only {len(m)} usable members — skipped")
         return None
     _rot = np.array([rot_by_id.get(int(g), (0.0, 0.0)) for g in m['Gaia_id']], float)
 
     out = {'n_members_used': int(len(m)),
-           'method': 'profile-MLE, frozen mu_pop/members/rotation, unshrunk PMs'}
+           'method': 'profile-MLE, frozen mu_pop/members/rotation, unshrunk PMs',
+           'pm_source': _pm_src}
     _smad = lambda v: 1.4826 * np.median(np.abs(v - np.median(v)))
     for _k, (ax, mu0) in enumerate((('ra', mu['mu_pop_ra_masyr']),
                                     ('dec', mu['mu_pop_dec_masyr']))):
@@ -1090,6 +1105,7 @@ def run_pop_fit_rotation(
     bp3m_results_name: "str | None" = None,
     pos_corr_table: "str | None" = None,
     pos_corr_model: "str | None" = None,
+    pos_err_floor: "float | None" = None,
     member_seed_csv: "Path | str | None" = None,
     use_member_seed: bool = False,
     freeze_member_seed: bool = False,
@@ -1236,9 +1252,14 @@ def run_pop_fit_rotation(
 
     # ── Load data ──────────────────────────────────────────────────────────────
     print(f"\n  Loading bp3m input data for '{field_name}'...")
+    # Floor for this solve: mirror the source run (until 2026-09-25 the loader default of
+    # 0.05 px was always used here); --pos_err_floor overrides it.
+    _floor = pos_err_floor if pos_err_floor is not None else v1_cfg.get('pos_err_floor', 0.05)
+    print(f"  pos_err_floor: {_floor} px ({'override' if pos_err_floor is not None else 'source run'})")
     imgs, stars_per_image, gaia_catalog = load_image_data_flc(
         data_root, field_name,
-        pos_corr_table=pos_corr_table, pos_corr_model=pos_corr_model)
+        pos_corr_table=pos_corr_table, pos_corr_model=pos_corr_model,
+        pos_err_floor=_floor, gaia_csv=v1_cfg.get('gaia_csv'))
     if imgs is None or len(imgs) == 0:
         raise RuntimeError(f"No usable images found for '{field_name}'.")
 
@@ -1907,6 +1928,10 @@ def run_pop_fit_rotation(
     g['pmra_bp3m_free']          = v_mean_free_marg[:, 2]
     g['pmdec_bp3m_free']         = v_mean_free_marg[:, 3]
     g['parallax_bp3m_free']      = v_mean_free_marg[:, 4]
+    _vcf = v_cov_free_sol + C_vT_free_sol
+    g['sigma_pmra_bp3m_free']    = np.sqrt(np.maximum(_vcf[:, 2, 2], 0.0))
+    g['sigma_pmdec_bp3m_free']   = np.sqrt(np.maximum(_vcf[:, 3, 3], 0.0))
+    g['corr_pmra_pmdec_free']    = _vcf[:, 2, 3] / np.sqrt(np.maximum(_vcf[:, 2, 2] * _vcf[:, 3, 3], 1e-30))
 
     _is_member_arr = np.zeros(solver.n_stars, dtype=bool)
     if member_sidx is not None and len(member_sidx) > 0:
@@ -2224,6 +2249,8 @@ def main():
     parser.add_argument('--pos_corr_model', type=str, default=None,
                         help="learned GDC-residual model DIR[:TAG]; default mirrors the source run, "
                              "'none' disables")
+    parser.add_argument('--pos_err_floor', type=float, default=None,
+                        help='HST position-error floor [px] for this solve; default mirrors the source run')
     parser.add_argument('--qso_anchors_csv', type=str, default=None, nargs='+')
 
     args = parser.parse_args()
@@ -2254,6 +2281,7 @@ def main():
         bp3m_results_name=args.bp3m_results_name,
         pos_corr_table=args.pos_corr_table,
         pos_corr_model=args.pos_corr_model,
+        pos_err_floor=args.pos_err_floor,
         member_seed_csv=args.member_seed_csv,
         use_member_seed=args.use_member_seed,
         freeze_member_seed=args.freeze_member_seed,

@@ -1986,16 +1986,32 @@ def _posthoc_sigma_int(bp3m_dir, output_pfr, mu):
         return
     ids = set(pf.loc[pf.is_member.astype(bool), 'Gaia_id'].astype(np.int64))
     u = src[(src.n_hst_used > 0) & ~src.prior_fallback.astype(bool)]
-    m = u[u.Gaia_id.astype(np.int64).isin(ids)]
+    keep = set(u.Gaia_id.astype(np.int64)) & ids          # usability flags from the source run
+    # Per-star PMs and errors from THIS solve (its alignment, its pos_err_floor, its alpha),
+    # diffuse prior for every star.  Until 2026-09-25 they were read from the source v1
+    # table, so --pos_err_floor never reached sigma_int / MAD / quoted sigma.
+    if {'pmra_bp3m_free', 'sigma_pmra_bp3m_free'}.issubset(pf.columns):
+        m = pf[pf.Gaia_id.astype(np.int64).isin(keep)].rename(columns={
+            'pmra_bp3m_free': 'pmra_bp3m_u', 'pmdec_bp3m_free': 'pmdec_bp3m_u',
+            'sigma_pmra_bp3m_free': 'sigma_pmra_bp3m_u', 'sigma_pmdec_bp3m_free': 'sigma_pmdec_bp3m_u'})
+        _pm_src = 'this pop-fit solve, diffuse-prior posteriors'
+    else:
+        m = u[u.Gaia_id.astype(np.int64).isin(ids)].rename(columns={
+            'pmra_bp3m': 'pmra_bp3m_u', 'pmdec_bp3m': 'pmdec_bp3m_u',
+            'sigma_pmra_bp3m': 'sigma_pmra_bp3m_u', 'sigma_pmdec_bp3m': 'sigma_pmdec_bp3m_u'})
+        _pm_src = 'source bp3m run (fallback: pop-fit table has no free sigmas)'
     if len(m) < 20:
         return
     out = {'n_members_used': int(len(m)),
-           'method': 'profile-MLE, frozen mu_pop/members, unshrunk PMs'}
+           'method': 'profile-MLE, frozen mu_pop/members, unshrunk PMs',
+           'pm_source': _pm_src}
     _smad = lambda v: 1.4826 * np.median(np.abs(v - np.median(v)))
     for ax, mu0 in (('ra', mu['mu_pop_ra_masyr']),
                     ('dec', mu['mu_pop_dec_masyr'])):
-        pm = m[f'pm{ax}_bp3m'].to_numpy()
-        sq = m[f'sigma_pm{ax}_bp3m'].to_numpy()
+        pm = m[f'pm{ax}_bp3m_u'].to_numpy(float)
+        sq = m[f'sigma_pm{ax}_bp3m_u'].to_numpy(float)
+        _g = np.isfinite(pm) & np.isfinite(sq) & (sq > 0)
+        pm, sq = pm[_g], sq[_g]
         d = pm - mu0
         s_mad = _smad(pm)
         dec_mad = float(np.sqrt(max(s_mad ** 2 - np.median(sq) ** 2, 0.0)))
@@ -2174,6 +2190,16 @@ def run_pop_fit(
         print(f"  Member seed {Path(member_seed_csv).name}: {len(_seed_priority)} "
               f"master_v2 rows exempt from the HST-only sigma_pmra cut and per-image cap")
 
+    # Position-error floor for THIS solve.  Mirrors the source run's floor; an explicit
+    # --pos_err_floor overrides it: the pop fit re-solves the alignment jointly with the
+    # population prior, so the floor is a property of this solve (user 2026-09-23).
+    # Applies to BOTH loaders: until 2026-09-25 the master_v2 branch never passed it, so
+    # every v2 pop fit loaded positions at the loader default of 0.05 px.
+    _floor = pos_err_floor if pos_err_floor is not None else v1_cfg.get('pos_err_floor', 0.05)
+    if pos_err_floor is not None:
+        print(f"  pos_err_floor: {_floor} px (overrides the source run's "
+              f"{v1_cfg.get('pos_err_floor', 0.05)})")
+
     if data_source == 'master_v2':
         # ── Load data from the v2 master catalog (incl. HST-only stars) ──────
         # load_master_v2 handles chip splitting and the epoch-distortion
@@ -2189,6 +2215,7 @@ def run_pop_fit(
             det_chi2_threshold=det_chi2_threshold_v2,
             pos_corr_table=pos_corr_table,
             pos_corr_model=pos_corr_model,
+            pos_err_floor=_floor,
             priority_source_indices=_seed_priority or None)
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable v2 images found for '{field_name}'.")
@@ -2222,13 +2249,7 @@ def run_pop_fit(
         # run reloaded at the 0.05 default would inflate every position error)
         # and the same Gaia CSV(s) when the v1 run_config records them (older
         # configs fall back to the sidecar-aware resolver in the loader).
-        # An explicit --pos_err_floor overrides the mirrored value: the pop fit re-solves
-        # the alignment jointly with the population prior, so the floor is a property of
-        # this solve, not of the v1 run that seeded it (user 2026-09-23).
-        _floor = pos_err_floor if pos_err_floor is not None else v1_cfg.get('pos_err_floor', 0.05)
-        if pos_err_floor is not None:
-            print(f"  pos_err_floor: {_floor} px (overrides the v1 run's "
-                  f"{v1_cfg.get('pos_err_floor', 0.05)})")
+        # (_floor is decided above, before the data-source branch)
         _gcsv = v1_cfg.get('gaia_csv')
         imgs, stars_per_image, gaia_catalog = load_image_data_flc(
             data_root, field_name, pos_corr_table=_pct,
@@ -3320,6 +3341,12 @@ def run_pop_fit(
     g['pmra_bp3m_free']          = v_mean_free_marg[:, 2]
     g['pmdec_bp3m_free']         = v_mean_free_marg[:, 3]
     g['parallax_bp3m_free']      = v_mean_free_marg[:, 4]
+    # full marginal covariance of the diffuse-prior posteriors (same construction
+    # as v1's sigma_pm*_bp3m: C_extra from the alignment + C_vT)
+    _vcf = v_cov_free_sol + C_vT_free_sol
+    g['sigma_pmra_bp3m_free']    = np.sqrt(np.maximum(_vcf[:, 2, 2], 0.0))
+    g['sigma_pmdec_bp3m_free']   = np.sqrt(np.maximum(_vcf[:, 3, 3], 0.0))
+    g['corr_pmra_pmdec_free']    = _vcf[:, 2, 3] / np.sqrt(np.maximum(_vcf[:, 2, 2] * _vcf[:, 3, 3], 1e-30))
     _is_member_arr               = np.zeros(solver.n_stars, dtype=bool)
     if member_sidx is not None and len(member_sidx) > 0:
         _is_member_arr[member_sidx] = True
