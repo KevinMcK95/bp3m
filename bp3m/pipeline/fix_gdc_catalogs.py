@@ -99,9 +99,13 @@ def fix_catalog(cat_path, lib_dir, out_dir=None, dry_run=False, force=False,
         return 'error', f'no GDC table in {gdc_dir} for this filter'
     gdc, gdc_id = _load_gdc(gdc_path)
 
+    if not force:                      # header-only check: cheap restarts
+        try:
+            if fits.getheader(str(cat_path), 1).get('GDC_ID') == gdc_id:
+                return 'skip', f'already {os.path.basename(gdc_path)} ({gdc_id})'
+        except Exception:
+            pass
     t = Table.read(str(cat_path))
-    if not force and t.meta.get('GDC_ID') == gdc_id:
-        return 'skip', f'already {os.path.basename(gdc_path)} ({gdc_id})'
 
     x = np.asarray(t['x'], float); y = np.asarray(t['y'], float)   # combined frame
     fx2 = float(t.meta.get('SIGMA_FLOOR_X', 0.0)) ** 2
@@ -151,32 +155,40 @@ def fix_catalog(cat_path, lib_dir, out_dir=None, dry_run=False, force=False,
     t.meta['GDC_PREV'] = old_file
 
     dr = np.hypot(x_gdc - old_x, y_gdc - old_y)
+    max_dr = float(np.nanmax(dr)) if np.isfinite(dr).any() else 0.0
+    # same table as before (e.g. WFC3/UVIS, ACS F775W): positions unchanged, so
+    # only add provenance + Jacobian columns and KEEP the cross-match products
+    unchanged = max_dr < 1e-6
+    status = 'stamp' if unchanged else 'fixed'
     msg = (f'{old_file} -> {os.path.basename(gdc_path)}: {len(t)} rows, '
-           f'|dpos| median {np.nanmedian(dr):.3f} max {np.nanmax(dr):.3f} px')
+           f'|dpos| median {np.nanmedian(dr):.3f} max {max_dr:.3f} px')
     if dry_run:
-        return 'dry', msg
+        return 'dry-' + status, msg
 
     if out_dir is not None:
         out = Path(out_dir) / cat_path.name
         out.parent.mkdir(parents=True, exist_ok=True)
         t.write(str(out), overwrite=True)
-        return 'fixed', msg + f' -> {out}'
+        return status, msg + f' -> {out}'
 
     # in place, same inode (hard-linked copies in other fields see the fix too)
     fd, tmp = tempfile.mkstemp(dir=str(img_dir), prefix=f'.{cat_path.name}.', suffix='.tmp')
     os.close(fd)
-    t.write(tmp, overwrite=True)
-    with open(tmp, 'rb') as src, open(str(cat_path), 'r+b') as dst:
-        dst.truncate(0)
-        shutil.copyfileobj(src, dst, 16 * 1024 * 1024)
-        dst.flush(); os.fsync(dst.fileno())
-    os.unlink(tmp)
-    if not keep_xmatch:
+    try:
+        t.write(tmp, format='fits', overwrite=True)
+        with open(tmp, 'rb') as src, open(str(cat_path), 'r+b') as dst:
+            dst.truncate(0)
+            shutil.copyfileobj(src, dst, 16 * 1024 * 1024)
+            dst.flush(); os.fsync(dst.fileno())
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    if not keep_xmatch and not unchanged:
         for f in XMATCH_FILES:
             p = img_dir / f
             if p.exists():
                 p.unlink()
-    return 'fixed', msg
+    return status, msg
 
 
 def _worker(args):
