@@ -510,7 +510,7 @@ def _parse_args():
                      help='Per-bin Gaia TAP query timeout in seconds (default 300). '
                           'Increase for large fields with slow archive responses.')
     ctl.add_argument('--force_redownload_hst', action='store_true',
-                     help='Re-search MAST and re-download HST files even if cached')
+                     help='Re-search MAST and re-download HST files even if cached (pypass products are kept; a changed delivery is refit via the FLC fingerprint)')
     ctl.add_argument('--mast_refresh_days', type=int, default=30, metavar='N',
                      help='Re-query MAST if the cached obs table is older than N days '
                           '(default 30). Set to 0 to always re-query, or use '

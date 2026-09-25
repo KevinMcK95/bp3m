@@ -860,15 +860,13 @@ def download_hst_images(
         # Some aux files are missing; fall through to download them without
         # touching PSF caches (FLCs did not change).
     else:
-        # Invalidate PSF caches for every file about to be downloaded so that a
-        # partially-completed or interrupted download never leaves stale PSF outputs.
-        if 'dataURI' in to_dl.columns:
-            _mast_root = hst_dir / "mastDownload" / tel_upper
-            for _, _row in tqdm(to_dl.iterrows(), total=len(to_dl),
-                                desc="  Invalidating PSF caches", unit="file",
-                                dynamic_ncols=True):
-                _dest = _mast_root / _row.get('obs_id', '') / Path(_row['dataURI']).name
-                _invalidate_psf_cache(_dest)
+        # force_redownload: FLCs are re-fetched but pypass/cross-match products are
+        # KEPT (user 2026-09-25).  The PSF-fit cache compares each FLC's content
+        # fingerprint (size + DATE/PROCTIME/CAL_VER) with the one recorded at fit
+        # time, so a changed delivery is refit automatically and an identical one
+        # is reused.  (Corrupt files and failed observations are still invalidated
+        # individually above/below.)
+        pass
 
         print(f"\n  Downloading {len(to_dl)} {im_type} file(s) to {hst_dir}...")
         _dl_delay = 10
