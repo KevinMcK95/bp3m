@@ -217,10 +217,19 @@ _GAIA_TAP_URLS = {
 }
 
 
+# Default mirror (user 2026-09-26): Heidelberg ARI.  Same gaiadr3 schema and columns as ESA
+# (booleans come back as 0/1 int16, which every consumer reads via astype(bool)); ~10x faster
+# per query and not subject to the ESA archive's DR4-preparation 500 errors.  Pass
+# gaia_tap_server='esa' (or the ESA URL) to use the ESA archive explicitly.
+DEFAULT_GAIA_TAP_SERVER = 'https://gaia.ari.uni-heidelberg.de/'
+
+
 def _make_gaia_client(gaia_tap_server: str | None):
-    """Return a Gaia TAP client for the given server URL."""
+    """Return a Gaia TAP client for the given server URL (None -> DEFAULT_GAIA_TAP_SERVER)."""
     from astroquery.gaia import Gaia
     if gaia_tap_server is None:
+        gaia_tap_server = DEFAULT_GAIA_TAP_SERVER
+    if str(gaia_tap_server).lower() in ('esa', 'https://gea.esac.esa.int/', 'https://gea.esac.esa.int'):
         return Gaia
     tap_url = _GAIA_TAP_URLS.get(gaia_tap_server)
     if tap_url is None:

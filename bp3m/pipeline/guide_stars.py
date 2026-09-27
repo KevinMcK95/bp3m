@@ -697,8 +697,10 @@ def _query_gaia_dr3_batch(dr2_ids: list[int]) -> dict[int, pd.Series]:
     Fetches all requested DR2 IDs in a single TAP query.
     Returns {dr2_source_id: closest-DR3-row-as-Series}.
     """
-    from astroquery.gaia import Gaia
-    Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"
+    # same default mirror as the catalogue downloads (Heidelberg; it serves
+    # gaiaedr3.dr2_neighbourhood and gaiadr3.gaia_source)
+    from bp3m.pipeline.download_gaia import _make_gaia_client
+    Gaia = _make_gaia_client(None)
 
     id_list = ", ".join(str(int(x)) for x in dr2_ids)
     adql = f"""
@@ -746,8 +748,10 @@ def _gaia_cone_search(ra: float, dec: float,
     """
     Fallback: Gaia DR3 cone search when no DR2 source ID is available.
     """
-    from astroquery.gaia import Gaia
-    Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"
+    # same default mirror as the catalogue downloads (Heidelberg; it serves
+    # gaiaedr3.dr2_neighbourhood and gaiadr3.gaia_source)
+    from bp3m.pipeline.download_gaia import _make_gaia_client
+    Gaia = _make_gaia_client(None)
 
     adql = f"""
     SELECT source_id, ra, dec, pmra, pmdec, parallax,

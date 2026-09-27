@@ -498,10 +498,9 @@ def _parse_args():
     ctl.add_argument('--n_processes', type=int, default=-1,
                      help='Number of cores to use (-1 = all available, default)')
     ctl.add_argument('--gaia_tap_server', type=str, default=None,
-                    help='Alternate Gaia TAP mirror for catalogue downloads, '
-                         'e.g. https://gaia.ari.uni-heidelberg.de/ '
-                         '(faster and less 500-prone than ESA during load; '
-                         'default: ESA archive)')
+                    help='Gaia TAP server for catalogue downloads (default: Heidelberg ARI, '
+                         'https://gaia.ari.uni-heidelberg.de/ -- faster and less 500-prone '
+                         'than ESA; pass "esa" for the ESA archive)')
     ctl.add_argument('--skip_download', action='store_true',
                      help='Skip Gaia and HST downloads (use existing files)')
     ctl.add_argument('--force_redownload_gaia', action='store_true',
