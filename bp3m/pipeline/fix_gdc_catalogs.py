@@ -85,6 +85,8 @@ def fix_catalog(cat_path, lib_dir, out_dir=None, dry_run=False, force=False,
     img_dir = cat_path.parent
     stem = cat_path.name.replace('_catalog.fits', '')
     flc = img_dir / f'{stem}.fits'
+    if not cat_path.exists():
+        return 'skip', 'no catalogue (image never fitted)'
     if not flc.exists():
         return 'error', f'no FLC next to {cat_path.name}'
     hdr = fits.getheader(str(flc), 0)
@@ -192,10 +194,20 @@ def fix_catalog(cat_path, lib_dir, out_dir=None, dry_run=False, force=False,
 
 
 def _worker(args):
-    cat, lib_dir, out_dir, dry_run, force, keep_xmatch = args
+    cat, lib_dir, out_dir, dry_run, force, keep_xmatch, twins = args
     t0 = time.time()
     try:
         st, msg = fix_catalog(cat, lib_dir, out_dir, dry_run, force, keep_xmatch)
+        # the catalogue is one inode shared by every hard-linked field copy: clear the
+        # cross-match products next to EACH copy, not only this one (47Tuc, 2026-09-27)
+        if st == 'fixed' and not keep_xmatch and out_dir is None and not dry_run:
+            for tw in twins:
+                for f in XMATCH_FILES:
+                    p = Path(tw).parent / f
+                    if p.exists():
+                        p.unlink()
+            if twins:
+                msg += f'; cross-match cleared in {len(twins)} linked copies'
     except Exception as e:
         st, msg = 'error', f'{type(e).__name__}: {e}'
     return str(cat), st, msg, time.time() - t0
@@ -229,11 +241,9 @@ def find_catalogs(fields=None, all_fields=False, gh_root=GH_ROOT, index=None, th
         dirs = [d for f, m in idx.items() if (all_fields or f in want)
                 and '_fs_' not in f and not f.startswith('Leo_I_scheme')
                 for d in m.values()]
-        def _one(d):
-            c = Path(d) / f'{os.path.basename(d)}_flc_catalog.fits'
-            return c if c.exists() else None
-        with ThreadPoolExecutor(threads) as ex:
-            return [c for c in ex.map(_one, dirs) if c is not None]
+        # no existence check here: on a loaded NFS 113k stats take longer than
+        # the fix itself; workers report a missing catalogue as 'error' cheaply
+        return [Path(d) / f'{os.path.basename(d)}_flc_catalog.fits' for d in dirs]
     if all_fields:
         with os.scandir(root) as it:
             fields = sorted(e.name for e in it if e.is_dir() and '_fs_' not in e.name
@@ -264,9 +274,14 @@ def main(argv=None):
         sys.exit('no --lib_dir and no bp3m config lib_dir')
     cats = [Path(c) for c in a.catalog] + find_catalogs(a.field, a.all, a.gh_root, index=a.from_index)
     print(f'[{time.strftime("%m-%d %H:%M")}] {len(cats)} catalogue paths enumerated', flush=True)
-    # dedupe hard links: one job per inode
-    seen, uniq, n_links = set(), [], 0
+    # dedupe hard links: one job per inode (skipped for --from_index: the
+    # stats are too slow on a loaded store; a hard-linked twin is caught by
+    # the worker's header GDC_ID check instead)
+    seen, uniq, n_links = {}, [], 0
+    twins = {}
     for c in cats:
+        if a.from_index:
+            uniq.append(c); twins[c] = []; continue
         try:
             st = os.stat(c)
         except OSError:
@@ -274,12 +289,16 @@ def main(argv=None):
         key = (st.st_dev, st.st_ino)
         if key in seen:
             n_links += 1
+            twins[seen[key]].append(c)
             continue
-        seen.add(key); uniq.append(c)
+        seen[key] = c; uniq.append(c); twins[c] = []
     print(f'[{time.strftime("%m-%d %H:%M")}] {len(uniq)} catalogues ({n_links} hard-linked duplicates '
           f'skipped), lib_dir={lib_dir}, {"DRY RUN" if a.dry_run else "in place" if not a.out else "-> "+a.out}',
           flush=True)
-    jobs = [(c, lib_dir, a.out, a.dry_run, a.force, a.keep_xmatch) for c in uniq]
+    jobs = [(c, lib_dir, a.out, a.dry_run, a.force, a.keep_xmatch, twins.get(c, [])) for c in uniq]
+    if a.from_index:
+        print('  NOTE: --from_index skips the inode scan, so cross-match products of hard-linked '
+              'copies are NOT cleared; run a cross-match cache check afterwards', flush=True)
     counts = {}
     log = open(a.log, 'a') if a.log else None
     t0 = time.time()

@@ -72,6 +72,15 @@ def _write_xmatch_status(root: Path, status: str, params_meta: dict,
 XMATCH_ALGO_VERSION = 3
 
 
+def catalog_gdc_changed(catalog_path) -> bool:
+    """True if the catalogue was re-corrected onto an OFFICIAL_JFRAME table (ACS/WFC)."""
+    try:
+        from astropy.io import fits as _fits
+        return 'OFFICIAL' in str(_fits.getheader(str(catalog_path), 1).get('GDC_FILE') or '')
+    except Exception:
+        return False
+
+
 def catalog_gdc_id(catalog_path) -> str | None:
     """GDC_ID recorded in a pypass catalogue (table header), or None for
     catalogues written before provenance was added (2026-09-24)."""
@@ -86,12 +95,18 @@ def catalog_gdc_id(catalog_path) -> str | None:
 def _params_match(saved: dict | None, current: dict) -> bool:
     """Cache-key comparison.  'gdc_id' (the distortion table the catalogue's
     x_gdc/y_gdc came from) is part of the key, so a swapped table forces a
-    rematch; a sidecar written before the tag existed is compared without it
-    (the catalogue itself changes only through bp3m-fix-gdc, which removes
-    the cross-match products of every catalogue it changes)."""
+    rematch.  A sidecar written before the tag existed is accepted (compared
+    without it) ONLY when the catalogue's table never changed: current key
+    'gdc_changed' is True for catalogues moved to an OFFICIAL_JFRAME table.
+    (bp3m-fix-gdc removed cross-match products in only ONE directory of each
+    hard-linked catalogue, so the other field copies kept VINTAGE_2005 matches,
+    e.g. 590 images in 47Tuc -- found 2026-09-27.)"""
     saved = dict(saved or {})
     cur = dict(current)
+    changed = cur.pop('gdc_changed', False)
     if 'gdc_id' not in saved:
+        if changed:
+            return False
         cur.pop('gdc_id', None)
     return saved == cur
 
@@ -133,7 +148,10 @@ def _xmatch_cache_status(hst_root: Path, params_meta: dict
         saved = json.loads(params_path.read_text())
     except Exception:
         return 'run', 'could not read xmatch_params.json'
-    diffs = [k for k, v in params_meta.items() if saved.get(k) != v
+    _chg = params_meta.get('gdc_changed', False)
+    if _chg and 'gdc_id' not in saved:
+        return 'run', 'legacy sidecar on a re-corrected catalogue'
+    diffs = [k for k, v in params_meta.items() if k != 'gdc_changed' and saved.get(k) != v
              and not (k == 'gdc_id' and 'gdc_id' not in saved)]
     if diffs:
         return 'run', f'params changed: {diffs}'
@@ -384,7 +402,8 @@ def run_cross_match(
         params_meta_img = dict(params_meta, gdc_id=catalog_gdc_id(hst['catalog']))
 
         if not force_rematch:
-            action, reason = _xmatch_cache_status(root, params_meta_img)
+            action, reason = _xmatch_cache_status(
+                root, dict(params_meta_img, gdc_changed=catalog_gdc_changed(hst['catalog'])))
             if action == 'skip':
                 skipped.append(name)
                 continue
