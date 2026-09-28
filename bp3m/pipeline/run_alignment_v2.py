@@ -1215,7 +1215,8 @@ def run_alignment_v2(
                           f"{_n_det_removed} detections removed from Phase 1+")
                 else:
                     print(f"  Phase 0 astrometric outliers: none (all stars consistent "
-                          f"with prior at chi2 ≤ {_PHASE0_CHI2_THRESH:.0f})")
+                          f"with prior at chi2 ≤ {_PHASE0_CHI2_THRESH_5P:.1f} (5p/6p), "
+                          f"≤ {_PHASE0_CHI2_THRESH_2P:.1f} (2p))")
 
                 # ── Catalogue sanity check (diagnostic) ───────────────────────
                 if _pmra_wls:
