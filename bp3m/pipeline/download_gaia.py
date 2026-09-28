@@ -241,11 +241,37 @@ def _make_gaia_client(gaia_tap_server: str | None):
     return TapPlus(url=tap_url)
 
 
+# Row limit requested from TAP servers.  Heidelberg (DaCHS) silently truncates any job to its
+# DEFAULT output limit of 100,000 rows unless MAXREC is passed (hard limit 10,000,000); ESA has no
+# such default.  Found 2026-09-28: NGC_6121's 3.9x3.5 deg catalogue had three magnitude bins cut at
+# exactly 100,000 rows each, halving the Gaia stars available to the alignment.
+GAIA_MAXREC = 10_000_000
+
+
+def _launch_async(client, query):
+    """launch_job_async with an explicit row limit, and refuse a result that hit it."""
+    from astroquery.utils.tap.core import TapPlus
+    from astroquery.gaia import GaiaClass
+    if isinstance(client, TapPlus) and not isinstance(client, GaiaClass):
+        job = client.launch_job_async(query, maxrec=GAIA_MAXREC)
+    else:
+        job = client.launch_job_async(query)
+    return job
+
+
+def _check_not_truncated(n_rows, what='Gaia query'):
+    # a result exactly at a known server limit is almost certainly truncated
+    if n_rows in (100_000, 2_000, 3_000_000, GAIA_MAXREC):
+        raise RuntimeError(f'{what} returned exactly {n_rows} rows -- a TAP output limit, not the '
+                           f'true count; refusing a truncated catalogue (split the query further)')
+
+
 def _submit_gaia_async(full_q: str, gaia_tap_server: str | None = None) -> pd.DataFrame:
     """Submit one Gaia TAP async job and return the result as a DataFrame."""
     client = _make_gaia_client(gaia_tap_server)
-    job = client.launch_job_async(full_q)
+    job = _launch_async(client, full_q)
     result = job.get_results().to_pandas()
+    _check_not_truncated(len(result))
     try:
         import io as _io
         _dev_null = _io.StringIO()
@@ -658,8 +684,9 @@ def download_gaia_qso_candidates(
     print(f"\n[Gaia] Downloading qso_candidates for {field_name}...")
     try:
         client = _make_gaia_client(gaia_tap_server)
-        job = client.launch_job_async(query)
+        job = _launch_async(client, query)
         result = job.get_results().to_pandas()
+        _check_not_truncated(len(result), 'Gaia candidate-table query')
         try:
             import io as _io
             _dev_null = _io.StringIO()
@@ -749,8 +776,9 @@ def download_gaia_galaxy_candidates(
     print(f"\n[Gaia] Downloading galaxy_candidates for {field_name}...")
     try:
         client = _make_gaia_client(gaia_tap_server)
-        job = client.launch_job_async(query)
+        job = _launch_async(client, query)
         result = job.get_results().to_pandas()
+        _check_not_truncated(len(result), 'Gaia candidate-table query')
         try:
             import io as _io
             _dev_null = _io.StringIO()
