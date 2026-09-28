@@ -218,9 +218,15 @@ def load_master_v2(
     det_chi2_threshold: float | None = None,
     pos_corr_table: "str | Path | None" = None,
     priority_source_indices: "set[int] | None" = None,
+    pos_corr_model: "str | Path | None" = None,
 ) -> tuple[dict, dict, pd.DataFrame, np.ndarray]:
     """
     Load BP3M v2 inputs from {field_dir}/hst_xmatch/master_combined_v2.csv.
+
+    pos_corr_model : learned GDC-residual model (bp3m --pos_corr_model).  Not yet
+        applied on the master_v2 path; requesting one raises instead of silently
+        fitting uncorrected positions.  (run_pop_fit passes it unconditionally since
+        a7fd22a, which broke every bp3m-pop-fit-v2 run with a TypeError.)
 
     priority_source_indices : master_combined_v2 row indices (e.g. a user member
         seed from notebook 08) that must survive the HST-only selection: they
@@ -260,6 +266,10 @@ def load_master_v2(
     hst_only_mask : (n_stars,) bool
         True for the synthetic HST-only rows in gaia_catalog.
     """
+    if pos_corr_model is not None and str(pos_corr_model).lower() != 'none':
+        raise NotImplementedError(
+            f"load_master_v2: pos_corr_model={pos_corr_model!r} is not supported on the "
+            "master_v2 path yet; rerun without --pos_corr_model or pass --pos_corr_model none")
     _ensure_bp3m()
     from bp3m.data_loader_flc import _read_image_meta  # private but stable
 
