@@ -769,6 +769,10 @@ def run_alignment_v2(
     v1_alpha:  dict[str, float]      = {}
     # v1 stellar astrometry (MAP conditional posteriors) used for Phase 0 chi2 validation
     v1_stellar_astrom: pd.DataFrame | None = None
+    # (image, Gaia id) detections the v1 fit aligned on: Phase 0 keeps them and
+    # measures its outlier threshold from them (pegasus_3, 2026-09-28)
+    from bp3m.pipeline.hst_catalog_crossmatch import load_v1_good_pairs
+    v1_good_pairs = load_v1_good_pairs(v1_bp3m_dir) if v1_xform_path.exists() else set()
     if v1_xform_path.exists():
         v1_df = pd.read_csv(v1_xform_path)
         for _, row in v1_df.iterrows():
@@ -917,6 +921,8 @@ def run_alignment_v2(
 
         from tqdm import tqdm
         n_flagged_total = 0
+        n_readmit_total = 0
+        _p0_gids = gaia_catalog['Gaia_id'].to_numpy(np.int64)
         for img in tqdm(image_names, desc="  Phase 0: pre-filter residuals",
                         unit="img", dynamic_ncols=True):
             d = solver._img_data.get(img)
@@ -929,6 +935,19 @@ def run_alignment_v2(
             xys   = d["xys"]
             JU    = d["JU"]
             sidx  = d["sidx"]
+            # v1-good detections: v1 aligned on them, so they are (re)admitted
+            # here whatever the xmatch flags or loader cuts said, and never flagged
+            # by this screen.  Without this, new cross-matches could drag an
+            # image's whole v1 star set out (pegasus_3 2017 F814W, 2026-09-28).
+            prot  = np.array([(img, int(g)) in v1_good_pairs
+                              for g in _p0_gids[sidx]], bool)
+            _readmit = prot & ~d["use_for_fit"]
+            if _readmit.any():
+                d["use_for_fit"][_readmit]     = True
+                d["use_for_fit_max"][_readmit] = True
+                if "use_for_astrom" in d:
+                    d["use_for_astrom"][_readmit] = True
+                n_readmit_total += int(_readmit.sum())
             use   = d["use_for_fit"].copy()
 
             _v_pm = np.zeros_like(solver.v_survey[sidx])
@@ -938,10 +957,13 @@ def run_alignment_v2(
             resid_mag = np.hypot(*(xys - x_pred).T)   # (n,)
 
             if use.any():
-                r_align    = resid_mag[use]
+                # threshold from the v1-good stars when there are enough of them,
+                # so a crowd of new (possibly wrong) matches cannot set it
+                _ref       = (use & prot) if int((use & prot).sum()) >= 3 else use
+                r_align    = resid_mag[_ref]
                 mad_sigma  = np.median(np.abs(r_align - np.median(r_align))) / 0.6745
                 thresh     = max(_PHASE0_SIGMA_THRESH * mad_sigma, 0.3)
-                bad        = use & (resid_mag > thresh)
+                bad        = use & ~prot & (resid_mag > thresh)
 
                 n_flag = int(bad.sum())
                 n_flagged_total += n_flag
@@ -959,9 +981,11 @@ def run_alignment_v2(
                 print(f"  {img}: {int(use.sum())-n_flag}/{int(use.sum())} kept  "
                       f"med={np.median(r_align):.4f}px  "
                       f"σ={mad_sigma:.4f}px  thresh={thresh:.4f}px  "
-                      f"flagged={n_flag}")
+                      f"flagged={n_flag}  v1-protected={int((use & prot).sum())}"
+                      + (f" (readmitted {int(_readmit.sum())})" if _readmit.any() else ""))
 
-        print(f"  Phase 0 total flagged: {n_flagged_total} detections")
+        print(f"  Phase 0 total flagged: {n_flagged_total} detections"
+              + (f"; {n_readmit_total} v1-good detections readmitted" if n_readmit_total else ""))
 
 
         # ── Phase 0 astrometry validation ─────────────────────────────────────
@@ -1197,6 +1221,14 @@ def run_alignment_v2(
                 # ── Flag outlier stars for Phase 1+ ───────────────────────────
                 # Stars with chi2 > threshold have their detections permanently
                 # removed so they cannot bias the Phase 1 transformation update.
+                # Stars v1 aligned on are exempt (see v1_good_pairs above).
+                _v1_good_gids = {g for (_im, g) in v1_good_pairs}
+                _spared = {_i for _i in _outlier_star_idxs
+                           if int(gc_ids[_i]) in _v1_good_gids}
+                if _spared:
+                    print(f"  Phase 0 chi2: {len(_spared)} flagged star(s) kept "
+                          f"because v1 aligned on them")
+                    _outlier_star_idxs -= _spared
                 _n_det_removed = 0
                 for _img in image_names:
                     _d = solver._img_data.get(_img)

@@ -249,8 +249,53 @@ def _project_to_radec(
 
 # ── Phase 0: load all detections and project to RA,Dec ───────────────────────
 
+# Saturation criterion shared with the v1 loader (data_loader_flc) and the v2
+# alignment loader (data_loader_master): a source is kept unless more than this
+# fraction of its PSF-fit window is saturated.  Requiring n_sat == 0 threw away
+# the brightest Gaia stars (1-2 saturated pixels), which are the best alignment
+# anchors (pegasus_3, 2026-09-28: 15 of 97 indv Gaia matches).
+_MAX_SAT_FRAC = 0.25
+
+
+def load_v1_good_pairs(v1_bp3m_dir: Optional[Path]) -> set[tuple[str, int]]:
+    """(sub-image name, Gaia id) pairs the v1 joint fit used for alignment.
+
+    Read from the v1 star_indices.npz / use_for_fit.npz / stellar_astrometry.csv.
+    These detections have already survived v1's own outlier rejection, so v2
+    must not discard them before it has fitted anything: they are kept at load
+    time, never rejected by the cross-match astrometry, and seed the v2
+    Phase 0 residual screen.  Empty set when no v1 results exist.
+    """
+    if v1_bp3m_dir is None:
+        return set()
+    v1_bp3m_dir = Path(v1_bp3m_dir)
+    si_path = v1_bp3m_dir / 'star_indices.npz'
+    uf_path = v1_bp3m_dir / 'use_for_fit.npz'
+    sa_path = v1_bp3m_dir / 'stellar_astrometry.csv'
+    if not (si_path.exists() and uf_path.exists() and sa_path.exists()):
+        return set()
+    try:
+        gids = pd.read_csv(sa_path, usecols=['Gaia_id'],
+                           dtype={'Gaia_id': np.int64})['Gaia_id'].to_numpy(np.int64)
+        si = np.load(si_path)
+        uf = np.load(uf_path)
+    except Exception as exc:
+        print(f"  Warning: could not read v1 alignment flags from {v1_bp3m_dir}: {exc}")
+        return set()
+    pairs: set[tuple[str, int]] = set()
+    for img in si.files:
+        if img not in uf.files:
+            continue
+        idx = np.asarray(si[img], int)[np.asarray(uf[img], bool)]
+        for g in gids[idx]:
+            if int(g) > 0:
+                pairs.add((img, int(g)))
+    return pairs
+
+
 def _load_all_detections(field_dir: Path,
-                         bp3m_results_dir: Optional[Path] = None) -> Optional[pd.DataFrame]:
+                         bp3m_results_dir: Optional[Path] = None,
+                         v1_good_pairs: Optional[set] = None) -> Optional[pd.DataFrame]:
     """
     For every processed image, load the full PSF catalog and project all
     detected sources to (RA, Dec) using the BP3M posterior transformation.
@@ -275,7 +320,10 @@ def _load_all_detections(field_dir: Path,
     x_gdc, y_gdc  : GDC pixel positions
     has_gaia_match : bool
     gaia_source_id : int64 (0 if no match)
+    v1_good        : bool — Gaia detection the v1 joint fit used for alignment
+                     (see load_v1_good_pairs); kept regardless of the quality cuts
     """
+    v1_good_pairs = v1_good_pairs or set()
     bp3m_dir = Path(bp3m_results_dir) if bp3m_results_dir is not None else field_dir / 'BP3M_results'
     hst_root = field_dir / 'HST' / 'mastDownload' / 'HST'
 
@@ -530,16 +578,35 @@ def _load_all_detections(field_dir: Path,
         else:
             mask = np.ones(len(cat_y_raw), bool)
 
-        mask &= (cat_nsat == 0)
+        chip_mask = mask.copy()
+        _psf_json = img_dir / 'psf_params.json'
+        _hw = 3
+        if _psf_json.exists():
+            try:
+                import json as _json_hw
+                with open(_psf_json) as _f_hw:
+                    _hw = int(_json_hw.load(_f_hw).get('half_width', 3))
+            except Exception:
+                _hw = 3
+        mask &= (cat_nsat / float((2 * _hw + 1) ** 2)) < _MAX_SAT_FRAC
         mask &= (cat_qfit < 2.0)
         mask &= np.isfinite(cat_mag)
+
+        # Gaia match lookup (hst_index → gaia_source_id)
+        gaia_match = _load_gaia_match_lookup(img_dir)
+
+        # v1-good Gaia detections survive the quality cuts: v1 aligned on them.
+        v1_good_cat = np.zeros(len(cat_y_raw), bool)
+        if v1_good_pairs:
+            for _ci, _gid in gaia_match.items():
+                if (sub_name, int(_gid)) in v1_good_pairs and 0 <= _ci < len(v1_good_cat):
+                    v1_good_cat[_ci] = True
+            v1_good_cat &= chip_mask & np.isfinite(cat_mag)
+            mask |= v1_good_cat
 
         idx = np.where(mask)[0]
         if len(idx) == 0:
             return None
-
-        # Gaia match lookup (hst_index → gaia_source_id)
-        gaia_match = _load_gaia_match_lookup(img_dir)
 
         r_j, C_r_j = r_vecs[sub_name]
 
@@ -616,6 +683,7 @@ def _load_all_detections(field_dir: Path,
             'cov_xy_raw':        cat_cov_xy[idx],
             'has_gaia_match':    gaia_ids != 0,
             'gaia_source_id':    gaia_ids,
+            'v1_good':           v1_good_cat[idx],
         })
 
     # Dispatch across sub-images with threads — FITS I/O and numpy projection
@@ -3115,6 +3183,7 @@ def _measure_astrometry_proper(
                 'cov_yy_raw': float(d['cov_yy_raw']),
                 'cov_xy_raw': float(d['cov_xy_raw']),
                 'alpha':      float(d['alpha']),
+                'v1_good':    bool(d.get('v1_good', False)),
             })
 
         if not det_data:
@@ -3374,6 +3443,10 @@ def _measure_astrometry_proper(
             chi2_per = ((_d*_r0 - _b*_r1)*_r0 + (-_c*_r0 + _a*_r1)*_r1) * _inv_det
 
             outlier_mask = chi2_per > outlier_sigma**2
+            # v1-good detections are never rejected here: v1 already vetted them,
+            # and a newly added bad detection of the same star must not take the
+            # good ones down with it (pegasus_3, 2026-09-28).
+            outlier_mask &= ~np.array([dd.get('v1_good', False) for dd in det_data], bool)
             if not outlier_mask.any():
                 break
             for i in np.where(outlier_mask)[0]:
@@ -4065,11 +4138,16 @@ def run_hst_crossmatch(
 
     # ── Phase 0: load all detections ─────────────────────────────────────────
     print("\nPhase 0: Loading all HST detections and projecting to RA,Dec ...")
-    det_df = _load_all_detections(field_dir, bp3m_results_dir=bp3m_results_dir)
+    _v1_good_pairs = load_v1_good_pairs(_anchor_dir)
+    det_df = _load_all_detections(field_dir, bp3m_results_dir=bp3m_results_dir,
+                                  v1_good_pairs=_v1_good_pairs)
     if det_df is None or len(det_df) == 0:
         print("  No detections found.")
         return {}
 
+    if _v1_good_pairs:
+        print(f"  v1 alignment detections protected: {int(det_df['v1_good'].sum())} "
+              f"of {len(_v1_good_pairs)} v1 (image, Gaia star) pairs")
     print(f"  Loaded {len(det_df)} detections from "
           f"{det_df['sub_name'].nunique()} sub-images "
           f"in {det_df['filter'].nunique()} filter(s)")
