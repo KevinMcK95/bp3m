@@ -1507,6 +1507,21 @@ def run_pop_fit_rotation(
             _mu_boot, member_sigma_clip, sigma_pm, pm_sys_floor)
         print(f"  Initial members: {len(member_sidx)}")
 
+    # A vetted QSO anchor is never a member: its secular-aberration prior REPLACES the
+    # member prior (QSO anchor design).  Both at once tie mu_pop directly to the
+    # aberration value -- NGC_300 2026-09-28: 5 seed "members" were anchors, pinning
+    # mu_pop to (-0.0046, -0.0018) +- 0.0005 whatever the floor or seed.
+    _qso_bar_sidx = (np.asarray(_qso_sidx, int)
+                     if _qso_sidx is not None and len(_qso_sidx) else None)
+    if _qso_bar_sidx is not None:
+        _clash = np.intersect1d(np.asarray(member_sidx, int), _qso_bar_sidx)
+        if len(_clash):
+            _gids = gaia_catalog['Gaia_id'].to_numpy(np.int64)[_clash]
+            print(f"  WARNING: {len(_clash)} initial member(s) are vetted QSO anchors — "
+                  f"removed from membership (QSO prior wins): "
+                  + ', '.join(str(int(g)) for g in _gids))
+            member_sidx = np.setdiff1d(np.asarray(member_sidx, int), _qso_bar_sidx)
+
     # ── μ_pop prior ────────────────────────────────────────────────────────────
     _extra = sigma_pm ** 2 + pm_sys_floor ** 2
     _mem_pm_ra   = _pmra_v1_only[member_sidx]
@@ -1599,6 +1614,8 @@ def run_pop_fit_rotation(
             pm_sys_floor=pm_sys_floor)
         if _seed_frozen_sidx is not None:
             _sidx = np.intersect1d(_sidx, _seed_frozen_sidx)
+        if _qso_bar_sidx is not None:
+            _sidx = np.setdiff1d(_sidx, _qso_bar_sidx)
         return _sidx
 
     # ── Phase 1: μ-only solve ─────────────────────────────────────────────────
