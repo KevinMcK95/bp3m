@@ -428,7 +428,7 @@ def compute_rotation_offsets_jacobian(
 # Copy of run_pop_fit._joint_solve_pop with two targeted changes:
 #
 #  1. Per-star member prior RHS:
-#       h_align/h_all[s, 2/3] += σ^{-2} · (μ_pop[0/1] + rot_ra/dec[s])
+#       h_all[s, 2/3] += σ^{-2} · (μ_pop[0/1] + rot_ra/dec[s])
 #     (base code has σ^{-2} · μ_pop[0/1] only).
 #
 #  2. Schur RHS correction for μ_pop:
@@ -523,16 +523,18 @@ def _joint_solve_pop_rot(
     H_vv[member_sidx, 3, 3] += sigma_pm_inv_sq
     H_vv[member_sidx, 4, 4] += sigma_plx_inv_sq
 
-    h_align = solver.C_survey_inv_dot_v.copy()
-    h_all   = solver.C_survey_inv_dot_v.copy()
+    # CONSISTENCY (ported from run_pop_fit 890496b, 2026-09-28): a single h channel
+    # feeds BOTH the r- and mu-Schur corrections.  The old second channel (h_align:
+    # fit-only detections against the FULL-precision C_vT) produced hybrid posteriors
+    # a_align != a; feeding a_align to the r equation while the mu equation saw a broke
+    # the joint fixed point wherever astrometry-only detections exist.  Astrom-only
+    # detections still never constrain r directly (K/XCsX are fit-masked).
+    h_all = solver.C_survey_inv_dot_v.copy()
 
     # ── Population prior RHS — rotation-corrected ────────────────────────────
-    h_align[member_sidx, 2] += sigma_pm_inv_sq * (mu_pop_current[0] + _rot_ra[member_sidx])
-    h_align[member_sidx, 3] += sigma_pm_inv_sq * (mu_pop_current[1] + _rot_dec[member_sidx])
-    h_all  [member_sidx, 2] += sigma_pm_inv_sq * (mu_pop_current[0] + _rot_ra[member_sidx])
-    h_all  [member_sidx, 3] += sigma_pm_inv_sq * (mu_pop_current[1] + _rot_dec[member_sidx])
-    h_align[member_sidx, 4] += sigma_plx_inv_sq * plx_pop
-    h_all  [member_sidx, 4] += sigma_plx_inv_sq * plx_pop
+    h_all[member_sidx, 2] += sigma_pm_inv_sq * (mu_pop_current[0] + _rot_ra[member_sidx])
+    h_all[member_sidx, 3] += sigma_pm_inv_sq * (mu_pop_current[1] + _rot_dec[member_sidx])
+    h_all[member_sidx, 4] += sigma_plx_inv_sq * plx_pop
 
     if qso_sidx is not None and len(qso_sidx) > 0:
         _sigma_qso_pm_inv_sq  = (3.5e-4) ** -2
@@ -540,10 +542,8 @@ def _joint_solve_pop_rot(
         H_vv[qso_sidx, 2, 2] += _sigma_qso_pm_inv_sq
         H_vv[qso_sidx, 3, 3] += _sigma_qso_pm_inv_sq
         H_vv[qso_sidx, 4, 4] += _sigma_qso_plx_inv_sq
-        h_align[qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
-        h_align[qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
-        h_all  [qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
-        h_all  [qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
+        h_all[qso_sidx, 2] += _sigma_qso_pm_inv_sq * qso_pmra
+        h_all[qso_sidx, 3] += _sigma_qso_pm_inv_sq * qso_pmdec
 
     # ── Per-image accumulation ─────────────────────────────────────────────────
     K_img       = {}
@@ -589,8 +589,6 @@ def _joint_solve_pop_rot(
 
         np.add.at(H_vv, sidx_any,
                   np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
-        np.subtract.at(h_align, sidx_fit,
-                       np.einsum('nik,nk->ni', JUT_Cs[use_fit], x_resid[use_fit]))
         np.subtract.at(h_all, sidx_any,
                        np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
 
@@ -608,8 +606,8 @@ def _joint_solve_pop_rot(
     _safe_sidx = np.where(_invertible)[0]
     if len(_safe_sidx) > 0:
         C_vT[_safe_sidx] = np.linalg.inv(H_vv[_safe_sidx])
-    a_align = np.einsum('nij,nj->ni', C_vT, h_align)
-    a       = np.einsum('nij,nj->ni', C_vT, h_all)
+    a = np.einsum('nij,nj->ni', C_vT, h_all)
+    a_align = a   # single consistent posterior (see CONSISTENCY note above)
 
     # ── Shared system (μ or r+μ) ───────────────────────────────────────────────
     Lambda = np.zeros((n_shared, n_shared))
