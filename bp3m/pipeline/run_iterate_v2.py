@@ -184,6 +184,12 @@ def main():
             else:
                 setattr(args, _key, _default)
                 print(f"  {_key} not specified and not in v1 run_config.json — defaulting to {_default}")
+    if args.pos_corr_model is None:      # v1 run had none recorded: fall back to the config.toml default
+        try:
+            from bp3m_run import _config_value
+            args.pos_corr_model = _config_value('pos_corr_model')
+        except Exception:
+            pass
     if str(args.pos_corr_model).lower() == 'none':
         args.pos_corr_model = None
     if args.no_pos_corr_table:

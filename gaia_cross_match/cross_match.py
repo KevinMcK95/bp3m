@@ -119,7 +119,14 @@ def get_hst_params(flc_file, catalog_file=None):
         orientat = primary_hdr.get('ORIENTAT', 0.0)
         _icfg = get_instrument_config(instrument, detector)
         pixel_scale   = _icfg["pixel_scale"]
-        initial_scale = _icfg["initial_scale"]
+        # scale prior centre = instrument constant x this exposure's velocity-aberration factor (as bp3m.data_loader_flc)
+        try:
+            _vaf = float(primary_hdr.get('VAFACTOR', header0.get('VAFACTOR', 1.0)) or 1.0)
+        except (TypeError, ValueError):
+            _vaf = 1.0
+        if not np.isfinite(_vaf) or abs(_vaf - 1.0) > 5e-4:
+            _vaf = 1.0
+        initial_scale = _icfg["initial_scale"] * _vaf
 
         expstart = header0.get('EXPSTART', 51544); obs_epoch_mjd = expstart
 
@@ -793,7 +800,18 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
 # Main per-image processor
 # ---------------------------------------------------------------------------
 
-def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True, sigma_rot_deg=None, sigma_scale=None, sigma_skew=None, init_resid_max=5.0):
+_PCM_CACHE = {}
+
+
+def _pos_corr_applier(spec):
+    """Learned GDC-correction applier (bp3m.pos_corr_basis), one per spec per worker process."""
+    if spec not in _PCM_CACHE:
+        from bp3m.pos_corr_basis import make_pos_corr
+        _PCM_CACHE[spec] = make_pos_corr(spec)
+    return _PCM_CACHE[spec]
+
+
+def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True, sigma_rot_deg=None, sigma_scale=None, sigma_skew=None, init_resid_max=5.0, pos_corr_model=None):
     start_time = time.time()
     image_name = os.path.basename(hst['flc']).replace("_flc.fits", "")
     log_file, original_stdout = os.path.join(hst['root'], "processing_log.txt"), sys.stdout
@@ -896,6 +914,19 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             _orig_row_idx = _orig_row_idx[_valid]
         x_hst      = hst_cat['x_gdc'].astype(float)
         y_hst      = hst_cat['y_gdc'].astype(float)
+        # Learned GDC correction (same applier and sign as the BP3M loaders: corrected = x_gdc - bias),
+        # so the cross-match sees the same frame the alignment will fit (user 2026-09-30).
+        if pos_corr_model:
+            try:
+                _pcm = _pos_corr_applier(pos_corr_model)
+                _mb = _pcm.bias(hst_cat, _pcm.read_header(hst['flc']))
+                if _mb is not None:
+                    x_hst = x_hst - np.asarray(_mb[0], float); y_hst = y_hst - np.asarray(_mb[1], float)
+                    print(f'  Learned GDC correction applied ({pos_corr_model}): median |bias| = {np.median(np.hypot(_mb[0], _mb[1])):.4f} px')
+                else:
+                    print(f'  Learned GDC correction: no model for this instrument/filter — positions unchanged')
+            except Exception as _e:
+                print(f'  WARNING: learned GDC correction failed ({_e}) — positions unchanged')
         mag_hst_gdc = hst_cat['mag_gdc'].astype(float)
         is_star    = hst_cat['is_star_candidate'].astype(bool)
         mag_err_hst = hst_cat['mag_err_gdc'].astype(float) if 'mag_err_gdc' in hst_cat.dtype.names else None

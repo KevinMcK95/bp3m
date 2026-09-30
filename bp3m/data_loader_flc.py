@@ -202,6 +202,16 @@ def _read_image_meta(img_dir: Path, img_name: str,
         cd11 = float(h1["CD1_1"]); cd12 = float(h1["CD1_2"])
         cd21 = float(h1["CD2_1"]); cd22 = float(h1["CD2_2"])
         real_pixel_scale_mas = _pixel_scale_from_cd(cd11, cd12, cd21, cd22)
+        # Velocity-aberration factor (SCI extension): the GDC-frame plate scale of
+        # this exposure is initial_scale x VAFACTOR (Leo I 2026-09-30: posterior
+        # scale ratio - constant = 1.07 x (VAFACTOR-1), r = 0.99 for ACS; the
+        # hst_dist_corr label projection has always used IDCSCALE x VAFACTOR).
+        try:
+            vafactor = float(h1.get("VAFACTOR", h0.get("VAFACTOR", 1.0)) or 1.0)
+        except (TypeError, ValueError):
+            vafactor = 1.0
+        if not np.isfinite(vafactor) or abs(vafactor - 1.0) > 5e-4:
+            vafactor = 1.0
 
     # ── transformation.csv ───────────────────────────────────────────────────
     tdf = pd.read_csv(tran_path).set_index("parameter")["value"]
@@ -238,7 +248,8 @@ def _read_image_meta(img_dir: Path, img_name: str,
         # sigma widths.  Sourced from instrument_config so cross-match and the
         # BP3M solver always use consistent values.  Solver uses these as
         # per-image defaults; explicit CLI overrides take precedence.
-        "initial_scale_ratio": get_instrument_config(instrument, detector)["initial_scale"],
+        "initial_scale_ratio": get_instrument_config(instrument, detector)["initial_scale"] * vafactor,
+        "vafactor":            vafactor,
         **{k: v for k, v in get_instrument_config(instrument, detector).items()
            if k.startswith("sigma_")},
         "on_skew":  on_skew,

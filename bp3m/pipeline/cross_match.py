@@ -229,6 +229,7 @@ def _match_one(args):
             sigma_scale=kwargs.get('prior_sigma_scale', None),
             sigma_skew=kwargs.get('prior_sigma_skew', None),
             init_resid_max=kwargs.get('init_resid_max', 5.0),
+            pos_corr_model=kwargs.get('pos_corr_model', None),
         )
         post_mtime = out.stat().st_mtime if out.exists() else None
         file_updated = post_mtime is not None and post_mtime != pre_mtime
@@ -304,6 +305,7 @@ def run_cross_match(
     prior_sigma_rot_deg: float | None = None,
     prior_sigma_scale: float | None = None,
     prior_sigma_skew: float | None = None,
+    pos_corr_model: str | None = None,
     init_resid_max: float = 5.0,
 ) -> list[Path]:
     """
@@ -388,7 +390,18 @@ def run_cross_match(
         'sigma_scale':          prior_sigma_scale   if prior_sigma_scale   is not None else _DEFAULT_SIGMA_SCALE,
         'sigma_skew':           prior_sigma_skew    if prior_sigma_skew    is not None else _DEFAULT_SIGMA_SKEW,
         'init_resid_max':       init_resid_max,
+        'pos_corr_model':       (str(pos_corr_model) if pos_corr_model else None),
     }
+    # With a learned GDC correction the catalog frame is the corrected one, so the plate
+    # priors are the (tight, data-driven) solver priors; without it the raw header frame
+    # keeps the loose XMATCH_* widths (uncorrected ACS TDD skew etc.).  CLI values win.
+    if pos_corr_model:
+        from bp3m.instrument_config import SIGMA_ROT_DEG, SIGMA_SCALE, SIGMA_SKEW_CORRECTED
+        if prior_sigma_rot_deg is None: prior_sigma_rot_deg = SIGMA_ROT_DEG
+        if prior_sigma_scale   is None: prior_sigma_scale   = SIGMA_SCALE
+        if prior_sigma_skew    is None: prior_sigma_skew    = SIGMA_SKEW_CORRECTED
+        params_meta.update(sigma_rot_deg=prior_sigma_rot_deg, sigma_scale=prior_sigma_scale, sigma_skew=prior_sigma_skew)
+        print(f"  cross-match with learned GDC correction {pos_corr_model}: priors rot {prior_sigma_rot_deg} deg, scale {prior_sigma_scale}, skew {prior_sigma_skew}")
 
     from tqdm import tqdm
     work = []
@@ -429,6 +442,7 @@ def run_cross_match(
             'prior_sigma_scale':    prior_sigma_scale,
             'prior_sigma_skew':     prior_sigma_skew,
             'init_resid_max':       init_resid_max,
+            'pos_corr_model':       (str(pos_corr_model) if pos_corr_model else None),
         }))
 
     if skipped:

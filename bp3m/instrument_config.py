@@ -57,10 +57,12 @@ _DEFAULT_CONFIG = {
     # the constant; even with the correction the scale scatters 4-8e-5 (VAFACTOR
     # is not in the prior mean).  A 1e-5/5e-6 prior around those means biased
     # mu_pop by 7 sigma.  So: rotation and chip take the Phase D widths; scale
-    # stays 1e-4 until the prior mean carries VAFACTOR; skew is 1e-4 without a
-    # correction model and sigma_skew_corrected with one (run_alignment picks).
+    # is 2e-5 now that the prior mean carries VAFACTOR (Leo I: scale residual = 1.07 x
+    # (VAFACTOR-1), r 0.99); skew is 1e-4 without a correction model and
+    # sigma_skew_corrected with one (run_alignment / cross-match pick).
     "sigma_rot_deg":  0.03,   # rotation prior width (deg); UVIS override below
-    "sigma_scale":    1e-4,   # pixel scale ratio prior width (fractional)
+    "sigma_scale":    2e-5,   # pixel scale ratio prior width; centre = initial_scale x VAFACTOR (loaders +
+                              # cross-match, 2026-09-30), after which the per-image scatter is ~1e-5
     "sigma_skew":     1e-4,   # on- and off-axis skew prior width, no correction model (ACS TDD)
     "sigma_skew_corrected": 1e-5,  # skew prior width when a pos_corr_model is applied (Phase D 3-5e-6; Fornax UVIS 1.2e-5)
     "sigma_pointing": 5000.0, # pointing offset prior width (mas)

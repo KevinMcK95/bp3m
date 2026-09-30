@@ -58,6 +58,20 @@ def _config_lib_dir() -> str | None:
         return None
 
 
+def _config_value(key: str) -> str | None:
+    """Read a string key from $BP3M_HOME/config.toml (same file/format as lib_dir)."""
+    import os
+    bp3m_home = Path(os.environ["BP3M_HOME"]) if "BP3M_HOME" in os.environ else Path.home() / ".bp3m"
+    config = bp3m_home / "config.toml"
+    if not config.exists():
+        return None
+    try:
+        m = re.search(rf'^{key}\s*=\s*["\']([^"\']+)["\']', config.read_text(), re.MULTILINE)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
 def _parse_args():
     p = argparse.ArgumentParser(
         prog='bp3m',
@@ -343,7 +357,7 @@ def _parse_args():
                     help='Plate rotation prior width in degrees (default: per-instrument, ACS 0.03 / UVIS 0.02 '
                          'from the 2026-09-30 Phase D archive fits; pre-2026-09-30: 0.1)')
     bp.add_argument('--prior_sigma_scale', type=float, default=None,
-                    help='Plate scale prior width, fractional (default 1e-4; Phase D measures 5e-6 but the prior mean lacks VAFACTOR; pre-2026-09-30: 5e-4)')
+                    help='Plate scale prior width, fractional (default 2e-5 around initial_scale x VAFACTOR; pre-2026-09-30: 5e-4 around a constant)')
     bp.add_argument('--prior_sigma_skew', type=float, default=None,
                     help='Plate skew prior width (default 1e-4 without a correction model, 1e-5 with --pos_corr_model; pre-2026-09-30: 2e-4)')
     bp.add_argument('--prior_sigma_pointing', type=float, default=None,
@@ -428,8 +442,9 @@ def _parse_args():
                          'MEMORY at catalog load to matching inst/det/filter '
                          'images; nothing on disk is modified.')
     bp.add_argument('--pos_corr_model', type=str, default=None,
-                    help='Learned GDC-residual correction (hst_dist_corr ml models): DIR[:TAG] or comma-separated json paths; '
-                         'evaluated per detection at catalog load (see bp3m/pos_corr_model.py). Composes with --pos_corr_table.')
+                    help='Learned GDC-residual correction: basis bundle DIR[:TAG[:noorbit]] (bp3m/pos_corr_basis.py) or MLP '
+                         'model dir/json paths; applied per detection at catalog load in the cross-match, v1, v2 and pop-fit. '
+                         'Default: the pos_corr_model key of $BP3M_HOME/config.toml; "none" disables. Composes with --pos_corr_table.')
     bp.add_argument('--gaia_uwu_mag', action='store_true',
                     help='use the magnitude-dependent Gaia unit-weight uncertainties (Fabricius '
                          '2021 Fig.19/20) instead of the scalar 1.05/1.22; parallax and '
@@ -766,6 +781,13 @@ def _run_indv_one(img_name, run_kw, indv_root, extra_cfg):
 
 def main():
     args = _parse_args()
+    # Learned GDC correction: CLI > $BP3M_HOME/config.toml pos_corr_model > none; "none" disables (arm-A tests)
+    if getattr(args, 'pos_corr_model', None) is None:
+        args.pos_corr_model = _config_value('pos_corr_model')
+        if args.pos_corr_model:
+            print(f'  pos_corr_model (config.toml default): {args.pos_corr_model}')
+    if args.pos_corr_model is not None and str(args.pos_corr_model).strip().lower() == 'none':
+        args.pos_corr_model = None
     if getattr(args, 'gaia_uwu_mag', False):
         from bp3m.astro_utils import set_gaia_uwu_mag
         set_gaia_uwu_mag(True)
@@ -1188,6 +1210,7 @@ def main():
     if not args.skip_crossmatch:
         from bp3m.pipeline.cross_match import run_cross_match
         run_cross_match(
+            pos_corr_model=args.pos_corr_model,
             output_dir=output_dir, field_name=field,
             telescope=args.telescope,
             im_type=args.hst_im_type,
