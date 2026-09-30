@@ -44,6 +44,15 @@ _DEFAULT_CONFIG = {
     "sigma_scale":    5e-4,   # pixel scale ratio prior width (fractional)
     "sigma_skew":     2e-4,   # on- and off-axis skew prior width
     "sigma_pointing": 5000.0, # pointing offset prior width (mas)
+    # 8p model (fit_chip_offset): 2-D translation of the upper chip relative to
+    # the lower one, in pixels, on top of the shared linear terms.  Calibration
+    # 2026-09-30: the hi−lo pointing difference of 8,164 split-CCD image pairs
+    # (256 fields) scatters by 0.08 px ACS / 0.045 px UVIS per axis, but that
+    # includes each chip's free rotation/scale; the 8p fit itself on Leo I (56
+    # images, ~70 stars each) gives MAD 0.012 px ACS with median sigma 0.012
+    # (pure noise) and UVIS consistent with 0.  0.02 px keeps low-n images
+    # tight; revisit from the archive-wide Phase D 8p fits.
+    "sigma_chip_px":  0.02,
 
     # Pair-coupling hyperpriors (hi−lo difference)
     # Calibrated: ACS rot 0.044°, WFC3 rot 0.025° → 0.10° conservative round number.
@@ -67,6 +76,7 @@ INSTRUMENT_CONFIG = {
         #   RA scatter 115 mas (≈ current 100 mas), Dec scatter 39 mas.
         #   Use 100 mas as a compromise covering both axes.
         "sigma_pair_pointing": 100.0,
+        "sigma_chip_px": 0.02,
     },
     ("WFC3", "UVIS"): {
         "pixel_scale":  0.040,
@@ -74,6 +84,7 @@ INSTRUMENT_CONFIG = {
         # Pair pointing calibrated from 2164 paired images:
         #   RA scatter 15 mas, Dec scatter 11 mas — much tighter than ACS.
         "sigma_pair_pointing": 15.0,
+        "sigma_chip_px": 0.02,
     },
     ("WFC3", "IR"):   {
         "pixel_scale":  0.128,
@@ -110,3 +121,4 @@ SIGMA_PAIR_ROT_DEG   = _DEFAULT_CONFIG["sigma_pair_rot_deg"]
 SIGMA_PAIR_SCALE     = _DEFAULT_CONFIG["sigma_pair_scale"]
 SIGMA_PAIR_SKEW      = _DEFAULT_CONFIG["sigma_pair_skew"]
 SIGMA_PAIR_POINTING  = _DEFAULT_CONFIG["sigma_pair_pointing"]
+SIGMA_CHIP_PX        = _DEFAULT_CONFIG["sigma_chip_px"]

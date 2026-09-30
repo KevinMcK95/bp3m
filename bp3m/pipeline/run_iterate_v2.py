@@ -63,6 +63,12 @@ def main():
     parser.add_argument('--poly_order', type=int, default=None,
                         help='Polynomial order for image transformation '
                              '(default: the v1 run\'s value from BP3M_results/run_config.json)')
+    parser.add_argument('--fit_chip_offset', type=lambda s: str(s).lower() in ('1', 'true', 'yes'),
+                        default=None, metavar='BOOL',
+                        help='8p image model: shared linear terms + pointing + a 2-D upper-chip offset '
+                             '(default: the v1 run\'s value from BP3M_results/run_config.json)')
+    parser.add_argument('--prior_sigma_chip_px', type=float, default=None,
+                        help='8p chip-offset prior width in px (default: per-instrument, ACS 0.08 / UVIS 0.045)')
     parser.add_argument('--pos_err_floor', type=float, default=None,
                         help='Minimum per-detection positional uncertainty in pixels, '
                              'added in quadrature (bp3m --bp3m_pos_err_floor). Default: '
@@ -166,7 +172,8 @@ def main():
     if _v1_cfg_path.exists():
         import json as _json
         _v1_cfg = _json.load(open(_v1_cfg_path))
-    for _key, _default in (('poly_order', 1), ('pos_err_floor', 0.05), ('pos_corr_table', None)):
+    for _key, _default in (('poly_order', 1), ('pos_err_floor', 0.05), ('pos_corr_table', None),
+                           ('fit_chip_offset', False)):
         if getattr(args, _key) is None:
             if _key in _v1_cfg:
                 setattr(args, _key, _v1_cfg[_key])
@@ -206,6 +213,8 @@ def main():
         n_samples            = args.n_samples,
         clip_sigma           = args.clip_sigma,
         poly_order           = args.poly_order,
+        fit_chip_offset      = bool(args.fit_chip_offset),
+        prior_sigma_chip_px  = args.prior_sigma_chip_px,
         pos_err_floor        = args.pos_err_floor,
         pos_corr_table       = args.pos_corr_table,
         use_sparse           = args.sparse,

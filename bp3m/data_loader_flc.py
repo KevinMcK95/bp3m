@@ -573,6 +573,25 @@ def _get_amp_splits(meta: dict) -> dict:
     return _AMP_SPLITS.get(key, _AMP_SPLITS_DEFAULT)
 
 
+_TWO_CHIP_DETECTORS = {"ACSWFC", "WFC3UVIS"}
+
+
+def chip_hi_mask(meta: dict, y, image_name: str | None = None):
+    """Upper-chip (``_hi`` half) mask for the 8p chip-offset column of an UNSPLIT image.
+
+    ``y`` is ``Y_orig`` (full-frame raw y) when available, else the GDC-frame y
+    (the inter-chip gap keeps both on the same side of ``y_split``).  Returns
+    None for single-chip detectors and for ``_hi``/``_lo`` split halves, where
+    there is nothing to offset.
+    """
+    key = (meta.get("instrument", "") + meta.get("detector", "")).upper()
+    if key not in _TWO_CHIP_DETECTORS:
+        return None
+    if image_name is not None and image_name.endswith(("_hi", "_lo")):
+        return None
+    return np.asarray(y, float) > _get_amp_splits(meta)["y_split"]
+
+
 def split_images_by_ccd(images, stars_per_image, min_stars_per_ccd: int = 20):
     """
     Split each image into two independent CCD halves along the Y boundary.

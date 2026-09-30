@@ -53,6 +53,7 @@ from .instrument_config import (
     SIGMA_PAIR_SCALE    as _SIGMA_PAIR_SCALE,
     SIGMA_PAIR_SKEW     as _SIGMA_PAIR_SKEW,
     SIGMA_PAIR_POINTING as _SIGMA_PAIR_POINTING,
+    SIGMA_CHIP_PX       as _SIGMA_CHIP_PX,
 )
 
 N_R = 6     # r_j dimensions for poly_order=1 (a,b,c,d,Δα0,Δδ0)
@@ -83,11 +84,14 @@ _INIT_RESID_CLIP_PX = 100.0
 def _make_image_prior(meta, poly_order=1,
                       sigma_rot_deg=None, sigma_scale=None,
                       sigma_skew=None, sigma_pointing=None,
-                      sigma_poly_px=None):
+                      sigma_poly_px=None, n_chip=0, sigma_chip_px=None):
     """
     Return (r_prior_j, C_r_prior_inv_j) for image j.
 
-    r_j = (a, b, c, d, Δα0, Δδ0 [, poly terms...])
+    r_j = (a, b, c, d, Δα0, Δδ0 [, poly terms...] [, chip_dx, chip_dy])
+      chip_dx/dy (8p model, n_chip=2): translation of the upper chip's
+      detections in pseudo-image pixels; zero mean, sigma_chip_px prior
+      (per-instrument default from instrument_config).
     Prior:
       (a,b,c,d) — from header rotation/scale (strong prior)
       (Δα0,Δδ0) — sigma = sigma_pointing mas (loose; ~100 ACS WFC pixels)
@@ -106,7 +110,8 @@ def _make_image_prior(meta, poly_order=1,
     if sigma_scale    is None: sigma_scale    = meta.get("sigma_scale",    _SIGMA_SCALE)
     if sigma_skew     is None: sigma_skew     = meta.get("sigma_skew",     _SIGMA_SKEW)
     if sigma_pointing is None: sigma_pointing = meta.get("sigma_pointing", _SIGMA_POINTING)
-    n_r = n_r_from_poly_order(poly_order)
+    n_r_poly = n_r_from_poly_order(poly_order)
+    n_r = n_r_poly + int(n_chip)
 
     rot_rad = meta["orig_rot_deg"] * DEG2RAD
     s = meta.get("initial_scale_ratio", 1.0)
@@ -135,17 +140,24 @@ def _make_image_prior(meta, poly_order=1,
     C_r_prior_inv[4, 4] = sigma_pointing ** -2  # Δα0
     C_r_prior_inv[5, 5] = sigma_pointing ** -2  # Δδ0
     # Indices 6+ (poly terms): flat prior, or a weak Gaussian if requested.
-    if sigma_poly_px is not None and n_r > 6:
+    if sigma_poly_px is not None and n_r_poly > 6:
         _sig_c = float(sigma_poly_px) / 2048.0
-        for k in range(6, n_r):
+        for k in range(6, n_r_poly):
             C_r_prior_inv[k, k] = _sig_c ** -2
+    # Trailing chip-offset columns (8p model): zero-mean Gaussian in pixels.
+    if n_chip:
+        if sigma_chip_px is None:
+            sigma_chip_px = meta.get("sigma_chip_px", _SIGMA_CHIP_PX)
+        for k in range(n_r_poly, n_r):
+            C_r_prior_inv[k, k] = float(sigma_chip_px) ** -2
 
     return r_prior, C_r_prior_inv
 
 
 def _make_pair_coupling_inv(meta_hi, poly_order=1,
                              sigma_pair_rot_deg=None, sigma_pair_scale=None,
-                             sigma_pair_skew=None, sigma_pair_pointing=None):
+                             sigma_pair_skew=None, sigma_pair_pointing=None,
+                             n_chip=0):
     """
     Return C_pair_inv (N_R × N_R) for the _hi/_lo chip coupling prior.
 
@@ -161,7 +173,7 @@ def _make_pair_coupling_inv(meta_hi, poly_order=1,
     if sigma_pair_skew     is None: sigma_pair_skew     = meta_hi.get("sigma_pair_skew",     _SIGMA_PAIR_SKEW)
     if sigma_pair_pointing is None: sigma_pair_pointing = meta_hi.get("sigma_pair_pointing", _SIGMA_PAIR_POINTING)
 
-    n_r = n_r_from_poly_order(poly_order)
+    n_r = n_r_from_poly_order(poly_order) + int(n_chip)   # chip cols uncoupled
     rot_rad = meta_hi["orig_rot_deg"] * DEG2RAD
     s = meta_hi.get("initial_scale_ratio", 1.0)
     cr, sr = np.cos(rot_rad), np.sin(rot_rad)
@@ -263,6 +275,7 @@ class BP3MSolver:
                  prior_sigma_pair_rot_deg=None, prior_sigma_pair_scale=None,
                  prior_sigma_pair_skew=None, prior_sigma_pair_pointing=None,
                  use_pair_prior=False, prior_sigma_poly_px=None,
+                 fit_chip_offset=False, prior_sigma_chip_px=None,
                  fit_epoch_distortion=False, epoch_dist_order=3,
                  epoch_gap_days=180.0, epoch_dist_sigma_mas=10.0,
                  epoch_breaks=None, epoch_dist_min_images=3,
@@ -283,7 +296,13 @@ class BP3MSolver:
         if poly_order < 1:
             raise ValueError(f"poly_order must be ≥ 1, got {poly_order}")
         self.poly_order = poly_order
-        self.N_R = n_r_from_poly_order(poly_order)
+        # 8p model (user 2026-09-30): shared linear terms + pointing + a 2-D
+        # translation of the upper chip, appended after the polynomial terms.
+        self.fit_chip_offset = bool(fit_chip_offset)
+        self.N_CHIP = 2 if self.fit_chip_offset else 0
+        self.N_R = n_r_from_poly_order(poly_order) + self.N_CHIP
+        self._sigma_chip_px_cli   = prior_sigma_chip_px
+        self._prior_sigma_chip_px = prior_sigma_chip_px if prior_sigma_chip_px is not None else _SIGMA_CHIP_PX
         self.exclude_2p_from_alignment = exclude_2p_from_alignment
         # Raw CLI overrides (None = use per-instrument value embedded in image meta).
         # _make_image_prior / _make_pair_coupling_inv fall back to meta then to
@@ -936,6 +955,15 @@ class BP3MSolver:
             X_mat = build_X_matrices(
                 X_c, Y_c, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
                 poly_order=self.poly_order)
+            # 8p: two trailing columns move the upper chip's detections by
+            # (chip_dx, chip_dy) pseudo-image px; zero rows for lower-chip
+            # stars, single-chip detectors and already-split halves.
+            chip_hi = None
+            if self.fit_chip_offset:
+                from bp3m.data_loader_flc import chip_hi_mask
+                _ycol = "Y_orig" if "Y_orig" in df.columns else "Y"
+                chip_hi = chip_hi_mask(meta, df[_ycol].to_numpy(float), img)
+                X_mat = self._append_chip_cols(X_mat, chip_hi)
 
             # HST position covariance C_hst: (n, 2, 2)
             x_err  = df["x_hst_err"].to_numpy(float)
@@ -952,6 +980,8 @@ class BP3MSolver:
                 sigma_skew     = self._sigma_skew_cli,
                 sigma_pointing = self._sigma_pointing_cli,
                 sigma_poly_px  = getattr(self, '_sigma_poly_px_cli', None),
+                n_chip         = self.N_CHIP,
+                sigma_chip_px  = self._sigma_chip_px_cli,
             )
 
             # ── Build r_init (initial iterate) ───────────────────────────────
@@ -960,7 +990,7 @@ class BP3MSolver:
             # is computed solely from the WCS header and is never modified here.
             # r_init is a copy: changing it never changes the prior.
             fcm_abcd = meta.get("fcm_abcd")
-            _n_fcm   = len(fcm_abcd) if fcm_abcd is not None else 0
+            _n_fcm   = min(len(fcm_abcd), self.N_R) if fcm_abcd is not None else 0
             r_init = r_prior.copy()
             if _n_fcm:
                 r_init[:_n_fcm] = fcm_abcd[:_n_fcm]
@@ -1002,6 +1032,7 @@ class BP3MSolver:
                 "xys"            : xys,               # (n, 2) Gaia pseudo-image xy
                 "JU"             : JU,                # (n, 2, 5)
                 "X_mat"          : X_mat,             # (n, 2, N_R)
+                "chip_hi"        : chip_hi,           # (n,) upper-chip mask for the 8p columns, or None
                 "B_mat"          : (epoch_distortion_basis(
                                         X_c, Y_c, self._ed_order,
                                         half_x=2048.0,
@@ -1036,6 +1067,14 @@ class BP3MSolver:
 
         n_total = sum(d["n"] for d in self._img_data.values() if d)
         print(f"  Done: {n_total} star-image pairs across {self.n_images} images.")
+        if self.fit_chip_offset:
+            _n_act = sum(1 for d in self._img_data.values() if d and d.get("chip_hi") is not None)
+            _n_two = sum(1 for d in self._img_data.values()
+                         if d and d.get("chip_hi") is not None and 0 < d["chip_hi"].sum() < d["n"])
+            _sig = (f"{self._sigma_chip_px_cli} px (CLI)" if self._sigma_chip_px_cli is not None
+                    else "per-instrument default (instrument_config sigma_chip_px)")
+            print(f"  8p chip offset: {_n_act} two-chip images ({_n_two} with stars on both chips); "
+                  f"prior σ_chip = {_sig}")
 
         # Diagnostic: track 5p/6p/2p stars through the three admission gates.
         # Gate 1: star appears in at least one image's sidx (has an HST match).
@@ -1084,6 +1123,7 @@ class BP3MSolver:
                     sigma_pair_scale    = self._sigma_pair_scale_cli,
                     sigma_pair_skew     = self._sigma_pair_skew_cli,
                     sigma_pair_pointing = self._sigma_pair_pointing_cli,
+                    n_chip              = self.N_CHIP,
                 )
                 self._chip_pairs.append((hi_idx, lo_idx))
                 self._chip_pair_couplings[(hi_idx, lo_idx)] = C_cp
@@ -1093,6 +1133,15 @@ class BP3MSolver:
                       f"scale={self._prior_sigma_pair_scale}, "
                       f"skew={self._prior_sigma_pair_skew}, "
                       f"point={self._prior_sigma_pair_pointing}mas)")
+
+    def _append_chip_cols(self, X_mat, chip_hi):
+        """Append the two 8p chip-offset columns to an (n, 2, N_R-2) design block."""
+        n = X_mat.shape[0]
+        X_mat = np.concatenate([X_mat, np.zeros((n, 2, 2))], axis=2)
+        if chip_hi is not None:
+            X_mat[:, 0, self.N_R - 2] = chip_hi
+            X_mat[:, 1, self.N_R - 1] = chip_hi
+        return X_mat
 
     def _init_transforms(self):
         """Initialise R_j (2×2 rotation matrix) from header info."""
@@ -1218,6 +1267,8 @@ class BP3MSolver:
             X_mat = build_X_matrices(
                 X_c, Y_c, dxs_dra0, dxs_ddec0, dys_dra0, dys_ddec0,
                 poly_order=self.poly_order)
+            if self.fit_chip_offset:
+                X_mat = self._append_chip_cols(X_mat, d.get("chip_hi"))
 
             d["xys"]  = xys
             d["JU"]   = JU

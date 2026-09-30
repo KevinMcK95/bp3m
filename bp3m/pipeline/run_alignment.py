@@ -88,6 +88,8 @@ def run_alignment(  # noqa: C901
     qso_anchors_csv: "Path | list | None" = None,
     gaia_epoch_obs: Optional[dict] = None,
     exclude_2p_from_alignment: bool = False,
+    fit_chip_offset: bool = False,
+    prior_sigma_chip_px: float | None = None,
     gaia_csv: "Path | list | None" = None,
     verbose_tests: bool = False,
     use_delve: bool = False,
@@ -160,6 +162,7 @@ def run_alignment(  # noqa: C901
         f" --clip-sigma {clip_sigma}"
         f" --poly-order {poly_order}"
         + (" --split-ccd"          if split_ccd else "")
+        + (" --fit-chip-offset"    if fit_chip_offset else "")
         + (f" --min-stars-split-ccd {min_stars_split_ccd}" if split_ccd and min_stars_split_ccd != 20 else "")
         + (" --inflate-hst-errors" if inflate_hst_errors else "")
         + (" --sparse"             if use_sparse else "")
@@ -487,6 +490,8 @@ def run_alignment(  # noqa: C901
                           prior_sigma_pair_skew=prior_sigma_pair_skew,
                           prior_sigma_pair_pointing=prior_sigma_pair_pointing,
                           use_pair_prior=use_pair_prior,
+                          fit_chip_offset=fit_chip_offset,
+                          prior_sigma_chip_px=prior_sigma_chip_px,
                           fit_epoch_distortion=fit_epoch_distortion,
                           epoch_dist_order=epoch_dist_order,
                           epoch_gap_days=epoch_gap_days,
@@ -715,6 +720,7 @@ def run_alignment(  # noqa: C901
             'epoch_dist_groupby': epoch_dist_groupby,
             'n_epoch_dist_groups': len(getattr(solver, 'ed_groups', [])),
             'poly_order':   poly_order,
+            'fit_chip_offset': fit_chip_offset,
         },
     )
 
@@ -1052,6 +1058,10 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
                 and d_img.get('alpha_raw', 0.0) >= d_img.get('alpha_max', np.inf) - 1e-9),
             ed_group=int(getattr(solver, '_ed_gidx', {}).get(img, -1)),
             **{f'r_{k}': float(r_j[k]) for k in range(6, solver.N_R)},
+            **({'chip_dx_px': float(r_j[solver.N_R - 2]), 'chip_dy_px': float(r_j[solver.N_R - 1]),
+                'sigma_chip_dx_px': float(np.sqrt(C_j[solver.N_R - 2, solver.N_R - 2])),
+                'sigma_chip_dy_px': float(np.sqrt(C_j[solver.N_R - 1, solver.N_R - 1]))}
+               if getattr(solver, 'fit_chip_offset', False) else {}),
         ))
     pd.DataFrame(rows).to_csv(output_dir / "image_transformations.csv", index=False)
 
@@ -1332,6 +1342,7 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
     config = {
         'poly_order':   solver.poly_order,
         'n_r_per_image': solver.N_R,
+        'fit_chip_offset': bool(getattr(solver, 'fit_chip_offset', False)),   # 8p: 2 chip-offset cols after the poly terms
         'n_images':     len(image_names),
         'n_stars':      solver.n_stars,
         'image_names':  image_names,   # ordered to match C_r blocks
@@ -1346,6 +1357,7 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
             'sigma_pair_scale':        solver._prior_sigma_pair_scale,
             'sigma_pair_skew':         solver._prior_sigma_pair_skew,
             'sigma_pair_pointing_mas': solver._prior_sigma_pair_pointing,
+            'sigma_chip_px':           getattr(solver, '_prior_sigma_chip_px', None),
         },
         # Per-image prior: mean vector r_prior and precision matrix C_r_prior_inv
         # (C_r_prior_inv varies per image because the Jacobian depends on rotation)

@@ -270,6 +270,13 @@ def _parse_args():
                     help='Minimum stars required on each CCD half to allow splitting. '
                          'Images where either half has fewer than N stars are kept unsplit. '
                          'Only applies when --no_split_ccd is not set. (default: 20)')
+    bp.add_argument('--fit_chip_offset', action='store_true',
+                    help='8p image model: the two chips of an unsplit ACS/WFC or WFC3/UVIS image share '
+                         'the 4 linear terms and the pointing, plus a 2-D translation of the upper chip '
+                         '(prior width --prior_sigma_chip_px). Meant for --no_split_ccd runs.')
+    bp.add_argument('--prior_sigma_chip_px', type=float, default=None,
+                    help='8p chip-offset prior width in pixels (default: per-instrument, '
+                         'ACS 0.08 / UVIS 0.045 from the split-CCD hi-lo pointing scatter)')
     bp.add_argument('--two_phase_align', action='store_true',
                     help='Two-phase alignment: converge with alpha OFF first '
                          '(rejection via adaptive thresholds only), then '
@@ -1443,6 +1450,8 @@ def main():
                 poly_order=args.poly_order,
                 split_ccd=not args.no_split_ccd,
                 min_stars_split_ccd=args.min_stars_split_ccd,
+                fit_chip_offset=args.fit_chip_offset,
+                prior_sigma_chip_px=args.prior_sigma_chip_px,
                 inflate_hst_errors=not args.no_inflate_hst_errors,
                 two_phase_align=args.two_phase_align,
                 fit_epoch_distortion=args.fit_epoch_distortion,
@@ -1492,6 +1501,7 @@ def main():
                 'clip_sigma': args.bp3m_clip_sigma,
                 'poly_order': args.poly_order,
                 'split_ccd': not args.no_split_ccd,
+                'fit_chip_offset': args.fit_chip_offset,
                 'inflate_hst_errors': not args.no_inflate_hst_errors,
                 'two_phase_align': args.two_phase_align,
                 'pos_err_floor': args.bp3m_pos_err_floor,
@@ -1624,6 +1634,8 @@ def main():
                 poly_order=args.poly_order,
                 split_ccd=not args.no_split_ccd,
                 min_stars_split_ccd=args.min_stars_split_ccd,
+                fit_chip_offset=args.fit_chip_offset,
+                prior_sigma_chip_px=args.prior_sigma_chip_px,
                 inflate_hst_errors=not args.no_inflate_hst_errors,
                 two_phase_align=args.two_phase_align,
                 fit_epoch_distortion=args.fit_epoch_distortion,
@@ -1720,6 +1732,8 @@ def main():
                 poly_order=args.poly_order,
                 split_ccd=not args.no_split_ccd,
                 min_stars_split_ccd=args.min_stars_split_ccd,
+                fit_chip_offset=args.fit_chip_offset,
+                prior_sigma_chip_px=args.prior_sigma_chip_px,
                 inflate_hst_errors=not args.no_inflate_hst_errors,
                 two_phase_align=args.two_phase_align,
                 fit_epoch_distortion=args.fit_epoch_distortion,

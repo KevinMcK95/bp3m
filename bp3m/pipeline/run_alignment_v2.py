@@ -542,8 +542,9 @@ def _compute_full_catalog_residuals_from_df(
 
         dt_arr = hst_yr - epoch_arr
 
+        _n_chip = int(getattr(solver, 'N_CHIP', 0))
         if poly_order == 1:
-            X_mat = np.zeros((n, 2, n_r))
+            X_mat = np.zeros((n, 2, n_r - _n_chip))
             X_mat[:, 0, 0] = X_c;         X_mat[:, 0, 1] = Y_c
             X_mat[:, 0, 4] = dxs_dra0;    X_mat[:, 0, 5] = dxs_ddec0
             X_mat[:, 1, 2] = X_c;         X_mat[:, 1, 3] = Y_c
@@ -555,6 +556,15 @@ def _compute_full_catalog_residuals_from_df(
                                dxs_dra0[k], dxs_ddec0[k],
                                dys_dra0[k], dys_ddec0[k], poly_order)
                 for k in range(n)])
+        if _n_chip:
+            # 8p chip-offset columns; the catalog has no Y_orig, so the GDC-frame
+            # y decides the chip (the inter-chip gap keeps both sides clear of y_split)
+            from bp3m.data_loader_flc import chip_hi_mask
+            _hi = chip_hi_mask(meta, y_gdc, img)
+            X_mat = np.concatenate([X_mat, np.zeros((n, 2, 2))], axis=2)
+            if _hi is not None:
+                X_mat[:, 0, n_r - 2] = _hi
+                X_mat[:, 1, n_r - 1] = _hi
 
         U_arr = np.zeros((n, 2, 5))
         U_arr[:, 0, 0] = 1.0;          U_arr[:, 1, 1] = 1.0
@@ -674,6 +684,8 @@ def run_alignment_v2(
     use_soft_weights: bool = False,
     student_t_nu: float = 50.0,
     exclude_2p_from_alignment: bool = False,
+    fit_chip_offset: bool = False,
+    prior_sigma_chip_px: float | None = None,
 ) -> Path:
     """
     Run BP3M v2 alignment using the master_combined_v2.csv cross-match catalog.
@@ -785,6 +797,10 @@ def run_alignment_v2(
                 -float(row.get("delta_ra0_mas", 0.0)),
                 -float(row.get("delta_dec0_mas", 0.0)),
             ])
+            # Warm-start the 8p chip offsets too when v1 fitted them with the same layout
+            if fit_chip_offset and "chip_dx_px" in row.index and poly_order == 1:
+                v1_abcd[img_key] = np.concatenate([v1_abcd[img_key],
+                                                   [float(row["chip_dx_px"]), float(row["chip_dy_px"])]])
             v1_alpha[img_key] = float(row["alpha"]) if "alpha" in row.index else 1.0
         n_matched = sum(1 for k in imgs if k in v1_abcd)
         print(f"  Loaded v1 BP3M results: {len(v1_abcd)} images, "
@@ -827,6 +843,8 @@ def run_alignment_v2(
         prior_sigma_pair_skew=prior_sigma_pair_skew,
         prior_sigma_pair_pointing=prior_sigma_pair_pointing,
         use_pair_prior=use_pair_prior,
+        fit_chip_offset=fit_chip_offset,
+        prior_sigma_chip_px=prior_sigma_chip_px,
     )
 
     # ── Override diffuse PM prior for HST-only stars ──────────────────────────
@@ -1419,6 +1437,7 @@ def run_alignment_v2(
             "mcmc_posteriors":   mcmc_posteriors,
             "clip_sigma":        clip_sigma,
             "poly_order":        poly_order,
+            "fit_chip_offset":   fit_chip_offset,
             "pos_err_floor":     pos_err_floor,
             "pos_corr_table":    (str(pos_corr_table) if pos_corr_table else None),
             "hst_enable_iter":   hst_enable_iter,

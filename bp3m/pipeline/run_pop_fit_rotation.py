@@ -1223,6 +1223,8 @@ def run_pop_fit_rotation(
     v1_prior_sigma_skew          = _v1_hp.get('sigma_skew',               None)
     v1_prior_sigma_pointing      = _v1_hp.get('sigma_pointing_mas',       None)
     v1_use_pair_prior            = _v1_hp.get('use_pair_prior',             False)
+    v1_fit_chip_offset           = bool(v1_cfg.get('fit_chip_offset', False))   # 8p: mirror the v1 layout
+    v1_prior_sigma_chip_px       = _v1_hp.get('sigma_chip_px',             None)
     v1_prior_sigma_pair_rot_deg  = _v1_hp.get('sigma_pair_rot_deg',        None)
     v1_prior_sigma_pair_scale    = _v1_hp.get('sigma_pair_scale',           None)
     v1_prior_sigma_pair_skew     = _v1_hp.get('sigma_pair_skew',            None)
@@ -1385,7 +1387,9 @@ def run_pop_fit_rotation(
                         prior_sigma_pair_scale=v1_prior_sigma_pair_scale,
                         prior_sigma_pair_skew=v1_prior_sigma_pair_skew,
                         prior_sigma_pair_pointing=v1_prior_sigma_pair_pointing,
-                        use_pair_prior=v1_use_pair_prior)
+                        use_pair_prior=v1_use_pair_prior,
+                        fit_chip_offset=v1_fit_chip_offset,
+                        prior_sigma_chip_px=v1_prior_sigma_chip_px)
     print(f"Stars: {solver.n_stars}  N_R/image: {solver.N_R}")
 
     # ── Load v1 r_hat and alpha ────────────────────────────────────────────────
@@ -2100,6 +2104,7 @@ def run_pop_fit_rotation(
             'mu_pop_dec': float(mu_pop_current[1]),
             'n_members': int(len(member_sidx)),
             'split_ccd': v1_split_ccd,
+            'fit_chip_offset': v1_fit_chip_offset,
             'f_star_mult': float(f_current),
             'sigma_f_star_mult': None if np.isnan(sigma_f_final) else float(sigma_f_final),
             'theta_offset_deg': float(np.degrees(theta_current)),
@@ -2116,6 +2121,7 @@ def run_pop_fit_rotation(
                 'sigma_pair_scale':        solver._prior_sigma_pair_scale,
                 'sigma_pair_skew':         solver._prior_sigma_pair_skew,
                 'sigma_pair_pointing_mas': solver._prior_sigma_pair_pointing,
+                'sigma_chip_px':           getattr(solver, '_prior_sigma_chip_px', None),
             },
             'image_priors': {
                 img: {

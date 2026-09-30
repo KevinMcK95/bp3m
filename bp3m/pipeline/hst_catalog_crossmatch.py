@@ -341,6 +341,7 @@ def _load_all_detections(field_dir: Path,
     C_r          = np.load(c_r_path)
     n_sub        = len(transform_df)
     n_r          = C_r.shape[0] // n_sub
+    C_r, transform_df, n_r = _strip_chip_offset_cols(bp3m_dir, C_r, transform_df, n_r)
     poly_order   = _infer_poly_order(n_r)
 
     # Epoch-distortion correction from the v1 fit (None if not fitted):
@@ -702,6 +703,28 @@ def _load_all_detections(field_dir: Path,
     result = pd.concat(per_image_dfs, ignore_index=True)
     result.attrs['pre_zp_applied'] = _apply_pre_zp
     return result
+
+
+def _strip_chip_offset_cols(bp3m_dir: Path, C_r: np.ndarray, transform_df: pd.DataFrame, n_r: int):
+    """An 8p v1 fit (run_config fit_chip_offset) appends two per-image chip-offset
+    columns after the polynomial terms.  The anchor path here rebuilds X_mat from
+    poly_order alone, so drop those rows/cols: the <=0.1 px upper-chip offset is
+    ignored in the warm start and refitted by the solver."""
+    import json as _json
+    cfg_p = bp3m_dir / 'run_config.json'
+    try:
+        cfg = _json.load(open(cfg_p)) if cfg_p.exists() else {}
+    except Exception:
+        cfg = {}
+    if not cfg.get('fit_chip_offset'):
+        return C_r, transform_df, n_r
+    n_sub, nrp = len(transform_df), n_r - 2
+    keep = np.concatenate([np.arange(j * n_r, j * n_r + nrp) for j in range(n_sub)])
+    C_r = C_r[np.ix_(keep, keep)]
+    transform_df = transform_df.drop(columns=[c for c in (f'r_{nrp}', f'r_{nrp + 1}') if c in transform_df.columns])
+    print(f"  Note: v1 fit_chip_offset — dropped the 2 chip-offset columns per image "
+          f"(N_R {n_r} -> {nrp}); chip offsets are ignored in the anchor warm start")
+    return C_r, transform_df, nrp
 
 
 def _infer_poly_order(n_r: int) -> int:
@@ -4350,6 +4373,7 @@ def run_hst_crossmatch(
             C_r_full      = np.load(c_r_path)
             n_sub4        = len(transform_df4)
             n_r4          = C_r_full.shape[0] // n_sub4
+            C_r_full, transform_df4, n_r4 = _strip_chip_offset_cols(bp3m_dir, C_r_full, transform_df4, n_r4)
             poly_order4   = _infer_poly_order(n_r4)
 
             # Reorder if run_config.json is available
