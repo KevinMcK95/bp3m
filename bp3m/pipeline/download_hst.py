@@ -52,6 +52,9 @@ _GAIA_DR3_MJD = Time('2017-05-28').mjd
 # STScI PSF files occasionally use abbreviated names that differ from MAST.
 _PSF_FILTER_NORM = {
     'F850L':  'F850LP',   # STDPSF_ACSWFC_F850L.fits → MAST F850LP
+    'F475Wx': 'F475W',    # STScI ships WFC3/UVIS F475W as STDPSF_WFC3UV_F475Wx.fits; without this
+                          # mapping UVIS F475W was never a PSF+GDC combo and its images were
+                          # excluded from download/fitting (NGC_55: 15 images, found 2026-09-30)
 }
 
 def _normalise_filter(name: str) -> str:
