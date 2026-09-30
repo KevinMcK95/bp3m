@@ -201,8 +201,10 @@ def find_jit(flc_path, hdr):
 # ---------------------------------------------------------------- the applier ----
 class PosCorrBasis:
     def __init__(self, spec: str):
-        """spec = 'DIR' (all basis_*.json in DIR) or 'DIR:TAG'."""
-        d, _, tag = str(spec).partition(':'); files = sorted(glob.glob(os.path.join(d, f'basis_*_{tag or "*"}.json')))
+        """spec = 'DIR' (all basis_*.json in DIR), 'DIR:TAG', or 'DIR:TAG:noorbit' (orbit-conditioned terms left out;
+        for tests of the rest of the correction while the orbit block is being validated)."""
+        parts = str(spec).split(':'); d = parts[0]; tag = parts[1] if len(parts) > 1 else ''; self.use_orbit = not (len(parts) > 2 and parts[2] == 'noorbit')
+        files = sorted(glob.glob(os.path.join(d, f'basis_*_{tag or "*"}.json')))
         if not files: raise FileNotFoundError(f'pos_corr_basis: no basis_*.json in {spec}')
         self.models = {}
         for f in files:
@@ -214,7 +216,7 @@ class PosCorrBasis:
 
     @property
     def summary(self):
-        return f'{len(self.models)} basis models from {self.dir}: ' + ', '.join(f'{k[0]}/{k[1]}' for k in sorted(self.models))
+        return f'{len(self.models)} basis models from {self.dir}' + ('' if self.use_orbit else ' (orbit terms OFF)') + ': ' + ', '.join(f'{k[0]}/{k[1]}' for k in sorted(self.models))
 
     @staticmethod
     def read_header(flc_path) -> dict:
@@ -248,8 +250,9 @@ class PosCorrBasis:
         lsky = np.log10(np.clip(np.nan_to_num(np.asarray(tbl['sky'], float), nan=1.0), 0.1, None)) if 'sky' in tbl.dtype.names else None
         phx, phy = np.mod(x, 1.0), np.mod(y, 1.0)                                                   # as extract_header_frame
         z = None
-        if spec.get('orbit_features'):
+        if spec.get('orbit_features') and self.use_orbit:
             jit = find_jit(hdr.get('_flc_path', ''), hdr); zrow, ok = orbit_features(hdr, jit, **(orbit or {})) if jit is not None else (np.zeros(len(ORBIT_FEATURES)), False)
+            feats = spec.get('orbit_feature_list') or ORBIT_FEATURES; zrow = np.array([zrow[ORBIT_FEATURES.index(f)] for f in feats])
             z = np.tile(zrow, (n, 1))
         A = model.design(x, y_chip, chip, t, dm, lsky=lsky, phx=phx, phy=phy, z=z)
         return A @ bx, A @ by
