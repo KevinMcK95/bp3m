@@ -263,7 +263,7 @@ def build_fallback_hst_images(field_dir, matches: pd.DataFrame,
     pcm = None
     if pos_corr_model is not None:
         from bp3m.pos_corr_model import PosCorrModel
-        pcm = PosCorrModel(pos_corr_model)
+        from bp3m.pos_corr_basis import make_pos_corr; pcm = make_pos_corr(pos_corr_model)
     field_dir = Path(field_dir)
     hst_root = field_dir / 'HST' / 'mastDownload' / 'HST'
     matches = (matches if 'star_id' in matches.columns

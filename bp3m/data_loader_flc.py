@@ -36,6 +36,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+from bp3m.pos_corr_basis import make_pos_corr   # basis or MLP GDC-correction applier (2026-09-30)
 import pandas as pd
 from astropy.io import fits
 from bp3m.instrument_config import get_instrument_config
@@ -78,8 +79,8 @@ def _loader_pool_init(g2i, pos_err_floor, pos_corr_table, pin_blas=True, pos_cor
     else:
         _LDR_STATE["pc"] = None
     if pos_corr_model is not None:
-        from bp3m.pos_corr_model import PosCorrModel
-        _LDR_STATE["pcm"] = PosCorrModel(pos_corr_model)
+        from bp3m.pos_corr_basis import make_pos_corr      # basis (basis_*.json) or MLP (*_shared_*.json) model dir
+        _LDR_STATE["pcm"] = make_pos_corr(pos_corr_model)
     else:
         _LDR_STATE["pcm"] = None
 
@@ -813,8 +814,8 @@ def load_image_data_flc(data_root, field_name: str,
         _pos_corr = PseudoGDCSet(pos_corr_table)
         print(f"  Pseudo-GDC corrections: {_pos_corr.summary}")
     if pos_corr_model is not None:
-        from bp3m.pos_corr_model import PosCorrModel
-        print(f"  Learned GDC correction (pos_corr_model): {PosCorrModel(pos_corr_model).summary}")
+        from bp3m.pos_corr_basis import make_pos_corr
+        print(f"  Learned GDC correction (pos_corr_model): {make_pos_corr(pos_corr_model).summary}")
 
     skipped = []
     observed_gaia_ids: set = set()
@@ -1194,7 +1195,7 @@ def load_image_data_flc(data_root, field_name: str,
             delve_only_stars = _build_delve_only_stars_df(
                 img_dir, img_name, gaia_hst_idx, delve_id_to_gaia_id, pos_err_floor,
                 delve_use_for_align=delve_use_for_align,
-                pos_corr_model=(_LDR_STATE.get('pcm') if _LDR_STATE.get('pcm') is not None else (PosCorrModel(pos_corr_model) if pos_corr_model else None)),
+                pos_corr_model=(_LDR_STATE.get('pcm') if _LDR_STATE.get('pcm') is not None else (make_pos_corr(pos_corr_model) if pos_corr_model else None)),
                 pos_corr=_pos_corr, meta=images.get(img_name))
             if delve_only_stars is not None and len(delve_only_stars):
                 # Keep only sources that made it into gaia_catalog
