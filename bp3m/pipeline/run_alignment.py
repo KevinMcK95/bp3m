@@ -474,6 +474,13 @@ def run_alignment(  # noqa: C901
                   'HST x CFHT cross-match (Step 4d) first')
 
     # ── Initialise solver ─────────────────────────────────────────────────────
+    # Skew prior: with a learned GDC correction the ACS time-dependent skew is
+    # removed and the Phase D width applies; without one the raw TDD (~1e-4) must
+    # stay free (instrument_config, 2026-09-30).  CLI --prior_sigma_skew overrides.
+    if prior_sigma_skew is None and pos_corr_model:
+        from bp3m.instrument_config import SIGMA_SKEW_CORRECTED
+        prior_sigma_skew = SIGMA_SKEW_CORRECTED
+        print(f"  skew prior: pos_corr_model applied -> sigma_skew = {prior_sigma_skew:g}")
     if use_sparse and fit_epoch_distortion:
         raise ValueError("--fit_epoch_distortion is not supported with --sparse yet")
     SolverClass = BP3MSolverSparse if use_sparse else BP3MSolver

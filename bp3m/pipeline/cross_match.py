@@ -26,9 +26,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import pandas as pd
 
 from bp3m.instrument_config import (
-    SIGMA_ROT_DEG   as _DEFAULT_SIGMA_ROT_DEG,
-    SIGMA_SCALE     as _DEFAULT_SIGMA_SCALE,
-    SIGMA_SKEW      as _DEFAULT_SIGMA_SKEW,
+    XMATCH_SIGMA_ROT_DEG   as _DEFAULT_SIGMA_ROT_DEG,
+    XMATCH_SIGMA_SCALE     as _DEFAULT_SIGMA_SCALE,
+    XMATCH_SIGMA_SKEW      as _DEFAULT_SIGMA_SKEW,
 )
 
 

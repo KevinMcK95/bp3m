@@ -343,9 +343,9 @@ def _parse_args():
                     help='Plate rotation prior width in degrees (default: per-instrument, ACS 0.03 / UVIS 0.02 '
                          'from the 2026-09-30 Phase D archive fits; pre-2026-09-30: 0.1)')
     bp.add_argument('--prior_sigma_scale', type=float, default=None,
-                    help='Plate scale prior width, fractional (default 1e-5 from Phase D; pre-2026-09-30: 5e-4)')
+                    help='Plate scale prior width, fractional (default 1e-4; Phase D measures 5e-6 but the prior mean lacks VAFACTOR; pre-2026-09-30: 5e-4)')
     bp.add_argument('--prior_sigma_skew', type=float, default=None,
-                    help='Plate skew prior width (default 5e-6 from Phase D; pre-2026-09-30: 2e-4)')
+                    help='Plate skew prior width (default 1e-4 without a correction model, 1e-5 with --pos_corr_model; pre-2026-09-30: 2e-4)')
     bp.add_argument('--prior_sigma_pointing', type=float, default=None,
                     help='Pointing offset prior width in mas (default 5000.0)')
     bp.add_argument('--inflate_alpha_max', type=float, default=3.0,

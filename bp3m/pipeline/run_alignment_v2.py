@@ -680,6 +680,7 @@ def run_alignment_v2(
     bp3m_dir: Path | None = None,
     pos_err_floor: float = 0.05,
     pos_corr_table: "str | Path | None" = None,
+    pos_corr_model: "str | None" = None,
     det_chi2_threshold: float | None = None,
     use_soft_weights: bool = False,
     student_t_nu: float = 50.0,
@@ -752,6 +753,7 @@ def run_alignment_v2(
         pos_err_floor=pos_err_floor,
         det_chi2_threshold=det_chi2_threshold,
         pos_corr_table=pos_corr_table,
+        pos_corr_model=pos_corr_model,
     )
 
     if not images:
@@ -828,6 +830,10 @@ def run_alignment_v2(
               "using transformation.csv initialization.")
 
     # ── Initialise solver ─────────────────────────────────────────────────────
+    if prior_sigma_skew is None and pos_corr_model:      # as run_alignment (2026-09-30)
+        from bp3m.instrument_config import SIGMA_SKEW_CORRECTED
+        prior_sigma_skew = SIGMA_SKEW_CORRECTED
+        print(f"  skew prior: pos_corr_model applied -> sigma_skew = {prior_sigma_skew:g}")
     SolverClass = BP3MSolverSparse if use_sparse else BP3MSolver
     solver = SolverClass(
         imgs, filtered_spi, gaia_catalog,
@@ -1440,6 +1446,7 @@ def run_alignment_v2(
             "fit_chip_offset":   fit_chip_offset,
             "pos_err_floor":     pos_err_floor,
             "pos_corr_table":    (str(pos_corr_table) if pos_corr_table else None),
+            "pos_corr_model":    (str(pos_corr_model) if pos_corr_model else None),
             "hst_enable_iter":   hst_enable_iter,
             "hst_max_pm_unc":    hst_max_pm_unc,
             "hst_max_per_image": hst_max_per_image,

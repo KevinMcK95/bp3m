@@ -50,10 +50,19 @@ _DEFAULT_CONFIG = {
     #   skew                MAD 2.6-3.9e-6 ACS, 3.7-4.8e-6 UVIS
     #   upper-chip offset   MAD 7-8 mpx, consistent with posterior noise (<~5 mpx)
     # Pre-2026-09-30 values: 0.10 deg / 5e-4 / 2e-4 (40-80x looser than the data).
-    # These are also the cross-match (Step 4) plate priors and part of its cache key.
+    # BUT the Phase D widths are measured around the header WITH the basis GDC
+    # correction applied, while BP3M's prior means are initial_scale_ratio (a
+    # constant) and zero skew.  Leo I 2026-09-30: without the correction the ACS
+    # posteriors sit at skew +5e-5..+8e-5 (uncorrected TDD) and scale -4.5e-5 from
+    # the constant; even with the correction the scale scatters 4-8e-5 (VAFACTOR
+    # is not in the prior mean).  A 1e-5/5e-6 prior around those means biased
+    # mu_pop by 7 sigma.  So: rotation and chip take the Phase D widths; scale
+    # stays 1e-4 until the prior mean carries VAFACTOR; skew is 1e-4 without a
+    # correction model and sigma_skew_corrected with one (run_alignment picks).
     "sigma_rot_deg":  0.03,   # rotation prior width (deg); UVIS override below
-    "sigma_scale":    1e-5,   # pixel scale ratio prior width (fractional)
-    "sigma_skew":     5e-6,   # on- and off-axis skew prior width
+    "sigma_scale":    1e-4,   # pixel scale ratio prior width (fractional)
+    "sigma_skew":     1e-4,   # on- and off-axis skew prior width, no correction model (ACS TDD)
+    "sigma_skew_corrected": 1e-5,  # skew prior width when a pos_corr_model is applied (Phase D 3-5e-6; Fornax UVIS 1.2e-5)
     "sigma_pointing": 5000.0, # pointing offset prior width (mas)
     # 8p model (fit_chip_offset): 2-D translation of the upper chip relative to
     # the lower one, in pixels, on top of the shared linear terms.  Phase D
@@ -123,9 +132,17 @@ def get_instrument_config(instrument: str, detector: str) -> dict:
 # ── Module-level aliases (backward compatibility) ─────────────────────────────
 # Code that imports these names directly still works; they equal the default
 # values.  New code should call get_instrument_config() for per-instrument values.
+# The Step-4 cross-match (cross_match.py, cross_match_delve.py) fits raw header ->
+# Gaia without any correction model and writes these widths into its cache key,
+# so it keeps the pre-2026-09-30 widths (XMATCH_*): tightening them would both
+# bias its uncorrected plate fits and re-cross-match the whole archive.
+XMATCH_SIGMA_ROT_DEG = 0.10
+XMATCH_SIGMA_SCALE   = 5e-4
+XMATCH_SIGMA_SKEW    = 2e-4
 SIGMA_ROT_DEG        = _DEFAULT_CONFIG["sigma_rot_deg"]
 SIGMA_SCALE          = _DEFAULT_CONFIG["sigma_scale"]
 SIGMA_SKEW           = _DEFAULT_CONFIG["sigma_skew"]
+SIGMA_SKEW_CORRECTED = _DEFAULT_CONFIG["sigma_skew_corrected"]
 SIGMA_POINTING       = _DEFAULT_CONFIG["sigma_pointing"]
 SIGMA_PAIR_ROT_DEG   = _DEFAULT_CONFIG["sigma_pair_rot_deg"]
 SIGMA_PAIR_SCALE     = _DEFAULT_CONFIG["sigma_pair_scale"]

@@ -77,6 +77,9 @@ def main():
                         help='Comma-separated pseudo-GDC npz table(s) (bp3m --pos_corr_table), '
                              'applied in memory at catalog load. Default: whatever the v1 run '
                              'recorded in BP3M_results/run_config.json (possibly none)')
+    parser.add_argument('--pos_corr_model', type=str, default=None,
+                        help='Learned GDC-correction model spec (bp3m --pos_corr_model, e.g. DIR:TAG[:noorbit]); '
+                             'default: the v1 run\'s value from BP3M_results/run_config.json; "none" disables')
     parser.add_argument('--no_pos_corr_table', action='store_true',
                         help='Apply no pseudo-GDC tables even if the v1 run used some')
     parser.add_argument('--hst_enable_iter', type=int, default=5,
@@ -173,7 +176,7 @@ def main():
         import json as _json
         _v1_cfg = _json.load(open(_v1_cfg_path))
     for _key, _default in (('poly_order', 1), ('pos_err_floor', 0.05), ('pos_corr_table', None),
-                           ('fit_chip_offset', False)):
+                           ('fit_chip_offset', False), ('pos_corr_model', None)):
         if getattr(args, _key) is None:
             if _key in _v1_cfg:
                 setattr(args, _key, _v1_cfg[_key])
@@ -181,6 +184,8 @@ def main():
             else:
                 setattr(args, _key, _default)
                 print(f"  {_key} not specified and not in v1 run_config.json — defaulting to {_default}")
+    if str(args.pos_corr_model).lower() == 'none':
+        args.pos_corr_model = None
     if args.no_pos_corr_table:
         args.pos_corr_table = None
         print("  --no_pos_corr_table: pseudo-GDC tables disabled")
@@ -217,6 +222,7 @@ def main():
         prior_sigma_chip_px  = args.prior_sigma_chip_px,
         pos_err_floor        = args.pos_err_floor,
         pos_corr_table       = args.pos_corr_table,
+        pos_corr_model       = args.pos_corr_model,
         use_sparse           = args.sparse,
         no_prefilter         = args.no_prefilter,
         hst_enable_iter      = args.hst_enable_iter,
