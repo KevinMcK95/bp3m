@@ -1474,4 +1474,6 @@ def run_alignment_v2(
             print(f"  WARNING: plots failed — {exc}")
 
     print(f"\n  Results written to: {output_bp3m}")
+    from bp3m.command_record import write_command_record
+    write_command_record(output_bp3m, 'bp3m v2 alignment')
     return output_bp3m

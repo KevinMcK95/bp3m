@@ -1640,6 +1640,8 @@ def main():
             print("─"*50)
             print(f"End: {_dt.now():%Y-%m-%d %H:%M:%S}")
             print(f"\nIndividual fitting complete: {_n_ok} succeeded, {_n_fail} failed")
+            from bp3m.command_record import write_command_record
+            write_command_record(_indv_root, 'bp3m indv fits', note=f'{_n_ok} succeeded, {_n_fail} failed')
 
         elif args.test_synthetic:
             # Run BP3M on the synthetic directory tree.

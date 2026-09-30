@@ -165,6 +165,8 @@ def main() -> None:
             n_fail += 1
 
     print(f"\n{n_ok} succeeded, {n_fail} failed.")
+    from bp3m.command_record import write_command_record
+    write_command_record(nb_out_dir, 'bp3m-notebooks')
     print(f"Open with:\n  jupyter notebook {nb_out_dir}/")
 
 

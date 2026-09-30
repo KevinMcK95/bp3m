@@ -3679,6 +3679,8 @@ def run_pop_fit(
 
     elapsed = time.time() - t_start
     print(f"\n  Done in {elapsed:.1f}s")
+    from bp3m.command_record import write_command_record
+    write_command_record(output_pfr, 'bp3m-pop-fit')
     print(f"  Results: {output_pfr}")
     return output_pfr
 

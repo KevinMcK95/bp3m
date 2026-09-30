@@ -2200,6 +2200,8 @@ def run_pop_fit_rotation(
 
     t_elapsed = time.time() - t_start
     print(f"\n  Done in {t_elapsed:.1f}s")
+    from bp3m.command_record import write_command_record
+    write_command_record(output_pfr, 'bp3m-pop-fit-rotation')
     return output_pfr
 
 

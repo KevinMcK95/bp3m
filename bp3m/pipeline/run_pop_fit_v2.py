@@ -443,10 +443,8 @@ def _catalog_main(argv=None):
         _plot_results(df, member, eligible, mu, out_dir / 'plots')
         print("  Saved: plots/")
 
-    from datetime import datetime
-    with open(out_dir / 'bp3m_pop_fit_v2_command.txt', 'a') as f:
-        f.write(f"# {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                + " ".join(sys.argv) + "\n")
+    from bp3m.command_record import write_command_record
+    write_command_record(out_dir, 'bp3m-pop-fit-v2 (catalog mode)')
     return 0
 
 

@@ -1379,5 +1379,7 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
     }
     if run_config:
         config.update(run_config)
+    from bp3m.command_record import write_command_record
+    write_command_record(output_dir, 'bp3m v1 alignment')
     with open(output_dir / 'run_config.json', 'w') as _f:
         _json.dump(config, _f, indent=2)
