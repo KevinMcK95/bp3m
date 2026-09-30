@@ -198,6 +198,52 @@ def find_jit(flc_path, hdr):
     return Path(hits[0]) if hits else None
 
 
+_CTX = {}   # mast root -> field orbit context (built once per process)
+
+
+def field_orbit_context(mast):
+    """Per-field context for the orbit features, mirroring hst_dist_corr/ml/orbit_features.py:
+    an index EXPNAME[:8] -> (jit_path, ext) over EVERY *_jit.fits under <mast> (an exposure's ASN_ID often names a
+    product association whose JIT holds only part of the visit, so the header ASN alone misses ~20% of exposures), and
+    the visit context first_vf (first exposure by EXPSTART of its visit x filter, only if it has a jitter track) and
+    t_in_visit_h (hours since the visit's first exposure; 0 without a track).  Cached per process."""
+    mast = str(mast)
+    if mast in _CTX: return _CTX[mast]
+    from astropy.io import fits
+    jit_idx = {}
+    for jp in sorted(glob.glob(os.path.join(mast, '*', '*_jit.fits'))):
+        try:
+            with fits.open(jp, memmap=True) as hd:
+                for i in range(1, len(hd)):
+                    nm = str(hd[i].header.get('EXPNAME', '')).lower()[:8]
+                    if nm and nm not in jit_idx and hd[i].data is not None and len(hd[i].data) >= 3: jit_idx[nm] = (jp, i)
+        except Exception:
+            continue
+    rows = []
+    for fp in sorted(glob.glob(os.path.join(mast, '*', '*_flc.fits'))):
+        try:
+            h = fits.getheader(fp, 0)
+        except Exception:
+            continue
+        root = str(h.get('ROOTNAME', os.path.basename(fp)[:9])).lower()
+        f = h.get('FILTER')
+        if not f:
+            f1, f2 = str(h.get('FILTER1', '')), str(h.get('FILTER2', ''))
+            f = f1 if (f1.startswith('F') and 'CLEAR' not in f1) else f2
+        rows.append((root, root[:6], str(f), float(h.get('EXPSTART') or np.inf), root[:8] in jit_idx))
+    rows.sort(key=lambda r: r[3])
+    seen_vf, vmin, ctx = set(), {}, {}
+    for root, visit, filt, t0, has in rows:
+        vmin.setdefault(visit, t0)
+        first = (visit, filt) not in seen_vf; seen_vf.add((visit, filt))
+        ctx[root] = dict(first_vf=float(first and has), t_in_visit_h=((t0 - vmin[visit]) * 24.0 if has and np.isfinite(t0) else 0.0))
+    n_has = sum(r[4] for r in rows)
+    print(f"  pos_corr orbit context [{os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(mast))))}]: {len(rows)} FLCs, "
+          f"{len(jit_idx)} exposures indexed from {len(set(v[0] for v in jit_idx.values()))} JIT files, "
+          f"{n_has} FLCs with a jitter track ({len(rows) - n_has} without -> orbit terms at 0)", flush=True)
+    _CTX[mast] = (jit_idx, ctx); return _CTX[mast]
+
+
 # ---------------------------------------------------------------- the applier ----
 class PosCorrBasis:
     def __init__(self, spec: str):
@@ -235,6 +281,22 @@ class PosCorrBasis:
             f = f1 if (f1.startswith('F') and 'CLEAR' not in f1) else f2
         return str(f)
 
+    def orbit_row(self, hdr, orbit=None):
+        """(9 scaled orbit features, ok) for one exposure: JIT track found through the field index (fallback: the
+        header's ASN), visit context from the field unless `orbit` (dict first_vf, t_in_visit_h) overrides it."""
+        flc = str(hdr.get('_flc_path', '')); root = str(hdr.get('ROOTNAME', '') or os.path.basename(flc)[:9]).lower()
+        p = Path(flc).resolve(); mast = None
+        for parent in p.parents:
+            if (parent / 'mastDownload' / 'HST').is_dir(): mast = parent / 'mastDownload' / 'HST'; break
+        jit, vctx = None, {}
+        if mast is not None:
+            jit_idx, ctx = field_orbit_context(mast)
+            hit = jit_idx.get(root[:8]); jit = hit[0] if hit else None; vctx = ctx.get(root, {})
+        if jit is None: jit = find_jit(flc, hdr)
+        kw = dict(vctx); kw.update(orbit or {})
+        if jit is None: return np.zeros(len(ORBIT_FEATURES)), False
+        return orbit_features(hdr, jit, **{k: kw[k] for k in ('first_vf', 't_in_visit_h') if k in kw})
+
     def bias(self, tbl, hdr, orbit=None):
         """(bias_x, bias_y) in GDC px per catalog row; corrected = x_gdc - bias.  orbit: optional dict(first_vf, t_in_visit_h)."""
         inst, det = str(hdr.get('INSTRUME')), str(hdr.get('DETECTOR')); key = f'{inst}/{det}'; filt = self._filter(hdr)
@@ -251,7 +313,7 @@ class PosCorrBasis:
         phx, phy = np.mod(x, 1.0), np.mod(y, 1.0)                                                   # as extract_header_frame
         z = None
         if spec.get('orbit_features') and self.use_orbit:
-            jit = find_jit(hdr.get('_flc_path', ''), hdr); zrow, ok = orbit_features(hdr, jit, **(orbit or {})) if jit is not None else (np.zeros(len(ORBIT_FEATURES)), False)
+            zrow, ok = self.orbit_row(hdr, orbit)
             feats = spec.get('orbit_feature_list') or ORBIT_FEATURES; zrow = np.array([zrow[ORBIT_FEATURES.index(f)] for f in feats])
             z = np.tile(zrow, (n, 1))
         A = model.design(x, y_chip, chip, t, dm, lsky=lsky, phx=phx, phy=phy, z=z)
