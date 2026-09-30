@@ -39,20 +39,28 @@ _DEFAULT_CONFIG = {
     "pixel_scale":  0.050,    # arcsec/pix (fallback for unknown instruments)
     "initial_scale": 1.0,     # prior mean for pixel_scale_ratio
 
-    # Individual-image hyperpriors
-    "sigma_rot_deg":  0.10,   # rotation prior width (deg)
-    "sigma_scale":    5e-4,   # pixel scale ratio prior width (fractional)
-    "sigma_skew":     2e-4,   # on- and off-axis skew prior width
+    # Individual-image hyperpriors — data-driven (user 2026-09-30) from the Phase D
+    # 8p per-image solves of 43,495 archive images against their headers with the
+    # basis3f GDC correction applied (hst_dist_corr ml/v4/basis3f/phaseD_image_params.csv;
+    # well-constrained images: >=200 stars on both chips).  Widths ~1.5-2x the
+    # measured MAD:
+    #   rotation vs header  MAD 0.021 deg ACS/WFC, 0.0097 deg WFC3/UVIS (a per-VISIT
+    #                       quantity: within-visit 0.001 deg -> visit pooling later)
+    #   scale-1 vs header   MAD 5.7e-6 ACS, 5.4e-6 UVIS
+    #   skew                MAD 2.6-3.9e-6 ACS, 3.7-4.8e-6 UVIS
+    #   upper-chip offset   MAD 7-8 mpx, consistent with posterior noise (<~5 mpx)
+    # Pre-2026-09-30 values: 0.10 deg / 5e-4 / 2e-4 (40-80x looser than the data).
+    # These are also the cross-match (Step 4) plate priors and part of its cache key.
+    "sigma_rot_deg":  0.03,   # rotation prior width (deg); UVIS override below
+    "sigma_scale":    1e-5,   # pixel scale ratio prior width (fractional)
+    "sigma_skew":     5e-6,   # on- and off-axis skew prior width
     "sigma_pointing": 5000.0, # pointing offset prior width (mas)
     # 8p model (fit_chip_offset): 2-D translation of the upper chip relative to
-    # the lower one, in pixels, on top of the shared linear terms.  Calibration
-    # 2026-09-30: the hi−lo pointing difference of 8,164 split-CCD image pairs
-    # (256 fields) scatters by 0.08 px ACS / 0.045 px UVIS per axis, but that
-    # includes each chip's free rotation/scale; the 8p fit itself on Leo I (56
-    # images, ~70 stars each) gives MAD 0.012 px ACS with median sigma 0.012
-    # (pure noise) and UVIS consistent with 0.  0.02 px keeps low-n images
-    # tight; revisit from the archive-wide Phase D 8p fits.
-    "sigma_chip_px":  0.02,
+    # the lower one, in pixels, on top of the shared linear terms.  Phase D
+    # (2026-09-30, 11k well-constrained archive images): MAD 7-8 mpx per axis,
+    # at the posterior-noise level, no era trend -> intrinsic <~5 mpx.  (The
+    # hi-lo pointing scatter of split-CCD fits, 0.08 px, is per-chip linear freedom.)
+    "sigma_chip_px":  0.01,
 
     # Pair-coupling hyperpriors (hi−lo difference)
     # Calibrated: ACS rot 0.044°, WFC3 rot 0.025° → 0.10° conservative round number.
@@ -76,7 +84,7 @@ INSTRUMENT_CONFIG = {
         #   RA scatter 115 mas (≈ current 100 mas), Dec scatter 39 mas.
         #   Use 100 mas as a compromise covering both axes.
         "sigma_pair_pointing": 100.0,
-        "sigma_chip_px": 0.02,
+        "sigma_chip_px": 0.01,
     },
     ("WFC3", "UVIS"): {
         "pixel_scale":  0.040,
@@ -84,7 +92,9 @@ INSTRUMENT_CONFIG = {
         # Pair pointing calibrated from 2164 paired images:
         #   RA scatter 15 mas, Dec scatter 11 mas — much tighter than ACS.
         "sigma_pair_pointing": 15.0,
-        "sigma_chip_px": 0.02,
+        "sigma_chip_px": 0.01,
+        # Phase D: UVIS rotation vs header MAD 0.0097 deg (side lobes to +-0.03)
+        "sigma_rot_deg": 0.02,
     },
     ("WFC3", "IR"):   {
         "pixel_scale":  0.128,

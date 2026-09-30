@@ -275,8 +275,7 @@ def _parse_args():
                          'the 4 linear terms and the pointing, plus a 2-D translation of the upper chip '
                          '(prior width --prior_sigma_chip_px). Meant for --no_split_ccd runs.')
     bp.add_argument('--prior_sigma_chip_px', type=float, default=None,
-                    help='8p chip-offset prior width in pixels (default: per-instrument, '
-                         'ACS 0.08 / UVIS 0.045 from the split-CCD hi-lo pointing scatter)')
+                    help='8p chip-offset prior width in pixels (default 0.01 from the Phase D archive fits)')
     bp.add_argument('--two_phase_align', action='store_true',
                     help='Two-phase alignment: converge with alpha OFF first '
                          '(rejection via adaptive thresholds only), then '
@@ -341,11 +340,12 @@ def _parse_args():
                     help='Disable test-4 Cook\'s D influence clipping (default: enabled; '
                          'targets moderate-outlier high-leverage detections missed by the sigma threshold)')
     bp.add_argument('--prior_sigma_rot_deg', type=float, default=None,
-                    help='Plate rotation prior width in degrees (default 0.05; pre-2026-08-04: 0.1)')
+                    help='Plate rotation prior width in degrees (default: per-instrument, ACS 0.03 / UVIS 0.02 '
+                         'from the 2026-09-30 Phase D archive fits; pre-2026-09-30: 0.1)')
     bp.add_argument('--prior_sigma_scale', type=float, default=None,
-                    help='Plate scale prior width, fractional (default 2e-4; pre-2026-08-04: 1.5e-2)')
+                    help='Plate scale prior width, fractional (default 1e-5 from Phase D; pre-2026-09-30: 5e-4)')
     bp.add_argument('--prior_sigma_skew', type=float, default=None,
-                    help='Plate skew prior width (default 1e-3; pre-2026-08-04: 5e-3)')
+                    help='Plate skew prior width (default 5e-6 from Phase D; pre-2026-09-30: 2e-4)')
     bp.add_argument('--prior_sigma_pointing', type=float, default=None,
                     help='Pointing offset prior width in mas (default 5000.0)')
     bp.add_argument('--inflate_alpha_max', type=float, default=3.0,
