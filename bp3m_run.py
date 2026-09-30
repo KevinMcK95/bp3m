@@ -1475,6 +1475,7 @@ def main():
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 fit_chip_offset=args.fit_chip_offset,
                 prior_sigma_chip_px=args.prior_sigma_chip_px,
+                pos_corr_model=args.pos_corr_model,      # indv fits in the same corrected frame as the joint fit (2026-09-30)
                 inflate_hst_errors=not args.no_inflate_hst_errors,
                 two_phase_align=args.two_phase_align,
                 fit_epoch_distortion=args.fit_epoch_distortion,
