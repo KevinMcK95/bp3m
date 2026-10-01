@@ -573,6 +573,11 @@ def _parse_args():
                           'psf_delta.npy and psf_perturbation.png for each image.')
     ctl.add_argument('--force_rematch', action='store_true',
                      help='Re-run cross-matching even if matched_gaia.csv already exists')
+    ctl.add_argument('--no_xmatch_group_pass', action='store_true',
+                     help='Skip Step 4c (visit-group completion: failed or sibling-inconsistent '
+                          'images rematched from the header error their visit siblings measured)')
+    ctl.add_argument('--force_xmatch_group_pass', action='store_true',
+                     help='Redo Step 4c for every visit group, even groups unchanged since their last pass')
     ctl.add_argument('--force_validate', action='store_true',
                      help='Re-run cross-image validation (regenerate cross_match_catalog.csv) '
                           'without re-running cross-matching')
@@ -1259,6 +1264,8 @@ def main():
             lib_dir=Path(args.lib_dir) if args.lib_dir else None,
             run_qso_vetting=False,
             force_validate=getattr(args, 'force_validate', False),
+            group_pass=not getattr(args, 'no_xmatch_group_pass', False),
+            force_group_pass=getattr(args, 'force_xmatch_group_pass', False),
             prior_sigma_rot_deg=args.prior_sigma_rot_deg,
             prior_sigma_scale=args.prior_sigma_scale,
             prior_sigma_skew=args.prior_sigma_skew,

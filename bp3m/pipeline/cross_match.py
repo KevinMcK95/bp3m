@@ -307,6 +307,8 @@ def run_cross_match(
     prior_sigma_skew: float | None = None,
     pos_corr_model: str | None = None,
     init_resid_max: float = 5.0,
+    group_pass: bool = True,
+    force_group_pass: bool = False,
 ) -> list[Path]:
     """
     Cross-match all PSF-fit HST catalogs in a field against Gaia.
@@ -331,6 +333,11 @@ def run_cross_match(
                            covariance added to C_total during affine refinement
     force_rematch        : re-match even if matched_gaia.csv and matching params exist
     image_id             : process only this single observation ID
+    group_pass           : Step 4c visit-group completion (bp3m.pipeline.xmatch_groups): failed and
+                           sibling-inconsistent images are rematched from the header error their
+                           visit siblings measured; complete members are left alone.  Groups whose
+                           members and matches are unchanged since their last pass are skipped.
+    force_group_pass     : redo Step 4c for every group even if unchanged
 
     Returns
     -------
@@ -403,6 +410,29 @@ def run_cross_match(
         params_meta.update(sigma_rot_deg=prior_sigma_rot_deg, sigma_scale=prior_sigma_scale, sigma_skew=prior_sigma_skew)
         print(f"  cross-match with learned GDC correction {pos_corr_model}: priors rot {prior_sigma_rot_deg} deg, scale {prior_sigma_scale}, skew {prior_sigma_skew}")
 
+    def _group_pass():
+        if not group_pass:
+            return 0
+        from .xmatch_groups import run_group_pass
+        _kw = {'hst_pix_floor': hst_pix_floor, 'min_matches': min_matches, 'zero_pm': zero_pm,
+               'max_mag_diff': max_mag_diff, 'scale_sweep': scale_sweep,
+               'discovery_max_offset': discovery_max_offset, 'use_resid_floor': use_resid_floor,
+               'prior_sigma_rot_deg': prior_sigma_rot_deg, 'prior_sigma_scale': prior_sigma_scale,
+               'prior_sigma_skew': prior_sigma_skew, 'init_resid_max': init_resid_max,
+               'pos_corr_model': (str(pos_corr_model) if pos_corr_model else None)}
+        print("\n  Step 4c: visit-group completion (sibling-seeded rematch of failed / inconsistent images)")
+        try:
+            return run_group_pass(
+                folders, gaia_df, _kw,
+                lambda m: dict(params_meta, gdc_id=catalog_gdc_id(m.catalog)), dict(params_meta),
+                n_processes=n_processes, force=force_group_pass,
+                cache_path=Path(output_dir) / field_name / telescope.upper() / 'visit_groups_cache.json')
+        except Exception as _ge:
+            import traceback
+            print(f"  WARNING: visit-group completion failed — {_ge}")
+            traceback.print_exc()
+            return 0
+
     from tqdm import tqdm
     work = []
     skipped = []
@@ -452,8 +482,9 @@ def run_cross_match(
               f"{', '.join(skipped_nophot)}")
     if not work:
         print("  All cross-matches up to date.")
+        _n_grp = _group_pass()
         _validate_catalog_if_needed(field_name, output_dir,
-                                    force=force_rematch or force_validate)
+                                    force=force_rematch or force_validate or _n_grp > 0)
         existing = [Path(f['root']) / "matched_gaia.csv" for f in folders]
         # Still run QSO vetting if the anchors file is missing
         if run_qso_vetting:
@@ -534,6 +565,8 @@ def run_cross_match(
                     f['root'] for f in folders
                     if Path(f['root']).name == name
                 )) / "matched_gaia.csv")
+
+    _group_pass()
 
     # Run cross-image validation — always forced after any fresh matching.
     print("\n  Running cross-image validation...")

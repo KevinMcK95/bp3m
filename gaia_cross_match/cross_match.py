@@ -806,6 +806,43 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
 _PCM_CACHE = {}
 
 
+GUESS_SEED_RADIUS_PX = 1.5   # direct association radius around a guess-predicted Gaia position
+
+
+def _guess_direct_seed(guess_affine, params, hst_d, gaia_f, max_mag_diff, min_matches):
+    """Seed pairs straight from a trusted guess transform (visit-group completion): each Gaia
+    source's predicted HST position takes the nearest HST source within GUESS_SEED_RADIUS_PX
+    (widened by its propagated Gaia error), one-to-one, magnitude-consistent.  Bypasses the
+    offset-histogram discovery, which in crowded fields locks onto chance peaks.  Returns a
+    discovery-style dict for _run_affine_refinement, or None (caller falls back to discovery)."""
+    M, t = np.asarray(guess_affine[0], float), np.asarray(guess_affine[1], float)
+    c = np.array([params['x_cen'], params['y_cen']])
+    h = np.einsum('ij,nj->ni', np.linalg.inv(M), np.column_stack([gaia_f['x'], gaia_f['y']]) - t) + c
+    rad = np.maximum(GUESS_SEED_RADIUS_PX, 3.0 * np.asarray(gaia_f['err'], float))
+    tree = KDTree(np.column_stack([hst_d['x'], hst_d['y']]))
+    d, j = tree.query(h, k=4, distance_upper_bound=float(np.max(rad)))
+    rows = []
+    for gi in range(len(h)):
+        for k in range(d.shape[1]):
+            if np.isfinite(d[gi, k]) and d[gi, k] < rad[gi]:
+                rows.append((gi, int(j[gi, k]), float(d[gi, k]), float(gaia_f['mag'][gi] - hst_d['mag'][j[gi, k]])))
+    if len(rows) < min_matches:
+        return None
+    df = pd.DataFrame(rows, columns=['g', 'h', 'd', 'dm'])
+    zp = float(np.median(df.sort_values('d').drop_duplicates('g')['dm']))
+    df = df[np.abs(df['dm'] - zp) < max_mag_diff]
+    df['cost'] = df['d'] ** 2 + (df['dm'] - zp) ** 2          # position (px) + magnitude (mag) consistency
+    df = df.sort_values('cost').drop_duplicates('g').drop_duplicates('h')
+    if len(df) < min_matches:
+        return None
+    zp = float(np.median(df['dm']))
+    return {'A': M[0, 0], 'B': M[0, 1], 'C': M[1, 0], 'D': M[1, 1],
+            'xs_o': c[0], 'ys_o': c[1], 'xt_o': t[0], 'yt_o': t[1],
+            'n_match': int(len(df)), 'red_chi2': float('nan'), 'red_cost': float('nan'),
+            'q': 'guess', 'm': float('nan'), 'zp': zp,
+            'h_v': df['h'].to_numpy(), 'g_v': df['g'].to_numpy(), 'offset_hist': None}
+
+
 def _pos_corr_applier(spec):
     """Learned GDC-correction applier (bp3m.pos_corr_basis), one per spec per worker process."""
     if spec not in _PCM_CACHE:
@@ -814,7 +851,12 @@ def _pos_corr_applier(spec):
     return _PCM_CACHE[spec]
 
 
-def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True, sigma_rot_deg=None, sigma_scale=None, sigma_skew=None, init_resid_max=5.0, pos_corr_model=None):
+def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True, sigma_rot_deg=None, sigma_scale=None, sigma_skew=None, init_resid_max=5.0, pos_corr_model=None,
+                         guess_affine=None, guess_max_offset=10.0):
+    """guess_affine: optional (M, t) predicting this image's HST-pixel -> Gaia-frame mapping
+    g = M (h - c) + t, c = (x_cen, y_cen) of its header frame (visit-group completion: own previous
+    solution or the sibling-transferred header error).  The Gaia guess positions are then taken from
+    it and the 4P offset search is narrowed to +-guess_max_offset px; every gate is unchanged."""
     start_time = time.time()
     image_name = os.path.basename(hst['flc']).replace("_flc.fits", "")
     log_file, original_stdout = os.path.join(hst['root'], "processing_log.txt"), sys.stdout
@@ -962,6 +1004,15 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             'err': g_err_in, 'has_pms': in_has_pms,
             'xguess': xg_guess_in, 'yguess': yg_guess_in,
         }
+        if guess_affine is not None:
+            _M, _t = np.asarray(guess_affine[0], float), np.asarray(guess_affine[1], float)
+            _c = np.array([params['x_cen'], params['y_cen']])
+            _h = np.einsum('ij,nj->ni', np.linalg.inv(_M), np.column_stack([x_g_in, y_g_in]) - _t) + _c
+            _sh = np.hypot(_h[:, 0] - xg_guess_in, _h[:, 1] - yg_guess_in)
+            gaia_field['xguess'], gaia_field['yguess'] = _h[:, 0], _h[:, 1]
+            discovery_max_offset = int(np.ceil(guess_max_offset))
+            print(f"  Guess transform supplied (visit-group completion): Gaia guesses moved by median "
+                  f"{np.median(_sh):.2f} px vs the header guess; offset search +-{discovery_max_offset} px")
         # 4P discovery uses high-confidence star candidates only (tight qfit/chi2
         # tiers make the geometric matching more reliable).  The 6P affine
         # refinement and final pass use all sources: non-stars contribute
@@ -1013,7 +1064,17 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             ("all Gaia / all HST",      _all_gaia,             hst_data_all_disc, False),
         ]
         best, used_tier, _used_stars_only = None, None, True
-        for _tier_name, _seed_mask, _hst_d, _stars_only in _disc_tiers:
+        if guess_affine is not None:
+            best = _guess_direct_seed(guess_affine, params, hst_data_all_disc, gaia_field,
+                                      max_mag_diff, max(3, int(min_matches)))
+            if best is not None:
+                used_tier, _used_stars_only = 'guess transform, direct association', False
+                print(f"  Guess-seeded association: {best['n_match']} Gaia-HST pairs within "
+                      f"{GUESS_SEED_RADIUS_PX} px of their predicted positions (zp={best['zp']:.3f}) "
+                      f"-> 6P refinement")
+            else:
+                print("  Guess-seeded association found < 3 pairs -> narrowed 4P discovery")
+        for _tier_name, _seed_mask, _hst_d, _stars_only in ([] if best is not None else _disc_tiers):
             _n_seed = int(_seed_mask.sum())
             if _n_seed < 3:
                 print(f"  Skipping tier '{_tier_name}': only {_n_seed} Gaia stars available.")
