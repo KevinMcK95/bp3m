@@ -3703,7 +3703,9 @@ def _lookup_lvd(lvd_dir: Path, key: str) -> dict:
     import pandas as pd
 
     lvd_dir = Path(lvd_dir)
-    for csv_name in ('dwarf_all.csv', 'gc_harris.csv'):
+    # dwarf_all + Harris GCs first; then the dwarf-hosted / ambiguous GC tables (e.g. lmc_gc-ngc_1916) and the
+    # combined table as a last resort (2026-10-01).
+    for csv_name in ('dwarf_all.csv', 'gc_harris.csv', 'gc_dwarf_hosted.csv', 'gc_ambiguous.csv', 'comb_all.csv'):
         csv = lvd_dir / csv_name
         if not csv.exists():
             continue
@@ -3753,7 +3755,7 @@ def _lookup_lvd(lvd_dir: Path, key: str) -> dict:
         return params
 
     raise ValueError(f"LVD key {key!r} not found in {lvd_dir} "
-                     f"(searched dwarf_all.csv and gc_harris.csv)")
+                     f"(searched dwarf_all, gc_harris, gc_dwarf_hosted, gc_ambiguous, comb_all)")
 
 
 def main(argv=None):
