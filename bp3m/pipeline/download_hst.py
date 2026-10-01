@@ -191,9 +191,13 @@ def search_mast(
     telescope: str = 'HST',
     instruments: list[str] | None = None,
     available_combos: dict[str, set[str]] | None = None,
+    include_recent: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Query MAST for science images of a sky region.
+
+    include_recent: keep observations taken within the last year (normally cut, since
+    they are usually still exclusive-access); for proprietary data with a MAST login.
 
     Parameters
     ----------
@@ -257,6 +261,8 @@ def search_mast(
     # When time_baseline_days is None, keep all images up to the Gaia epoch
     if time_baseline_days is not None:
         t_max_mjd = _GAIA_DR3_MJD - time_baseline_days
+    elif include_recent:
+        t_max_mjd = Time.now().mjd + 1.0
     else:
         t_max_mjd = (Time.now()-366*u.day).mjd
 
@@ -462,6 +468,7 @@ def download_hst_images(
     skip_mast_download: bool = False,
     extra_pointings: "list[tuple[float, float, float, float]] | None" = None,
     delve_csv_path: 'str | Path | None' = None,
+    include_recent: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Search MAST for images of a field and download them.
@@ -594,6 +601,7 @@ def download_hst_images(
                 im_type=im_type, telescope=telescope,
                 instruments=instruments,
                 available_combos=available_combos,
+                include_recent=include_recent,
             )
 
         if n_pointings == 1:

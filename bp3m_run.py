@@ -530,6 +530,12 @@ def _parse_args():
     ctl.add_argument('--gaia_timeout', type=int, default=300,
                      help='Per-bin Gaia TAP query timeout in seconds (default 300). '
                           'Increase for large fields with slow archive responses.')
+    ctl.add_argument('--include_proprietary', action='store_true',
+                     help='Proprietary / recent HST data: (1) the MAST search keeps observations from the last '
+                          'year (normally cut) — downloads need a MAST token (~/.mast_token, $BP3M_HOME/mast_token '
+                          'or $MAST_API_TOKEN); (2) every valid local FLC under HST/mastDownload/ that is not in the '
+                          'MAST selection (e.g. data downloaded by hand) is added to the image set for PSF fitting, '
+                          'cross-matching, indv and joint fits.')
     ctl.add_argument('--force_redownload_hst', action='store_true',
                      help='Re-search MAST and re-download HST files even if cached (pypass products are kept; a changed delivery is refit via the FLC fingerprint)')
     ctl.add_argument('--mast_refresh_days', type=int, default=30, metavar='N',
@@ -1042,6 +1048,7 @@ def main():
             n_processes=args.n_processes,
             extra_pointings=_extra_pt,
             delve_csv_path=delve_csv_path,
+            include_recent=args.include_proprietary,
         )
 
     # Read manifest of selected obsids written by step 2 (persists across runs)
@@ -1084,6 +1091,32 @@ def main():
                     print(f"  {_oid}: {_reason}")
         except Exception:
             pass
+
+    # --include_proprietary: add valid local FLCs that the MAST selection does not list
+    # (hand-downloaded / exclusive-access data), user 2026-10-01.
+    if getattr(args, 'include_proprietary', False):
+        from bp3m.pipeline.download_hst import _check_exptime as _cet2
+        _mast_root2 = _hst_dir / "mastDownload" / args.telescope.upper()
+        _failed_set = set()
+        if _failed_manifest.exists():
+            try:
+                _failed_set = set(_json.loads(_failed_manifest.read_text()))
+            except Exception:
+                pass
+        _sel = list(_selected_obsids or [])
+        _added = []
+        for _d in sorted(_mast_root2.glob('*')) if _mast_root2.exists() else []:
+            _flc = _d / f"{_d.name}_{args.hst_im_type.lstrip('_')}.fits"
+            if _d.name in _sel or _d.name in _failed_set or not _flc.exists():
+                continue
+            if _cet2(_flc):
+                continue
+            _sel.append(_d.name); _added.append(_d.name)
+        if _added:
+            _selected_obsids = _sel
+            _manifest.write_text(_json.dumps(_selected_obsids, indent=2))
+            print(f"\n--include_proprietary: added {len(_added)} local image(s) not in the MAST selection: "
+                  + ', '.join(_added))
 
     # ── Check that we have images before continuing ───────────────────────────
     if _selected_obsids is not None and len(_selected_obsids) == 0:
