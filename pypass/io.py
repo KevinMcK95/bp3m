@@ -591,12 +591,17 @@ def _apply_gdc_wcs(records, gdc, image_path, chips, instrume, detector, verbose=
                     # CRPIX_COMBINED and CRPIX_GDC are in the same frame as catalog x,y.
                     _crpix1_0 = chip_wcs_vals[sci_ext]['CRPIX1'] - 1.0
                     _crpix2_0 = chip_wcs_vals[sci_ext]['CRPIX2'] - 1.0
+                    # same chip-local -> detector offsets the photometry used
+                    # (CCDCHIP mosaic position + subarray LTV)
+                    _xoff, _yoff = chip_detector_offsets(
+                        instrume, detector, sci_ext, hdul[sci_ext].header)
+                    chip_wcs_vals[sci_ext]['X_OFFSET']        = _xoff
                     chip_wcs_vals[sci_ext]['Y_OFFSET']        = _yoff
                     chip_wcs_vals[sci_ext]['CRPIX2_COMBINED'] = _crpix2_0 + _yoff
 
                     if gdc is not None:
                         #transform ref coordinate to GDC frame (0-indexed input)
-                        _rx, _ry, _ = apply_gdc(_crpix1_0,
+                        _rx, _ry, _ = apply_gdc(_crpix1_0 + _xoff,
                                                  _crpix2_0 + _yoff,
                                                  gdc)
                         chip_wcs_vals[sci_ext]['CRPIX1_GDC'] = float(_rx[0])
@@ -733,7 +738,7 @@ def load_image(path, sci_ext=1, dq_ext=None, dq_flags=None):
         noise_info = _get_noise_info(primary_hdr, sci_hdr, instrume)
         mask = _load_dq_mask(hdul, dq_ext, dq_flags)
 
-    x_offset, y_offset = _detector_offsets(instrume, detector, sci_ext)
+    x_offset, y_offset = chip_detector_offsets(instrume, detector, sci_ext, sci_hdr)
     return (data, noise_info['effective_gain'], noise_info['read_noise'],
             mask, x_offset, y_offset)
 
@@ -816,6 +821,41 @@ def _get_noise_params(hdr, instrume):
     """Thin wrapper — returns (effective_gain, read_noise) for backward compat."""
     info = _get_noise_info(hdr, None, instrume)
     return info['effective_gain'], info['read_noise']
+
+
+# Cameras whose FLC/FLT full-frame products have LTV1 = LTV2 = 0, so a nonzero LTV
+# can only mean a subarray readout.  (WFC3/IR FLTs carry LTV = -5 for the trimmed
+# reference pixels and are deliberately excluded.)
+_SUBARRAY_LTV_CAMERAS = {('ACS', 'WFC'), ('WFC3', 'UVIS')}
+
+
+def chip_detector_offsets(instrume, detector, sci_ext, sci_hdr=None):
+    """(x_offset, y_offset) taking 0-indexed chip-local pixels to the combined
+    full-detector frame used by the STDPSF grid and the STDGDC tables.
+
+    y_offset is the chip's place in the two-chip mosaic (from CCDCHIP when the
+    header is given, else from the extension number); for ACS/WFC and WFC3/UVIS
+    subarrays the subarray origin on the physical chip is added as well:
+    x_full = x_sub - LTV1, y_full = y_sub - LTV2 (IRAF physical = image - LTV),
+    as hst1pass does.  Full-frame images have LTV = 0 and are unchanged.
+    """
+    instr = (instrume or '').strip().upper()
+    det = (detector or '').strip().upper()
+    x_off, y_off = _detector_offsets(instr, det, sci_ext)
+    if sci_hdr is None:
+        return x_off, y_off
+    ccdchip = sci_hdr.get('CCDCHIP', None)
+    try:
+        y_off = _CCDCHIP_Y_OFFSET.get((instr, det, int(ccdchip)), y_off)
+    except (TypeError, ValueError):
+        pass
+    if (instr, det) in _SUBARRAY_LTV_CAMERAS:
+        try:
+            x_off -= float(sci_hdr.get('LTV1', 0.0) or 0.0)
+            y_off -= float(sci_hdr.get('LTV2', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+    return float(x_off), float(y_off)
 
 
 def _detector_offsets(instrume, detector, sci_ext):
@@ -1037,7 +1077,8 @@ def run_photometry_fits(
                       f"(fmin_thresh floor; mag_st_max={mag_st_max:.2f} → "
                       f"{_fmin_from_mag:.1f} e- in {_exptime:.0f}s)")
 
-        data, _g, _rn, mask, x_offset, _ = load_image(
+        # offsets from the chip header: CCDCHIP mosaic position + subarray LTV
+        data, _g, _rn, mask, x_offset, y_offset = load_image(
             image_path, sci_ext=sci_ext, dq_ext=dq_ext, dq_flags=dq_flags)
 
         # Load raw DQ integer array for per-star DQ stats and to rebuild the
@@ -1393,7 +1434,7 @@ def catalog_to_table(records, zero_point=0.0,
         _cext = getattr(r, '_chip_ext', 0)
         if _cext not in _chip_wcs_seen:
             _chip_wcs_seen[_cext] = getattr(r, '_chip_wcs', {})
-    _wcs_meta_keys = ('CRPIX1', 'CRPIX2', 'CRPIX2_COMBINED', 'Y_OFFSET',
+    _wcs_meta_keys = ('CRPIX1', 'CRPIX2', 'CRPIX2_COMBINED', 'X_OFFSET', 'Y_OFFSET',
                       'CRPIX1_GDC', 'CRPIX2_GDC',
                       'CRVAL1', 'CRVAL2',
                       'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2')

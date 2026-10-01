@@ -807,7 +807,12 @@ def download_hst_images(
             # mtime cache hit: file unchanged since last verification — skip FITS open.
             cached = _vcache.get(cache_key)
             if cached and cached[0] == disk_size and cached[1] == st.st_mtime_ns:
-                return spec, 'cached', cached[2], None   # cached[2] = fail_reason or None
+                _cr = cached[2]   # fail_reason or None
+                # The no-HDRLET rule was dropped 2026-10-01: a missing headerlet only
+                # means no a-posteriori WCS, which BP3M never uses (pointing is fitted).
+                if _cr and 'HDRLET' in str(_cr):
+                    _cr = None
+                return spec, 'cached', _cr, None
 
             # Full FITS verify + failed-observation check in one open.
             # memmap=True avoids loading pixel data into RAM.
@@ -817,7 +822,6 @@ def download_hst_images(
                     h0        = hdul[0].header
                     exptime   = h0.get('EXPTIME',  None)
                     expflag   = h0.get('EXPFLAG',  'NORMAL').strip()
-                    has_hdrlet = any(h.name == 'HDRLET' for h in hdul)
             except Exception as e:
                 return spec, 'broken', f"FITS error: {e}", None
 
@@ -826,8 +830,6 @@ def download_hst_images(
                 fail_reason = "EXPTIME=0"
             elif expflag and expflag != 'NORMAL':
                 fail_reason = f"EXPFLAG={expflag!r}"
-            elif not has_hdrlet:
-                fail_reason = "no HDRLET extensions"
 
             new_entry = [disk_size, st.st_mtime_ns, fail_reason]
             return spec, 'verified', fail_reason, new_entry
@@ -1549,7 +1551,7 @@ def _invalidate_psf_cache(flc_path: Path) -> None:
 def _check_exptime(flc_path: Path) -> str | None:
     """Return a failure reason string if the FLC file is a failed observation, else None.
 
-    Checks three conditions in priority order (file is kept on disk in all cases):
+    Checks two conditions in priority order (file is kept on disk in all cases):
     1. EXPTIME == 0 — shutter open but no real sky signal (e.g. EXCESSIVE DOWNTIME).
     2. EXPFLAG != 'NORMAL' — any non-nominal exposure flag indicates compromised data.
        Known values seen in practice:
@@ -1557,23 +1559,21 @@ def _check_exptime(flc_path: Path) -> str | None:
          'TDF-DOWN AT EXPSTART'  — science telemetry unavailable; data may be corrupt
          'INTERRUPTED'           — exposure cut short by HST safing or guide-star loss
        Any other non-NORMAL value is also flagged.
-    3. No HDRLET extensions — image was not fully processed by the HST calibration
-       pipeline (drizzle/astrodrizzle did not apply WCS corrections). These images
-       have less trustworthy astrometry and tend to produce poor cross-matches.
+    A missing HDRLET extension is NOT a failure (rule removed 2026-10-01): headerlets
+    only carry MAST's a-posteriori WCS solutions.  BP3M takes CRVAL as the tangent
+    point (pointing is fitted), CD/ORIENTAT as the rotation prior centre and applies
+    its own GDC, so the header distortion/headerlet solution is never used.
     """
     from astropy.io import fits
     try:
         with fits.open(flc_path, memmap=False) as hdul:
             exptime = hdul[0].header.get('EXPTIME', None)
             expflag = hdul[0].header.get('EXPFLAG', '').strip()
-            has_hdrlet = any(hdu.name == 'HDRLET' for hdu in hdul)
         if exptime is not None and float(exptime) == 0.0:
             reason = f"EXPTIME=0.0 (EXPFLAG='{expflag}')" if expflag else "EXPTIME=0.0"
             return reason
         if expflag and expflag != 'NORMAL':
             return f"EXPFLAG='{expflag}'"
-        if not has_hdrlet:
-            return "no HDRLET/WCS corrections (image not fully pipeline-calibrated)"
     except Exception:
         pass
     return None

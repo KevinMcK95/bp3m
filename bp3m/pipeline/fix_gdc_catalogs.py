@@ -146,8 +146,9 @@ def fix_catalog(cat_path, lib_dir, out_dir=None, dry_run=False, force=False,
             pfx = k[:-len('_CRPIX1_GDC')]
             cx = t.meta.get(f'{pfx}_CRPIX1'); cy = t.meta.get(f'{pfx}_CRPIX2')
             yoff = t.meta.get(f'{pfx}_Y_OFFSET', 0.0)
+            xoff = t.meta.get(f'{pfx}_X_OFFSET', 0.0)   # subarray -LTV1 (catalogs after 2026-10-01)
             if cx is not None and cy is not None:
-                rx, ry, _ = apply_gdc(cx - 1.0, cy - 1.0 + yoff, gdc)
+                rx, ry, _ = apply_gdc(cx - 1.0 + xoff, cy - 1.0 + yoff, gdc)
                 t.meta[f'{pfx}_CRPIX1_GDC'] = float(rx[0])
                 t.meta[f'{pfx}_CRPIX2_GDC'] = float(ry[0])
     old_file = t.meta.get('GDC_FILE', 'unknown')
