@@ -2225,6 +2225,16 @@ class BP3MSolver:
             r_hat, C_r, a_arr, K_img, C_vT = self._solve_one_pass(r_hat)
             self._update_R(r_hat)
             self._update_geometry(r_hat, a_arr)
+            # _solve_one_pass returns the stellar astrometry CONDITIONAL ON ITS
+            # INPUT r (Δr = 0), not on the updated r_hat.  Testing those stars
+            # against r_hat put the whole first alignment update (~0.5 px from the
+            # cross-match transformation) into every residual, 2p stars included.
+            # With >= 10 stars the adaptive threshold inflated along with the
+            # median and hid it; with < 10 the fixed chi2(2) floor rejected
+            # nearly everything (archive: median 1-3 of 3-9 matches kept, and
+            # --use_indv_outputs then hard-blocked them from the joint fit).
+            # Re-solve the stars at the updated r so the residuals are consistent.
+            _, _, a_arr, _, C_vT = self._solve_one_pass(r_hat)
             clip_info, _, _ = self._update_use_for_fit(
                 r_hat, a_arr, C_r, C_vT, clip_sigma,
                 ok_star_prev=None, inflate_errors=False,
