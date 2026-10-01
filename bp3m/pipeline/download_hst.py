@@ -756,7 +756,8 @@ def download_hst_images(
     if not force_redownload and 'dataURI' in to_dl.columns:
         from astropy.io import fits
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from tqdm import tqdm
+        # tqdm: module-level import (a local import here made the name local to the whole
+        # function, so the force-redownload path raised UnboundLocalError, 2026-10-01)
 
         mast_root  = hst_dir / "mastDownload" / tel_upper
         _cache_path = hst_dir / ".verify_cache.json"
@@ -910,11 +911,13 @@ def download_hst_images(
         _dl_delay = 10
         for _dl_attempt in range(5):
             try:
+                # cache=False under force_redownload: astroquery otherwise keeps any local file of the
+                # "expected size", and a reprocessed FLC usually has the SAME size (HVS3 ibsi03 3.7.2 -> 3.7.3)
                 try:
                     Observations.download_products(
-                        Table.from_pandas(to_dl), download_dir=str(hst_dir))
+                        Table.from_pandas(to_dl), download_dir=str(hst_dir), cache=not force_redownload)
                 except Exception:
-                    Observations.download_products(to_dl, download_dir=str(hst_dir))
+                    Observations.download_products(to_dl, download_dir=str(hst_dir), cache=not force_redownload)
                 break
             except Exception as _e:
                 if _dl_attempt < 4:
