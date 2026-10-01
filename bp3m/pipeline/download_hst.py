@@ -400,6 +400,40 @@ def search_mast(
     return obs_df.reset_index(drop=True), prod_df.reset_index(drop=True)
 
 
+_MAST_LOGGED_IN = False
+
+
+def mast_login() -> bool:
+    """Log in to MAST for exclusive-access (proprietary) data, if a token is available.
+
+    Token source, first found wins: $MAST_API_TOKEN, $BP3M_HOME/mast_token, ~/.mast_token
+    (create at https://auth.mast.stsci.edu/token with the 'mast:exclusive_access' scope;
+    keep the file chmod 600).  The token is never printed.  Without a token, public data
+    download as before and exclusive-access products fail with an authorisation error.
+    """
+    global _MAST_LOGGED_IN
+    if _MAST_LOGGED_IN:
+        return True
+    import os
+    tok = os.environ.get('MAST_API_TOKEN', '').strip()
+    src = 'MAST_API_TOKEN'
+    if not tok:
+        home = Path(os.environ['BP3M_HOME']) if 'BP3M_HOME' in os.environ else Path.home() / '.bp3m'
+        for p in (home / 'mast_token', Path.home() / '.mast_token'):
+            if p.exists():
+                tok, src = p.read_text().strip(), str(p)
+                break
+    if not tok:
+        return False
+    try:
+        Observations.login(token=tok)
+        _MAST_LOGGED_IN = True
+        print(f"  MAST: logged in for exclusive-access data (token from {src})")
+    except Exception as e:
+        print(f"  WARNING: MAST login failed ({type(e).__name__}) — exclusive-access products will not download")
+    return _MAST_LOGGED_IN
+
+
 def download_hst_images(
     ra: float,
     dec: float,
@@ -458,6 +492,7 @@ def download_hst_images(
     -------
     obs_table, data_products_table  (both pd.DataFrame)
     """
+    mast_login()
     tel_upper  = telescope.upper()
     hst_dir    = Path(output_dir) / field_name / tel_upper
     hst_dir.mkdir(parents=True, exist_ok=True)
