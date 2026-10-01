@@ -1855,10 +1855,11 @@ def main():
     from datetime import datetime as _datetime
     _cmd_file = output_dir / field / 'bp3m_command.txt'
     _cmd_file.parent.mkdir(parents=True, exist_ok=True)
-    _cmd_file.write_text(
+    from bp3m.command_record import replace_text as _replace_text
+    _replace_text(_cmd_file,
         f"# {_datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         + ' '.join(_shlex.quote(a) for a in sys.argv) + '\n'
-    )
+    )   # temp + rename: never write through a hard link shared with a field copy
 
     print("\n" + "=" * 55)
     print("Pipeline complete.")
