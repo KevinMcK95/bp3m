@@ -481,6 +481,9 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
 
     Returns best-tier dict or None.
     """
+    if hst_d is None or len(hst_d['x']) == 0:
+        print('  4P discovery: no HST sources in this tier — skipping')
+        return None
     seed_margin = 2000
     near = (np.abs(gaia_f['x'] - params['x_cen']) <= seed_margin) & \
            (np.abs(gaia_f['y'] - params['y_cen']) <= seed_margin)
@@ -1014,6 +1017,9 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             _n_seed = int(_seed_mask.sum())
             if _n_seed < 3:
                 print(f"  Skipping tier '{_tier_name}': only {_n_seed} Gaia stars available.")
+                continue
+            if _hst_d is None or len(_hst_d['x']) == 0:
+                print(f"  Skipping tier '{_tier_name}': no HST sources after the tier's cuts.")
                 continue
             print(f"  Trying 4P discovery [{_tier_name}] ({_n_seed} Gaia in field, "
                   f"{len(_hst_d['x'])} HST sources)...")
