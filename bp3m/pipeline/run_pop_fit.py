@@ -2253,9 +2253,13 @@ def run_pop_fit(
         # configs fall back to the sidecar-aware resolver in the loader).
         # (_floor is decided above, before the data-source branch)
         _gcsv = v1_cfg.get('gaia_csv')
+        # pos_corr_model MUST reach the loader (2026-10-02): it was resolved/printed above but never
+        # passed, so pop-fits of model-corrected v1 runs fitted RAW positions against the corrected
+        # v1 alignment (~0.08 px median bias) and rejected most seed members.
         imgs, stars_per_image, gaia_catalog = load_image_data_flc(
             data_root, field_name, pos_corr_table=_pct,
             pos_err_floor=_floor, gaia_csv=_gcsv,
+            pos_corr_model=pos_corr_model,
             n_processes=min(8, os.cpu_count() or 1))
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable images found for '{field_name}'.")
@@ -3502,6 +3506,9 @@ def run_pop_fit(
             'hst_members_fit': bool(hst_members_fit), 'hst_all_fit': bool(hst_all_fit),
             'poly_prior_px': poly_prior_px, 'restrict_filters': restrict_filters, 'restrict_instdet': restrict_instdet,
             'pos_err_floor_override': pos_err_floor,   # None = mirrored the v1 run's floor
+            'pos_err_floor': _floor,
+            'pos_corr_model': (str(pos_corr_model) if pos_corr_model else None),
+            'pos_corr_table': (str(pos_corr_table) if pos_corr_table else None),
             'member_sigma_clip': member_sigma_clip,
             'mu_pop_ra': float(mu_pop_current[0]),
             'mu_pop_dec': float(mu_pop_current[1]),
