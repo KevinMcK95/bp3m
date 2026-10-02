@@ -148,6 +148,10 @@ def run_alignment(  # noqa: C901
     data_root   = Path(output_dir)
     output_bp3m = Path(bp3m_dir) if bp3m_dir is not None else data_root / field_name / "BP3M_results"
     output_bp3m.mkdir(parents=True, exist_ok=True)
+    from bp3m.hardlinks import detach_tree as _detach_tree
+    _n_det = _detach_tree(output_bp3m)
+    if _n_det:
+        print(f"  Detached {_n_det} hard-linked file(s) in {output_bp3m.name} (shared with a field copy) before rewriting")
 
     print("\n" + "─"*50)
     print("Step 5: Bayesian alignment (BP3M)")

@@ -68,6 +68,16 @@ def _write_xmatch_status(root: Path, status: str, params_meta: dict,
     }, indent=2))
 
 
+def _detach_hardlinked_outputs(roots) -> int:
+    """Private copies of hard-linked cross-match outputs before they are rewritten in place
+    (Leo_I shares matched_gaia.csv with its *_fs_* copies, nlink 10).  Non-FITS files in each
+    image dir and in the HST dir above it; pypass products (*.fits, psf_*) stay shared."""
+    from bp3m.hardlinks import detach_tree
+    keep = lambda name: name.endswith('.fits') or name.startswith('psf_')
+    dirs = {Path(r) for r in roots} | {Path(r).parent.parent.parent for r in roots}
+    return sum(detach_tree(d, recursive=False, keep_shared=keep) for d in dirs)
+
+
 WIDE_DISCOVERY_OFFSET = 150   # px; second attempt for images that fail at discovery_max_offset
 MARGINAL_FA_PROB = 1e-6       # a first success less significant than this also gets the wide attempt
 
@@ -415,6 +425,10 @@ def run_cross_match(
     if not folders:
         print("  No image catalogs found to cross-match.")
         return []
+
+    _n_det = _detach_hardlinked_outputs([Path(f['root']) for f in folders])
+    if _n_det:
+        print(f"  Detached {_n_det} hard-linked cross-match output file(s) (shared with a field copy) before rewriting")
 
     params_meta = {
         # Matching-algorithm version: bump on any change to the matching
