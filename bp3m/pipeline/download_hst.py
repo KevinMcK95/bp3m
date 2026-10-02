@@ -807,12 +807,13 @@ def download_hst_images(
             # mtime cache hit: file unchanged since last verification — skip FITS open.
             cached = _vcache.get(cache_key)
             if cached and cached[0] == disk_size and cached[1] == st.st_mtime_ns:
-                _cr = cached[2]   # fail_reason or None
-                # The no-HDRLET rule was dropped 2026-10-01: a missing headerlet only
-                # means no a-posteriori WCS, which BP3M never uses (pointing is fitted).
-                if _cr and 'HDRLET' in str(_cr):
-                    _cr = None
-                return spec, 'cached', _cr, None
+                if len(cached) >= 4 and cached[3] == _VERIFY_RULES:
+                    return spec, 'cached', cached[2], None
+                # Verdict made under older rules (no-HDRLET rule, no calibration-exposure
+                # rule; 2026-10-01): re-judge from the primary header only (the FITS
+                # structure was already verified for this size+mtime).
+                _cr = _check_exptime(dest)
+                return spec, 'verified', _cr, [disk_size, st.st_mtime_ns, _cr, _VERIFY_RULES]
 
             # Full FITS verify + failed-observation check in one open.
             # memmap=True avoids loading pixel data into RAM.
@@ -822,16 +823,20 @@ def download_hst_images(
                     h0        = hdul[0].header
                     exptime   = h0.get('EXPTIME',  None)
                     expflag   = h0.get('EXPFLAG',  'NORMAL').strip()
+                    imagetyp  = str(h0.get('IMAGETYP', 'EXT') or 'EXT').strip().upper()
+                    targname  = str(h0.get('TARGNAME', '') or '').strip()
             except Exception as e:
                 return spec, 'broken', f"FITS error: {e}", None
 
             fail_reason = None
-            if exptime == 0:
+            if imagetyp != 'EXT':     # see _check_exptime: internal lamps / darks
+                fail_reason = f"calibration exposure (IMAGETYP='{imagetyp}', TARGNAME='{targname}')"
+            elif exptime == 0:
                 fail_reason = "EXPTIME=0"
             elif expflag and expflag != 'NORMAL':
                 fail_reason = f"EXPFLAG={expflag!r}"
 
-            new_entry = [disk_size, st.st_mtime_ns, fail_reason]
+            new_entry = [disk_size, st.st_mtime_ns, fail_reason, _VERIFY_RULES]
             return spec, 'verified', fail_reason, new_entry
 
         already        = []
@@ -1548,6 +1553,11 @@ def _invalidate_psf_cache(flc_path: Path) -> None:
             p.unlink()
 
 
+# Failed-observation rule set recorded in each verify-cache entry; bump on any rule change so
+# cached verdicts are re-judged.  2 = 2026-10-01: no-HDRLET rule dropped, calibration rule added.
+_VERIFY_RULES = 2
+
+
 def _check_exptime(flc_path: Path) -> str | None:
     """Return a failure reason string if the FLC file is a failed observation, else None.
 
@@ -1559,6 +1569,11 @@ def _check_exptime(flc_path: Path) -> str | None:
          'TDF-DOWN AT EXPSTART'  — science telemetry unavailable; data may be corrupt
          'INTERRUPTED'           — exposure cut short by HST safing or guide-star loss
        Any other non-NORMAL value is also flagged.
+    3. IMAGETYP != 'EXT' — calibration exposure (internal FLAT lamps TUNGSTEN/DEUTERIUM,
+       DARK, BIAS; RA_TARG = DEC_TARG = 0).  MAST position queries return some of them;
+       the no-HDRLET rule used to drop them as a side effect (calibration frames carry no
+       headerlet): 47% of the 2,357 HDRLET-excluded archive images (sample of 600,
+       2026-10-01), e.g. Leo_I iblb2qltq (DARK, 900 s) PSF-fitted and then 'No stars in field'.
     A missing HDRLET extension is NOT a failure (rule removed 2026-10-01): headerlets
     only carry MAST's a-posteriori WCS solutions.  BP3M takes CRVAL as the tangent
     point (pointing is fitted), CD/ORIENTAT as the rotation prior centre and applies
@@ -1569,6 +1584,10 @@ def _check_exptime(flc_path: Path) -> str | None:
         with fits.open(flc_path, memmap=False) as hdul:
             exptime = hdul[0].header.get('EXPTIME', None)
             expflag = hdul[0].header.get('EXPFLAG', '').strip()
+            imagetyp = str(hdul[0].header.get('IMAGETYP', 'EXT') or 'EXT').strip().upper()
+            targname = str(hdul[0].header.get('TARGNAME', '') or '').strip()
+        if imagetyp != 'EXT':
+            return f"calibration exposure (IMAGETYP='{imagetyp}', TARGNAME='{targname}')"
         if exptime is not None and float(exptime) == 0.0:
             reason = f"EXPTIME=0.0 (EXPFLAG='{expflag}')" if expflag else "EXPTIME=0.0"
             return reason
