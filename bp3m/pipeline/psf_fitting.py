@@ -1561,6 +1561,27 @@ def _image_fingerprint(img_path) -> dict | None:
         return None
 
 
+def _ltv_stale(img_path, catalog) -> bool:
+    """True for a subarray FLC (nonzero LTV1/LTV2 on ACS/WFC or WFC3/UVIS) whose catalog
+    predates the 2026-10-01 LTV fix (pypass 7868235): those were fitted with the GDC and the
+    STDPSF grid evaluated at the subarray-local instead of the detector position.  Post-fix
+    catalogs record CHIPn_X_OFFSET in their metadata; full-frame images are never stale."""
+    try:
+        from astropy.io import fits as _fits
+        with _fits.open(str(img_path), memmap=True) as h:
+            cam = (str(h[0].header.get('INSTRUME', '')).upper(), str(h[0].header.get('DETECTOR', '')).upper())
+            if cam not in {('ACS', 'WFC'), ('WFC3', 'UVIS')}:
+                return False
+            ltv = any(float(x.header.get('LTV1', 0) or 0) != 0 or float(x.header.get('LTV2', 0) or 0) != 0
+                      for x in h[1:] if x.name == 'SCI')
+        if not ltv:
+            return False
+        ch = _fits.getheader(str(catalog), 1)
+        return not any(k.endswith('X_OFFSET') for k in ch)
+    except Exception:
+        return False
+
+
 def _saved_fingerprint(params_path: Path) -> dict | None:
     try:
         fp = json.loads(params_path.read_text()).get('image_fingerprint')
@@ -1767,6 +1788,10 @@ def run_psf_fitting(
                             continue
                     except OSError:
                         pass
+                if _ltv_stale(img, catalog):
+                    print(f"  {img.name}: subarray catalog predates the LTV fix — re-fitting")
+                    work.append(img)
+                    continue
                 skipped.append(img.name)
                 continue
             if catalog.exists():
