@@ -1214,7 +1214,7 @@ def run_pop_fit_rotation(
 
     v1_image_names      = v1_cfg.get('image_names', [])
     v1_split_ccd        = bool(v1_cfg.get('split_ccd', True))
-    min_stars_split_ccd = int(v1_cfg.get('min_stars_split_ccd', 20))
+    min_stars_split_ccd = int(v1_cfg.get('min_stars_split_ccd') or 20)   # v2 run_configs record null = default
     poly_order          = int(v1_cfg.get('poly_order', 1))
 
     _v1_hp = v1_cfg.get('prior_hyperparams', {})
