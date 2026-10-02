@@ -450,6 +450,7 @@ def _load_all_detections(field_dir: Path,
 
     # r-vectors per sub-image
     r_vecs = {}
+    _n_from_indv, _n_prior_only = [0], [0]
     for j, row in enumerate(transform_df.itertuples()):
         cs       = j * n_r
         sub_name = row.image_name
@@ -465,7 +466,23 @@ def _load_all_detections(field_dir: Path,
         else:
             r_j   = r_base
         C_r_j      = C_r[cs:cs + n_r, cs:cs + n_r]
+        # Images the joint fit DEMOTED to astrometry-only keep their warm-start r but report the
+        # prior as covariance (pointing sigma 5000 mas): projected positions would carry a 5" error
+        # and nothing links (Leo_P 2026-10-02: 35/39 deep images, Gaia stars saturated).  Use the
+        # image's own indv fit -- r and C_r -- when it was made on the current matches.
+        if n_r >= 6 and np.sqrt(abs(C_r_j[4, 4])) >= 1000.0:
+            _iv = _indv_solution(field_dir, hst_root, sub_name, n_r)
+            if _iv is not None:
+                r_j, C_r_j, _ra0i = _iv
+                if _ra0i is not None:
+                    ra0_initial_lookup[sub_name] = _ra0i; _uses_ra0_final.add(sub_name)
+                _n_from_indv[0] += 1
+            else:
+                _n_prior_only[0] += 1
         r_vecs[sub_name] = (r_j, C_r_j)
+    if _n_from_indv[0] or _n_prior_only[0]:
+        print(f"  {_n_from_indv[0]} demoted sub-image(s) use their indv solution + covariance; "
+              f"{_n_prior_only[0]} remain prior-only (no current indv fit)")
 
     # ── Per-sub-image processing ──────────────────────────────────────────────
     # Closures over r_vecs, zp_legacy, alpha_lookup, hst_root, n_r, poly_order —
@@ -768,6 +785,42 @@ def _load_all_detections(field_dir: Path,
     result = pd.concat(per_image_dfs, ignore_index=True)
     result.attrs['pre_zp_applied'] = _apply_pre_zp
     return result
+
+
+def _indv_solution(field_dir: Path, hst_root: Path, sub_name: str, n_r: int):
+    """(r, C_r, (ra0_final, dec0_final)) of sub_name from BP3M_indv_results/<base>, or None if the
+    indv fit is missing, has no constrained pointing, or was made on different matches."""
+    import json as _js, hashlib as _hl
+    base = sub_name.replace('_hi', '').replace('_lo', '')
+    d = field_dir / 'BP3M_indv_results' / base
+    try:
+        cfg = _js.load(open(d / 'run_config.json'))
+        md5 = cfg.get('matched_gaia_md5')
+        mg = hst_root / base / 'matched_gaia.csv'
+        if md5 and (not mg.exists() or _hl.md5(mg.read_bytes()).hexdigest() != md5):
+            return None
+        it = pd.read_csv(d / 'image_transformations.csv')
+        Ci = np.load(d / 'C_r.npy')
+    except Exception:
+        return None
+    rows = it.index[it.image_name.astype(str) == sub_name].tolist()
+    if not rows:
+        return None
+    j = rows[0]; k = Ci.shape[0] // len(it)
+    if k < n_r:
+        return None
+    row = it.iloc[j]
+    C = Ci[j * k:j * k + n_r, j * k:j * k + n_r]
+    if not np.isfinite(C).all() or np.sqrt(abs(C[4, 4])) >= 1000.0:
+        return None
+    ra0f, dec0f = float(row.get('ra0_final', np.nan)), float(row.get('dec0_final', np.nan))
+    use_final = np.isfinite(ra0f) and np.isfinite(dec0f)
+    r = np.array([row['a'], row['b'], row['c'], row['d'],
+                  0.0 if use_final else float(row.get('delta_ra0_mas', 0.0)),
+                  0.0 if use_final else float(row.get('delta_dec0_mas', 0.0))])
+    if n_r > 6:
+        r = np.concatenate([r, [float(row.get(f'r_{q}', 0.0)) for q in range(6, n_r)]])
+    return r, C, ((ra0f, dec0f) if use_final else None)
 
 
 def _strip_chip_offset_cols(bp3m_dir: Path, C_r: np.ndarray, transform_df: pd.DataFrame, n_r: int):
