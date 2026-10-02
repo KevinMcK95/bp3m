@@ -79,7 +79,13 @@ class V2AlignmentCallback:
     def __init__(self, hst_star_mask: np.ndarray,
                  hst_enable_iter: int = 5,
                  outlier_sigma: float = 5.0,
-                 pm_init: np.ndarray | None = None):
+                 pm_init: np.ndarray | None = None,
+                 hst_align: bool = False):
+        # hst_align (2026-10-02, opt-in test): enabled HST-only detections also enter use_for_fit
+        # (alignment) with their diffuse PM prior -- geometry only, the frame PM stays Gaia's; the
+        # solver keeps them to sigma_resid < hst_fit_sigma_mult x the Gaia threshold and excludes
+        # diffuse-prior stars from the threshold reference (they cannot tighten the Gaia cut).
+        self.hst_align = bool(hst_align)
         self.hst_star_mask   = np.asarray(hst_star_mask, dtype=bool)
         self.hst_enable_iter = hst_enable_iter
         self.outlier_sigma   = outlier_sigma
@@ -246,16 +252,20 @@ class V2AlignmentCallback:
 
                 use_astrom = d.get("use_for_astrom",
                                    d["use_for_fit"].copy())
+                use_fit_k = np.asarray(d["use_for_fit"], bool).copy()
                 for k in np.where(hst_mask)[0]:
                     star_idx = int(sidx[k])
                     if (hst_detect_count.get(star_idx, 0) >= 2 and
                             not excl[k] and soft[k] == 0):
-                        # use_for_fit stays False → no transformation influence
+                        # default: use_for_fit stays False → no transformation influence
                         use_astrom[k] = True
+                        if self.hst_align:
+                            use_fit_k[k] = True
                         n_enabled += 1
 
                 d["use_for_astrom"] = use_astrom
-                # use_for_fit intentionally NOT modified here
+                if self.hst_align:
+                    d["use_for_fit"] = use_fit_k
 
             # Seed v_survey PM for newly-enabled HST-only sources from their
             # crossmatch PM estimates.  Without this, all HST-only stars start
@@ -688,6 +698,7 @@ def run_alignment_v2(
     fit_chip_offset: bool = False,
     prior_sigma_chip_px: float | None = None,
     min_stars_split_ccd: int | None = None,
+    hst_align: bool = False,
 ) -> Path:
     """
     Run BP3M v2 alignment using the master_combined_v2.csv cross-match catalog.
@@ -858,6 +869,18 @@ def run_alignment_v2(
         fit_chip_offset=fit_chip_offset,
         prior_sigma_chip_px=prior_sigma_chip_px,
     )
+    # warm-start covariances from v1 (2026-10-02): a v2-demoted image reports the v1 posterior block
+    # (for images v1 itself demoted, that is their indv covariance) instead of the prior
+    try:
+        _C1 = np.load(v1_bp3m_dir / "C_r.npy"); _k1 = _C1.shape[0] // len(v1_df)
+        if _k1 == solver.N_R:
+            solver._indv_C_r = {}
+            for _j1, _n1 in enumerate(v1_df["image_name"].astype(str)):
+                _b1 = _C1[_j1 * _k1:(_j1 + 1) * _k1, _j1 * _k1:(_j1 + 1) * _k1]
+                if np.isfinite(_b1).all() and np.sqrt(abs(_b1[4, 4])) < 1000.0:
+                    solver._indv_C_r[_n1] = _b1.copy()
+    except Exception as _exc_c1:
+        print(f"  (no v1 warm-start covariances: {_exc_c1})")
 
     # ── Override diffuse PM prior for HST-only stars ──────────────────────────
     # The solver is initialised with _SIGMA_PM=100 mas/yr for all 2p/HST-only
@@ -919,7 +942,10 @@ def run_alignment_v2(
         hst_enable_iter=hst_enable_iter,
         outlier_sigma=outlier_sigma,
         pm_init=pm_init,
+        hst_align=hst_align,
     )
+    if hst_align:
+        print("  --hst_align: HST-only detections join the alignment (diffuse PM prior, stricter residual cut)")
 
     # ── Phase 0 (fixed-transformation pre-filter) ─────────────────────────────
     # When v1 BP3M results are available, use the converged transformation
@@ -1389,6 +1415,8 @@ def run_alignment_v2(
         inflate_from_iter=0,       # v1 alpha is pre-validated: allow decrease from iter 0
         min_outer_iters=_min_outer,
         hst_fit_sigma_mult=0.5,    # HST-only must have tighter residuals to stay in alignment
+        demote_from_iter=hst_enable_iter + 1,   # 2026-10-02: demote only after HST-only stars are in the alignment,
+                                   # counting them (Gaia-poor / saturated images align on HST-only stars)
         prefilter=_run_solver_prefilter,
         use_influence_clip=use_influence_clip,
         influence_k=influence_k,
@@ -1404,6 +1432,9 @@ def run_alignment_v2(
         z_init=_z_init,
     )
     print(f"  Fit completed in {time.time()-t0:.1f}s")
+    # demoted (astrometry-only) images: their v1/indv warm-start covariance instead of the prior
+    from bp3m.pipeline.run_alignment import _demoted_indv_covariance
+    C_r = _demoted_indv_covariance(solver, solver.image_names, C_r)
 
     # ── Soft-weight output ────────────────────────────────────────────────────
     if use_soft_weights and z_weights_out is not None:
@@ -1454,6 +1485,7 @@ def run_alignment_v2(
             "pos_corr_table":    (str(pos_corr_table) if pos_corr_table else None),
             "pos_corr_model":    (str(pos_corr_model) if pos_corr_model else None),
             "min_stars_split_ccd": min_stars_split_ccd,
+            "hst_align":         bool(hst_align),
             "settings_inherited_from": "BP3M_results/run_config.json unless given on the bp3m-v2 CLI",
             "hst_enable_iter":   hst_enable_iter,
             "hst_max_pm_unc":    hst_max_pm_unc,

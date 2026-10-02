@@ -1826,7 +1826,7 @@ class BP3MSolver:
     # ── Public fit interface ───────────────────────────────────────────────────
 
     def fit(self, n_iter=20, tol=1e-6, clip_sigma=4.5, inflate_hst_errors=False,
-            adaptive_delta=1.0, min_align_demote=5,
+            adaptive_delta=1.0, min_align_demote=5, demote_from_iter=0,
             inflate_from_iter=3, inflate_alpha_max=3.0, min_outer_iters=None,
             two_phase_align=False,
             mask_tol_frac=1e-3, mask_tol_iters=3,
@@ -2405,7 +2405,9 @@ class BP3MSolver:
                 # Decisions only; the masks themselves are managed inside
                 # _update_use_for_fit (astrometry follows admissions, the
                 # alignment mask empties while demoted, churn stays clean).
-                if min_align_demote > 0:
+                # demote_from_iter (2026-10-02): v2 decides only once its HST-only stars are in the
+                # alignment (outer iteration >= hst_enable_iter), so the count includes them
+                if min_align_demote > 0 and it_outer + 1 >= demote_from_iter:
                     for _img, _d in self._img_data.items():
                         if _d is None:
                             continue

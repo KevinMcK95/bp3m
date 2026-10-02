@@ -113,6 +113,9 @@ def main():
                         help='Use Student-t IRLS soft weights instead of hard tests 1-4')
     parser.add_argument('--student_t_nu', type=float, default=50.0,
                         help='Student-t degrees of freedom for soft-weight IRLS')
+    parser.add_argument('--hst_align', action='store_true',
+                        help='TEST (2026-10-02): HST-only detections also constrain the alignment '
+                             '(diffuse PM prior: geometry only; the frame PM stays set by Gaia)')
     parser.add_argument('--exclude_2p_from_alignment', action='store_true',
                         help='Exclude 2-parameter Gaia stars from the alignment solve '
                              '(they still contribute to their own astrometric posteriors)')
@@ -262,6 +265,7 @@ def main():
         student_t_nu                  = args.student_t_nu,
         exclude_2p_from_alignment     = args.exclude_2p_from_alignment,
         min_stars_split_ccd           = _min_split,
+        hst_align                     = args.hst_align,
         **_prior_kw,
     )
 

@@ -685,6 +685,7 @@ def run_alignment(  # noqa: C901
         no_align_prior=no_align_prior,
     )
     print(f"  Fit completed in {time.time()-t0:.1f}s")
+    C_r = _demoted_indv_covariance(solver, image_names, C_r)
 
     # ── Sample posteriors ─────────────────────────────────────────────────────
     if mcmc_posteriors:
@@ -871,6 +872,27 @@ def compute_chi2_per_star(solver, r_hat, v_hat, image_names, use_key='use_for_as
     return chi2, n_det
 
 
+def _demoted_indv_covariance(solver, image_names, C_r):
+    """Demoted (astrometry-only) images kept their warm-start r (the indv solution); give them that
+    solution's covariance instead of the prior.  Cross-terms with other images are zeroed (the indv
+    fit is independent of them).  Applied before the star posteriors, so PM marginalisation uses it."""
+    dem = getattr(solver, '_align_demoted', set()) or set()
+    blocks = getattr(solver, '_indv_C_r', {}) or {}
+    if not dem or not blocks:
+        return C_r
+    nr = solver.N_R; C_r = np.array(C_r, copy=True); n = 0
+    names = list(getattr(solver, 'image_names', None) or image_names)   # C_r follows the solver's image order
+    for img in sorted(dem):
+        if img not in blocks or img not in names:
+            continue
+        j = names.index(img); sl = slice(j * nr, (j + 1) * nr)
+        C_r[sl, :] = 0.0; C_r[:, sl] = 0.0; C_r[sl, sl] = blocks[img]; n += 1
+    if n:
+        print(f"  {n} demoted image(s): covariance = their indv posterior (not the prior); "
+              f"{len(dem) - n} without an indv block keep the prior")
+    return C_r
+
+
 def _apply_indv_init(solver, image_names, data_root, field_name):
     """--use_indv_outputs: warm-start the joint fit from per-image fits.
 
@@ -945,6 +967,10 @@ def _apply_indv_init(solver, image_names, data_root, field_name):
             _fb(f'match algo v{_ver} != v{XMATCH_ALGO_VERSION}', len(subs)); continue
 
         it = _pd.read_csv(d_indv / 'image_transformations.csv').set_index('image_name')
+        try:
+            _Ci_all = np.load(d_indv / 'C_r.npy')
+        except Exception:
+            _Ci_all = None
         sa = _pd.read_csv(d_indv / 'stellar_astrometry.csv',
                           dtype={'Gaia_id': np.int64})
         uff = np.load(d_indv / 'use_for_fit.npz')
@@ -992,6 +1018,16 @@ def _apply_indv_init(solver, image_names, data_root, field_name):
             acc  = np.isin(jg, g_fit) if len(g_fit) else np.zeros(len(jg), bool)
 
             d['r_init'] = r_vec
+            # the indv posterior covariance of this warm start: a DEMOTED (astrometry-only, r frozen)
+            # image reports it instead of the prior (2026-10-02, user-approved; pointing prior 5"
+            # otherwise leaks into every star PM measured through Gaia-poor / saturated images)
+            if _Ci_all is not None:
+                _jj = list(it.index).index(sub); _k = _Ci_all.shape[0] // len(it)
+                if _k == nr:
+                    _blk = _Ci_all[_jj * _k:(_jj + 1) * _k, _jj * _k:(_jj + 1) * _k]
+                    if np.isfinite(_blk).all() and np.sqrt(abs(_blk[4, 4])) < 1000.0:
+                        solver._indv_C_r = getattr(solver, '_indv_C_r', {})
+                        solver._indv_C_r[sub] = _blk.copy()
             _uf = np.asarray(d['use_for_fit'], bool)
             # acceptance list seeds the mask (only where indv saw the star)
             _uf = _uf & np.where(seen, acc, True)
