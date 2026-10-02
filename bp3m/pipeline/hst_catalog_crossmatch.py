@@ -4562,6 +4562,26 @@ def run_hst_crossmatch(
             n_r4          = C_r_full.shape[0] // n_sub4
             C_r_full, transform_df4, n_r4 = _strip_chip_offset_cols(bp3m_dir, C_r_full, transform_df4, n_r4)
             poly_order4   = _infer_poly_order(n_r4)
+            # Demoted (astrometry-only) images: their own indv solution + covariance, as in the loader
+            # (otherwise every PM through a deep, Gaia-saturated image is nulled by its 5" prior).
+            _hst_root4 = field_dir / 'HST' / 'mastDownload' / 'HST'
+            _n_sub4 = 0
+            for _j4, _nm4 in enumerate(transform_df4['image_name'].astype(str)):
+                _cs = _j4 * n_r4
+                if n_r4 >= 6 and np.sqrt(abs(C_r_full[_cs + 4, _cs + 4])) >= 1000.0:
+                    _iv = _indv_solution(field_dir, _hst_root4, _nm4, n_r4)
+                    if _iv is None:
+                        continue
+                    _ri, _Ci, _ra0i = _iv
+                    C_r_full[_cs:_cs + n_r4, :] = 0.0; C_r_full[:, _cs:_cs + n_r4] = 0.0
+                    C_r_full[_cs:_cs + n_r4, _cs:_cs + n_r4] = _Ci
+                    for _k4, _col in enumerate(('a', 'b', 'c', 'd')):
+                        transform_df4.loc[transform_df4.index[_j4], _col] = float(_ri[_k4])
+                    if _ra0i is not None and 'ra0_final' in transform_df4.columns:
+                        transform_df4.loc[transform_df4.index[_j4], ['ra0_final', 'dec0_final']] = _ra0i
+                    _n_sub4 += 1
+            if _n_sub4:
+                print(f"  Phase 6: {_n_sub4} demoted sub-image(s) use their indv solution + covariance")
 
             # Reorder if run_config.json is available
             run_cfg_path = bp3m_dir / 'run_config.json'
