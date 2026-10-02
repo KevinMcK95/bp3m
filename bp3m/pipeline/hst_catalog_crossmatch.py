@@ -506,7 +506,9 @@ def _load_all_detections(field_dir: Path,
 
         img_dir  = hst_root / base
         cat_path = img_dir / f'{base}_flc_catalog.fits'
-        tran_csv = img_dir / ('transformation_prealign.csv' if sub_name in _prealigned else 'transformation.csv')
+        # prealigned solutions are per exposure (one affine for both chips): match the sub-image's base name
+        tran_csv = img_dir / ('transformation_prealign.csv' if (sub_name in _prealigned or base in _prealigned)
+                              else 'transformation.csv')
 
         if not cat_path.exists() or not tran_csv.exists():
             return None
