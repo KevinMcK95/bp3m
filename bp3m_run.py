@@ -40,6 +40,12 @@ from multiprocessing import cpu_count
 import numpy as np
 
 
+
+# Individual-fit version: bump when the single-image fit or its outputs change, so cached indv
+# results whose matched_gaia.csv md5 is unchanged are still refit (run_config 'indv_fit_version').
+#   2 = 2026-10-01: Phase-0 pre-filter fix (51e5dba), gdc_labels.csv.gz export, pos_corr_model in key
+INDV_FIT_VERSION = 2
+
 def _config_lib_dir() -> str | None:
     """Read lib_dir from config.toml if it exists (written by bp3m-setup).
 
@@ -1502,7 +1508,7 @@ def main():
                 import hashlib as _hl
                 _m = (output_dir / field / 'HST' / 'mastDownload' / 'HST'
                       / _img_name / 'matched_gaia.csv')
-                _cfg = {}
+                _cfg = {'indv_fit_version': INDV_FIT_VERSION}
                 if _m.exists():
                     _cfg['matched_gaia_md5'] = _hl.md5(_m.read_bytes()).hexdigest()
                     _cfg['matched_gaia_mtime'] = _m.stat().st_mtime
@@ -1581,6 +1587,8 @@ def main():
                 'inflate_hst_errors': not args.no_inflate_hst_errors,
                 'two_phase_align': args.two_phase_align,
                 'pos_err_floor': args.bp3m_pos_err_floor,
+                'pos_corr_model': (str(args.pos_corr_model) if args.pos_corr_model else None),
+                'indv_fit_version': INDV_FIT_VERSION,
             }
 
             def _indv_cached(_img):
