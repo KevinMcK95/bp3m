@@ -428,7 +428,7 @@ def save_diagnostic_plots(out_dir, image_name, matched_df, rejected_df):
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]); plt.savefig(os.path.join(out_dir, "diagnostic_plots.png"), dpi=150); plt.close()
 
 class FileLogger(object):
-    def __init__(self, filename): self.log = open(filename, "w")
+    def __init__(self, filename, mode="w"): self.log = open(filename, mode)
     def write(self, message): self.log.write(message)
     def flush(self): self.log.flush()
 
@@ -472,8 +472,10 @@ def _save_offset_histogram(best, image_name, out_dir):
 def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, discovery_max_offset=50,
                       seed_quality_mask=None, debug_verbose=False,
                       sigma_rot_deg=None, sigma_scale=None,
-                      forced=None):
-    """
+                      forced=None, selection='lowest_cost'):
+    """selection: 'lowest_cost' (legacy rule; DELVE / CFHT / other callers) or 'evaluate' (HST,
+    2026-10-01: one candidate per agreeing tier cluster, refined and chance-tested by the caller).
+
     Tier-walks qfit x mag limits to find a physically plausible 4P similarity seed.
 
     hst_d  keys: x, y, mag, C, qfit, chi2
@@ -697,7 +699,94 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
         if debug_verbose:
             print(f"    DBG failure summary: {_dbg}")
         return None
+    if selection == 'evaluate':
+        return _select_discovery(discovered, params)
     return min(discovered, key=lambda x: x['red_cost'])
+
+
+CHANCE_SHIFTS_PX = (25.0, 50.0)   # rings of 8 shifted copies of the final solution
+CHANCE_FA_PROB = 1e-3             # accept only if P(N >= N_real | Poisson(lambda_chance)) < this
+CHANCE_MAG_WIN = 1.0              # minimum half-width of the zero-point window of the test; the window is
+                                  # max(this, 3 x robust MAD of the matches' G-HST) so UV filters with a
+                                  # several-mag colour spread are not cut (NGC 300 F225W: G-HST -4..+2)
+CHANCE_SIGMA_MAX = 2.0            # the test counts pairs within this many sigma: real matches sit well
+                                  # inside it, chance pairs are uniform over the 5-sigma area (~16% inside)
+
+
+def _final_pass_count(xh_in_g, yh_in_g, x_g, y_g, M, C_pix_hst, C_g, C_params, xs_o, ys_o, x_hst, y_hst,
+                      resid_cov, g_mag, mag_hst, zp, max_mag_diff, zp_win=None, mag_win=CHANCE_MAG_WIN):
+    """Number of one-to-one pairs the final pass would accept for these Gaia positions, counting only
+    pairs within CHANCE_MAG_WIN of zp_win (default zp)."""
+    tree = KDTree(np.column_stack([x_g, y_g]))
+    ds, g_idxs = tree.query(np.column_stack([xh_in_g, yh_in_g]), k=5, distance_upper_bound=100)
+    h_v = np.repeat(np.arange(len(xh_in_g)), 5); valid = ds.flatten() < 100
+    h_v, g_v = h_v[valid], g_idxs.flatten()[valid]
+    if len(h_v) == 0:
+        return 0
+    dx_v, dy_v = x_g[g_v] - xh_in_g[h_v], y_g[g_v] - yh_in_g[h_v]
+    C_proj = np.einsum('ij,njk,lk->nil', M, C_pix_hst[h_v], M)
+    J = np.zeros((len(h_v), 2, 6)); dxh, dyh = x_hst[h_v] - xs_o, y_hst[h_v] - ys_o
+    J[:, 0, 0], J[:, 0, 1], J[:, 0, 2] = dxh, dyh, 1.0
+    J[:, 1, 3], J[:, 1, 4], J[:, 1, 5] = dxh, dyh, 1.0
+    C_tot = C_g[g_v] + C_proj + np.einsum('nij,jk,nlk->nil', J, C_params, J) + resid_cov
+    sig = compute_mahalanobis(dx_v, dy_v, C_tot); cost = compute_logprob_cost(dx_v, dy_v, C_tot)
+    md = g_mag[g_v] - mag_hst[h_v]; cost = cost + ((md - zp) / 1.0) ** 2
+    df = pd.DataFrame({'h': h_v, 'g': g_v, 's': sig, 'c': cost, 'md': md}).sort_values('c')
+    df = df.drop_duplicates('g').drop_duplicates('h')
+    zc = zp if zp_win is None else zp_win
+    return int(((df['s'] < CHANCE_SIGMA_MAX) & (np.abs(df['md'] - zp) < max_mag_diff)
+                & (np.abs(df['md'] - zc) < min(max_mag_diff, mag_win))).sum())
+
+
+def chance_significance(n_real, counts):
+    """(lambda, false-alarm probability) of n_real matches given the shifted-solution counts."""
+    from scipy.stats import poisson
+    lam = max(float(np.mean(counts)), 1e-3)
+    return lam, float(poisson.sf(n_real - 1, lam))
+
+
+DISCOVERY_AGREE_PX = 3.0    # two tier solutions agree if they map the footprint within this
+MAX_DISCOVERY_CANDIDATES = 4   # distinct discovery clusters evaluated end to end
+
+
+def _select_discovery(discovered, params):
+    """Pick the 4P seed the tiers AGREE on (user 2026-10-01).
+
+    The old rule (lowest red_cost) favours tiny seed sets: on 47 Tuc j8fw01b6q ~40 tiers found the
+    same ~960-star solution at offset (0,0) but a lone 3-star tier with scale 0.971 / rot 0.19 deg had
+    a lower cost and became a 430-pair chance solution.  Now: cluster tier solutions that map the
+    footprint within DISCOVERY_AGREE_PX, take the cluster supported by the most tiers (ties: most
+    stars), and inside it the lowest-cost solution among those with >= half the cluster's largest
+    seed set.  A single discovered solution is returned unchanged."""
+    if len(discovered) == 1:
+        return discovered[0]
+    gx, gy = np.meshgrid(np.linspace(-1800, 1800, 5), np.linspace(-1800, 1800, 5))
+    hx = params['x_cen'] + gx.ravel(); hy = params['y_cen'] + gy.ravel()
+    P = np.array([np.column_stack(apply_affine(hx, hy, d['A'], d['B'], d['C'], d['D'],
+                                               d['xs_o'], d['ys_o'], d['xt_o'], d['yt_o']))
+                  for d in discovered])                                   # (n, 25, 2)
+    D = np.max(np.hypot(P[:, None, :, 0] - P[None, :, :, 0], P[:, None, :, 1] - P[None, :, :, 1]), axis=2)
+    agree = D < DISCOVERY_AGREE_PX
+    support = agree.sum(axis=1)
+    nmax = np.array([max(discovered[j]['n_match'] for j in np.where(agree[i])[0]) for i in range(len(discovered))])
+    order = sorted(range(len(discovered)), key=lambda i: (support[i], nmax[i]), reverse=True)
+    reps, assigned = [], set()
+    for i in order:
+        if i in assigned:
+            continue
+        members = [discovered[j] for j in np.where(agree[i])[0]]
+        assigned |= set(np.where(agree[i])[0].tolist())
+        nm = max(d['n_match'] for d in members)
+        reps.append((int(support[i]), min((d for d in members if d['n_match'] >= 0.5 * nm), key=lambda d: d['red_cost'])))
+    old = min(discovered, key=lambda d: d['red_cost'])
+    if all(r[1] is not old for r in reps):
+        reps.append((1, old))
+    pick = reps[0][1]
+    pick['_alternatives'] = [r[1] for r in reps[1:]]
+    print(f"  Discovery selection: {len(discovered)} tier solutions in {len(reps)} distinct clusters "
+          f"(support {[r[0] for r in reps[:MAX_DISCOVERY_CANDIDATES]]}); candidates go through refinement + "
+          f"chance test, the most significant wins")
+    return pick
 
 
 def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_resid_floor=True,
@@ -852,7 +941,7 @@ def _pos_corr_applier(spec):
 
 
 def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True, sigma_rot_deg=None, sigma_scale=None, sigma_skew=None, init_resid_max=5.0, pos_corr_model=None,
-                         guess_affine=None, guess_max_offset=10.0):
+                         guess_affine=None, guess_max_offset=10.0, log_mode="w"):
     """guess_affine: optional (M, t) predicting this image's HST-pixel -> Gaia-frame mapping
     g = M (h - c) + t, c = (x_cen, y_cen) of its header frame (visit-group completion: own previous
     solution or the sibling-transferred header error).  The Gaia guess positions are then taken from
@@ -860,7 +949,9 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
     start_time = time.time()
     image_name = os.path.basename(hst['flc']).replace("_flc.fits", "")
     log_file, original_stdout = os.path.join(hst['root'], "processing_log.txt"), sys.stdout
-    sys.stdout = FileLogger(log_file)
+    sys.stdout = FileLogger(log_file, log_mode)
+    if log_mode == "a":
+        print(f"\n===== retry: discovery_max_offset={discovery_max_offset} px =====")
     print(f"Starting {image_name}...", file=original_stdout)
     try:
         print(f"--- Processing HST image: {image_name} ---")
@@ -1084,7 +1175,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 continue
             print(f"  Trying 4P discovery [{_tier_name}] ({_n_seed} Gaia in field, "
                   f"{len(_hst_d['x'])} HST sources)...")
-            best = _run_4p_discovery(_hst_d, gaia_field, params, max_mag_diff,
+            best = _run_4p_discovery(_hst_d, gaia_field, params, max_mag_diff, selection='evaluate',
                                       scale_sweep=scale_sweep,
                                       discovery_max_offset=discovery_max_offset,
                                       seed_quality_mask=_seed_mask,
@@ -1102,68 +1193,123 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         print(f"  4P Discovery Succeeded [{used_tier}]: Best Q<{best['q']}, Mag<{best['m']:.1f} "
               f"({best['n_match']} matches, red_chi2={best['red_chi2']:.2f}, red_cost={best['red_cost']:.2f})")
 
-        # --- Save offset histogram plot for the best discovery tier ---
+        def _evaluate(cand):
+
+            # --- Affine Refinement (all sources) ---
+            # Seed indices from 4P discovery index into the HST dataset used for that
+            # tier.  For the stars-only round, remap to full-array indices; for the
+            # all-sources round they are already full-array indices.
+            if _used_stars_only:
+                best_all = {**cand, 'h_v': star_indices[cand['h_v']]}
+            else:
+                best_all = cand
+            A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f, _init_rx, _init_ry = \
+                _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor,
+                                       sigma_rot_deg=sigma_rot_deg, sigma_scale=sigma_scale, sigma_skew=sigma_skew)
+
+            # Sanity check: if the 4P seed was spurious, the Init 6P residuals
+            # (on the seed pairs before any iteration inflates resid_cov) are large.
+            # Correct matches have sub-pixel Init 6P residuals; wrong matches have
+            # multi-pixel residuals even before the 6P iterates.
+            # Since the chance-coincidence test (2026-10-01) the seed-residual gate only warns: a crowded
+            # field's real seed set can be >16% mispairs (47 Tuc j8fw01b6q: 10 px at Init 6P, 0.4-0.8 px and
+            # 1263 matches after refinement); spurious seeds are rejected by the chance test instead.
+            if max(_init_rx, _init_ry) > init_resid_max:
+                print(f"  WARNING: Init 6P seed residuals large ({_init_rx:.2f},{_init_ry:.2f}px > {init_resid_max}) — "
+                      f"refining anyway; the chance-coincidence test decides")
+
+            M = np.array([[A, B], [C, D]])
+
+            # --- Final pass: gather all candidates with the converged transform ---
+            xh_in_g, yh_in_g = apply_affine(x_hst, y_hst, A, B, C, D, xs_o, ys_o, xt_o, yt_o)
+            ds, g_idxs = tree_gaia_all.query(np.column_stack([xh_in_g, yh_in_g]), k=5, distance_upper_bound=100)
+            h_idx_all = np.repeat(np.arange(len(x_hst)), 5)
+            valid = ds.flatten() < 100
+            h_v, g_v = h_idx_all[valid], g_idxs.flatten()[valid]
+
+            dx_v, dy_v = x_g_in[g_v] - xh_in_g[h_v], y_g_in[g_v] - yh_in_g[h_v]
+            C_proj = np.einsum('ij,njk,lk->nil', M, C_pix_hst[h_v], M)
+            dxh_v, dyh_v = x_hst[h_v] - xs_o, y_hst[h_v] - ys_o
+            J = np.zeros((len(h_v), 2, 6))
+            J[:, 0, 0], J[:, 0, 1], J[:, 0, 2] = dxh_v, dyh_v, 1.0
+            J[:, 1, 3], J[:, 1, 4], J[:, 1, 5] = dxh_v, dyh_v, 1.0
+            C_model = np.einsum('nij,jk,nlk->nil', J, C_params, J)
+            C_total = C_g_in[g_v] + C_proj + C_model + resid_cov
+
+            sigs_v = compute_mahalanobis(dx_v, dy_v, C_total)
+            costs_v = compute_logprob_cost(dx_v, dy_v, C_total)
+            mag_diffs = g_mag_in[g_v] - mag_hst[h_v]
+            costs_v += ((mag_diffs - zp) / 1.0)**2
+            costs_v[np.abs(mag_diffs - zp) > max_mag_diff] = np.inf
+
+            final_mdf = pd.DataFrame({
+                'h': h_v, 'g': g_v, 's': sigs_v, 'c': costs_v,
+                'dx': dx_v, 'dy': dy_v, 'mag_diff': mag_diffs,
+                'cxx': C_total[:, 0, 0], 'cyy': C_total[:, 1, 1],
+            }).sort_values('c')
+            all_mdf   = final_mdf.drop_duplicates('g')
+            final_mdf = final_mdf.drop_duplicates('g').drop_duplicates('h')
+            final_mdf = final_mdf[(final_mdf['s'] < 5.0) & (np.abs(final_mdf['mag_diff'] - zp) < max_mag_diff)]
+
+            h_final, g_final = final_mdf['h'].values, final_mdf['g'].values
+            print(f"  Final matches found: {len(h_final)}")
+            if len(h_final) == 0:
+                return dict(ok=False, reason='Final match filtering removed all stars.')
+            if len(h_final) < max(3, int(min_matches)):
+                return dict(ok=False, reason=f'only {len(h_final)} final matches (< {max(3, int(min_matches))}) — rejected.')
+
+            # --- Chance-coincidence test: the same solution shifted by tens of px ---
+            _md_core = final_mdf['mag_diff'].values[final_mdf['s'].values < CHANCE_SIGMA_MAX]
+            if len(_md_core) == 0:
+                _md_core = final_mdf['mag_diff'].values
+            _zc = float(np.median(_md_core))   # window centre = the matches' own zp
+            _mwin = float(max(CHANCE_MAG_WIN, 3.0 * 1.4826 * np.median(np.abs(_md_core - _zc))))
+            _counts = []
+            for _r in CHANCE_SHIFTS_PX:
+                for _a in np.radians(np.arange(0, 360, 45) + (22.5 if _r != CHANCE_SHIFTS_PX[0] else 0.0)):
+                    _counts.append(_final_pass_count(
+                        xh_in_g, yh_in_g, x_g_in + _r * np.cos(_a), y_g_in + _r * np.sin(_a), M, C_pix_hst, C_g_in,
+                        C_params, xs_o, ys_o, x_hst, y_hst, resid_cov, g_mag_in, mag_hst, zp, max_mag_diff, zp_win=_zc,
+                        mag_win=_mwin))
+            _n_win = int(((np.abs(final_mdf['mag_diff'].values - _zc) < min(max_mag_diff, _mwin))
+                          & (final_mdf['s'].values < CHANCE_SIGMA_MAX)).sum())
+            _lam, _fap = chance_significance(_n_win, _counts)
+            print(f"  Chance-coincidence test: {_n_win} of {len(h_final)} matches within {CHANCE_SIGMA_MAX} sigma and {_mwin:.1f} mag of zp vs {_lam:.2f} expected by chance "
+                  f"(shifted copies: median {np.median(_counts):.0f}, max {max(_counts)}) -> false-alarm P = {_fap:.2e}")
+            if _fap >= CHANCE_FA_PROB:
+                return dict(ok=False, n_win=_n_win, lam=_lam, fap=_fap,
+                            reason=f'match set not significant against chance ({_n_win} vs {_lam:.1f} expected, P={_fap:.2e}) — spurious solution rejected.')
+            return dict(ok=True, cand=cand, A=A, B=B, C=C, D=D, xs_o=xs_o, ys_o=ys_o, xt_o=xt_o, yt_o=yt_o, M=M,
+                        C_params=C_params, resid_cov=resid_cov, zp=zp, xh_in_g=xh_in_g, yh_in_g=yh_in_g,
+                        final_mdf=final_mdf, all_mdf=all_mdf, h_final=h_final, g_final=g_final,
+                        _lam=_lam, _fap=_fap, n_win=_n_win)
+
+
+        _cands = [best] + list(best.get('_alternatives', []))[:MAX_DISCOVERY_CANDIDATES - 1]
+        _results = []
+        for _k, _cand in enumerate(_cands):
+            if len(_cands) > 1:
+                print(f"  --- candidate {_k + 1}/{len(_cands)}: q<{_cand['q']} m<{_cand['m']:.1f} ({_cand['n_match']} seeds) ---")
+            _results.append(_evaluate(_cand))
+        _good = [r for r in _results if r['ok']]
+        if not _good:
+            print(f"Finished {image_name}: {_results[0]['reason']}", file=original_stdout)
+            return
+        _pick = min(_good, key=lambda r: (r['_fap'], -r['n_win']))
+        if len(_cands) > 1:
+            print(f"  Candidate chosen: {_results.index(_pick) + 1}/{len(_cands)} ({_pick['n_win']} matches vs "
+                  f"{_pick['_lam']:.1f} by chance, P={_pick['_fap']:.2e})")
+        best = _pick['cand']
+        A, B, C, D = _pick['A'], _pick['B'], _pick['C'], _pick['D']
+        xs_o, ys_o, xt_o, yt_o = _pick['xs_o'], _pick['ys_o'], _pick['xt_o'], _pick['yt_o']
+        M, C_params, resid_cov, zp = _pick['M'], _pick['C_params'], _pick['resid_cov'], _pick['zp']
+        xh_in_g, yh_in_g = _pick['xh_in_g'], _pick['yh_in_g']
+        final_mdf, all_mdf = _pick['final_mdf'], _pick['all_mdf']
+        h_final, g_final = _pick['h_final'], _pick['g_final']
+        _lam, _fap = _pick['_lam'], _pick['_fap']
+
+        # --- Save offset histogram plot for the chosen discovery tier ---
         _save_offset_histogram(best, image_name, hst['root'])
-
-        # --- Affine Refinement (all sources) ---
-        # Seed indices from 4P discovery index into the HST dataset used for that
-        # tier.  For the stars-only round, remap to full-array indices; for the
-        # all-sources round they are already full-array indices.
-        if _used_stars_only:
-            best_all = {**best, 'h_v': star_indices[best['h_v']]}
-        else:
-            best_all = best
-        A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f, _init_rx, _init_ry = \
-            _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor,
-                                   sigma_rot_deg=sigma_rot_deg, sigma_scale=sigma_scale, sigma_skew=sigma_skew)
-
-        # Sanity check: if the 4P seed was spurious, the Init 6P residuals
-        # (on the seed pairs before any iteration inflates resid_cov) are large.
-        # Correct matches have sub-pixel Init 6P residuals; wrong matches have
-        # multi-pixel residuals even before the 6P iterates.
-        if max(_init_rx, _init_ry) > init_resid_max:
-            print(f"Finished {image_name}: Init 6P residuals too large "
-                  f"({_init_rx:.2f},{_init_ry:.2f}px) — spurious 4P seed, skipping.", file=original_stdout)
-            return
-
-        M = np.array([[A, B], [C, D]])
-
-        # --- Final pass: gather all candidates with the converged transform ---
-        xh_in_g, yh_in_g = apply_affine(x_hst, y_hst, A, B, C, D, xs_o, ys_o, xt_o, yt_o)
-        ds, g_idxs = tree_gaia_all.query(np.column_stack([xh_in_g, yh_in_g]), k=5, distance_upper_bound=100)
-        h_idx_all = np.repeat(np.arange(len(x_hst)), 5)
-        valid = ds.flatten() < 100
-        h_v, g_v = h_idx_all[valid], g_idxs.flatten()[valid]
-
-        dx_v, dy_v = x_g_in[g_v] - xh_in_g[h_v], y_g_in[g_v] - yh_in_g[h_v]
-        C_proj = np.einsum('ij,njk,lk->nil', M, C_pix_hst[h_v], M)
-        dxh_v, dyh_v = x_hst[h_v] - xs_o, y_hst[h_v] - ys_o
-        J = np.zeros((len(h_v), 2, 6))
-        J[:, 0, 0], J[:, 0, 1], J[:, 0, 2] = dxh_v, dyh_v, 1.0
-        J[:, 1, 3], J[:, 1, 4], J[:, 1, 5] = dxh_v, dyh_v, 1.0
-        C_model = np.einsum('nij,jk,nlk->nil', J, C_params, J)
-        C_total = C_g_in[g_v] + C_proj + C_model + resid_cov
-
-        sigs_v = compute_mahalanobis(dx_v, dy_v, C_total)
-        costs_v = compute_logprob_cost(dx_v, dy_v, C_total)
-        mag_diffs = g_mag_in[g_v] - mag_hst[h_v]
-        costs_v += ((mag_diffs - zp) / 1.0)**2
-        costs_v[np.abs(mag_diffs - zp) > max_mag_diff] = np.inf
-
-        final_mdf = pd.DataFrame({
-            'h': h_v, 'g': g_v, 's': sigs_v, 'c': costs_v,
-            'dx': dx_v, 'dy': dy_v, 'mag_diff': mag_diffs,
-            'cxx': C_total[:, 0, 0], 'cyy': C_total[:, 1, 1],
-        }).sort_values('c')
-        all_mdf   = final_mdf.drop_duplicates('g')
-        final_mdf = final_mdf.drop_duplicates('g').drop_duplicates('h')
-        final_mdf = final_mdf[(final_mdf['s'] < 5.0) & (np.abs(final_mdf['mag_diff'] - zp) < max_mag_diff)]
-
-        h_final, g_final = final_mdf['h'].values, final_mdf['g'].values
-        print(f"  Final matches found: {len(h_final)}")
-        if len(h_final) == 0:
-            print(f"Finished {image_name}: Final match filtering removed all stars.", file=original_stdout)
-            return
 
         # --- Build diagnostic dataframe ---
         diag_df = pd.DataFrame({
@@ -1228,6 +1374,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                                params['ra_cen'], params['dec_cen'],
                                params['x_cen'], params['y_cen'],
                                params['pixel_scale'], params['orientat']]
+        trans_out.add_row(['n_chance_expected', _lam]); trans_out.add_row(['chance_fa_prob', _fap])
         trans_out.write(os.path.join(hst['root'], "transformation.csv"), format='ascii.csv', overwrite=True)
         print(f"Finished {image_name}: Found {len(final_matches)} matches in {time.time()-start_time:.2f}s.", file=original_stdout)
 

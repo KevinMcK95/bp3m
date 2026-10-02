@@ -68,6 +68,8 @@ def _write_xmatch_status(root: Path, status: str, params_meta: dict,
     }, indent=2))
 
 
+WIDE_DISCOVERY_OFFSET = 150   # px; second attempt for images that fail at discovery_max_offset
+
 # Current matching-algorithm version (see params_meta note in run_cross_match).
 XMATCH_ALGO_VERSION = 3
 
@@ -216,14 +218,12 @@ def _match_one(args):
         out = root / 'matched_gaia.csv'
         pre_mtime = out.stat().st_mtime if out.exists() else None
 
-        process_single_image(
-            hst_dict, gaia_df,
+        _psi_kw = dict(
             hst_pix_floor=kwargs.get('hst_pix_floor', 0.5),
             min_matches=kwargs.get('min_matches', 3),
             zero_pm=kwargs.get('zero_pm', False),
             max_mag_diff=kwargs.get('max_mag_diff', 3.0),
             scale_sweep=kwargs.get('scale_sweep', False),
-            discovery_max_offset=kwargs.get('discovery_max_offset', 50),
             use_resid_floor=kwargs.get('use_resid_floor', True),
             sigma_rot_deg=kwargs.get('prior_sigma_rot_deg', None),
             sigma_scale=kwargs.get('prior_sigma_scale', None),
@@ -231,8 +231,18 @@ def _match_one(args):
             init_resid_max=kwargs.get('init_resid_max', 5.0),
             pos_corr_model=kwargs.get('pos_corr_model', None),
         )
+        _off = kwargs.get('discovery_max_offset', 50)
+        process_single_image(hst_dict, gaia_df, discovery_max_offset=_off, **_psi_kw)
         post_mtime = out.stat().st_mtime if out.exists() else None
         file_updated = post_mtime is not None and post_mtime != pre_mtime
+        # Wide-window retry (2026-10-01): a header more than ~50 px off (47 Tuc j8c051t9q, a
+        # FIT_IMG_GSC242 solution) cannot be found inside the default offset search.  The
+        # chance-coincidence test guards the wider search against spurious solutions.
+        if not file_updated and _off < WIDE_DISCOVERY_OFFSET:
+            process_single_image(hst_dict, gaia_df, discovery_max_offset=WIDE_DISCOVERY_OFFSET,
+                                 log_mode='a', **_psi_kw)
+            post_mtime = out.stat().st_mtime if out.exists() else None
+            file_updated = post_mtime is not None and post_mtime != pre_mtime
         n = len(pd.read_csv(str(out))) if file_updated else 0
         if file_updated and n > 0:
             if params_meta:
@@ -437,6 +447,7 @@ def run_cross_match(
     work = []
     skipped = []
     skipped_nophot = []
+    skipped_trailed = []
     for hst in tqdm(folders, desc="  Checking cross-match cache", unit="img",
                     dynamic_ncols=True):
         root = Path(hst['root'])
@@ -457,6 +468,16 @@ def run_cross_match(
             _write_xmatch_status(root, 'skipped', params_meta_img,
                                   reason='no photometric calibration (PHOTFLAM/EXPTIME missing)')
             skipped_nophot.append(name)
+            continue
+
+        # Trailed exposures (guiding failures the headers do not report) are not cross-matched.
+        from .image_quality import image_quality as _iq
+        _q = _iq(hst['flc'], hst['catalog'])
+        if _q.get('trailed'):
+            _write_status(root, 'skipped', params_meta_img,
+                          reason=f"trailed exposure (star axis ratio {_q['axis_ratio']:.2f}, orientation "
+                                 f"coherence {_q['pa_coherence']:.2f} at PA {_q['pa_deg']:.0f} deg)")
+            skipped_trailed.append(name)
             continue
 
         work.append((hst, gaia_df, {
@@ -480,6 +501,9 @@ def run_cross_match(
     if skipped_nophot:
         print(f"  {len(skipped_nophot)} image(s) skipped — no photometric calibration (PHOTFLAM missing): "
               f"{', '.join(skipped_nophot)}")
+    if skipped_trailed:
+        print(f"  {len(skipped_trailed)} image(s) skipped — trailed exposure (image_quality.json): "
+              f"{', '.join(skipped_trailed)}")
     if not work:
         print("  All cross-matches up to date.")
         _n_grp = _group_pass()

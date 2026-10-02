@@ -64,8 +64,12 @@ def field_zp_reference(folders: list) -> dict:
     return {k: float(np.median(v)) for k, v in acc.items()}
 
 
+ZP_DECIDES = False   # 2026-10-01: zp ~ -10 is often a REAL match to saturated stars (wing-fit flux);
+                     # the main-pass chance-coincidence test rejects spurious solutions instead.
+
+
 def zp_sane(zp: float, ref, n: int = 0) -> bool:
-    if n >= ZP_GATE_MAX_N:
+    if not ZP_DECIDES or n >= ZP_GATE_MAX_N:
         return True
     if not np.isfinite(zp):
         return False
