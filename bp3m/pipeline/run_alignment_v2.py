@@ -832,11 +832,15 @@ def run_alignment_v2(
             print(f"  (visit prealign not loaded: {_exc_pre})")
         if _pre_df is not None:
             _n_pre = 0
+            from bp3m.pipeline.visit_prealign import epoch_override_names
+            _ovr = epoch_override_names(_pre_df)
             for _jp, _rp in _pre_df.iterrows():
                 _np_ = str(_rp["image_name"])
-                if _np_ in v1_abcd:
+                if _np_ in v1_abcd and _np_ not in _ovr:
                     continue
                 for _sub in [k for k in imgs if k == _np_ or k.replace('_hi', '').replace('_lo', '') == _np_]:
+                    if _sub in v1_abcd and _np_ not in _ovr:
+                        continue
                     v1_abcd[_sub] = np.array([float(_rp["a"]), float(_rp["b"]), float(_rp["c"]), float(_rp["d"]), 0.0, 0.0])
                     v1_alpha[_sub] = 1.0; _n_pre += 1
                     # pointing prior = the sibling-derived pointing (mean 0 on the prealigned centre)
@@ -909,7 +913,10 @@ def run_alignment_v2(
             for _jp, _np_ in enumerate(_pre_df["image_name"].astype(str)):
                 _bp = _pre_C[6 * _jp:6 * _jp + 6, 6 * _jp:6 * _jp + 6]
                 for _sub in [k for k in image_names if k.replace('_hi', '').replace('_lo', '') == _np_]:
-                    solver._indv_C_r.setdefault(_sub, _bp.copy())
+                    if _np_ in epoch_override_names(_pre_df):
+                        solver._indv_C_r[_sub] = _bp.copy()      # epoch anchor replaces the v1 (suspect) block
+                    else:
+                        solver._indv_C_r.setdefault(_sub, _bp.copy())
     except Exception as _exc_c1:
         print(f"  (no v1 warm-start covariances: {_exc_c1})")
 

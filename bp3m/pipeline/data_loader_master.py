@@ -589,8 +589,11 @@ def load_master_v2(
         _pre_df, _ = load_prealign(field_dir)
         _prealigned = set(_pre_df['image_name'].astype(str)) if _pre_df is not None else set()
         _v1x = Path(field_dir) / 'BP3M_results' / 'image_transformations.csv'
-        if _prealigned and _v1x.exists():      # a v1 solution wins (its offsets refer to transformation.csv)
-            _prealigned -= {_sub_name_to_base(n) for n in pd.read_csv(_v1x, usecols=['image_name'])['image_name'].astype(str)}
+        if _prealigned and _v1x.exists():      # a v1 solution wins (its offsets refer to transformation.csv) ...
+            from bp3m.pipeline.visit_prealign import epoch_override_names
+            _override = epoch_override_names(_pre_df)          # ... except over an epoch anchor (failed/suspect xmatch)
+            _prealigned -= ({_sub_name_to_base(n) for n in pd.read_csv(_v1x, usecols=['image_name'])['image_name'].astype(str)}
+                            - _override)
     except Exception:
         _prealigned = set()
     for sub_name in tqdm(sorted(all_sub_names), desc="  Loading image metadata",

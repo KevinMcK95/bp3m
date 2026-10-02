@@ -247,6 +247,14 @@ def set_prealign_enabled(field_dir, enabled: bool) -> None:
         rec = json.loads(m.read_text()); rec['enabled'] = bool(enabled); m.write_text(json.dumps(rec))
 
 
+def epoch_override_names(pre_df) -> set:
+    """Exposures whose prealignment is an epoch anchor: they REPLACE any source-run (v1/v2) solution, which for these
+    images is a failed or suspect low-N Gaia cross-match."""
+    if pre_df is None or 'anchor' not in pre_df.columns:
+        return set()
+    return set(pre_df.loc[pre_df['anchor'].astype(str) == 'epoch:v2', 'image_name'].astype(str))
+
+
 def load_prealign(field_dir):
     """(DataFrame of v1-style rows, block-diagonal C_r) or (None, None) when absent or not enabled."""
     out = Path(field_dir) / 'hst_xmatch' / 'prealign'
@@ -259,3 +267,141 @@ def load_prealign(field_dir):
     except Exception:
         return None, None
     return pd.read_csv(p), np.load(c)
+
+
+# ── epoch anchoring (2026-10-02) ───────────────────────────────────────────────────────────────────────────────
+EPOCH_SIG_PM_MAX = 0.5      # mas/yr: reference stars of the previous v2 catalogue
+EPOCH_MIN_MATCH = 10
+EPOCH_VOTE_PX = 40.0        # header WCS error searched by the offset vote (px; Gaia-tied headers are good to ~1 px)
+EPOCH_FRAME_FLOOR_MAS = 2.0
+
+
+def _epoch_reference(v2_dir, t_obs):
+    """Well-measured stars of a v2 catalogue (stellar_astrometry.csv) propagated to epoch t_obs: (ra, dec, sig_mas)."""
+    s = pd.read_csv(Path(v2_dir) / 'stellar_astrometry.csv', low_memory=False)
+    sp = np.hypot(s.sigma_pmra_bp3m, s.sigma_pmdec_bp3m) / np.sqrt(2)
+    s = s[(sp < EPOCH_SIG_PM_MAX) & np.isfinite(s.pmra_bp3m) & np.isfinite(s.delta_racosdec_bp3m)]
+    cosd = np.cos(np.radians(s.dec.to_numpy()))
+    dt = t_obs - s.Gaia_time.to_numpy(float)
+    ra = s.ra.to_numpy() + (s.delta_racosdec_bp3m.to_numpy() + s.pmra_bp3m.to_numpy() * dt) / (cosd * 3.6e6)
+    dec = s.dec.to_numpy() + (s.delta_dec_bp3m.to_numpy() + s.pmdec_bp3m.to_numpy() * dt) / 3.6e6
+    sig = np.sqrt(0.5 * (s.sigma_delta_racosdec.to_numpy() ** 2 + s.sigma_delta_dec.to_numpy() ** 2)
+                  + (np.hypot(s.sigma_pmra_bp3m, s.sigma_pmdec_bp3m).to_numpy() / np.sqrt(2) * dt) ** 2)
+    return ra, dec, sig
+
+
+def run_epoch_anchor(field_dir, v2_dir=None) -> int:
+    """Align exposures whose Gaia cross-match failed or is a suspect low-N solution (xmatch_groups.low_n_suspect)
+    to the previous v2 catalogue propagated to their epoch, by offset voting in the header frame + clipped affine.
+    Writes the same products as run_visit_prealign (rows + covariance in hst_xmatch/prealign, per-image
+    transformation_prealign.csv), keeping sibling prealignments only where their anchor is trustworthy."""
+    from astropy.io import fits
+    from scipy.spatial import cKDTree
+    from gaia_cross_match import sibling_seed as ss
+    from bp3m.pipeline.cross_match import _find_image_folders
+    from bp3m.pipeline.xmatch_groups import Member, low_n_suspect
+    field_dir = Path(field_dir); F = field_dir.name
+    v2_dir = Path(v2_dir) if v2_dir else field_dir / 'BP3M_v2_results'
+    if not (v2_dir / 'stellar_astrometry.csv').exists():
+        print(f"  epoch anchor: no v2 catalogue at {v2_dir}; skipped"); return 0
+    out = field_dir / 'hst_xmatch' / 'prealign'; out.mkdir(parents=True, exist_ok=True)
+    folders = _find_image_folders(field_dir.parent, F)
+    try:
+        sel = set(json.loads((field_dir / 'HST' / f'{F}_selected_obsids.json').read_text()))
+        folders = [f for f in folders if Path(f['root']).name in sel]
+    except Exception:
+        pass
+    mem, suspect = {}, set()
+    for f in folders:
+        try:
+            m = Member(f)
+        except Exception:
+            continue
+        mem[m.name] = m
+        if low_n_suspect(m)[0]:
+            suspect.add(m.name)
+    old_rows, old_C = load_prealign(field_dir) if (out / 'prealign_meta.json').exists() else (None, None)
+    if old_rows is None and (out / 'image_transformations.csv').exists():      # present but not enabled
+        old_rows, old_C = pd.read_csv(out / 'image_transformations.csv'), np.load(out / 'C_r.npy')
+    targets = [m for m in mem.values() if not m.empty and ((not m.ok) or m.name in suspect)]
+    if old_rows is not None:      # sibling prealignments anchored on a suspect solution are redone too
+        for _, r in old_rows.iterrows():
+            if str(r.get('anchor', '')) in suspect and str(r.image_name) in mem and mem[str(r.image_name)] not in targets:
+                targets.append(mem[str(r.image_name)])
+    rows, blocks, report = [], [], []
+    for T in sorted(targets, key=lambda m: m.name):
+        try:
+            T.cat = fits.getdata(T.catalog, 1); it_ = _good_stars(T.cat, n=3000)
+            if len(it_) < EPOCH_MIN_MATCH:
+                report.append(dict(image=T.name, status='too few stars')); continue
+            t_obs = 2000.0 + (float(fits.getheader(T.flc, 0)['EXPSTART']) - 51544.5) / 365.25
+            ra_r, de_r, sig_r = _epoch_reference(v2_dir, t_obs)
+            fr = {k: T.params[k] for k in ('ra_cen', 'dec_cen', 'x_cen', 'y_cen', 'pixel_scale', 'orientat')}
+            gA = np.column_stack(ss.sky_to_frame(ra_r, de_r, fr))
+            hT = np.column_stack([T.cat['x_gdc'][it_], T.cat['y_gdc'][it_]]).astype(float)
+            xr = (float(np.percentile(hT[:, 0], 1)), float(np.percentile(hT[:, 0], 99)))
+            yr = (float(np.percentile(hT[:, 1], 1)), float(np.percentile(hT[:, 1], 99)))
+            E0 = dict(a=1.0, b=0.0, tx=0.0, ty=0.0, ra0=fr['ra_cen'], dec0=fr['dec_cen'])   # header-only guess
+            M, t, _ = ss.predicted_affine(T.params, E0, xr, yr); c = np.array([fr['x_cen'], fr['y_cen']])
+            gT = (hT - c) @ M.T + t
+            inside = (gA[:, 0] > gT[:, 0].min()) & (gA[:, 0] < gT[:, 0].max()) & (gA[:, 1] > gT[:, 1].min()) & (gA[:, 1] < gT[:, 1].max())
+            if inside.sum() < EPOCH_MIN_MATCH:
+                report.append(dict(image=T.name, status=f'only {int(inside.sum())} reference stars in the field')); continue
+            dd = (gA[inside][None, :, :] - gT[:, None, :]).reshape(-1, 2)
+            dd = dd[np.hypot(dd[:, 0], dd[:, 1]) < EPOCH_VOTE_PX]
+            bins = np.arange(-EPOCH_VOTE_PX, EPOCH_VOTE_PX + 0.2, 0.2)
+            Hh, xb, yb = np.histogram2d(dd[:, 0], dd[:, 1], [bins, bins])
+            k = np.unravel_index(np.argmax(Hh), Hh.shape); off = np.array([xb[k[0]] + 0.1, yb[k[1]] + 0.1])
+            t = t + off; ok_fit = False
+            for rad in (2.0, 1.0, 0.6):
+                gT = (hT - c) @ M.T + t
+                d, j = cKDTree(gA).query(gT, distance_upper_bound=rad); m = np.isfinite(d)
+                if m.sum() < EPOCH_MIN_MATCH: break
+                M, t, c, res, cov6 = _fit_affine(hT[m], gA[j[m]]); ok_fit = True
+            else:
+                pass
+            if not ok_fit or m.sum() < EPOCH_MIN_MATCH:
+                report.append(dict(image=T.name, status=f'not aligned (vote peak {int(Hh[k])})')); continue
+            rms = float(np.sqrt(np.mean(res ** 2)))
+            if rms > MAX_RMS_PX:
+                report.append(dict(image=T.name, status=f'rms {rms:.3f} px too large')); continue
+            sig_frame = max(EPOCH_FRAME_FLOOR_MAS, float(np.median(sig_r[j[m]])) / np.sqrt(m.sum()))
+            frame_block = np.zeros((6, 6)); frame_block[4, 4] = frame_block[5, 5] = sig_frame ** 2
+            row, C = _v1_row(T.name, fr, M, t, c, cov6, xr, yr, frame_block)
+            row.update(anchor='epoch:v2', n_match=int(m.sum()), rms_px=rms)
+            rows.append(row); blocks.append(C)
+            A_, B_, C_, D_ = M[0, 0], M[0, 1], M[1, 0], M[1, 1]
+            vals = dict(A=A_, B=B_, C=C_, D=D_, xs_o=c[0], ys_o=c[1], xt_o=t[0], yt_o=t[1],
+                        ratio=float(np.sqrt(A_ * D_ - B_ * C_)), rot_deg=float(np.degrees(np.arctan2(B_ - C_, A_ + D_))),
+                        on_skew=0.5 * (A_ - D_), off_skew=0.5 * (B_ + C_), zp=np.nan,
+                        ra_cen=fr['ra_cen'], dec_cen=fr['dec_cen'], x_cen=fr['x_cen'], y_cen=fr['y_cen'],
+                        pixel_scale=fr['pixel_scale'], orientat=fr['orientat'], prealign_anchor=np.nan,
+                        n_match=int(m.sum()), rms_px=rms)
+            pd.DataFrame({'parameter': list(vals), 'value': list(vals.values())}).to_csv(T.root / 'transformation_prealign.csv', index=False)
+            report.append(dict(image=T.name, anchor='epoch:v2', n_match=int(m.sum()), rms_px=round(rms, 4), vote_peak=int(Hh[k]),
+                               header_offset_px=np.round(off, 2).tolist(), sigma_frame_mas=round(sig_frame, 2),
+                               reason='suspect low-N xmatch' if T.name in suspect else 'xmatch failed', status='aligned'))
+        except Exception as e:
+            report.append(dict(image=T.name, status=f'error {type(e).__name__}: {str(e)[:80]}'))
+    done = {r['image_name'] for r in rows}
+    # keep sibling prealignments whose anchor is trustworthy and that were not redone here
+    if old_rows is not None:
+        for j, r in old_rows.reset_index(drop=True).iterrows():
+            n = str(r.image_name)
+            if n in done or str(r.get('anchor', '')) in suspect or n in suspect:
+                continue
+            rows.append(r.to_dict()); blocks.append(old_C[6 * j:6 * j + 6, 6 * j:6 * j + 6]); done.add(n)
+    pd.DataFrame(report).to_csv(out / 'epoch_anchor_report.csv', index=False)
+    if rows:
+        pd.DataFrame(rows).to_csv(out / 'image_transformations.csv', index=False)
+        Cb = np.zeros((6 * len(blocks), 6 * len(blocks)))
+        for i, b in enumerate(blocks): Cb[6 * i:6 * i + 6, 6 * i:6 * i + 6] = b
+        np.save(out / 'C_r.npy', Cb)
+    (out / 'prealign_meta.json').write_text(json.dumps({'version': PREALIGN_VERSION, 'n_aligned': len(rows), 'enabled': True,
+                                                        'epoch_anchor_from': str(v2_dir),
+                                                        'n_epoch_anchored': sum(1 for r in report if r.get('anchor') == 'epoch:v2'),
+                                                        'suspect_low_n': sorted(suspect)}))
+    n_ep = sum(1 for r in report if r.get('anchor') == 'epoch:v2')
+    print(f"  epoch anchor: {n_ep}/{len(targets)} exposure(s) aligned to the v2 catalogue at their epoch "
+          f"({len(suspect)} suspect low-N cross-matches); {len(rows)} prealigned in total -> {out}")
+    return n_ep

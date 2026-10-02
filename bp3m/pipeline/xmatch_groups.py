@@ -128,6 +128,28 @@ class Member:
         return _grid(self.xr, self.yr, n)
 
 
+GAIA_TIED_WCS = ('GAIA', 'GSC242', 'GSC243')   # a-posteriori WCSNAMEs tied to the Gaia frame (GSC 2.4.2+ is Gaia-calibrated)
+LOW_N_MAX = 4                                  # a 6p solution from <= 4 stars is (nearly) exactly determined: chance pairs fit
+LOW_N_MAX_OFFSET_MAS = 300.0
+
+
+def low_n_suspect(member, max_n: int = LOW_N_MAX, max_offset_mas: float = LOW_N_MAX_OFFSET_MAS):
+    """(suspect, E) -- a 'successful' Gaia cross-match on <= max_n stars whose solution disagrees with a Gaia-tied
+    header WCS by more than max_offset_mas (2026-10-02, Leo_P 2024 epoch: 3-4 matches each, solutions off by
+    0.1-3.7 arcsec while the FIT_REL_GSC242 headers agree with an HST-star solution to ~50 mas).  E is the
+    header-error similarity (sibling_seed.measure_header_error) or None when not evaluated."""
+    from gaia_cross_match import sibling_seed as ss
+    if not getattr(member, 'ok', False) or member.n > max_n or member.trans is None:
+        return False, None
+    if not any(k in str(member.wcsname).upper() for k in GAIA_TIED_WCS):
+        return False, None
+    try:
+        E = member.E or ss.measure_header_error(member.params, member.trans, member.xr, member.yr)
+    except Exception:
+        return False, None
+    return bool(E['offset_mas'] > max_offset_mas), E
+
+
 def affine_from_trans(tr: dict, c) -> tuple:
     """transformation.csv (g = M (h - s_o) + t_o) -> (M, t) with g = M (h - c) + t."""
     M = np.array([[tr['A'], tr['B']], [tr['C'], tr['D']]])

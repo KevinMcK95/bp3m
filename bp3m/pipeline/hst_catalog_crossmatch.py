@@ -367,7 +367,7 @@ def _load_all_detections(field_dir: Path,
     n_r          = C_r.shape[0] // n_sub
     C_r, transform_df, n_r = _strip_chip_offset_cols(bp3m_dir, C_r, transform_df, n_r)
     poly_order   = _infer_poly_order(n_r)
-    transform_df, C_r, _prealigned = _append_prealign(field_dir, transform_df, C_r, n_r)
+    transform_df, C_r, _prealigned = _append_prealign(field_dir, transform_df, C_r, n_r, bp3m_dir)
 
     # Epoch-distortion correction from the v1 fit (None if not fitted):
     # detections are corrected at load time (x' = x + R^{-1} B d) so every
@@ -790,9 +790,19 @@ def _load_all_detections(field_dir: Path,
     return result
 
 
-def _append_prealign(field_dir: Path, transform_df: pd.DataFrame, C_r: np.ndarray, n_r: int):
+def _append_prealign(field_dir: Path, transform_df: pd.DataFrame, C_r: np.ndarray, n_r: int, bp3m_dir=None):
     """Add visit-prealigned images (bp3m.pipeline.visit_prealign, Gaia-failed exposures aligned to their
-    visit siblings on HST stars) that the source run has no solution for.  Returns (df, C_r, names)."""
+    visit siblings on HST stars) that the source run has no solution for.  Returns (df, C_r, names).
+    The source rows are first put in the run's C_r block order (run_config image_names), so that rows and
+    covariance blocks can be dropped / appended by position."""
+    if bp3m_dir is not None:
+        try:
+            import json as _js
+            _names = _js.loads((Path(bp3m_dir) / 'run_config.json').read_text()).get('image_names')
+            if _names and set(_names) == set(transform_df['image_name'].astype(str)):
+                transform_df = transform_df.set_index('image_name').loc[_names].reset_index()
+        except Exception:
+            pass
     try:
         from bp3m.pipeline.visit_prealign import load_prealign
         pre, Cp = load_prealign(field_dir)
@@ -800,6 +810,18 @@ def _append_prealign(field_dir: Path, transform_df: pd.DataFrame, C_r: np.ndarra
         pre, Cp = None, None
     if pre is None or n_r != 6 or not len(pre):
         return transform_df, C_r, set()
+    from bp3m.pipeline.visit_prealign import epoch_override_names
+    override = epoch_override_names(pre)
+    if override:                  # epoch anchors replace the source run's (failed / suspect low-N) solutions
+        base = transform_df['image_name'].astype(str).str.replace('_hi', '').str.replace('_lo', '')
+        drop = np.where(base.isin(override).to_numpy())[0]
+        if len(drop):
+            k = C_r.shape[0] // max(1, len(transform_df)); keep_rows = np.setdiff1d(np.arange(len(transform_df)), drop)
+            idx = np.concatenate([np.arange(j * k, j * k + k) for j in keep_rows]) if len(keep_rows) else np.zeros(0, int)
+            C_r = C_r[np.ix_(idx, idx)]
+            transform_df = transform_df.iloc[keep_rows].reset_index(drop=True)
+            print(f"  {len(drop)} source-run sub-image solution(s) replaced by epoch anchors "
+                  f"({len(override)} exposure(s) with failed / suspect low-N Gaia cross-matches)")
     have = set(transform_df['image_name'].astype(str))
     keep = [j for j, n in enumerate(pre['image_name'].astype(str)) if n not in have]
     if not keep:
@@ -4592,7 +4614,7 @@ def run_hst_crossmatch(
             n_r4          = C_r_full.shape[0] // n_sub4
             C_r_full, transform_df4, n_r4 = _strip_chip_offset_cols(bp3m_dir, C_r_full, transform_df4, n_r4)
             poly_order4   = _infer_poly_order(n_r4)
-            transform_df4, C_r_full, _prealigned4 = _append_prealign(field_dir, transform_df4, C_r_full, n_r4)
+            transform_df4, C_r_full, _prealigned4 = _append_prealign(field_dir, transform_df4, C_r_full, n_r4, bp3m_dir)
             # Demoted (astrometry-only) images: their own indv solution + covariance, as in the loader
             # (otherwise every PM through a deep, Gaia-saturated image is nulled by its 5" prior).
             _hst_root4 = field_dir / 'HST' / 'mastDownload' / 'HST'

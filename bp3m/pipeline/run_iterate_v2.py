@@ -120,6 +120,11 @@ def main():
                         help='TEST (2026-10-02): before the initial crossmatch, align Gaia-failed images to '
                              'their visit siblings on HST stars (indv/v1 anchor + header offsets) and carry '
                              'that solution (rows, covariance, pointing prior) into the crossmatch and v2 solve')
+    parser.add_argument('--epoch_anchor', action='store_true',
+                        help='TEST (2026-10-02): before the initial crossmatch, align exposures whose Gaia cross-match '
+                             'failed or is a suspect low-N solution to the EXISTING v2 catalogue (BP3M_v2_results) '
+                             'propagated to their epoch (offset vote + clipped affine on HST stars); the solutions '
+                             'replace the source-run ones in the crossmatch and v2 solve.  Run after a first v2 pass.')
     parser.add_argument('--exclude_2p_from_alignment', action='store_true',
                         help='Exclude 2-parameter Gaia stars from the alignment solve '
                              '(they still contribute to their own astrometric posteriors)')
@@ -279,12 +284,15 @@ def main():
         print("--align_only: aligning on the existing master_combined_v2.csv, no crossmatch")
 
     # ── Step 0: visit pre-alignment of Gaia-failed images (opt-in) ─────────────
-    from bp3m.pipeline.visit_prealign import run_visit_prealign, set_prealign_enabled
+    from bp3m.pipeline.visit_prealign import run_visit_prealign, set_prealign_enabled, run_epoch_anchor
     if args.visit_prealign:
         print(f"\n# Step 0: visit pre-alignment (Gaia-failed images -> visit siblings, HST stars)")
         run_visit_prealign(field_dir, bp3m_v1_dir)
-    else:
+    elif not args.epoch_anchor:
         set_prealign_enabled(field_dir, False)
+    if args.epoch_anchor:
+        print(f"\n# Step 0b: epoch anchoring (failed / suspect low-N cross-matches -> v2 catalogue at their epoch)")
+        run_epoch_anchor(field_dir, field_dir / 'BP3M_v2_results')
 
     # ── Step 1: initial crossmatch ─────────────────────────────────────────────
     if not args.skip_initial_crossmatch:
