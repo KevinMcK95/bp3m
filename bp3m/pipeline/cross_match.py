@@ -68,6 +68,27 @@ def _write_xmatch_status(root: Path, status: str, params_meta: dict,
     }, indent=2))
 
 
+def _annotate_image_quality(folders, flagged: dict) -> None:
+    """Record the image-quality flag (possible trailing) in each flagged image's xmatch_status.json,
+    after matching and the group pass, so downstream steps can see it."""
+    if not flagged:
+        return
+    for f in folders:
+        name = Path(f['root']).name
+        if name not in flagged:
+            continue
+        p = Path(f['root']) / 'xmatch_status.json'
+        try:
+            st = json.loads(p.read_text())
+            st['image_quality'] = flagged[name]
+            tmp = p.with_name('.xmatch_status.json.tmp'); tmp.write_text(json.dumps(st, indent=2, default=str))
+            import os as _os; _os.replace(tmp, p)
+            print(f"  {name}: possibly trailed (axis ratio {flagged[name]['axis_ratio']:.2f}, coherence "
+                  f"{flagged[name]['pa_coherence']:.2f}) -> {st.get('status')} with {st.get('n_matched', 0)} matches")
+        except Exception as e:
+            print(f"  WARNING: could not record image quality for {name}: {e}")
+
+
 def _detach_hardlinked_outputs(roots) -> int:
     """Private copies of hard-linked cross-match outputs before they are rewritten in place
     (Leo_I shares matched_gaia.csv with its *_fs_* copies, nlink 10).  Non-FITS files in each
@@ -146,6 +167,9 @@ def _xmatch_cache_status(hst_root: Path, params_meta: dict
             if (hst_root / 'matched_gaia.csv').exists():
                 return 'skip', f"previously matched ({saved.get('n_matched', '?')} stars)"
             return 'run', 'status=success but matched_gaia.csv missing'
+        if st == 'skipped' and 'trailed exposure' in str(saved.get('reason', '')):
+            # trailed images are matched since 2026-10-02 (flag only); re-judge old skips
+            return 'run', 'previously skipped as trailed (now flag-only)'
         if st in ('failed', 'skipped'):
             return 'skip', f"previously {st}: {saved.get('reason', '')}"
         return 'run', f'unknown status: {st}'
@@ -495,7 +519,7 @@ def run_cross_match(
     work = []
     skipped = []
     skipped_nophot = []
-    skipped_trailed = []
+    flagged_trailed: dict = {}
     for hst in tqdm(folders, desc="  Checking cross-match cache", unit="img",
                     dynamic_ncols=True):
         root = Path(hst['root'])
@@ -518,15 +542,13 @@ def run_cross_match(
             skipped_nophot.append(name)
             continue
 
-        # Trailed exposures (guiding failures the headers do not report) are not cross-matched.
+        # Possibly trailed exposures are FLAGGED, not skipped (user 2026-10-02): the metric also fires on
+        # catalogues dominated by streaks / cosmic rays (NGC_288 j9l929e0q, whose v3 match was real),
+        # and the chance-coincidence test already rejects the chance-pair solutions trailing produces.
         from .image_quality import image_quality as _iq
         _q = _iq(hst['flc'], hst['catalog'])
         if _q.get('trailed'):
-            _write_xmatch_status(root, 'skipped', params_meta_img,
-                                  reason=f"trailed exposure (star axis ratio {_q['axis_ratio']:.2f}, orientation "
-                                 f"coherence {_q['pa_coherence']:.2f} at PA {_q['pa_deg']:.0f} deg)")
-            skipped_trailed.append(name)
-            continue
+            flagged_trailed[name] = {k: _q.get(k) for k in ('trailed', 'axis_ratio', 'pa_coherence', 'pa_deg', 'n_sources')}
 
         work.append((hst, gaia_df, {
             'hst_pix_floor':        hst_pix_floor,
@@ -549,9 +571,9 @@ def run_cross_match(
     if skipped_nophot:
         print(f"  {len(skipped_nophot)} image(s) skipped — no photometric calibration (PHOTFLAM missing): "
               f"{', '.join(skipped_nophot)}")
-    if skipped_trailed:
-        print(f"  {len(skipped_trailed)} image(s) skipped — trailed exposure (image_quality.json): "
-              f"{', '.join(skipped_trailed)}")
+    if flagged_trailed:
+        print(f"  {len(flagged_trailed)} image(s) look trailed (image_quality.json) — matched anyway, flagged in "
+              f"xmatch_status.json: {', '.join(flagged_trailed)}")
     if not work:
         print("  All cross-matches up to date.")
         _n_grp = _group_pass()
@@ -639,6 +661,7 @@ def run_cross_match(
                 )) / "matched_gaia.csv")
 
     _group_pass()
+    _annotate_image_quality(folders, flagged_trailed)
 
     # Run cross-image validation — always forced after any fresh matching.
     print("\n  Running cross-image validation...")
