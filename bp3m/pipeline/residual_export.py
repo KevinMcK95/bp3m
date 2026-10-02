@@ -28,7 +28,20 @@ import numpy as np
 import pandas as pd
 
 LABEL_FILE = 'gdc_labels.csv.gz'
-LABEL_VERSION = 1
+HDR_FILE = 'gdc_hdr.csv.gz'          # header-frame (model-independent) rows, bp3m.pipeline.header_frame
+IMAGE_FILE = 'gdc_image.json'        # per-image record; written LAST, so it marks a complete export
+LABEL_VERSION = 2
+# every per-image header keyword the hst_dist_corr GDC chain reads (image_features HDR0/HDR1,
+# extract_header_frame, chip_geometry, jitter_accumulate), so it never re-opens FLC headers
+HDR0_ALL = ['MOONANGL', 'SUNANGLE', 'SUN_ALT', 'POSTARG1', 'POSTARG2', 'FLASHLVL', 'FLASHCUR', 'FGSLOCK', 'GYROMODE',
+            'SUBARRAY', 'EXPFLAG', 'PCTECORR', 'APERTURE', 'CCDAMP', 'ATODGNA', 'ATODGNB', 'ATODGNC', 'ATODGND',
+            'READNSEA', 'CCDOFSTA', 'BIASLEVA', 'BIASLEVB', 'BIASLEVC', 'BIASLEVD', 'DATE-OBS', 'TIME-OBS', 'EXPSTART',
+            'EXPEND', 'EXPTIME', 'DARKTIME', 'PA_V3', 'RA_TARG', 'DEC_TARG', 'ASN_ID', 'OBSTYPE', 'PRIMESI', 'POSTNSTX',
+            'POSTNSTY', 'POSTNSTZ', 'CCDGAIN', 'FLASHDUR', 'PCTEFRAC', 'PROPOSID', 'VAFACTOR', 'INSTRUME', 'DETECTOR',
+            'FILTER', 'FILTER1', 'FILTER2', 'IMAGETYP', 'TARGNAME', 'ROOTNAME']
+HDR1_ALL = ['MDRIZSKY', 'ORIENTAT', 'VAFACTOR', 'CCDCHIP', 'LTV1', 'LTV2', 'BINAXIS1', 'NAXIS1', 'NAXIS2', 'MEANDARK',
+            'MEANBLEV', 'MEANFLSH', 'WCSNAME', 'CRPIX1', 'CRPIX2', 'CRVAL1', 'CRVAL2', 'IDCSCALE', 'CD1_1', 'CD1_2',
+            'CD2_1', 'CD2_2']
 HDR_KEYS = ['EXPSTART', 'EXPTIME', 'PA_V3', 'CCDGAIN', 'FLASHDUR', 'PCTEFRAC', 'SUN_ALT',
             'PROPOSID', 'SUBARRAY', 'POSTARG1', 'POSTARG2', 'VAFACTOR', 'ASN_ID', 'APERTURE']
 
@@ -54,9 +67,38 @@ def _pos_corr(spec: str):
     return make_pos_corr(spec)
 
 
+def _jsonable(v):
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return None if not np.isfinite(v) else float(v)
+    if isinstance(v, float) and not np.isfinite(v):
+        return None
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    return str(v)
+
+
+def export_is_current(output_dir) -> bool:
+    """True when <output_dir> holds a complete export of the current LABEL_VERSION that postdates the fit."""
+    out_dir = Path(output_dir); rec_p = out_dir / IMAGE_FILE; det = out_dir / 'detections.npz'
+    try:
+        rec = json.loads(rec_p.read_text())
+        return (int(rec.get('label_version', 0)) == LABEL_VERSION
+                and (not det.exists() or rec_p.stat().st_mtime >= det.stat().st_mtime))
+    except Exception:
+        return False
+
+
 def export_gdc_labels(output_dir, field_name: str, data_root, image_name: str,
                       telescope: str = 'HST', pos_corr_model=None, pos_corr_table=None) -> int:
-    """Write <output_dir>/gdc_labels.csv.gz for a single-image fit; returns the number of rows."""
+    """Write the GDC label export of a single-image fit into <output_dir>; returns the Stage-1 row count.
+
+    Files: gdc_labels.csv.gz (Stage-1 residual rows of this fit), gdc_hdr.csv.gz (header-frame,
+    model-independent rows), gdc_image.json (per-image record; written last).  Reads only files
+    on disk, so it can (re)build the export of an image whose fit is cached and not redone."""
     from astropy.io import fits
     from scipy.spatial import cKDTree
     out_dir = Path(output_dir)
@@ -66,6 +108,89 @@ def export_gdc_labels(output_dir, field_name: str, data_root, image_name: str,
     cat_p = img_root / f'{image_name}_flc_catalog.fits'
     if not (out_dir / 'detections.npz').exists() or not flc.exists() or not cat_p.exists():
         return 0
+    try:
+        n_rows, s1_err = _export_stage1(out_dir, field_name, image_name, img_root, flc, cat_p,
+                                        pos_corr_model, pos_corr_table), None
+    except Exception as exc:
+        n_rows, s1_err = 0, f'{type(exc).__name__}: {exc}'
+    if n_rows == 0 and (out_dir / LABEL_FILE).exists():
+        (out_dir / LABEL_FILE).unlink()               # never leave rows of an earlier export behind
+    _export_header_frame_and_record(out_dir, field_name, image_name, img_root, flc, cat_p,
+                                    pos_corr_model, pos_corr_table, n_rows, s1_err)
+    return n_rows
+
+
+def _export_header_frame_and_record(out_dir, field_name, image_name, img_root, flc, cat_p,
+                                    pos_corr_model, pos_corr_table, n_stage1, stage1_error=None):
+    import hashlib
+    from astropy.io import fits
+    from bp3m.pipeline.header_frame import frame_geometry, header_frame_inputs, trusted_ids
+    with fits.open(flc, memmap=True) as hd:
+        ph = hd[0].header; h1 = hd[1].header.copy()
+        sci = {}
+        for e in range(1, len(hd)):
+            if hd[e].header.get('EXTNAME') == 'SCI':
+                sci[e] = {k: _jsonable(hd[e].header.get(k)) for k in ('CCDCHIP', 'MDRIZSKY', 'LTV1', 'LTV2', 'NAXIS1', 'NAXIS2')}
+        h0 = {k.replace('-', '_'): _jsonable(ph.get(k)) for k in HDR0_ALL}
+        ph = ph.copy()
+    h1d = {k: _jsonable(h1.get(k)) for k in HDR1_ALL}
+    with fits.open(cat_p, memmap=True) as hc:
+        cat_hdr1 = hc[1].header.copy(); cat = hc[1].data
+        geom = frame_geometry(ph, h1, cat_hdr1)
+        n_hdr = 0; hdr_err = None
+        try:
+            mg = img_root / 'matched_gaia.csv'
+            if mg.exists():
+                matched = pd.read_csv(mg, dtype={'gaia_source_id': np.int64})
+                sa = pd.read_csv(out_dir / 'stellar_astrometry.csv', dtype={'Gaia_id': np.int64}, low_memory=False)
+                rows = header_frame_inputs(matched, sa, cat, geom, trusted_ids([out_dir]))
+                if rows is not None and len(rows):
+                    rows.insert(0, 'image', image_name); rows.insert(0, 'field', field_name)
+                    rows.to_csv(out_dir / HDR_FILE, index=False); n_hdr = len(rows)
+        except Exception as exc:
+            hdr_err = f'{type(exc).__name__}: {exc}'
+        gdc_id, gdc_file = cat_hdr1.get('GDC_ID'), cat_hdr1.get('GDC_FILE')
+    if n_hdr == 0 and (out_dir / HDR_FILE).exists():
+        (out_dir / HDR_FILE).unlink()                 # never leave rows of an earlier export behind
+    md5 = lambda p: hashlib.md5(p.read_bytes()).hexdigest() if p.exists() else None
+    def _js(p):
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {}
+    xs = _js(img_root / 'xmatch_status.json'); rc = _js(out_dir / 'run_config.json')
+    try:
+        tr = pd.read_csv(img_root / 'transformation.csv').set_index('parameter')['value']
+        tr = {k: _jsonable(v) for k, v in tr.items()}
+    except Exception:
+        tr = {}
+    try:
+        xf = pd.read_csv(out_dir / 'image_transformations.csv').to_dict(orient='records')
+        xf = [{k: _jsonable(v) for k, v in r.items()} for r in xf]
+    except Exception:
+        xf = []
+    geom_j = {k: (v if k == 'M' else _jsonable(v)) for k, v in geom.items()}
+    rec = {'field': field_name, 'image': image_name, 'label_version': LABEL_VERSION,
+           'n_stage1_rows': int(n_stage1), 'n_hdr_rows': int(n_hdr), 'stage1_error': stage1_error, 'hdr_error': hdr_err,
+           'header_frame': geom_j, 'h0': h0, 'h1': h1d, 'sci_ext': {str(k): v for k, v in sci.items()},
+           'jitter': {k: _jsonable(v) for k, v in _jitter_columns(img_root).items()},
+           'jitter_present': (img_root / 'jitter_summary.json').exists(),
+           'catalog_gdc_id': _jsonable(gdc_id), 'catalog_gdc_file': _jsonable(gdc_file),
+           'matched_gaia_md5': md5(img_root / 'matched_gaia.csv'),
+           'xmatch_status': _jsonable(xs.get('status')), 'xmatch_gdc_id': _jsonable((xs.get('params') or {}).get('gdc_id')),
+           'indv_gdc_id': _jsonable(rc.get('gdc_id')), 'indv_matched_gaia_md5': _jsonable(rc.get('matched_gaia_md5')),
+           'indv_fit_version': _jsonable(rc.get('indv_fit_version')),
+           'gdc_corr_model': str(pos_corr_model) if pos_corr_model else '',
+           'gdc_corr_table': str(pos_corr_table) if pos_corr_table else '',
+           'pos_err_floor': _jsonable(rc.get('pos_err_floor')),
+           'transformation_csv': tr, 'image_transformations': xf}
+    tmp = out_dir / (IMAGE_FILE + '.tmp')
+    tmp.write_text(json.dumps(rec, indent=1)); tmp.replace(out_dir / IMAGE_FILE)
+
+
+def _export_stage1(out_dir, field_name, image_name, img_root, flc, cat_p, pos_corr_model, pos_corr_table) -> int:
+    from astropy.io import fits
+    from scipy.spatial import cKDTree
     det = np.load(out_dir / 'detections.npz', allow_pickle=True)
     keys = [k for k in det.files if k.endswith('_sidx')]
     if not keys:
@@ -159,3 +284,164 @@ def export_gdc_labels(output_dir, field_name: str, data_root, image_name: str,
     df = df.copy()
     df.to_csv(out_dir / LABEL_FILE, index=False)
     return len(df)
+
+
+def _export_one(args):
+    """Pool worker: (re)export one indv result dir with the settings ITS fit used (run_config.json)."""
+    indv_dir, field_name, data_root = args
+    d = Path(indv_dir)
+    try:
+        rc = json.loads((d / 'run_config.json').read_text())
+        n = export_gdc_labels(d, field_name, data_root, d.name,
+                              pos_corr_model=rc.get('pos_corr_model'), pos_corr_table=rc.get('pos_corr_table'))
+        return d.name, n, None
+    except Exception as exc:
+        return d.name, 0, f'{type(exc).__name__}: {exc}'
+
+
+def stale_exports(field_name: str, data_root, images=None, indv_root=None) -> list:
+    """Indv result dirs of a field that hold a fit (detections.npz + run_config.json) but no current export."""
+    root = Path(indv_root) if indv_root else Path(data_root) / field_name / 'BP3M_indv_results'
+    if not root.is_dir():
+        return []
+    dirs = [root / i for i in images] if images is not None else sorted(p for p in root.iterdir() if p.is_dir())
+    return [d for d in dirs if (d / 'detections.npz').exists() and (d / 'run_config.json').exists()
+            and not export_is_current(d)]
+
+
+def export_field(field_name: str, data_root, images=None, workers: int = 4, log=print, indv_root=None) -> dict:
+    """(Re)build the GDC export of every indv fit of a field that lacks a current one, WITHOUT refitting
+    (2026-10-02: images whose fit is cached must still contribute up-to-date label rows)."""
+    import time
+    from concurrent.futures import ProcessPoolExecutor
+    todo = stale_exports(field_name, data_root, images, indv_root)
+    out = {'field': field_name, 'stale': len(todo), 'ok': 0, 'failed': 0, 'rows': 0}
+    if not todo:
+        log(f"  GDC export: all indv results of {field_name} current (label_version {LABEL_VERSION})")
+        return out
+    log(f"  GDC export: rebuilding {len(todo)} indv result(s) of {field_name} without refitting "
+        f"(label_version {LABEL_VERSION}, {workers} workers)")
+    t0 = time.time(); args = [(str(d), field_name, str(data_root)) for d in todo]
+    def _run(it):
+        for k, (img, n, err) in enumerate(it, 1):
+            if err:
+                out['failed'] += 1
+                log(f"  [{time.strftime('%Y-%m-%d %H:%M:%S')}] {img} ({k}/{len(todo)}) export FAILED: {err}")
+            else:
+                out['ok'] += 1; out['rows'] += n
+            if k % 100 == 0 or k == len(todo):
+                log(f"  [{time.strftime('%Y-%m-%d %H:%M:%S')}] GDC export {k}/{len(todo)}: {out['ok']} ok, "
+                    f"{out['failed']} failed, {out['rows']} rows ({time.time() - t0:.0f}s)")
+    if workers > 1 and len(todo) > 1:
+        import multiprocessing as mp
+        with ProcessPoolExecutor(max_workers=min(workers, len(todo)), mp_context=mp.get_context('forkserver')) as ex:
+            _run(ex.map(_export_one, args, chunksize=4))
+    else:
+        _run(map(_export_one, args))
+    return out
+
+
+FIELD_FILES = {'stage1': 'gdc_labels_field.csv.gz', 'hdr': 'gdc_hdr_field.csv.gz', 'images': 'gdc_images_field.csv.gz'}
+MANIFEST = 'gdc_export_manifest.json'
+
+
+def flatten_record(rec: dict) -> dict:
+    """One gdc_image.json record -> one flat row (h0_*, h1_*, hf_*, sci<ext>_*, tr_*, jitter, provenance)."""
+    row = {k: v for k, v in rec.items() if not isinstance(v, (dict, list))}
+    for k, v in (rec.get('h0') or {}).items(): row[f'h0_{k}'] = v
+    for k, v in (rec.get('h1') or {}).items(): row[f'h1_{k}'] = v
+    for k, v in (rec.get('header_frame') or {}).items():
+        if k == 'M':
+            (row['hf_M11'], row['hf_M12']), (row['hf_M21'], row['hf_M22']) = v
+        else:
+            row[f'hf_{k}'] = v
+    for e, d in (rec.get('sci_ext') or {}).items():
+        for k, v in d.items(): row[f'sci{e}_{k}'] = v
+    for k, v in (rec.get('transformation_csv') or {}).items(): row[f'tr_{k}'] = v
+    row.update(rec.get('jitter') or {})
+    row['image_transformations_json'] = json.dumps(rec.get('image_transformations') or [])
+    return row
+
+
+def consolidate_field(field_name: str, data_root, indv_root=None, log=print) -> dict:
+    """Gather every CURRENT per-image export of a field into one file per table (+ manifest), so the GDC
+    work reads three files per field instead of three per image (2026-10-02).
+
+    Incremental: images whose gdc_image.json is unchanged since the last consolidation are carried over
+    from the existing field files; changed/new images are re-read; images without a current export
+    (stale, failed fit, removed) are dropped and listed in the manifest.  in_selection marks images in
+    the field's current MAST selection ({field}_selected_obsids.json)."""
+    import time
+    root = Path(indv_root) if indv_root else Path(data_root) / field_name / 'BP3M_indv_results'
+    if not root.is_dir():
+        return {}
+    t0 = time.time()
+    dirs = sorted(p for p in root.iterdir() if p.is_dir())
+    cur, stale = {}, []
+    for d in dirs:
+        rp = d / IMAGE_FILE
+        if (d / 'detections.npz').exists() and export_is_current(d):
+            cur[d.name] = rp.stat().st_mtime
+        elif (d / 'detections.npz').exists():
+            stale.append(d.name)
+    try:
+        sel = set(json.loads((Path(data_root) / field_name / 'HST' / f'{field_name}_selected_obsids.json').read_text()))
+    except Exception:
+        sel = None
+    old_man = {}
+    try:
+        old_man = json.loads((root / MANIFEST).read_text())
+        if int(old_man.get('label_version', 0)) != LABEL_VERSION:
+            old_man = {}
+    except Exception:
+        old_man = {}
+    keep = {i for i, t in cur.items() if old_man.get('images', {}).get(i) == t}
+    if keep and not all((root / f).exists() for f in FIELD_FILES.values()):
+        keep = set()
+    redo = [i for i in cur if i not in keep]
+    tables = {}
+    for key, fname in FIELD_FILES.items():
+        parts = []
+        if keep:
+            old = pd.read_csv(root / fname, dtype={'gaia_id': np.int64} if key != 'images' else None, low_memory=False)
+            parts.append(old[old['image'].astype(str).isin(keep)])
+        for i in redo:
+            d = root / i
+            if key == 'images':
+                parts.append(pd.DataFrame([flatten_record(json.loads((d / IMAGE_FILE).read_text()))]))
+            else:
+                f = d / (LABEL_FILE if key == 'stage1' else HDR_FILE)
+                if f.exists():
+                    parts.append(pd.read_csv(f, dtype={'gaia_id': np.int64}, low_memory=False))
+        df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+        if len(df) and sel is not None:
+            df['in_selection'] = df['image'].astype(str).isin(sel)
+        tables[key] = df
+        tmp = root / (fname + '.tmp.gz')
+        df.to_csv(tmp, index=False); tmp.replace(root / fname)
+    man = {'field': field_name, 'label_version': LABEL_VERSION, 'built': time.strftime('%Y-%m-%d %H:%M:%S'),
+           'images': cur, 'stale_or_missing_export': stale,
+           'n_rows': {k: int(len(v)) for k, v in tables.items()}, 'files': FIELD_FILES}
+    tmp = root / (MANIFEST + '.tmp'); tmp.write_text(json.dumps(man, indent=1)); tmp.replace(root / MANIFEST)
+    log(f"  GDC export consolidated: {field_name} {len(cur)} images ({len(redo)} re-read, {len(keep)} carried over"
+        f"{', ' + str(len(stale)) + ' without a current export' if stale else ''}); rows stage-1 "
+        f"{man['n_rows']['stage1']}, header-frame {man['n_rows']['hdr']} -> {root} ({time.time() - t0:.0f}s)")
+    return man
+
+
+def main():
+    import argparse, os
+    ap = argparse.ArgumentParser(description='(Re)build the per-image GDC label export of finished indv fits '
+                                             'without refitting (bp3m.pipeline.residual_export).')
+    ap.add_argument('--name', nargs='+', required=True, help='field name(s)')
+    ap.add_argument('--output_dir', default=os.getcwd(), help='GaiaHub_results root (default: cwd)')
+    ap.add_argument('--workers', type=int, default=4)
+    a = ap.parse_args()
+    for f in a.name:
+        r = export_field(f, a.output_dir, workers=a.workers)
+        print(f"{f}: {r['stale']} stale, {r['ok']} exported, {r['failed']} failed, {r['rows']} stage-1 rows", flush=True)
+        consolidate_field(f, a.output_dir)
+
+
+if __name__ == '__main__':
+    main()

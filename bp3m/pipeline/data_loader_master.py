@@ -582,12 +582,24 @@ def load_master_v2(
     base_meta_cache: dict[str, dict | None] = {}
 
     from tqdm import tqdm
+    # visit-prealigned images (Gaia-failed, aligned to siblings on HST stars) take their metadata
+    # from transformation_prealign.csv (same schema), like the CFHT relative-alignment path
+    try:
+        from bp3m.pipeline.visit_prealign import load_prealign
+        _pre_df, _ = load_prealign(field_dir)
+        _prealigned = set(_pre_df['image_name'].astype(str)) if _pre_df is not None else set()
+        _v1x = Path(field_dir) / 'BP3M_results' / 'image_transformations.csv'
+        if _prealigned and _v1x.exists():      # a v1 solution wins (its offsets refer to transformation.csv)
+            _prealigned -= {_sub_name_to_base(n) for n in pd.read_csv(_v1x, usecols=['image_name'])['image_name'].astype(str)}
+    except Exception:
+        _prealigned = set()
     for sub_name in tqdm(sorted(all_sub_names), desc="  Loading image metadata",
                          unit="img", dynamic_ncols=True):
         base = _sub_name_to_base(sub_name)
         if base not in base_meta_cache:
             img_dir = hst_root / base
-            base_meta_cache[base] = _read_image_meta(img_dir, base)
+            base_meta_cache[base] = _read_image_meta(
+                img_dir, base, transformation_file=('transformation_prealign.csv' if base in _prealigned else None))
         meta = base_meta_cache[base]
         if meta is None:
             skipped_meta.append(sub_name)

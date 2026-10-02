@@ -116,6 +116,10 @@ def main():
     parser.add_argument('--hst_align', action='store_true',
                         help='TEST (2026-10-02): HST-only detections also constrain the alignment '
                              '(diffuse PM prior: geometry only; the frame PM stays set by Gaia)')
+    parser.add_argument('--visit_prealign', action='store_true',
+                        help='TEST (2026-10-02): before the initial crossmatch, align Gaia-failed images to '
+                             'their visit siblings on HST stars (indv/v1 anchor + header offsets) and carry '
+                             'that solution (rows, covariance, pointing prior) into the crossmatch and v2 solve')
     parser.add_argument('--exclude_2p_from_alignment', action='store_true',
                         help='Exclude 2-parameter Gaia stars from the alignment solve '
                              '(they still contribute to their own astrometric posteriors)')
@@ -273,6 +277,14 @@ def main():
         args.skip_initial_crossmatch = True
         args.n_refine = 0
         print("--align_only: aligning on the existing master_combined_v2.csv, no crossmatch")
+
+    # ── Step 0: visit pre-alignment of Gaia-failed images (opt-in) ─────────────
+    from bp3m.pipeline.visit_prealign import run_visit_prealign, set_prealign_enabled
+    if args.visit_prealign:
+        print(f"\n# Step 0: visit pre-alignment (Gaia-failed images -> visit siblings, HST stars)")
+        run_visit_prealign(field_dir, bp3m_v1_dir)
+    else:
+        set_prealign_enabled(field_dir, False)
 
     # ── Step 1: initial crossmatch ─────────────────────────────────────────────
     if not args.skip_initial_crossmatch:

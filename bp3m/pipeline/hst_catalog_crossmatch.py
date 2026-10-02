@@ -367,6 +367,7 @@ def _load_all_detections(field_dir: Path,
     n_r          = C_r.shape[0] // n_sub
     C_r, transform_df, n_r = _strip_chip_offset_cols(bp3m_dir, C_r, transform_df, n_r)
     poly_order   = _infer_poly_order(n_r)
+    transform_df, C_r, _prealigned = _append_prealign(field_dir, transform_df, C_r, n_r)
 
     # Epoch-distortion correction from the v1 fit (None if not fitted):
     # detections are corrected at load time (x' = x + R^{-1} B d) so every
@@ -505,7 +506,7 @@ def _load_all_detections(field_dir: Path,
 
         img_dir  = hst_root / base
         cat_path = img_dir / f'{base}_flc_catalog.fits'
-        tran_csv = img_dir / 'transformation.csv'
+        tran_csv = img_dir / ('transformation_prealign.csv' if sub_name in _prealigned else 'transformation.csv')
 
         if not cat_path.exists() or not tran_csv.exists():
             return None
@@ -785,6 +786,33 @@ def _load_all_detections(field_dir: Path,
     result = pd.concat(per_image_dfs, ignore_index=True)
     result.attrs['pre_zp_applied'] = _apply_pre_zp
     return result
+
+
+def _append_prealign(field_dir: Path, transform_df: pd.DataFrame, C_r: np.ndarray, n_r: int):
+    """Add visit-prealigned images (bp3m.pipeline.visit_prealign, Gaia-failed exposures aligned to their
+    visit siblings on HST stars) that the source run has no solution for.  Returns (df, C_r, names)."""
+    try:
+        from bp3m.pipeline.visit_prealign import load_prealign
+        pre, Cp = load_prealign(field_dir)
+    except Exception:
+        pre, Cp = None, None
+    if pre is None or n_r != 6 or not len(pre):
+        return transform_df, C_r, set()
+    have = set(transform_df['image_name'].astype(str))
+    keep = [j for j, n in enumerate(pre['image_name'].astype(str)) if n not in have]
+    if not keep:
+        return transform_df, C_r, set()
+    add = pre.iloc[keep].copy()
+    for col in transform_df.columns:
+        if col not in add.columns:
+            add[col] = np.nan if col not in ('alpha',) else 1.0
+    df = pd.concat([transform_df, add[transform_df.columns]], ignore_index=True)
+    n0 = C_r.shape[0]; k = len(keep); C = np.zeros((n0 + 6 * k, n0 + 6 * k)); C[:n0, :n0] = C_r
+    for q, j in enumerate(keep):
+        C[n0 + 6 * q:n0 + 6 * q + 6, n0 + 6 * q:n0 + 6 * q + 6] = Cp[6 * j:6 * j + 6, 6 * j:6 * j + 6]
+    names = set(add['image_name'].astype(str))
+    print(f"  {len(names)} visit-prealigned image(s) added (Gaia-failed, aligned to siblings on HST stars)")
+    return df, C, names
 
 
 def _indv_solution(field_dir: Path, hst_root: Path, sub_name: str, n_r: int):
@@ -4562,6 +4590,7 @@ def run_hst_crossmatch(
             n_r4          = C_r_full.shape[0] // n_sub4
             C_r_full, transform_df4, n_r4 = _strip_chip_offset_cols(bp3m_dir, C_r_full, transform_df4, n_r4)
             poly_order4   = _infer_poly_order(n_r4)
+            transform_df4, C_r_full, _prealigned4 = _append_prealign(field_dir, transform_df4, C_r_full, n_r4)
             # Demoted (astrometry-only) images: their own indv solution + covariance, as in the loader
             # (otherwise every PM through a deep, Gaia-saturated image is nulled by its 5" prior).
             _hst_root4 = field_dir / 'HST' / 'mastDownload' / 'HST'
@@ -4592,11 +4621,12 @@ def run_hst_crossmatch(
                     poly_order4 = int(run_cfg4['poly_order'])
                 if 'image_names' in run_cfg4:
                     saved_names = run_cfg4['image_names']
-                    if set(saved_names) == set(transform_df4['image_name'].tolist()):
-                        transform_df4 = (transform_df4
-                                         .set_index('image_name')
-                                         .loc[saved_names]
-                                         .reset_index())
+                    _pre_rows = transform_df4[transform_df4['image_name'].isin(_prealigned4)]
+                    _src_rows = transform_df4[~transform_df4['image_name'].isin(_prealigned4)]
+                    if set(saved_names) == set(_src_rows['image_name'].tolist()):
+                        # source-run rows in C_r order; prealigned rows stay appended (their blocks follow)
+                        transform_df4 = pd.concat([_src_rows.set_index('image_name').loc[saved_names].reset_index(),
+                                                   _pre_rows], ignore_index=True)
 
             # Build r_hat array from image_transformations.csv.
             # With rolling re-linearization, r_j[4:6] were reset to 0 at convergence
@@ -4632,7 +4662,7 @@ def run_hst_crossmatch(
             sub_img_xoyo4: dict[str, tuple[float, float]] = {}
             pscale4 = 50.0  # ACS/WFC default; overwritten per image below
             for img_dir4 in sorted(hst_root4.iterdir()):
-                t4 = img_dir4 / 'transformation.csv'
+                t4 = img_dir4 / ('transformation_prealign.csv' if img_dir4.name in _prealigned4 else 'transformation.csv')
                 if not t4.exists():
                     continue
                 try:

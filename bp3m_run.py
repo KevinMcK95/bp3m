@@ -1625,6 +1625,14 @@ def main():
                     print(f"  {len(_cached)}/{_n_all} images cached "
                           f"(md5 + fit params match) — skipping; "
                           f"--force_indv_refit to redo")
+                    # cached fits still contribute GDC label rows: (re)build any export that is
+                    # missing or of an older label_version from the files on disk (no refit)
+                    try:
+                        from bp3m.pipeline.residual_export import export_field as _export_field
+                        _export_field(field, output_dir, images=_cached, indv_root=_indv_root,
+                                      workers=max(1, min(args.n_processes, 8)))
+                    except Exception as _exc_ex:
+                        print(f"  WARNING: GDC export of cached images failed: {_exc_ex}")
 
             from datetime import datetime as _dt
             _n_total = len(_indv_names)
@@ -1700,6 +1708,12 @@ def main():
             print("─"*50)
             print(f"End: {_dt.now():%Y-%m-%d %H:%M:%S}")
             print(f"\nIndividual fitting complete: {_n_ok} succeeded, {_n_fail} failed")
+            # one file per table per field for the GDC work (refit AND cached images)
+            try:
+                from bp3m.pipeline.residual_export import consolidate_field as _consolidate
+                _consolidate(field, output_dir, indv_root=_indv_root)
+            except Exception as _exc_cf:
+                print(f"  WARNING: GDC export consolidation failed: {_exc_cf}")
             from bp3m.command_record import write_command_record
             write_command_record(_indv_root, 'bp3m indv fits', note=f'{_n_ok} succeeded, {_n_fail} failed')
 

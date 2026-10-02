@@ -798,6 +798,7 @@ def run_alignment_v2(
     v1_xform_path = v1_bp3m_dir / "image_transformations.csv"
     v1_abcd: dict[str, np.ndarray] = {}
     v1_alpha:  dict[str, float]      = {}
+    _pre_df, _pre_C, _pre_sig = None, None, {}
     # v1 stellar astrometry (MAP conditional posteriors) used for Phase 0 chi2 validation
     v1_stellar_astrom: pd.DataFrame | None = None
     # (image, Gaia id) detections the v1 fit aligned on: Phase 0 keeps them and
@@ -821,6 +822,27 @@ def run_alignment_v2(
                 v1_abcd[img_key] = np.concatenate([v1_abcd[img_key],
                                                    [float(row["chip_dx_px"]), float(row["chip_dy_px"])]])
             v1_alpha[img_key] = float(row["alpha"]) if "alpha" in row.index else 1.0
+        # visit-prealigned images (Gaia-failed, aligned to visit siblings on HST stars before the
+        # initial cross-match; 2026-10-02) warm-start from that solution.  The loader centred them
+        # on transformation_prealign.csv, so their pointing offset starts at 0.
+        try:
+            from bp3m.pipeline.visit_prealign import load_prealign
+            _pre_df, _pre_C = load_prealign(data_root / field_name)
+        except Exception as _exc_pre:
+            print(f"  (visit prealign not loaded: {_exc_pre})")
+        if _pre_df is not None:
+            _n_pre = 0
+            for _jp, _rp in _pre_df.iterrows():
+                _np_ = str(_rp["image_name"])
+                if _np_ in v1_abcd:
+                    continue
+                for _sub in [k for k in imgs if k == _np_ or k.replace('_hi', '').replace('_lo', '') == _np_]:
+                    v1_abcd[_sub] = np.array([float(_rp["a"]), float(_rp["b"]), float(_rp["c"]), float(_rp["d"]), 0.0, 0.0])
+                    v1_alpha[_sub] = 1.0; _n_pre += 1
+                    # pointing prior = the sibling-derived pointing (mean 0 on the prealigned centre)
+                    # with its uncertainty, floored at 5 mas: couples the image to its visit
+                    _pre_sig[_sub] = max(5.0, float(_rp.get("sigma_dra0_mas", 50.0)), float(_rp.get("sigma_ddec0_mas", 50.0)))
+            print(f"  visit prealign: {_n_pre} Gaia-failed sub-image(s) warm-started from their sibling alignment")
         n_matched = sum(1 for k in imgs if k in v1_abcd)
         print(f"  Loaded v1 BP3M results: {len(v1_abcd)} images, "
               f"{n_matched}/{len(imgs)} matched to current image list.")
@@ -831,6 +853,8 @@ def run_alignment_v2(
         for sub, meta in imgs.items():
             if sub in v1_abcd:
                 meta["fcm_abcd"] = v1_abcd[sub]
+            if sub in _pre_sig:
+                meta["sigma_pointing_override"] = _pre_sig[sub]
 
         # Load v1 MAP stellar astrometry for chi2 validation in Phase 0
         _v1_astrom_path = v1_bp3m_dir / "stellar_astrometry.csv"
@@ -879,6 +903,13 @@ def run_alignment_v2(
                 _b1 = _C1[_j1 * _k1:(_j1 + 1) * _k1, _j1 * _k1:(_j1 + 1) * _k1]
                 if np.isfinite(_b1).all() and np.sqrt(abs(_b1[4, 4])) < 1000.0:
                     solver._indv_C_r[_n1] = _b1.copy()
+        if _pre_df is not None and solver.N_R == 6:
+            if not hasattr(solver, "_indv_C_r"):
+                solver._indv_C_r = {}
+            for _jp, _np_ in enumerate(_pre_df["image_name"].astype(str)):
+                _bp = _pre_C[6 * _jp:6 * _jp + 6, 6 * _jp:6 * _jp + 6]
+                for _sub in [k for k in image_names if k.replace('_hi', '').replace('_lo', '') == _np_]:
+                    solver._indv_C_r.setdefault(_sub, _bp.copy())
     except Exception as _exc_c1:
         print(f"  (no v1 warm-start covariances: {_exc_c1})")
 
@@ -1486,6 +1517,7 @@ def run_alignment_v2(
             "pos_corr_model":    (str(pos_corr_model) if pos_corr_model else None),
             "min_stars_split_ccd": min_stars_split_ccd,
             "hst_align":         bool(hst_align),
+            "visit_prealigned":  sorted(_pre_sig),
             "settings_inherited_from": "BP3M_results/run_config.json unless given on the bp3m-v2 CLI",
             "hst_enable_iter":   hst_enable_iter,
             "hst_max_pm_unc":    hst_max_pm_unc,

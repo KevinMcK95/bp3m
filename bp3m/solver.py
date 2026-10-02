@@ -978,7 +978,8 @@ class BP3MSolver:
                 sigma_rot_deg  = self._sigma_rot_deg_cli,
                 sigma_scale    = self._sigma_scale_cli,
                 sigma_skew     = self._sigma_skew_cli,
-                sigma_pointing = self._sigma_pointing_cli,
+                # per-image override (v2 visit prealign: pointing known from the visit siblings)
+                sigma_pointing = meta.get("sigma_pointing_override", self._sigma_pointing_cli),
                 sigma_poly_px  = getattr(self, '_sigma_poly_px_cli', None),
                 n_chip         = self.N_CHIP,
                 sigma_chip_px  = self._sigma_chip_px_cli,
@@ -1487,6 +1488,12 @@ class BP3MSolver:
                   if _vg_h is not None else self.C_survey_inv_dot_v)
         h_align = h_base.copy()
         h_all   = h_base.copy()
+        # H_vv_align: the star precision the ALIGNMENT sees (prior + alignment detections only).
+        # The Schur complement must pair h_align with this, not with the full H_vv: with the full
+        # H_vv every astrometry-only detection acts as a zero-residual pseudo-observation, pulling
+        # the star (as the alignment sees it) toward v = 0 -- the catalogue J2016 position with
+        # PM = 0 and parallax = 0 -- and the image transforms follow (2026-10-02, Pal5 --hst_align).
+        H_vv_align = H_vv.copy()
 
         H_rr = np.zeros((n_s, n_s))
 
@@ -1553,6 +1560,7 @@ class BP3MSolver:
 
             # H_vv/h_all: stellar astrometry from all used detections
             np.add.at(H_vv, sidx_any, np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
+            np.add.at(H_vv_align, sidx_align, np.einsum('nik,nkj->nij', JUT_Cs[use_align], JU[use_align]))
             np.subtract.at(h_all, sidx_any, np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
 
             # h_align: residual information from alignment detections only
@@ -1580,6 +1588,7 @@ class BP3MSolver:
                 # 2p epoch contributions excluded from alignment when flag is set.
                 if not (self.exclude_2p_from_alignment and self.gaia_2p[i]):
                     h_align[i] += contrib['h_contrib']
+                    H_vv_align[i] += contrib['H_contrib']
 
         # ── Epoch-distortion coefficient prior: diagonal, sigma in pixels ────
         # zero-centred by default; set_epoch_dist_prior() recentres a group on
@@ -1620,7 +1629,11 @@ class BP3MSolver:
                       f"g={self.gaia_g[_i]:.2f} n_det={self.gaia_n_hst_used[_i]} "
                       f"Hdiag={np.diag(H_vv[_i])}")
             raise
-        a_align = np.einsum('nij,nj->ni', C_vT, h_align)  # for Schur complement rhs
+        try:
+            C_vT_align = np.linalg.inv(H_vv_align)
+        except np.linalg.LinAlgError:
+            C_vT_align = np.linalg.pinv(H_vv_align)
+        a_align = np.einsum('nij,nj->ni', C_vT_align, h_align)  # for Schur complement rhs
         a       = np.einsum('nij,nj->ni', C_vT, h_all)    # returned stellar posteriors
 
         # ── Schur complement for the shared parameters (r blocks + epoch-D) ──
@@ -1677,7 +1690,7 @@ class BP3MSolver:
                 _schur_obs.append((sidx, K, cols))
                 continue
 
-            CvT_K    = np.einsum('nij,njk->nik', C_vT[sidx], K)
+            CvT_K    = np.einsum('nij,njk->nik', C_vT_align[sidx], K)
             KT_CvT_K = np.einsum('nji,njk->ik',  K, CvT_K)
             Cr_inv[np.ix_(cols, cols)] -= KT_CvT_K
 
@@ -1698,7 +1711,7 @@ class BP3MSolver:
                 if len(common) == 0:
                     continue
 
-                CvT_c  = C_vT[common]
+                CvT_c  = C_vT_align[common]
                 CvT_K2 = np.einsum('nij,njk->nik', CvT_c, K2[idx2])
                 block  = np.einsum('nji,njk->ik', K[idx1], CvT_K2)
 
@@ -1710,15 +1723,15 @@ class BP3MSolver:
         if not _pair_major and _schur_obs:
             from scipy import sparse as _sp
             try:
-                L_chol = np.linalg.cholesky(C_vT)          # C_vT = L L^T
+                L_chol = np.linalg.cholesky(C_vT_align)    # C_vT_align = L L^T
             except np.linalg.LinAlgError:
-                w_e, Q_e = np.linalg.eigh(C_vT)
+                w_e, Q_e = np.linalg.eigh(C_vT_align)
                 L_chol = Q_e * np.sqrt(np.clip(w_e, 1e-30, None))[:, None, :]
             # Accumulate B~ in bounded chunks (int32 indices, csr-summed) so
             # dense many-image fields don't spike transient memory: one giant
             # COO concat at 200+ dense images costs ~10 GB and risks the
             # per-user OOM kill.
-            _shape = (5 * C_vT.shape[0], n_s)
+            _shape = (5 * C_vT_align.shape[0], n_s)
             B_til = None
             data_l, rows_l, cols_l, _budget = [], [], [], 0
 
