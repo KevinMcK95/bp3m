@@ -69,6 +69,7 @@ def _write_xmatch_status(root: Path, status: str, params_meta: dict,
 
 
 WIDE_DISCOVERY_OFFSET = 150   # px; second attempt for images that fail at discovery_max_offset
+MARGINAL_FA_PROB = 1e-6       # a first success less significant than this also gets the wide attempt
 
 # Current matching-algorithm version (see params_meta note in run_cross_match).
 XMATCH_ALGO_VERSION = 3
@@ -238,11 +239,40 @@ def _match_one(args):
         # Wide-window retry (2026-10-01): a header more than ~50 px off (47 Tuc j8c051t9q, a
         # FIT_IMG_GSC242 solution) cannot be found inside the default offset search.  The
         # chance-coincidence test guards the wider search against spurious solutions.
-        if not file_updated and _off < WIDE_DISCOVERY_OFFSET:
+        def _fap_of():
+            try:
+                _t = pd.read_csv(root / 'transformation.csv').set_index('parameter')['value']
+                return float(_t.get('chance_fa_prob', 0.0))
+            except Exception:
+                return 1.0
+        _marginal = file_updated and _fap_of() > MARGINAL_FA_PROB
+        if (not file_updated or _marginal) and _off < WIDE_DISCOVERY_OFFSET:
+            # a marginal first success (e.g. 7 pairs vs 1.3 by chance) can hide the real solution
+            # outside the default window: run the wide attempt and keep the more significant one
+            import shutil as _sh
+            _keep = ('matched_gaia.csv', 'transformation.csv', 'diagnostic_plots.png', 'offset_histogram.png')
+            _bak = root / '.xmatch_first_attempt'
+            if _marginal:
+                _bak.mkdir(exist_ok=True)
+                for _f in _keep:
+                    if (root / _f).exists():
+                        _sh.copy2(root / _f, _bak / _f)
+                _fap1 = _fap_of()
+            _pre2 = out.stat().st_mtime if out.exists() else None
             process_single_image(hst_dict, gaia_df, discovery_max_offset=WIDE_DISCOVERY_OFFSET,
                                  log_mode='a', **_psi_kw)
+            _post2 = out.stat().st_mtime if out.exists() else None
+            _wide_new = _post2 is not None and _post2 != _pre2
+            if _marginal:
+                if not (_wide_new and _fap_of() < _fap1):
+                    for _f in _keep:          # the first attempt stays
+                        if (_bak / _f).exists():
+                            _sh.copy2(_bak / _f, root / _f)
+                _sh.rmtree(_bak, ignore_errors=True)
+                file_updated = True
+            else:
+                file_updated = _wide_new
             post_mtime = out.stat().st_mtime if out.exists() else None
-            file_updated = post_mtime is not None and post_mtime != pre_mtime
         n = len(pd.read_csv(str(out))) if file_updated else 0
         if file_updated and n > 0:
             if params_meta:

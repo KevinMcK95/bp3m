@@ -105,8 +105,12 @@ class Member:
         self.c = np.array([self.params['x_cen'], self.params['y_cen']])
         cat = fits.getdata(self.catalog)
         x = np.asarray(cat['x_gdc'], float); y = np.asarray(cat['y_gdc'], float); okp = np.isfinite(x) & np.isfinite(y)
-        self.xr = (float(np.percentile(x[okp], 1)), float(np.percentile(x[okp], 99)))
-        self.yr = (float(np.percentile(y[okp], 1)), float(np.percentile(y[okp], 99)))
+        self.empty = int(okp.sum()) < 3          # no usable catalogue: never a sibling, never rematched
+        if self.empty:
+            self.xr, self.yr = (0.0, 1.0), (0.0, 1.0)
+        else:
+            self.xr = (float(np.percentile(x[okp], 1)), float(np.percentile(x[okp], 99)))
+            self.yr = (float(np.percentile(y[okp], 1)), float(np.percentile(y[okp], 99)))
         self.wcsname = str(fits.getheader(self.flc, 1).get('WCSNAME', ''))
         self.ids, self.trans, self.affine, self.E = set(), None, None, None
         self.filt = filter_key(self.flc); self.zp = float('nan')
@@ -454,7 +458,9 @@ def run_group_pass(folders: list, gaia_df: pd.DataFrame, match_kwargs: dict, par
     for rnd in range(1, MAX_ROUNDS + 1):
         tasks, ctx = [], {}
         for gi, fs in enumerate(active):
-            grp = [Member(f) for f in fs]
+            grp = [m for m in (Member(f) for f in fs) if not m.empty]
+            if len(grp) < 2:
+                continue
             if all(_status(m.root).get('status') in _SKIP_STATUS for m in grp):
                 continue
             info = classify(grp, zp_ref); master = master_ids(grp, info)

@@ -87,6 +87,42 @@ def get_chip_config(instrume, detector):
     return config
 
 
+ORIENTAT_FIT_MAX_DEG = 1.0      # never move the orientation further than this from ORIENTAT
+
+
+def _orientat_in_gdc_frame(catalog_file, ra_cen, dec_cen, x_cen, y_cen, pixel_scale, orientat):
+    """Orientation (deg) of the GDC-corrected frame, fitted from the catalogue's header-WCS RA/Dec and
+    x_gdc/y_gdc so that the header-only guess has zero rotation.  None if it cannot be determined."""
+    t = fits.getdata(catalog_file)
+    ra = np.asarray(t['ra'], float); de = np.asarray(t['dec'], float)
+    xg = np.asarray(t['x_gdc'], float); yg = np.asarray(t['y_gdc'], float)
+    ok = np.isfinite(ra) & np.isfinite(de) & np.isfinite(xg) & np.isfinite(yg)
+    if ok.sum() < 10:
+        return None
+    idx = np.where(ok)[0]
+    if len(idx) > 3000:
+        idx = idx[np.linspace(0, len(idx) - 1, 3000).astype(int)]
+    ra, de, xg, yg = ra[idx], de[idx], xg[idx], yg[idx]
+    sdeg = pixel_scale / 3600.0
+    dx = rd2x(ra, de, ra_cen, dec_cen); dy = rd2y(ra, de, ra_cen, dec_cen)
+    u = -dx / sdeg; v = dy / sdeg                      # sky offsets in unrotated pixel units
+
+    def _rot_for(ori):
+        th = np.radians(-ori)
+        R = np.array([[np.cos(th), np.sin(th)], [-np.sin(th), np.cos(th)]])
+        g = np.column_stack([u, v]) @ np.linalg.inv(R).T      # header-frame coordinates (minus centre)
+        X = np.column_stack([xg - xg.mean(), yg - yg.mean(), np.ones_like(xg)])
+        a, b, _ = np.linalg.lstsq(X, g[:, 0], rcond=None)[0]
+        c, d, _ = np.linalg.lstsq(X, g[:, 1], rcond=None)[0]
+        return float(np.degrees(np.arctan2(b - c, a + d)))
+
+    r0 = _rot_for(orientat)
+    best = min((orientat + r0, orientat - r0), key=lambda o: abs(_rot_for(o)))
+    if abs(best - orientat) > ORIENTAT_FIT_MAX_DEG or abs(_rot_for(best)) > 0.1 * max(abs(r0), 1e-3) + 1e-3:
+        return None
+    return float(best)
+
+
 def get_hst_params(flc_file, catalog_file=None):
     with fits.open(flc_file) as hdul:
         header0 = hdul[0].header
@@ -155,9 +191,27 @@ def get_hst_params(flc_file, catalog_file=None):
         except Exception:
             pass
 
+    # ORIENTAT describes the RAW pixel frame at the image's reference pixel; the matching frame is the
+    # GDC-corrected one.  Their rotation differs by the local distortion rotation, which is negligible
+    # near the chip centre but 0.2-0.35 deg at the corner reference pixel of a subarray (UVIS2-C512C,
+    # -C1K1C, -2K2C: solutions came out 0.21-0.33 deg from ORIENTAT and failed the 4P |rot| < 0.2 deg
+    # gate).  The pypass catalogue holds RA/Dec from the FULL header WCS (incl. its distortion terms)
+    # and the GDC positions of every detection, so the orientation of the GDC frame is fitted here
+    # (2026-10-01; predicts the measured offsets to <= 0.024 deg, full frames to 0.001 deg).  Positions
+    # are never corrected with the header distortion -- it only sets this initial orientation.
+    orientat_header = orientat
+    if catalog_file is not None:
+        try:
+            _ori = _orientat_in_gdc_frame(catalog_file, ra_cen, dec_cen, x_cen, y_cen, pixel_scale, orientat)
+            if _ori is not None:
+                orientat = _ori
+        except Exception:
+            pass
+
     return {"ra_cen": ra_cen, "dec_cen": dec_cen, "x_cen": x_cen, "y_cen": y_cen,
             "pixel_scale": pixel_scale, "initial_scale": initial_scale,
-            "obs_epoch_mjd": obs_epoch_mjd, "orientat": orientat, "naxis1": naxis1, "naxis2": naxis2,
+            "obs_epoch_mjd": obs_epoch_mjd, "orientat": orientat, "orientat_header": orientat_header,
+            "naxis1": naxis1, "naxis2": naxis2,
             "instrument": instrument, "detector": detector,
             "chip_dims": {ext: (h.get('NAXIS1'), h.get('NAXIS2')) for ext, h in sci_hdrs.items()}}
 
@@ -706,9 +760,10 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
 
 CHANCE_SHIFTS_PX = (25.0, 50.0)   # rings of 8 shifted copies of the final solution
 CHANCE_FA_PROB = 1e-3             # accept only if P(N >= N_real | Poisson(lambda_chance)) < this
-CHANCE_MAG_WIN = 1.0              # minimum half-width of the zero-point window of the test; the window is
-                                  # max(this, 3 x robust MAD of the matches' G-HST) so UV filters with a
-                                  # several-mag colour spread are not cut (NGC 300 F225W: G-HST -4..+2)
+CHANCE_MAG_WIN = 1.5              # half-width of the test's zero-point window (optical / IR filters)
+CHANCE_MAG_WIN_UV = 3.5           # UV filters (PHOTPLAM < 4000 A): G-HST spans several mag (NGC 300 F225W -4..+2)
+                                  # Fixed per filter class: an adaptive (3 x MAD) window let a spurious set with
+                                  # uniformly spread G-HST widen it to 11 mag (47 Tuc j8c051t9q, 2026-10-01).
 CHANCE_SIGMA_MAX = 2.0            # the test counts pairs within this many sigma: real matches sit well
                                   # inside it, chance pairs are uniform over the 5-sigma area (~16% inside)
 
@@ -779,8 +834,14 @@ def _select_discovery(discovered, params):
         nm = max(d['n_match'] for d in members)
         reps.append((int(support[i]), min((d for d in members if d['n_match'] >= 0.5 * nm), key=lambda d: d['red_cost'])))
     old = min(discovered, key=lambda d: d['red_cost'])
-    if all(r[1] is not old for r in reps):
-        reps.append((1, old))
+    # the legacy lowest-cost pick is ALWAYS evaluated (second, after the best-supported cluster): with
+    # >= MAX_DISCOVERY_CANDIDATES clusters it used to be cut off (GOODS-N j91we8mgq: its 6-match,
+    # 0.06 px solution was never tried)
+    _rest = [r for r in reps if r[1] is not old]
+    if reps[0][1] is old:
+        reps = [reps[0]] + _rest
+    else:
+        reps = [reps[0], (next((r[0] for r in reps if r[1] is old), 1), old)] + _rest[1:]
     pick = reps[0][1]
     pick['_alternatives'] = [r[1] for r in reps[1:]]
     print(f"  Discovery selection: {len(discovered)} tier solutions in {len(reps)} distinct clusters "
@@ -895,6 +956,14 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
 _PCM_CACHE = {}
 
 
+PLAUS_SCALE = 6e-4            # |ratio / (header scale x VAFACTOR) - 1| allowed for a final solution
+PLAUS_ROT_DEG = 0.15          # |rotation vs header| allowed
+PLAUS_SKEW = 1e-3             # |on-/off-axis skew| allowed
+PLAUS_MAX_N = 30              # the plausibility gate only applies below this many significant matches (high-N
+                              # solutions cannot be bent onto chance pairs; old headers may be > 0.15 deg off)
+PLAUS_NSIG = 5.0              # ... plus this many fitted sigmas (low-N solutions are poorly constrained)
+CR_SEED_CONC = 1.05          # concentration above which a detection is too sharp for the PSF
+CR_SEED_QFIT = 0.10          # ... only when the PSF fit is also poor (qfit above this)
 GUESS_SEED_RADIUS_PX = 1.5   # direct association radius around a guess-predicted Gaia position
 
 
@@ -960,6 +1029,14 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             print(f"Finished {image_name}: Failed to load parameters.", file=original_stdout)
             return
         params['min_matches'] = min_matches
+        try:
+            _photplam = float(fits.getval(hst['flc'], 'PHOTPLAM', ext=1))
+        except Exception:
+            try:
+                _photplam = float(fits.getval(hst['flc'], 'PHOTPLAM', ext=0))
+            except Exception:
+                _photplam = np.nan
+        _chance_mag_win = CHANCE_MAG_WIN_UV if (np.isfinite(_photplam) and _photplam < 4000.0) else CHANCE_MAG_WIN
 
         # --- Propagate Gaia to HST epoch and project to pixel frame ---
         from bp3m.astro_utils import field_typical_astrometry
@@ -1109,10 +1186,33 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         # refinement and final pass use all sources: non-stars contribute
         # additional positional constraints once a good transform seed exists.
         star_indices = np.where(is_star)[0]   # full-array indices of star candidates
+        # CR-like seeds (2026-10-01): in images where AstroDrizzle never flagged cosmic rays (single,
+        # un-associated exposures, e.g. GOODS-N ibtm9hbmq: 26.5k detections, mostly CRs), detections
+        # sharper than the PSF (1x1 concentration > CR_SEED_CONC) or whose central pixel the PSF fit
+        # itself sigma-clipped (concentration NaN although the pixel is not DQ-flagged) are excluded
+        # from the DISCOVERY seeds only (qfit -> NaN fails every tier); refinement and the final pass
+        # still see every detection.
+        _q_disc = hst_cat['qfit'].astype(float).copy()
+        _names = hst_cat.dtype.names
+        if 'concentration' in _names and 'dq_3x3' in _names:
+            _dq3 = np.asarray(hst_cat['dq_3x3'])
+            if not np.any((_dq3 & 4096) != 0):
+                _conc = np.asarray(hst_cat['concentration'], float)
+                _dq1 = np.asarray(hst_cat['dq_1x1']) if 'dq_1x1' in _names else np.zeros(len(_conc), int)
+                # ... AND a poor PSF fit: bright real stars can have their core clipped (NaN concentration)
+                # yet fit perfectly (pgc_039646 j8hozqkrq: 4 of 6 Gaia stars, qfit 0.02-0.05)
+                _qf = hst_cat['qfit'].astype(float)
+                _cr_like = ((np.isfinite(_conc) & (_conc > CR_SEED_CONC)) | (~np.isfinite(_conc) & (_dq1 == 0))) \
+                           & ~(_qf <= CR_SEED_QFIT)
+                if _cr_like.any():
+                    _q_disc[_cr_like] = np.nan
+                    print(f"  No AstroDrizzle CR flags in this image: {int(_cr_like.sum())} of {len(_conc)} detections "
+                          f"look like cosmic rays (concentration > {CR_SEED_CONC} or core clipped by the fit, with qfit > {CR_SEED_QFIT}) — "
+                          f"excluded from the discovery seeds")
         hst_data = {
             'x': x_hst[is_star], 'y': y_hst[is_star], 'mag': mag_hst[is_star],
             'C': C_pix_hst[is_star],
-            'qfit': hst_cat['qfit'].astype(float)[is_star],
+            'qfit': _q_disc[is_star],
             'chi2': hst_cat['chi2'].astype(float)[is_star],
         }
         # All HST sources (stars + non-stars) with qfit/chi2 — used in the
@@ -1122,7 +1222,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         hst_data_all_disc = {
             'x': x_hst, 'y': y_hst, 'mag': mag_hst,
             'C': C_pix_hst,
-            'qfit': hst_cat['qfit'].astype(float),
+            'qfit': _q_disc,
             'chi2': hst_cat['chi2'].astype(float),
         }
         # All sources (stars + non-stars) for 6P refinement and final pass.
@@ -1220,6 +1320,27 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
 
             M = np.array([[A, B], [C, D]])
 
+            # Plausibility of the refined plate solution vs the header (2026-10-01): with few pairs the 6P fit
+            # can bend onto chance coincidences and make them look tight (47 Tuc j8c051t9q: scale -850 ppm,
+            # 6 pairs "significant"); genuine solutions (282, 10 fields) sit within -277..+92 ppm, |rot| < 0.06 deg,
+            # |skew| < 2.4e-4.
+            _ratio = float(np.sqrt(A * D - B * C)); _rot = float(np.degrees(np.arctan2(B - C, A + D)))
+            _dsc = _ratio / params['initial_scale'] - 1.0
+            _on, _off = 0.5 * (A - D), 0.5 * (B + C)
+            # parameter uncertainties from the refinement covariance (order A, B, xt, C, D, yt): a poorly
+            # constrained low-N solution may sit far from the header without being wrong
+            _V = np.asarray(C_params, float)
+            _ss = float(np.sqrt(max(_V[0, 0] + _V[4, 4] + 2 * _V[0, 4], 0.0)) / 2 / max(_ratio, 1e-9))
+            _sr = float(np.degrees(np.sqrt(max(_V[1, 1] + _V[3, 3] - 2 * _V[1, 3], 0.0)) / 2))
+            _sk = float(np.sqrt(max(_V[0, 0] + _V[4, 4] - 2 * _V[0, 4], _V[1, 1] + _V[3, 3] + 2 * _V[1, 3], 0.0)) / 2)
+            print(f"  Plate solution vs header: scale {_dsc * 1e6:+.0f} +- {_ss * 1e6:.0f} ppm, rot {_rot:+.3f} +- {_sr:.3f} deg, "
+                  f"skew ({_on:+.1e},{_off:+.1e}) +- {_sk:.1e}")
+            _implaus = bool(abs(_dsc) > PLAUS_SCALE + PLAUS_NSIG * _ss or abs(_rot) > PLAUS_ROT_DEG + PLAUS_NSIG * _sr
+                            or max(abs(_on), abs(_off)) > PLAUS_SKEW + PLAUS_NSIG * _sk)
+            if _implaus:
+                print(f"  Plate solution beyond tolerance + {PLAUS_NSIG:.0f} sigma of the header — rejected unless the "
+                      f"chance test finds >= {PLAUS_MAX_N} significant matches")
+
             # --- Final pass: gather all candidates with the converged transform ---
             xh_in_g, yh_in_g = apply_affine(x_hst, y_hst, A, B, C, D, xs_o, ys_o, xt_o, yt_o)
             ds, g_idxs = tree_gaia_all.query(np.column_stack([xh_in_g, yh_in_g]), k=5, distance_upper_bound=100)
@@ -1263,7 +1384,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             if len(_md_core) == 0:
                 _md_core = final_mdf['mag_diff'].values
             _zc = float(np.median(_md_core))   # window centre = the matches' own zp
-            _mwin = float(max(CHANCE_MAG_WIN, 3.0 * 1.4826 * np.median(np.abs(_md_core - _zc))))
+            _mwin = _chance_mag_win
             _counts = []
             for _r in CHANCE_SHIFTS_PX:
                 for _a in np.radians(np.arange(0, 360, 45) + (22.5 if _r != CHANCE_SHIFTS_PX[0] else 0.0)):
@@ -1276,6 +1397,9 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             _lam, _fap = chance_significance(_n_win, _counts)
             print(f"  Chance-coincidence test: {_n_win} of {len(h_final)} matches within {CHANCE_SIGMA_MAX} sigma and {_mwin:.1f} mag of zp vs {_lam:.2f} expected by chance "
                   f"(shifted copies: median {np.median(_counts):.0f}, max {max(_counts)}) -> false-alarm P = {_fap:.2e}")
+            if _implaus and _n_win < PLAUS_MAX_N:
+                return dict(ok=False, n_win=_n_win, lam=_lam, fap=_fap,
+                            reason=f'implausible plate solution (scale {_dsc * 1e6:+.0f} ppm, rot {_rot:+.3f} deg) with only {_n_win} significant matches — rejected.')
             if _fap >= CHANCE_FA_PROB:
                 return dict(ok=False, n_win=_n_win, lam=_lam, fap=_fap,
                             reason=f'match set not significant against chance ({_n_win} vs {_lam:.1f} expected, P={_fap:.2e}) — spurious solution rejected.')
