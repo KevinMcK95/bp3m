@@ -687,6 +687,7 @@ def run_alignment_v2(
     exclude_2p_from_alignment: bool = False,
     fit_chip_offset: bool = False,
     prior_sigma_chip_px: float | None = None,
+    min_stars_split_ccd: int | None = None,
 ) -> Path:
     """
     Run BP3M v2 alignment using the master_combined_v2.csv cross-match catalog.
@@ -736,6 +737,10 @@ def run_alignment_v2(
     data_root   = Path(output_dir)
     output_bp3m = data_root / field_name / "BP3M_v2_results"
     output_bp3m.mkdir(parents=True, exist_ok=True)
+    from bp3m.hardlinks import detach_tree as _detach_tree
+    _nd = _detach_tree(output_bp3m)
+    if _nd:
+        print(f"  Detached {_nd} hard-linked file(s) in BP3M_v2_results before rewriting")
 
     print("\n" + "─" * 50)
     print("BP3M v2: alignment with HST-only sources")
@@ -754,6 +759,7 @@ def run_alignment_v2(
         det_chi2_threshold=det_chi2_threshold,
         pos_corr_table=pos_corr_table,
         pos_corr_model=pos_corr_model,
+        min_stars_split_ccd=min_stars_split_ccd,
     )
 
     if not images:
@@ -1447,6 +1453,8 @@ def run_alignment_v2(
             "pos_err_floor":     pos_err_floor,
             "pos_corr_table":    (str(pos_corr_table) if pos_corr_table else None),
             "pos_corr_model":    (str(pos_corr_model) if pos_corr_model else None),
+            "min_stars_split_ccd": min_stars_split_ccd,
+            "settings_inherited_from": "BP3M_results/run_config.json unless given on the bp3m-v2 CLI",
             "hst_enable_iter":   hst_enable_iter,
             "hst_max_pm_unc":    hst_max_pm_unc,
             "hst_max_per_image": hst_max_per_image,

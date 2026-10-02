@@ -255,6 +255,8 @@ def _project_to_radec(
 # the brightest Gaia stars (1-2 saturated pixels), which are the best alignment
 # anchors (pegasus_3, 2026-09-28: 15 of 97 indv Gaia matches).
 _MAX_SAT_FRAC = 0.25
+_CR_SEED_CONC = 1.05   # = gaia_cross_match.cross_match.CR_SEED_CONC
+_CR_SEED_QFIT = 0.10   # = gaia_cross_match.cross_match.CR_SEED_QFIT
 
 
 def load_v1_good_pairs(v1_bp3m_dir: Optional[Path]) -> set[tuple[str, int]]:
@@ -336,6 +338,28 @@ def _load_all_detections(field_dir: Path,
     if not img_csv.exists() or not c_r_path.exists():
         print("  Error: image_transformations.csv or C_r.npy missing in BP3M_results/")
         return None
+
+    # Position model of the alignment we project with (2026-10-02, review of the v2 crossmatch):
+    # the same pseudo-GDC tables, learned GDC correction and error floor that the source run
+    # (BP3M_results or BP3M_v2_results) solved on -- otherwise every projected position is off
+    # that frame by the whole correction (0.1-0.3 px median) and the errors are ~10x too small.
+    _run_cfg = {}
+    try:
+        import json as _json_cfg
+        _run_cfg = _json_cfg.load(open(bp3m_dir / 'run_config.json'))
+    except Exception:
+        pass
+    _floor = float(_run_cfg.get('pos_err_floor') or 0.0)
+    _pc_set, _pcm = None, None
+    if _run_cfg.get('pos_corr_table'):
+        from bp3m.pos_corr import PseudoGDCSet
+        _pc_set = PseudoGDCSet(_run_cfg['pos_corr_table'])
+    if _run_cfg.get('pos_corr_model'):
+        from bp3m.pos_corr_basis import make_pos_corr
+        _pcm = make_pos_corr(str(_run_cfg['pos_corr_model']))
+    print(f"  position model from {bp3m_dir.name}/run_config.json: floor {_floor} px, "
+          f"pos_corr_table {'yes' if _pc_set else 'none'}, "
+          f"pos_corr_model {_run_cfg.get('pos_corr_model') or 'none'}")
 
     transform_df = pd.read_csv(img_csv)
     C_r          = np.load(c_r_path)
@@ -447,6 +471,8 @@ def _load_all_detections(field_dir: Path,
     # Closures over r_vecs, zp_legacy, alpha_lookup, hst_root, n_r, poly_order —
     # all read-only.  FITS I/O (astropy) and numpy ops release the GIL so threads
     # give real parallelism even for CPU-heavy projection work.
+    _cr_counts: dict = {}
+
     def _process_one_sub_image(j_trow: tuple) -> Optional[pd.DataFrame]:
         _, trow = j_trow
         sub_name = trow.image_name
@@ -552,6 +578,20 @@ def _load_all_detections(field_dir: Path,
             except Exception as _del_exc:
                 print(f"    (deletion failed: {_del_exc})")
             return None
+        # Same corrections as the v1 loader (data_loader_flc): pseudo-GDC tables, then the learned
+        # model, both subtracted from x_gdc/y_gdc; the floor is added to the variances in quadrature.
+        if _pc_set is not None and np.isfinite(epoch_mjd):
+            for _t in (_pc_set.match(instrument, detector, flt, epoch_mjd) or []):
+                _bx, _by = _t.bias(np.asarray(tbl['x'], float), np.asarray(tbl['y'], float),
+                                   np.asarray(tbl['flux'], float), epoch_mjd)
+                cat_xgdc = cat_xgdc - _bx; cat_ygdc = cat_ygdc - _by
+        if _pcm is not None and flc_path.exists():
+            _mb = _pcm.bias(tbl, _pcm.read_header(flc_path))
+            if _mb is not None:
+                cat_xgdc = cat_xgdc - _mb[0]; cat_ygdc = cat_ygdc - _mb[1]
+        if _floor > 0:
+            cat_cov_xx = cat_cov_xx + _floor ** 2
+            cat_cov_yy = cat_cov_yy + _floor ** 2
         cat_mag_cal = np.asarray(tbl['mag_st_gdc'], float)
         cat_qfit = np.asarray(tbl['qfit'],  float)
         cat_chi2 = np.asarray(tbl['chi2'],  float)
@@ -595,6 +635,28 @@ def _load_all_detections(field_dir: Path,
 
         # Gaia match lookup (hst_index → gaia_source_id)
         gaia_match = _load_gaia_match_lookup(img_dir)
+
+        # Cosmic-ray-like detections are never linked as HST-only sources (2026-10-02, same rule as
+        # the per-image Gaia cross-match seeding, gaia_cross_match.cross_match CR_SEED_*): in images
+        # with no AstroDrizzle CR flags (DQ 4096), sharper than the PSF (1x1 concentration > 1.05) or
+        # core clipped by the fit (NaN concentration, DQ clean) AND a poor fit (qfit > 0.1); plus the
+        # pypass CR-recovery detections.  Per-image Gaia matches and v1 alignment detections stay.
+        _nm = tbl.dtype.names
+        _cr_like = np.zeros(len(cat_y_raw), bool)
+        if 'concentration' in _nm and 'dq_3x3' in _nm and not np.any((np.asarray(tbl['dq_3x3']) & 4096) != 0):
+            _conc = np.asarray(tbl['concentration'], float)
+            _dq1 = np.asarray(tbl['dq_1x1']) if 'dq_1x1' in _nm else np.zeros(len(_conc), int)
+            _cr_like = ((np.isfinite(_conc) & (_conc > _CR_SEED_CONC)) | (~np.isfinite(_conc) & (_dq1 == 0))) \
+                       & ~(cat_qfit <= _CR_SEED_QFIT)
+        if 'cr_recovered' in _nm:
+            _cr_like |= np.asarray(tbl['cr_recovered'], bool)
+        if _cr_like.any():
+            _gm = np.zeros(len(cat_y_raw), bool)
+            _gm[[ci for ci in gaia_match if 0 <= ci < len(_gm)]] = True
+            _drop = _cr_like & mask & ~_gm
+            if _drop.any():
+                mask &= ~_drop
+                _cr_counts[sub_name] = int(_drop.sum())
 
         # v1-good Gaia detections survive the quality cuts: v1 aligned on them.
         v1_good_cat = np.zeros(len(cat_y_raw), bool)
@@ -697,6 +759,9 @@ def _load_all_detections(field_dir: Path,
     else:
         img_dfs = [_process_one_sub_image(jt) for jt in jobs]
 
+    if _cr_counts:
+        print(f"  CR-like detections excluded from linking: {sum(_cr_counts.values())} in "
+              f"{len(_cr_counts)} sub-images (max {max(_cr_counts.values())} in one)")
     per_image_dfs = [df for df in img_dfs if df is not None]
     if not per_image_dfs:
         return None
@@ -1182,7 +1247,10 @@ def _phase0b_anchor_gaia_stars(
     n_anchored  = 0
     n_stars_improved = 0
 
-    def _try_match(gid, ra0_g, dec0_g, pmra, pmdec, plx, g_mag, sub_name, epoch_yr):
+    sig_det_sub = {sub: float(np.nanmedian(np.hypot(g['sigma_ra'], g['sigma_dec']) / np.sqrt(2)))
+                   for sub, g in det_df.groupby('sub_name')}
+
+    def _try_match(gid, ra0_g, dec0_g, pmra, pmdec, plx, g_mag, sub_name, epoch_yr, sig_pos=5.0, sig_pm=1.0):
         """Try to find star (gid) in sub_name; return det_df row index or None."""
         if (gid, sub_name) in already_labelled or sub_name not in sub_trees:
             return None
@@ -1193,8 +1261,11 @@ def _phase0b_anchor_gaia_stars(
         tree, ra_s, dec_s, mag_s, idx_s = sub_trees[sub_name]
         k = min(n_candidates, len(ra_s))
         dists, ii = tree.query([[ra_pred * cos_dec_global, dec_pred]], k=k)
-        dists = dists[0]; ii = ii[0]
-        ok = dists < search_deg
+        dists = np.atleast_1d(dists[0]); ii = np.atleast_1d(ii[0])
+        # 5 sigma of (v1 posterior position at this epoch, image detection error), in [20 mas, search]
+        _sp = np.hypot(sig_pos, sig_pm * abs(dt))
+        _r = min(max(5.0 * np.hypot(_sp, sig_det_sub.get(sub_name, 5.0)), 20.0), search_radius_px * 50.0) / 3.6e6
+        ok = dists < _r
         if not ok.any():
             return None
         zp_info = zp_per_sub.get(sub_name)
@@ -1226,11 +1297,21 @@ def _phase0b_anchor_gaia_stars(
         if not np.isfinite(plx):
             plx = 0.0
         g_mag  = gaia_g_lookup.get(gid, np.nan)
+        def _f(c, d):
+            v = star.get(c, d)
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return d
+            return v if np.isfinite(v) else d
+        _sig_pos = np.hypot(_f('sigma_delta_racosdec', 5.0), _f('sigma_delta_dec', 5.0)) / np.sqrt(2)
+        _sig_pm = np.hypot(_f('sigma_pmra_bp3m_cond', _f('sigma_pmra_bp3m', 1.0)),
+                           _f('sigma_pmdec_bp3m_cond', _f('sigma_pmdec_bp3m', 1.0))) / np.sqrt(2)
 
         star_added = 0
         for sub_name, epoch_yr in epoch_lookup.items():
             row_idx = _try_match(gid, ra0_g, dec0_g, pmra, pmdec, plx, g_mag,
-                                 sub_name, epoch_yr)
+                                 sub_name, epoch_yr, sig_pos=_sig_pos, sig_pm=_sig_pm)
             if row_idx is None:
                 continue
             # row_idx is an index LABEL (from grp.index.values) — use .loc,
@@ -1328,6 +1409,14 @@ def _phase2_gaia_catalog_anchor(
     tgt_plx   = np.where(np.isfinite(_plx), _plx, _f["plx"])
     tgt_gmag  = targets['gmag'].to_numpy(dtype=float) if 'gmag' in targets.columns else np.full(len(targets), np.nan)
     tgt_cos   = np.cos(np.radians(tgt_dec))
+    # Prediction uncertainty for the search radius (2026-10-02): Gaia position error + PM error x dt;
+    # 2p stars use the field PM spread.  radius = 5 sigma (det + prediction), within [30 mas, search].
+    def _col(c, fill):
+        return (targets[c].to_numpy(dtype=float) if c in targets.columns else np.full(len(targets), fill))
+    tgt_pos_err = np.nan_to_num(np.hypot(_col('ra_error', 1.0), _col('dec_error', 1.0)) / np.sqrt(2), nan=1.0)
+    _pme = np.hypot(_col('pmra_error', np.nan), _col('pmdec_error', np.nan)) / np.sqrt(2)
+    tgt_pm_err = np.where(np.isfinite(_pmra) & np.isfinite(_pme), _pme, float(_f.get('pm_sig', 5.0)))
+    R_MIN_MAS, R_MAX_MAS = 30.0, search_radius_px * 50.0
     valid_pos = np.isfinite(tgt_ra) & np.isfinite(tgt_dec)
 
     # ── ZP offsets per sub-image ──────────────────────────────────────────────
@@ -1393,6 +1482,9 @@ def _phase2_gaia_catalog_anchor(
         if k == 1:
             dists_all = dists_all[:, np.newaxis]
             ii_all    = ii_all[:, np.newaxis]
+        _sig_det = float(np.nanmedian(np.hypot(sub_grp['sigma_ra'].values, sub_grp['sigma_dec'].values) / np.sqrt(2)))
+        _sig_pred = np.hypot(tgt_pos_err, tgt_pm_err * abs(dt))
+        r_tgt_deg = np.clip(5.0 * np.hypot(_sig_pred, _sig_det), R_MIN_MAS, R_MAX_MAS) / 3.6e6
 
         # For each target, find its best valid candidate (closest passing
         # distance + magnitude filters).  Loop is over k≤5, not over stars.
@@ -1407,7 +1499,7 @@ def _phase2_gaia_catalog_anchor(
             ii    = ii_all[:,   ki]
 
             # Only consider targets that haven't found a valid match yet
-            need = (best_det == -1) & valid_pos & (dists < search_deg)
+            need = (best_det == -1) & valid_pos & (dists < r_tgt_deg)
             if not need.any():
                 break
 
@@ -2065,6 +2157,8 @@ def _within_filter_match(
             'is_star':         fdf['is_star_candidate'].values,
             'has_gaia':        fdf['has_gaia_match'].values,
             'gaia_id':         fdf['gaia_source_id'].values,
+            'v1_good':         (fdf['v1_good'].values.astype(bool) if 'v1_good' in fdf.columns
+                                else np.zeros(len(fdf), bool)),
             'sub_name':        fdf['orig_sub_name'].values,
             'source_id':       fdf['source_id'].values,
             'catalog_index':   fdf['catalog_index'].values,
@@ -2079,6 +2173,7 @@ def _within_filter_match(
         }
 
         src_ids_sorted = fdf.groupby('source_id').groups   # {src_id: [pos_in_fdf]}
+        _n_mixed_gid = [0]
         for src_id, grp_idx in src_ids_sorted.items():
             gi = np.array(grp_idx)
             n  = len(gi)
@@ -2110,6 +2205,7 @@ def _within_filter_match(
                 mad = float(np.median(np.abs(mag_g - mag_wm))) * 1.4826
                 thresh = max(mag_outlier_sigma * mad, mag_outlier_floor)
                 bad = np.abs(mag_g - mag_wm) > thresh
+                bad &= ~grp_arrays['v1_good'][gi]     # v1 aligned on these: variables keep them
                 n_bad = int(bad.sum())
                 if n_bad > 0 and (n - n_bad) >= min_detections:
                     keep_mask = ~bad
@@ -2135,7 +2231,13 @@ def _within_filter_match(
                     n_mag_out = n_bad
 
             gaia_mask = grp_arrays['has_gaia'][gi]
-            gaia_id   = int(grp_arrays['gaia_id'][gi[gaia_mask][0]]) if gaia_mask.any() else 0
+            gaia_id = 0
+            if gaia_mask.any():
+                # majority Gaia ID of the group (was: the first one); mixed groups are counted
+                _ids, _cnt = np.unique(grp_arrays['gaia_id'][gi[gaia_mask]].astype(np.int64), return_counts=True)
+                gaia_id = int(_ids[np.argmax(_cnt)])
+                if len(_ids) > 1:
+                    _n_mixed_gid[0] += 1
 
             pm_size = np.sqrt(astrom['pmra']**2 + astrom['pmdec']**2)
 
@@ -2176,6 +2278,8 @@ def _within_filter_match(
                 'n_mag_outliers':  n_mag_out,
             })
 
+        if _n_mixed_gid[0]:
+            print(f"    {_n_mixed_gid[0]} linked source(s) carried more than one Gaia ID; kept the majority ID")
         if not master_rows:
             return None
 
@@ -2378,6 +2482,10 @@ def _deduplicate_merged(df: pd.DataFrame, pos_threshold_mas: float = 50.0) -> pd
                     snj = _sub_names_of_row(rj)
                     if sni & snj:
                         continue  # share an image — can't be a merge failure
+                    # two DIFFERENT Gaia stars are never one source (2026-10-02)
+                    _ga = int(ri.get('gaia_source_id', 0) or 0); _gb = int(rj.get('gaia_source_id', 0) or 0)
+                    if _ga > 0 and _gb > 0 and _ga != _gb:
+                        continue
                     # Merge: keep primary as the one with more detections
                     pri_idx, sec_idx = (ri_idx, rj_idx) if (ri.get('n_detect', 0) or 0) >= (rj.get('n_detect', 0) or 0) else (rj_idx, ri_idx)
                     rows[pri_idx] = _merge_two_rows(rows[pri_idx], rows[sec_idx])
@@ -2538,13 +2646,24 @@ def _cross_filter_match(
         _used_c: set[int] = set()
         _used_m: set[int] = set()
         _pairs: list[tuple[int, int]] = []
+        _gid_cur = _gaia_ids_by_filt.get(filt)
+        _n_conf = 0
         for _ci, _mi in zip(_ci_v, _mi_v):
+            # never merge two DIFFERENT Gaia stars across filters (2026-10-02): the merged row
+            # used to keep the first ID silently and the other star's detections were lost
+            if _gid_cur is not None:
+                _a = int(_gid_cur[_ci]); _b = int(merged_rows[_mi].get('gaia_source_id', 0) or 0)
+                if _a > 0 and _b > 0 and _a != _b:
+                    _n_conf += 1
+                    continue
             if _ci not in _used_c and _mi not in _used_m:
                 _pairs.append((int(_ci), int(_mi)))
                 _used_c.add(int(_ci))
                 _used_m.add(int(_mi))
         matched_cur = np.zeros(len(cur_x), dtype=bool)
         matched_cur[list(_used_c)] = True
+        if _n_conf:
+            print(f"    cross-filter {filt}: refused {_n_conf} candidate pair(s) joining different Gaia stars")
 
         # Populate per-filter columns on matched merged rows
         for ci, mi in _pairs:
@@ -2669,7 +2788,10 @@ def _recover_gaia_matches(
     # ── Propagate Gaia positions to mean HST epoch ────────────────────────────
     mean_epoch_yr = float(unmatched['epoch_ref'].mean()) if 'epoch_ref' in unmatched else 2015.0
     gaia_df = gaia_df.copy()
-    dt_yr = mean_epoch_yr - 2015.5   # Gaia DR3 reference epoch
+    # Gaia reference epoch from the catalog (DR3: J2016.0; was hard-coded 2015.5 = DR2, 2026-10-02)
+    _ref_ep = (float(np.nanmedian(gaia_df['ref_epoch'])) if 'ref_epoch' in gaia_df.columns
+               and np.isfinite(gaia_df['ref_epoch']).any() else 2016.0)
+    dt_yr = mean_epoch_yr - _ref_ep
     try:
         _xyz_rec = get_tele_position(
             AstropyTime(mean_epoch_yr, format='jyear'), curr_id='earth')
@@ -4147,6 +4269,15 @@ def run_hst_crossmatch(
     if output_dir is None:
         output_dir = field_dir / 'hst_xmatch'
     output_dir = Path(output_dir)
+    # every writer below truncates in place: give this field private copies of any file shared
+    # by hard link with a field copy first (Leo_I hst_xmatch/master_combined_v2.csv had nlink 7)
+    try:
+        from bp3m.hardlinks import detach_tree as _detach_tree
+        _nd = _detach_tree(output_dir, recursive=True)
+        if _nd:
+            print(f"  Detached {_nd} hard-linked file(s) in {output_dir.name} before rewriting")
+    except Exception as _exc_d:
+        print(f"  WARNING: could not detach hard links in {output_dir}: {_exc_d}")
     if bp3m_results_dir is None:
         bp3m_results_dir = field_dir / 'BP3M_results'
     bp3m_results_dir = Path(bp3m_results_dir)
@@ -4259,6 +4390,9 @@ def run_hst_crossmatch(
         _fill2 = field_typical_astrometry(
             _va.loc[_ok, 'pmra_bp3m'], _va.loc[_ok, 'pmdec_bp3m'],
             plx=_va.loc[_ok, 'parallax_bp3m'])
+        # PM spread of the field for the 2p search radius (robust, >= 1 mas/yr)
+        _dpm = np.hypot(_va.loc[_ok, 'pmra_bp3m'] - _fill2['pmra'], _va.loc[_ok, 'pmdec_bp3m'] - _fill2['pmdec'])
+        _fill2['pm_sig'] = float(max(1.0, np.nanmedian(_dpm) / np.sqrt(np.log(4.0))))   # 2-D: median |d| = sigma sqrt(ln 4) if len(_dpm) else 5.0
         print(f"  2p propagation fill from anchor-run astrometry "
               f"({_fill2['method']}, n={_fill2['n']}): "
               f"pm=({_fill2['pmra']:+.2f},{_fill2['pmdec']:+.2f}) mas/yr  "

@@ -203,6 +203,10 @@ def _load_fits_catalog(cat_path: Path) -> dict | None:
             "mag_gdc": tbl["mag_gdc"].astype(float),
             "qfit":   tbl["qfit"].astype(float),
             "n_sat":  tbl["n_sat"].astype(int),
+            # learned GDC correction inputs (pos_corr_basis.bias reads x, y, chip_ext, mag, sky)
+            "chip_ext": (tbl["chip_ext"].astype(int) if "chip_ext" in tbl.names
+                         else np.where(tbl["y"] >= 2048, 4, 1)),
+            "sky":    (tbl["sky"].astype(float) if "sky" in tbl.names else None),
         }
 
 
@@ -219,14 +223,15 @@ def load_master_v2(
     pos_corr_table: "str | Path | None" = None,
     priority_source_indices: "set[int] | None" = None,
     pos_corr_model: "str | Path | None" = None,
+    min_stars_split_ccd: "int | None" = None,
 ) -> tuple[dict, dict, pd.DataFrame, np.ndarray]:
     """
     Load BP3M v2 inputs from {field_dir}/hst_xmatch/master_combined_v2.csv.
 
-    pos_corr_model : learned GDC-residual model (bp3m --pos_corr_model).  Not yet
-        applied on the master_v2 path; requesting one raises instead of silently
-        fitting uncorrected positions.  (run_pop_fit passes it unconditionally since
-        a7fd22a, which broke every bp3m-pop-fit-v2 run with a TypeError.)
+    pos_corr_model : learned GDC-residual model (bp3m --pos_corr_model), applied in memory
+        exactly as the v1 loader does (data_loader_flc): bias evaluated per detection from
+        its catalog row + FLC header, subtracted from x_gdc/y_gdc after any pos_corr_table
+        and before the epoch-distortion term (2026-10-02; until then this path raised).
 
     priority_source_indices : master_combined_v2 row indices (e.g. a user member
         seed from notebook 08) that must survive the HST-only selection: they
@@ -266,10 +271,8 @@ def load_master_v2(
     hst_only_mask : (n_stars,) bool
         True for the synthetic HST-only rows in gaia_catalog.
     """
-    if pos_corr_model is not None and str(pos_corr_model).lower() != 'none':
-        raise NotImplementedError(
-            f"load_master_v2: pos_corr_model={pos_corr_model!r} is not supported on the "
-            "master_v2 path yet; rerun without --pos_corr_model or pass --pos_corr_model none")
+    if pos_corr_model is not None and str(pos_corr_model).lower() == 'none':
+        pos_corr_model = None
     _ensure_bp3m()
     from bp3m.data_loader_flc import _read_image_meta  # private but stable
 
@@ -614,6 +617,11 @@ def load_master_v2(
         _pos_corr = PseudoGDCSet(pos_corr_table)
         print(f"  Pseudo-GDC corrections: {_pos_corr.summary}")
     _n_pc_imgs = 0
+    _pcm, _pcm_hdr, _n_pcm_imgs = None, {}, 0
+    if pos_corr_model is not None:
+        from bp3m.pos_corr_basis import make_pos_corr
+        _pcm = make_pos_corr(str(pos_corr_model))
+        print(f"  Learned GDC correction (pos_corr_model): {_pcm.summary}")
 
     from bp3m.epoch_distortion import EpochDistortion
     _v1_dir = Path(data_root) / field_name / 'BP3M_results'
@@ -722,6 +730,7 @@ def load_master_v2(
         is_outlier  = np.zeros(n, dtype=bool)   # Phase 6-flagged outlier
         det_chi2_arr = np.full(n, np.nan)        # Phase 6 per-detection chi2
         flux_arr    = np.full(n, np.nan)
+        cidx        = np.full(n, -1, dtype=int)
 
         for k, r in enumerate(recs_img):
             ci = r["cat_idx"]
@@ -741,6 +750,7 @@ def load_master_v2(
             denom = sx * sy
             rho = float(np.clip(cxy / denom if denom > 0 else 0.0, -0.9999, 0.9999))
 
+            cidx[k]      = ci
             X[k]         = fits_data["x_gdc"][ci]
             Y[k]         = fits_data["y_gdc"][ci]
             # (epoch-distortion correction applied vectorised below)
@@ -771,6 +781,24 @@ def load_master_v2(
                     _bx, _by = _t.bias(X_orig[_fin], Y_orig[_fin], flux_arr[_fin], _mjd)
                     X[_fin] = X[_fin] - _bx
                     Y[_fin] = Y[_fin] - _by
+
+        # Learned GDC correction (same per-row evaluation and sign as data_loader_flc)
+        if _pcm is not None:
+            _base = _sub_name_to_base(sub_name)
+            _sel = np.isfinite(X) & np.isfinite(Y) & (cidx >= 0)
+            if _sel.any():
+                if _base not in _pcm_hdr:
+                    _pcm_hdr[_base] = _pcm.read_header(hst_root / _base / f"{_base}_flc.fits")
+                _ci = cidx[_sel]
+                _cols = [fits_data["x"][_ci], fits_data["y"][_ci], fits_data["chip_ext"][_ci], fits_data["mag"][_ci]]
+                _names = ["x", "y", "chip_ext", "mag"]
+                if fits_data.get("sky") is not None:
+                    _cols.append(fits_data["sky"][_ci]); _names.append("sky")
+                _mb = _pcm.bias(np.rec.fromarrays(_cols, names=_names), _pcm_hdr[_base])
+                if _mb is not None:
+                    X[_sel] = X[_sel] - _mb[0]
+                    Y[_sel] = Y[_sel] - _mb[1]
+                    _n_pcm_imgs += 1
 
         # Epoch-distortion correction from the v1 fit (x' = x + R^{-1} B d):
         # keeps the v2 solve consistent with a v1 fit that modelled X r + B d.
@@ -818,6 +846,8 @@ def load_master_v2(
 
     if _pos_corr is not None:
         print(f"  Pseudo-GDC corrections applied to {_n_pc_imgs}/{len(stars_per_image)} sub-images")
+    if _pcm is not None:
+        print(f"  Learned GDC correction applied to {_n_pcm_imgs}/{len(stars_per_image)} sub-images")
     if skipped_fits:
         print(f"  Warning: FITS catalog missing for {len(skipped_fits)} sub-images "
               f"(skipped): {skipped_fits[:5]}{'...' if len(skipped_fits)>5 else ''}")
@@ -827,7 +857,7 @@ def load_master_v2(
     # Gaia-matched (use_for_alignment=True) stars.  Chips with fewer stars are
     # combined into a single unsplit image so the transformation is not under-
     # constrained.  HST-only stars do NOT count toward this threshold.
-    _MIN_GAIA_PER_CHIP = 20
+    _MIN_GAIA_PER_CHIP = int(min_stars_split_ccd) if min_stars_split_ccd else 20   # v1's min_stars_split_ccd
     bases_with_split = set()
     for sname in list(stars_per_image.keys()):
         if sname.endswith("_hi") or sname.endswith("_lo"):

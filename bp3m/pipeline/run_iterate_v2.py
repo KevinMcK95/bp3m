@@ -54,12 +54,12 @@ def main():
                              'skips earlier cycles (useful for resuming)')
 
     # ── BP3M v2 parameters ─────────────────────────────────────────────────────
-    parser.add_argument('--n_iter', type=int, default=20,
-                        help='Maximum BP3M outer iterations per cycle')
+    parser.add_argument('--n_iter', type=int, default=None,
+                        help='Maximum BP3M outer iterations per cycle (default: the v1 run\'s n_iter, else 20)')
     parser.add_argument('--n_samples', type=int, default=1000,
                         help='Posterior samples for marginalisation')
-    parser.add_argument('--clip_sigma', type=float, default=4.5,
-                        help='MAD sigma for outlier rejection (0 = disabled)')
+    parser.add_argument('--clip_sigma', type=float, default=None,
+                        help='MAD sigma for outlier rejection (0 = disabled; default: the v1 run\'s value, else 4.5)')
     parser.add_argument('--poly_order', type=int, default=None,
                         help='Polynomial order for image transformation '
                              '(default: the v1 run\'s value from BP3M_results/run_config.json)')
@@ -176,7 +176,8 @@ def main():
         import json as _json
         _v1_cfg = _json.load(open(_v1_cfg_path))
     for _key, _default in (('poly_order', 1), ('pos_err_floor', 0.05), ('pos_corr_table', None),
-                           ('fit_chip_offset', False), ('pos_corr_model', None)):
+                           ('fit_chip_offset', False), ('pos_corr_model', None),
+                           ('n_iter', 20), ('clip_sigma', 4.5)):
         if getattr(args, _key) is None:
             if _key in _v1_cfg:
                 setattr(args, _key, _v1_cfg[_key])
@@ -200,6 +201,22 @@ def main():
         if _missing:
             print(f"Error: pos_corr_table file(s) not found: {_missing}")
             sys.exit(1)
+
+    # Alignment priors: the v1 run's prior hyperparameters (incl. the tight GDC-corrected set) unless
+    # given here (2026-10-02, user: v2 must use what v1 used).  run_alignment_v2 still applies the
+    # corrected skew width when a model is set and v1 recorded nothing.
+    _hp = _v1_cfg.get('prior_hyperparams') or {}
+    _prior_kw = {k_out: _hp[k_in] for k_in, k_out in (
+        ('sigma_rot_deg', 'prior_sigma_rot_deg'), ('sigma_scale', 'prior_sigma_scale'),
+        ('sigma_skew', 'prior_sigma_skew'), ('sigma_pointing_mas', 'prior_sigma_pointing'),
+        ('sigma_pair_rot_deg', 'prior_sigma_pair_rot_deg'), ('sigma_pair_scale', 'prior_sigma_pair_scale'),
+        ('sigma_pair_skew', 'prior_sigma_pair_skew'), ('sigma_pair_pointing_mas', 'prior_sigma_pair_pointing'),
+        ('use_pair_prior', 'use_pair_prior')) if _hp.get(k_in) is not None}
+    if args.prior_sigma_chip_px is None and _hp.get('sigma_chip_px') is not None:
+        args.prior_sigma_chip_px = _hp['sigma_chip_px']
+    if _prior_kw:
+        print("  alignment priors from v1: " + ", ".join(f"{k}={v}" for k, v in _prior_kw.items()))
+    _min_split = _v1_cfg.get('min_stars_split_ccd')
 
     crossmatch_kwargs = dict(
         field_dir                = field_dir,
@@ -244,6 +261,8 @@ def main():
         use_soft_weights              = args.soft_weights,
         student_t_nu                  = args.student_t_nu,
         exclude_2p_from_alignment     = args.exclude_2p_from_alignment,
+        min_stars_split_ccd           = _min_split,
+        **_prior_kw,
     )
 
     if args.align_only:
@@ -302,11 +321,10 @@ def main():
         _snap = bp3m_v2_dir / 'master_combined_v2_aligned.csv'
         if _snap.exists() or _snap.is_symlink():
             _snap.unlink()
-        try:
-            _os.link(xmatch_dir / 'master_combined_v2.csv', _snap)
-        except OSError:
-            import shutil as _shutil
-            _shutil.copy2(xmatch_dir / 'master_combined_v2.csv', _snap)
+        # a real copy, not a hard link: a later crossmatch rewrites master_combined_v2.csv in
+        # place and would silently change the snapshot of the catalog these results index
+        import shutil as _shutil
+        _shutil.copy2(xmatch_dir / 'master_combined_v2.csv', _snap)
     except Exception as _exc:
         print(f"  WARNING: could not snapshot master_combined_v2.csv into BP3M_v2_results: {_exc}")
 
