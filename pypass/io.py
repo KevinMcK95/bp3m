@@ -823,6 +823,28 @@ def _get_noise_params(hdr, instrume):
     return info['effective_gain'], info['read_noise']
 
 
+# DQ bits NOT treated as bad for detection / sky / PSF fitting (the raw DQ is still recorded per
+# star in dq_1x1/2x2/3x3).  Bit 4096 (cosmic ray flagged by AstroDrizzle) STAYS MASKED in the main
+# fit: in single FLC exposures it marks real cosmic rays, and ignoring it everywhere added 10^3-10^4
+# CR "star candidates" per image (2026-10-01 test: >90% of the extra detections had the flag at their
+# centre).  Real stars that AstroDrizzle flagged in a misregistered association (47 Tuc j8c051t9q:
+# every bright star) are recovered by the separate CR-flag recovery pass below instead.
+DQ_IGNORE_BITS = 4
+
+# CR-flag recovery pass (user 2026-10-01): after the main fit, look for sources on the residual image
+# whose peak pixel carries DQ 4096, fit them with that bit unmasked, and keep only PSF-consistent
+# ones (strict qfit / central_res / concentration cuts below).  Existing detections are untouched; recovered ones carry cr_recovered=True.
+CR_RECOVERY = True
+CR_RECOVER_FMIN = 1000.0      # e-; the stars this rescues are the bright ones
+CR_QFIT_MAX = 0.10
+CR_CRES_MAX = 0.05
+CR_CONC_MAX = 1.0             # 1x1 concentration: stars ~0.995, CRs ~1.02 (sharper than the PSF)
+# Calibrated 2026-10-01 on recovered sources: real CR-flagged stars (47 Tuc j8c051t9q) kept 43%,
+# cosmic rays (GOODS-S jbev9dd5q / Leo I jbjm02l3q, unconfirmed in sibling exposures) kept 5%.
+# The looser (qfit<0.15) cut let ~70% of Leo I's recovered sources be cosmic rays.
+CR_MATCH_RADIUS_PX = 2.5      # a recovered source this close to an existing detection is a duplicate
+
+
 # Cameras whose FLC/FLT full-frame products have LTV1 = LTV2 = 0, so a nonzero LTV
 # can only mean a subarray readout.  (WFC3/IR FLTs carry LTV = -5 for the trimmed
 # reference pixels and are deliberately excluded.)
@@ -1089,7 +1111,7 @@ def run_photometry_fits(
             try:
                 with fits.open(image_path) as _dqh:
                     _dq_array = np.array(_dqh[dq_ext].data, dtype=np.int32)
-                mask = (_dq_array & ~np.int32(4)) != 0
+                mask = (_dq_array & ~np.int32(DQ_IGNORE_BITS)) != 0
                 _dq_arrays[sci_ext] = _dq_array
             except Exception:
                 pass
@@ -1120,19 +1142,64 @@ def run_photometry_fits(
             sigma_clip=sigma_clip,
             sigma_clip_sigma=sigma_clip_sigma,
             sigma_clip_iter=sigma_clip_iter,
-            return_residual=return_residual,
+            return_residual=(return_residual or CR_RECOVERY),
             _apply_chi2_inflation=False,
             _classify=False,
             backend=backend,
             conc_limit=conc_limit,
             **kwargs,
         )
-        if return_residual:
+        if return_residual or CR_RECOVERY:
             records, chip_residual, chip_var = result
-            residuals[sci_ext] = chip_residual
-            var_images[sci_ext] = chip_var
+            if return_residual:
+                residuals[sci_ext] = chip_residual
+                var_images[sci_ext] = chip_var
         else:
             records = result
+
+        # --- CR-flag recovery pass (see CR_RECOVERY) ---
+        if CR_RECOVERY and _dq_array is not None and np.any((_dq_array & 4096) != 0):
+            _crm = (_dq_array & 4096) != 0
+            _mask2 = (_dq_array & ~np.int32(DQ_IGNORE_BITS | 4096)) != 0
+            try:
+                _rec2 = run_photometry(
+                    data=chip_residual, psf_models=psf_cube, psf_positions=(xs, ys), psf_scale=psf_scale,
+                    half_width=half_width, sky_inner=sky_inner, sky_outer=sky_outer, hmin=hmin,
+                    fmin=max(_fmin_effective, CR_RECOVER_FMIN), max_iter_fit=max_iter_fit, tol=tol,
+                    n_passes=1, gain=gain_use, read_noise=rn_use, zero_point=zero_point,
+                    mask=_mask2, peak_mask=(_mask2 | ~_crm), verbose=False,
+                    x_offset=x_offset, y_offset=y_offset,
+                    sat_threshold=(sat_threshold if sat_threshold is not None else np.inf),
+                    sigma_clip=sigma_clip, sigma_clip_sigma=sigma_clip_sigma, sigma_clip_iter=sigma_clip_iter,
+                    return_residual=False, _apply_chi2_inflation=False, _classify=False,
+                    backend=backend, conc_limit=conc_limit, **kwargs)
+            except Exception as _cre:
+                _rec2 = []
+                if verbose:
+                    print(f"  CR-flag recovery pass failed: {_cre}")
+            if _rec2:
+                from scipy.spatial import cKDTree as _cKD
+                _have = np.array([[r.x, r.y] for r in records]) if records else np.zeros((0, 2))
+                _tree = _cKD(_have) if len(_have) else None
+                _ny, _nx = _crm.shape
+                _kept = []
+                for r in _rec2:
+                    if not getattr(r, 'converged', False):
+                        continue
+                    if not (np.isfinite(r.qfit) and r.qfit < CR_QFIT_MAX and abs(r.central_res) < CR_CRES_MAX
+                            and np.isfinite(getattr(r, 'concentration', np.nan)) and r.concentration < CR_CONC_MAX):
+                        continue
+                    _xi, _yi = int(round(r.x)), int(round(r.y))
+                    if not (0 <= _xi < _nx and 0 <= _yi < _ny and _crm[_yi, _xi]):
+                        continue
+                    if _tree is not None and _tree.query([r.x, r.y])[0] < CR_MATCH_RADIUS_PX:
+                        continue
+                    r._cr_recovered = True
+                    _kept.append(r)
+                records = list(records) + _kept
+                if verbose:
+                    print(f"  CR-flag recovery: {len(_rec2)} candidates on CR-flagged peaks -> {len(_kept)} "
+                          f"PSF-consistent stars kept (qfit<{CR_QFIT_MAX}, |central_res|<{CR_CRES_MAX}, conc<{CR_CONC_MAX})")
 
         for r in records:
             r._chip_ext  = sci_ext
@@ -1357,6 +1424,7 @@ def catalog_to_table(records, zero_point=0.0,
         'psf_peak':     np.array([r.psf_peak for r in records]),
         'peak':         np.array([r.peak for r in records]),
         'pass_number':  np.array([r.pass_number for r in records], dtype=int),
+        'cr_recovered': np.array([bool(getattr(r, '_cr_recovered', False)) for r in records], dtype=bool),
         'n_neighbors':           np.array([r.n_neighbors for r in records], dtype=int),
         'dist_nearest':          np.array([r.dist_nearest for r in records]),
         'dist_nearest_brighter': np.array([r.dist_nearest_brighter for r in records]),
@@ -1421,6 +1489,7 @@ def catalog_to_table(records, zero_point=0.0,
     if gdc_path is not None and os.path.exists(str(gdc_path)):
         t.meta['GDC_FILE'] = os.path.basename(str(gdc_path))
         t.meta['GDC_ID']   = gdc_file_id(str(gdc_path))
+    t.meta['DQ_IGNORE'] = int(DQ_IGNORE_BITS)   # provenance of the detection/fit mask policy
     t.meta['SIGMA_FLOOR_X'] = sigma_floor_x
     t.meta['SIGMA_FLOOR_Y'] = sigma_floor_y
     t.meta['EPS_FLUX']      = eps_flux
