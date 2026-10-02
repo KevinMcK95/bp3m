@@ -778,6 +778,18 @@ def _run_indv_one(img_name, run_kw, indv_root, extra_cfg):
         except Exception as exc:  # full traceback goes to the log
             traceback.print_exc()
             err = f"{type(exc).__name__}: {exc}"
+        if err is None:
+            # GDC/PSF label rows for the hst_dist_corr training (replaces the slow
+            # extract_labels second pass); failures never fail the fit
+            try:
+                from bp3m.pipeline.residual_export import export_gdc_labels, LABEL_FILE
+                _n = export_gdc_labels(out_dir, run_kw['field_name'], run_kw['output_dir'], img_name,
+                                       pos_corr_model=run_kw.get('pos_corr_model'),
+                                       pos_corr_table=run_kw.get('pos_corr_table'))
+                print(f"  Saved: {LABEL_FILE}  ({_n} rows)")
+            except Exception:
+                print("  WARNING: GDC label export failed")
+                traceback.print_exc()
     if err is None:
         try:
             with np.load(out_dir / "use_for_fit.npz") as zf:

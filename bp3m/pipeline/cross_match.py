@@ -72,7 +72,7 @@ WIDE_DISCOVERY_OFFSET = 150   # px; second attempt for images that fail at disco
 MARGINAL_FA_PROB = 1e-6       # a first success less significant than this also gets the wide attempt
 
 # Current matching-algorithm version (see params_meta note in run_cross_match).
-XMATCH_ALGO_VERSION = 3
+XMATCH_ALGO_VERSION = 4
 
 
 def catalog_gdc_changed(catalog_path) -> bool:
@@ -425,6 +425,10 @@ def run_cross_match(
         #   v2 = mode-centred 2p propagation + dispersion window
         #   v3 = + zero-PM coverage term in the 2p window; API pix-floor
         #        default aligned to the CLI (0.5 px)
+        #   v4 = (2026-10-01) multi-candidate discovery evaluation, chance-
+        #        coincidence test, sigma-aware low-N plausibility gate, CR-like
+        #        seeding, GDC-frame orientation, wide/marginal retry,
+        #        trailed-exposure skip, Step 4c visit-group completion
         'xmatch_algo_version':  XMATCH_ALGO_VERSION,
         'hst_pix_floor':        hst_pix_floor,
         'min_matches':          min_matches,
