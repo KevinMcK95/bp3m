@@ -482,7 +482,39 @@ def main(argv=None):
             argv.remove('--no_hst_members_fit')
         elif '--hst_members_fit' not in argv:
             extra += ['--hst_members_fit']
+        # Inherit the v2 alignment mode (2026-10-02): when bp3m-v2 ran with --hst_align, HST-only detections
+        # (members AND non-members) constrained the per-image geometry there; with --hst_members_fit alone the
+        # joint phases demote every non-member HST-only fit detection, i.e. pop-fit v2 would fit a different
+        # alignment model than the v2 solution it starts from.  --no_hst_all_fit overrides.
+        if '--no_hst_all_fit' in argv:
+            argv.remove('--no_hst_all_fit')
+        elif '--hst_all_fit' not in argv and _v2_hst_align(argv):
+            extra += ['--hst_all_fit']
+            if '--hst_members_fit' not in argv + extra:
+                extra += ['--hst_members_fit']
+            print('bp3m-pop-fit-v2: BP3M_v2_results ran with --hst_align -> --hst_all_fit '
+                  '(HST-only detections, members and non-members, constrain the alignment; --no_hst_all_fit to disable)')
     return _joint_main(argv + extra)
+
+
+def _v2_hst_align(argv) -> bool:
+    """True when the field's BP3M_v2_results/run_config.json records hst_align."""
+    import json
+    def _arg(flag, default=None):
+        for i, a in enumerate(argv):
+            if a == flag and i + 1 < len(argv):
+                return argv[i + 1]
+            if a.startswith(flag + '='):
+                return a.split('=', 1)[1]
+        return default
+    name, out = _arg('--name'), _arg('--output_dir', '.')
+    if not name:
+        return False
+    try:
+        cfg = json.loads((Path(out).resolve() / name / 'BP3M_v2_results' / 'run_config.json').read_text())
+        return bool(cfg.get('hst_align', False))
+    except Exception:
+        return False
 
 
 if __name__ == '__main__':
