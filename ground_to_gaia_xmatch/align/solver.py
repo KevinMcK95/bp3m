@@ -785,6 +785,12 @@ class AlignmentSolver:
 
         h_align = self.C_survey_inv_dot_v.copy()              # (n_stars, 5)
         h_all   = self.C_survey_inv_dot_v.copy()
+        # H_vv_align: the star precision the ALIGNMENT sees (prior + alignment detections only).  The
+        # Schur complement must pair h_align with it, not with the full H_vv: with the full H_vv every
+        # astrometry-only detection of an aligned star acts as a zero-residual pseudo-observation of
+        # v = 0 (catalogue position, PM = 0, parallax = 0) and pulls the image transforms
+        # (bp3m.solver, 2026-10-02: Pal5 v2 --hst_align frame shift, Draco/Leo_A bug-demoted visits).
+        H_vv_align = H_vv.copy()
 
         H_rr       = np.zeros((n_r, n_r))
         K_img      = {}
@@ -835,6 +841,8 @@ class AlignmentSolver:
                            np.einsum('nik,nk->ni', JUT_Cs[use_any], x_resid[use_any]))
             np.subtract.at(h_align, sidx_aln,
                            np.einsum('nik,nk->ni', JUT_Cs[use_align], x_resid[use_align]))
+            np.add.at(H_vv_align, sidx_aln,
+                      np.einsum('nik,nkj->nij', JUT_Cs[use_align], JU[use_align]))
 
             K = np.einsum('nik,nkl->nil', JUT_Cs, X)     # (n, 5, 6)
             K_img[img] = K
@@ -847,7 +855,11 @@ class AlignmentSolver:
 
         # ── H_vv inversion → C_vT ─────────────────────────────────────────
         C_vT    = np.linalg.inv(H_vv)                              # (n_stars, 5, 5)
-        a_align = np.einsum('nij,nj->ni', C_vT, h_align)
+        try:
+            C_vT_align = np.linalg.inv(H_vv_align)
+        except np.linalg.LinAlgError:
+            C_vT_align = np.linalg.pinv(H_vv_align)
+        a_align = np.einsum('nij,nj->ni', C_vT_align, h_align)
         a_all   = np.einsum('nij,nj->ni', C_vT, h_all)
 
         # ── Schur complement ─────────────────────────────────────────────────
@@ -884,9 +896,9 @@ class AlignmentSolver:
         if _schur_obs:
             from scipy import sparse as _sp
             try:
-                L_chol = np.linalg.cholesky(C_vT)
+                L_chol = np.linalg.cholesky(C_vT_align)    # alignment-only precision (see H_vv_align)
             except np.linalg.LinAlgError:
-                w_e, Q_e = np.linalg.eigh(C_vT)
+                w_e, Q_e = np.linalg.eigh(C_vT_align)
                 L_chol = Q_e * np.sqrt(np.clip(w_e, 1e-30, None))[:, None, :]
             data_l, rows_l, cols_l = [], [], []
             for sidx_o, K_o, cols_o in _schur_obs:
@@ -906,7 +918,7 @@ class AlignmentSolver:
                 B_til = _sp.csr_matrix(
                     (np.concatenate(data_l),
                      (np.concatenate(rows_l), np.concatenate(cols_l))),
-                    shape=(5 * C_vT.shape[0], n_r))
+                    shape=(5 * C_vT_align.shape[0], n_r))
                 del data_l, rows_l, cols_l
                 Cr_inv -= (B_til.T @ B_til).toarray()
                 del B_til
