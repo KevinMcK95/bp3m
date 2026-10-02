@@ -1395,7 +1395,7 @@ def main():
             if _gaia_files_json_ep.exists():
                 try:
                     import json as _json_ep
-                    _gaia_csvs_ep = json.loads(_gaia_files_json_ep.read_text())
+                    _gaia_csvs_ep = _json_ep.loads(_gaia_files_json_ep.read_text())
                 except Exception:
                     _gaia_csvs_ep = []
             else:

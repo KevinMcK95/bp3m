@@ -522,8 +522,8 @@ def run_cross_match(
         from .image_quality import image_quality as _iq
         _q = _iq(hst['flc'], hst['catalog'])
         if _q.get('trailed'):
-            _write_status(root, 'skipped', params_meta_img,
-                          reason=f"trailed exposure (star axis ratio {_q['axis_ratio']:.2f}, orientation "
+            _write_xmatch_status(root, 'skipped', params_meta_img,
+                                  reason=f"trailed exposure (star axis ratio {_q['axis_ratio']:.2f}, orientation "
                                  f"coherence {_q['pa_coherence']:.2f} at PA {_q['pa_deg']:.0f} deg)")
             skipped_trailed.append(name)
             continue
