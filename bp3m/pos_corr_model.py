@@ -167,6 +167,11 @@ class PosCorrModel:
         f = acc / len(ms)
         return f[:, 0], f[:, 1]
 
+    def area_mag(self, tbl, hdr, h=4.0):
+        """magnitude term of this correction's pixel-area change (add to calibrated mags); see pos_corr_basis.area_mag."""
+        from bp3m.pos_corr_basis import area_mag
+        return area_mag(lambda t: self.bias(t, hdr), tbl, h=h)
+
 
 FEATURE_GROUPS = {
     'flux':   ['logflux', 'qfit', 'psf_frac', 'chi2'],

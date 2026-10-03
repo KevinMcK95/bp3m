@@ -605,14 +605,21 @@ def _load_all_detections(field_dir: Path,
                 _bx, _by = _t.bias(np.asarray(tbl['x'], float), np.asarray(tbl['y'], float),
                                    np.asarray(tbl['flux'], float), epoch_mjd)
                 cat_xgdc = cat_xgdc - _bx; cat_ygdc = cat_ygdc - _by
+        _dm_area = 0.0
         if _pcm is not None and flc_path.exists():
-            _mb = _pcm.bias(tbl, _pcm.read_header(flc_path))
+            _hdr_pcm = _pcm.read_header(flc_path)
+            _mb = _pcm.bias(tbl, _hdr_pcm)
             if _mb is not None:
                 cat_xgdc = cat_xgdc - _mb[0]; cat_ygdc = cat_ygdc - _mb[1]
+                # the learned correction's own pixel-area term goes on the calibrated mags too (user 2026-10-03;
+                # same convention as the STDGDC MGC already in mag_st_gdc; |dm| < 0.5 mmag)
+                _am = _pcm.area_mag(tbl, _hdr_pcm)
+                if _am is not None:
+                    _dm_area = np.nan_to_num(_am, nan=0.0)
         if _floor > 0:
             cat_cov_xx = cat_cov_xx + _floor ** 2
             cat_cov_yy = cat_cov_yy + _floor ** 2
-        cat_mag_cal = np.asarray(tbl['mag_st_gdc'], float)
+        cat_mag_cal = np.asarray(tbl['mag_st_gdc'], float) + _dm_area
         cat_qfit = np.asarray(tbl['qfit'],  float)
         cat_chi2 = np.asarray(tbl['chi2'],  float)
         cat_nsat = np.asarray(tbl['n_sat'], int)

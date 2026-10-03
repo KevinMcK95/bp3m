@@ -319,6 +319,35 @@ class PosCorrBasis:
         A = model.design(x, y_chip, chip, t, dm, lsky=lsky, phx=phx, phy=phy, z=z)
         return A @ bx, A @ by
 
+    def area_mag(self, tbl, hdr, orbit=None, h=4.0):
+        """magnitude term of this correction's pixel-area change (add to calibrated mags); see area_mag()."""
+        return area_mag(lambda t: self.bias(t, hdr, orbit=orbit), tbl, h=h)
+
+
+def area_mag(bias_fn, tbl, h=4.0):
+    """Pixel-area magnitude term of a learned GDC correction, to ADD to a magnitude (same convention as the STDGDC MGC
+    term in mag_gdc / mag_st_gdc: dm = -2.5 log10(relative area)).  corrected = x_gdc - b(x_raw), so the correction's
+    local area factor is det(I - db/dx), from central differences of bias_fn at x +- h, y +- h (integer h keeps the
+    pixel phase, so phase terms do not leak into the area).  User 2026-10-03: whenever the learned positions are
+    applied, apply this term to calibrated magnitudes too (tiny: rms 0.05-0.10 mmag, |dm| < 0.5 mmag).
+    Returns None when the model has no entry for this exposure."""
+    x0 = np.asarray(tbl['x'], float)
+    # the correction jumps at the amplifier boundary x = 2048 (readout direction flips in the CTE term) -- a real
+    # step in the measurement bias, not a pixel-area change -- so x-differences never straddle it (one-sided there)
+    side = np.where(x0 < AX, -1.0, 1.0)
+    cross = (x0 + h >= AX) & (x0 - h < AX)
+    sx = np.where(cross, side * h, 0.0)                  # shift the stencil centre away from the boundary
+    def shifted(dx, dy):
+        t = tbl.copy(); t['x'] = x0 + sx + dx; t['y'] = np.asarray(tbl['y'], float) + dy
+        return bias_fn(t)
+    out = [shifted(*d) for d in ((h, 0.0), (-h, 0.0), (0.0, h), (0.0, -h))]
+    if any(o is None for o in out): return None
+    (bxp, byp), (bxm, bym), (bxq, byq), (bxr, byr) = out
+    jxx, jyx = (bxp - bxm) / (2 * h), (byp - bym) / (2 * h)
+    jxy, jyy = (bxq - bxr) / (2 * h), (byq - byr) / (2 * h)
+    det = (1.0 - jxx) * (1.0 - jyy) - jxy * jyx
+    return -2.5 * np.log10(np.clip(det, 1e-6, None))
+
 
 def make_pos_corr(spec: str):
     """factory used by the loaders: a basis model dir (basis_*.json) or an MLP model dir (*_shared_*.json)."""
