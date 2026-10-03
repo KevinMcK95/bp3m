@@ -254,6 +254,18 @@ def load_galaxy_candidates(
     return df
 
 
+def _projection_scale(r) -> float:
+    """Gnomonic projection scale (mas/px) that goes with a transformation row's (a, b, c, d).  Alignment outputs
+    (run_alignment / v2 / pop-fit) report pixel_scale_mas = sqrt(ad - bc) * orig_pixel_scale -- the EFFECTIVE scale --
+    while the solver projects with orig_pixel_scale (coords.hst_to_radec), so using pixel_scale_mas directly applies the
+    plate scale twice (tens of mas at the chip edges; found 2026-10-03).  visit_prealign rows already store the
+    projection scale (flag prealign=True)."""
+    if bool(r.get('prealign', False)) and str(r.get('prealign')) not in ('False', 'nan'):
+        return float(r['pixel_scale_mas'])
+    det = float(r['a']) * float(r['d']) - float(r['b']) * float(r['c'])
+    return float(r['pixel_scale_mas']) / np.sqrt(abs(det))
+
+
 def _aligned_sky(df, cat_rows, obs_id, xform, pos_corr=None, image_flc=None):
     """Sky positions through the BP3M plate solution of each detection's sub-image (2026-10-02).
 
@@ -280,7 +292,7 @@ def _aligned_sky(df, cat_rows, obs_id, xform, pos_corr=None, image_flc=None):
             continue
         dx, dy = x[m] - float(r['Xo_pivot']), y[m] - float(r['Yo_pivot'])
         px = float(r['a']) * dx + float(r['b']) * dy; py = float(r['c']) * dx + float(r['d']) * dy
-        ra, dec = plane_project_inverse(px, py, float(r['ra0_final']), float(r['dec0_final']), float(r['pixel_scale_mas']))
+        ra, dec = plane_project_inverse(px, py, float(r['ra0_final']), float(r['dec0_final']), _projection_scale(r))
         df.loc[m, 'ra'] = np.atleast_1d(ra); df.loc[m, 'dec'] = np.atleast_1d(dec); df.loc[m, 'aligned'] = True
     return df
 
