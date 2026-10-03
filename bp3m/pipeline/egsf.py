@@ -171,6 +171,8 @@ def load_galaxy_candidates(
     xform: dict | None = None,
     pos_corr=None,
     image_flc: str | None = None,
+    max_mag: float | None = None,
+    max_per_image: int | None = None,
 ) -> pd.DataFrame:
     """
     Load pypass FLC catalog and return galaxy candidate rows.
@@ -220,6 +222,11 @@ def load_galaxy_candidates(
     # Select: quality-passing, morphologically extended
     # Prioritise non-Gaia sources, but also include Gaia sources flagged as non-star
     sel = quality & morph_galaxy
+    if max_mag is not None:                       # 2026-10-02: fainter 'candidates' are mostly noise / chance pairs
+        sel &= mag_st < max_mag
+    if max_per_image is not None and sel.sum() > max_per_image:   # deep single exposures: keep the brightest
+        idx = np.where(sel)[0]; keep = idx[np.argsort(mag_st[idx])[:max_per_image]]
+        sel = np.zeros(n, bool); sel[keep] = True
 
     if sel.sum() == 0:
         return pd.DataFrame()
@@ -2018,6 +2025,8 @@ def run_egsf(
     match_radius_arcsec: float = 0.5,
     min_detections: int = 2,
     force_rerun: bool = False,
+    max_mag: float | None = 25.0,
+    max_per_image: int | None = 1500,
 ) -> pd.DataFrame:
     """
     Run eGSF background galaxy candidate identification.
@@ -2120,6 +2129,7 @@ def run_egsf(
                 str(cat_path), obs_id, g_set,
                 chi2_nsigma=chi2_nsigma, conc_cut=conc_cut,
                 xform=_xform, pos_corr=_pcm, image_flc=str(flc_path),
+                max_mag=max_mag, max_per_image=max_per_image,
             )
             n_nongaia = (~df['is_gaia_matched']).sum() if len(df) else 0
             n_gaia_ext = (df['is_gaia_matched'] & ~df['is_star_candidate']).sum() if len(df) else 0
@@ -2220,6 +2230,10 @@ def _cli():
                         help='Min epochs to keep a galaxy candidate (default: 2)')
     parser.add_argument('--force', action='store_true',
                         help='Overwrite existing output')
+    parser.add_argument('--max_mag', type=float, default=25.0,
+                        help='candidate mag_st limit (default 25; fainter ones are mostly noise / chance pairs)')
+    parser.add_argument('--max_per_image', type=int, default=1500,
+                        help='keep at most this many (brightest) candidates per image (default 1500)')
     parser.add_argument('--use_psf_delta', action='store_true',
                         help='add psf_delta.npy to the STDPSF (default: bare STDPSF)')
     parser.add_argument('--morphology', action='store_true',
@@ -2251,6 +2265,8 @@ def _cli():
         match_radius_arcsec=args.match_radius,
         min_detections=args.min_detections,
         force_rerun=args.force,
+        max_mag=args.max_mag,
+        max_per_image=args.max_per_image,
     )
 
     if args.morphology:
