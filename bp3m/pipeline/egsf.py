@@ -168,6 +168,9 @@ def load_galaxy_candidates(
     gaia_indices: set[int],
     chi2_nsigma: float = 3.0,
     conc_cut: float = 1.3,
+    xform: dict | None = None,
+    pos_corr=None,
+    image_flc: str | None = None,
 ) -> pd.DataFrame:
     """
     Load pypass FLC catalog and return galaxy candidate rows.
@@ -239,7 +242,39 @@ def load_galaxy_candidates(
         'x_gdc':             np.asarray(t['x_gdc'])[sel],
         'y_gdc':             np.asarray(t['y_gdc'])[sel],
     })
+    if xform:
+        df = _aligned_sky(df, t[sel], obs_id, xform, pos_corr, image_flc)
+    return df
 
+
+def _aligned_sky(df, cat_rows, obs_id, xform, pos_corr=None, image_flc=None):
+    """Sky positions through the BP3M plate solution of each detection's sub-image (2026-10-02).
+
+    The pypass ra/dec come from the FLC header WCS (visit-to-visit errors of tens to hundreds of mas); the
+    alignment's solution is pseudo = [[a,b],[c,d]] (x_gdc' - Xo, y_gdc' - Yo) about (ra0_final, dec0_final),
+    with x_gdc' = x_gdc - learned-GDC-correction bias (the pos_corr_model the alignment used).  Header
+    positions are kept as ra_hdr/dec_hdr; rows without a solution keep the header position (aligned=False)."""
+    from bp3m.coords import plane_project_inverse
+    df = df.copy(); df['ra_hdr'] = df['ra']; df['dec_hdr'] = df['dec']; df['aligned'] = False
+    df['gdc_corr_bx'] = 0.0; df['gdc_corr_by'] = 0.0
+    x = df['x_gdc'].to_numpy(float).copy(); y = df['y_gdc'].to_numpy(float).copy()
+    if pos_corr is not None and image_flc is not None:
+        try:
+            bx, by = pos_corr.bias(cat_rows, pos_corr.read_header(image_flc))
+            x -= np.asarray(bx, float); y -= np.asarray(by, float)
+            df['gdc_corr_bx'] = np.asarray(bx, float); df['gdc_corr_by'] = np.asarray(by, float)
+        except Exception as e:
+            warnings.warn(f"{obs_id}: learned GDC correction not applied ({e})")
+    chip = df['chip_ext'].to_numpy(int)
+    for sub_sfx, m in (('_hi', chip == 4), ('_lo', chip == 1), ('', np.ones(len(df), bool))):
+        r = xform.get(obs_id + sub_sfx)
+        m = m & ~df['aligned'].to_numpy(bool)
+        if r is None or not m.any():
+            continue
+        dx, dy = x[m] - float(r['Xo_pivot']), y[m] - float(r['Yo_pivot'])
+        px = float(r['a']) * dx + float(r['b']) * dy; py = float(r['c']) * dx + float(r['d']) * dy
+        ra, dec = plane_project_inverse(px, py, float(r['ra0_final']), float(r['dec0_final']), float(r['pixel_scale_mas']))
+        df.loc[m, 'ra'] = np.atleast_1d(ra); df.loc[m, 'dec'] = np.atleast_1d(dec); df.loc[m, 'aligned'] = True
     return df
 
 
@@ -281,6 +316,9 @@ def _cross_match_epoch_group(
                 'ra', 'dec', 'chi2', 'concentration', 'mag_st',
                 'is_gaia_matched', 'is_star_candidate',
                 'sigma_x_model', 'sigma_y_model', 'x_gdc', 'y_gdc']
+    # alignment-based positions (2026-10-02): keep the header ones and the applied correction for diagnostics
+    DET_COLS += [c for c in ('ra_hdr', 'dec_hdr', 'aligned', 'gdc_corr_bx', 'gdc_corr_by')
+                 if any(c in df.columns for df in epoch_dfs)]
 
     clusters: list[list[dict]] = [
         [row[DET_COLS].to_dict()]
@@ -356,6 +394,7 @@ def _cross_match_epoch_group(
 # ── ePSF constants ────────────────────────────────────────────────────────────
 
 _CUTOUT_HALF = 4    # 9×9 pixel cutout (±4 pixels)
+USE_PSF_DELTA = False   # bare STDPSF unless --use_psf_delta
 _WEIGHT_SIGMA = 1.5  # Gaussian weight sigma in pixels for moment measurement
 
 
@@ -399,9 +438,9 @@ def _load_image_psf(
         psf_path = find_psf(str(psf_dir), h0)
         psf_cube, xs, ys, psf_scale, _ = load_stdpsf(psf_path)
 
-        # Apply psf_delta correction if it exists for this image
+        # psf_delta correction only on request (user rule 2026-09: always the bare STDPSF unless asked)
         delta_path = obs_dir / 'psf_delta.npy'
-        if delta_path.exists():
+        if USE_PSF_DELTA and delta_path.exists():
             psf_delta = np.load(str(delta_path))
             psf_cube = psf_cube + psf_delta[np.newaxis, :, :]
 
@@ -2042,6 +2081,20 @@ def run_egsf(
     meta = _get_image_metadata(output_dir, bp3m_results_subdir)
     meta_dict = {row.obs_id: row for _, row in meta.iterrows()}
     hst_dir = output_dir / 'HST' / 'mastDownload' / 'HST'
+    # candidate positions through the alignment's plate solutions + its learned GDC correction (2026-10-02)
+    _xdf = pd.read_csv(output_dir / bp3m_results_subdir / 'image_transformations.csv')
+    _xform = {str(r['image_name']): r for _, r in _xdf.iterrows()}
+    _pcm = None
+    try:
+        import json as _json
+        _spec = _json.loads((output_dir / bp3m_results_subdir / 'run_config.json').read_text()).get('pos_corr_model')
+        if _spec:
+            from bp3m.pos_corr_basis import make_pos_corr
+            _pcm = make_pos_corr(str(_spec))
+    except Exception as _e:
+        print(f"  (learned GDC correction not loaded: {_e})")
+    print(f"  positions: {bp3m_results_subdir} plate solutions ({len(_xform)} sub-images)"
+          + (f" + learned GDC correction {_spec}" if _pcm is not None else " (no learned GDC correction)"))
 
     # ── 4. Per-epoch galaxy candidate extraction & cross-matching ──────────────
     print(f"\nStep 3 — extracting galaxy candidates")
@@ -2066,6 +2119,7 @@ def run_egsf(
             df = load_galaxy_candidates(
                 str(cat_path), obs_id, g_set,
                 chi2_nsigma=chi2_nsigma, conc_cut=conc_cut,
+                xform=_xform, pos_corr=_pcm, image_flc=str(flc_path),
             )
             n_nongaia = (~df['is_gaia_matched']).sum() if len(df) else 0
             n_gaia_ext = (df['is_gaia_matched'] & ~df['is_star_candidate']).sum() if len(df) else 0
@@ -2166,6 +2220,8 @@ def _cli():
                         help='Min epochs to keep a galaxy candidate (default: 2)')
     parser.add_argument('--force', action='store_true',
                         help='Overwrite existing output')
+    parser.add_argument('--use_psf_delta', action='store_true',
+                        help='add psf_delta.npy to the STDPSF (default: bare STDPSF)')
     parser.add_argument('--morphology', action='store_true',
                         help='Also run measure_galaxy_morphology after identification')
     parser.add_argument('--lib_dir', default=None,
@@ -2182,6 +2238,8 @@ def _cli():
     parser.add_argument('--diag_n', type=int, default=24,
                         help='Number of sources in diagnostic PDF (default: 24)')
     args = parser.parse_args()
+    global USE_PSF_DELTA
+    USE_PSF_DELTA = bool(args.use_psf_delta)
 
     run_egsf(
         field_name=args.field_name,
