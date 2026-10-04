@@ -2050,6 +2050,7 @@ def _posthoc_sigma_int(bp3m_dir, output_pfr, mu):
 # Set from main() (--galaxy_anchors CSV with a source_index column); positions normally come from
 # --position_overrides (forward-model eGSF centres with calibrated errors).
 _GALAXY_ANCHOR_SI: "set | None" = None
+_GAIA_ERROR_SCALE: float = 1.0      # --gaia_error_scale (1 = unchanged)
 
 def run_pop_fit(
     output_dir: Path,
@@ -2227,6 +2228,14 @@ def run_pop_fit(
             priority_source_indices=((set(_seed_priority or ()) | set(_GALAXY_ANCHOR_SI or ())) or None))
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable v2 images found for '{field_name}'.")
+        if _GAIA_ERROR_SCALE != 1.0:
+            # 2026-10-04: test how much Gaia (incl. possible local zero-point systematics) drives the solution.
+            # Only real Gaia sources (Gaia_id > 0); HST-only rows keep their synthetic diffuse priors.
+            _real = gaia_catalog['Gaia_id'].to_numpy() > 0
+            for _c in ('ra_error', 'dec_error', 'pmra_error', 'pmdec_error', 'parallax_error'):
+                if _c in gaia_catalog.columns:
+                    gaia_catalog.loc[_real, _c] = gaia_catalog.loc[_real, _c].astype(float) * _GAIA_ERROR_SCALE
+            print(f"  Gaia astrometric errors x{_GAIA_ERROR_SCALE:g} for {int(_real.sum())} real Gaia sources (--gaia_error_scale)")
         # Keep only images the v2 fit actually solved (r_hat must exist).
         _xdf_names = set(pd.read_csv(
             bp3m_dir / 'image_transformations.csv')['image_name'].astype(str))
@@ -3915,6 +3924,9 @@ def main(argv=None):
                              '{field}/Gaia/{field}_*_qso_anchors.csv (produced at Phase 1) '
                              'and applies tight secular-aberration '
                              'PM + zero-parallax priors to vetted QSOs.')
+    parser.add_argument('--gaia_error_scale', type=float, default=1.0,
+                        help='multiply every real Gaia source\'s astrometric errors (pos, PM, parallax) after loading; 1000 = '
+                             'Gaia effectively uninformative (galaxy/HST-only frame test); 2 = Gaia floor-excess test (2026-10-04)')
     parser.add_argument('--galaxy_anchors', type=str, default=None,
                         help='CSV with source_index (master_combined_v2 rows) of background galaxies used as zero-motion '
                              'anchors: secular-aberration PM + zero-parallax priors (QSO widths), never members (2026-10-04)')
@@ -3982,6 +3994,8 @@ def main(argv=None):
                              'Overrides the default glob in {field}/Gaia/.')
 
     args = parser.parse_args(argv)
+    global _GAIA_ERROR_SCALE
+    _GAIA_ERROR_SCALE = float(getattr(args, 'gaia_error_scale', 1.0) or 1.0)
     if getattr(args, 'galaxy_anchors', None):
         global _GALAXY_ANCHOR_SI
         _GALAXY_ANCHOR_SI = set(pd.read_csv(args.galaxy_anchors).source_index.astype(int))
