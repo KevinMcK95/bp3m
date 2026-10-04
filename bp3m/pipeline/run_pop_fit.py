@@ -2045,6 +2045,12 @@ def _posthoc_sigma_int(bp3m_dir, output_pfr, mu):
     print("  Saved: sigma_int.json")
 
 
+# Galaxy anchors (2026-10-04): master_combined_v2 rows (source_index) of confirmed background galaxies, treated exactly
+# like vetted QSO anchors -- secular-aberration PM prior + zero parallax at the QSO widths, barred from membership.
+# Set from main() (--galaxy_anchors CSV with a source_index column); positions normally come from
+# --position_overrides (forward-model eGSF centres with calibrated errors).
+_GALAXY_ANCHOR_SI: "set | None" = None
+
 def run_pop_fit(
     output_dir: Path,
     field_name: str,
@@ -2218,7 +2224,7 @@ def run_pop_fit(
             pos_corr_table=pos_corr_table,
             pos_corr_model=pos_corr_model,
             pos_err_floor=_floor,
-            priority_source_indices=_seed_priority or None)
+            priority_source_indices=((set(_seed_priority or ()) | set(_GALAXY_ANCHOR_SI or ())) or None))
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable v2 images found for '{field_name}'.")
         # Keep only images the v2 fit actually solved (r_hat must exist).
@@ -2417,6 +2423,24 @@ def run_pop_fit(
             print("  QSO anchor file not found; re-run from Phase 1 to generate it")
     else:
         print("  QSO anchors disabled (--no_qso_anchors)")
+
+    if _GALAXY_ANCHOR_SI:
+        from .secular_aberration import secular_aberration_pm
+        _mc_g = pd.read_csv(data_root / field_name / 'hst_xmatch' / 'master_combined_v2.csv', usecols=['ra0', 'dec0'], low_memory=False)
+        _gi, _gra, _gde = [], [], []
+        for _si in sorted(_GALAXY_ANCHOR_SI):
+            _sx = star_id_to_idx.get(int(-(_si + 1)))
+            if _sx is None or _si >= len(_mc_g):
+                continue
+            _a, _d = secular_aberration_pm(float(_mc_g.ra0.iloc[_si]), float(_mc_g.dec0.iloc[_si]))
+            _gi.append(_sx); _gra.append(float(_a) * 1e-3); _gde.append(float(_d) * 1e-3)
+        if _gi:
+            _qso_sidx = np.concatenate([_qso_sidx, np.array(_gi, int)]) if _qso_sidx is not None else np.array(_gi, int)
+            _qso_pmra_mas = np.concatenate([_qso_pmra_mas, _gra]) if _qso_pmra_mas is not None else np.array(_gra)
+            _qso_pmdec_mas = np.concatenate([_qso_pmdec_mas, _gde]) if _qso_pmdec_mas is not None else np.array(_gde)
+            _n_qso_anchors = len(_qso_sidx)
+        print(f"  Galaxy anchors: {len(_GALAXY_ANCHOR_SI)} requested, {len(_gi)} in the solver "
+              f"(secular-aberration PM ~({np.median(_gra) if _gi else 0:+.4f}, {np.median(_gde) if _gi else 0:+.4f}) mas/yr, plx 0; barred from membership)")
 
     # ── Build solver ──────────────────────────────────────────────────────────
     solver = BP3MSolver(imgs, filtered_spi, gaia_catalog,
@@ -3891,6 +3915,9 @@ def main(argv=None):
                              '{field}/Gaia/{field}_*_qso_anchors.csv (produced at Phase 1) '
                              'and applies tight secular-aberration '
                              'PM + zero-parallax priors to vetted QSOs.')
+    parser.add_argument('--galaxy_anchors', type=str, default=None,
+                        help='CSV with source_index (master_combined_v2 rows) of background galaxies used as zero-motion '
+                             'anchors: secular-aberration PM + zero-parallax priors (QSO widths), never members (2026-10-04)')
     parser.add_argument('--position_overrides', type=str, default=None,
                         help='parquet of model-based centres (egsf_fwd: obs_id, idx, x_fit, y_fit, cov_*_px) replacing the '
                              'pypass positions of those catalogue rows when the v2 master data are loaded (2026-10-04)')
@@ -3955,6 +3982,10 @@ def main(argv=None):
                              'Overrides the default glob in {field}/Gaia/.')
 
     args = parser.parse_args(argv)
+    if getattr(args, 'galaxy_anchors', None):
+        global _GALAXY_ANCHOR_SI
+        _GALAXY_ANCHOR_SI = set(pd.read_csv(args.galaxy_anchors).source_index.astype(int))
+        print(f"  galaxy anchors: {len(_GALAXY_ANCHOR_SI)} source_index rows from {args.galaxy_anchors}")
     if getattr(args, 'position_overrides', None):
         from bp3m.pipeline.data_loader_master import set_position_overrides
         print(f"  position overrides: {set_position_overrides(args.position_overrides)} catalogue rows from {args.position_overrides}")
