@@ -3891,6 +3891,9 @@ def main(argv=None):
                              '{field}/Gaia/{field}_*_qso_anchors.csv (produced at Phase 1) '
                              'and applies tight secular-aberration '
                              'PM + zero-parallax priors to vetted QSOs.')
+    parser.add_argument('--position_overrides', type=str, default=None,
+                        help='parquet of model-based centres (egsf_fwd: obs_id, idx, x_fit, y_fit, cov_*_px) replacing the '
+                             'pypass positions of those catalogue rows when the v2 master data are loaded (2026-10-04)')
     parser.add_argument('--use_master_v2', action='store_true',
                         help='JOINT pop-fit v2: load the full v2 master '
                              'catalog (incl. HST-only stars, synthetic '
@@ -3952,6 +3955,9 @@ def main(argv=None):
                              'Overrides the default glob in {field}/Gaia/.')
 
     args = parser.parse_args(argv)
+    if getattr(args, 'position_overrides', None):
+        from bp3m.pipeline.data_loader_master import set_position_overrides
+        print(f"  position overrides: {set_position_overrides(args.position_overrides)} catalogue rows from {args.position_overrides}")
 
     # ── Resolve LVD-derived parameters ───────────────────────────────────────
     _sigma_pm         = args.sigma_pm          # None if not given by user

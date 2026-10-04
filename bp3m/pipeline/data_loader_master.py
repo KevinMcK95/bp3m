@@ -184,6 +184,44 @@ def _estimate_gmag(row: pd.Series,
     return 20.0
 
 
+# ── Model-based position overrides (2026-10-04) ───────────────────────────────
+# Galaxies measured with forward-modelled templates (egsf_fwd) instead of pypass PSF fits: per (base obs, catalog row),
+# the model centre in RAW combined-frame pixels and its raw-pixel covariance.  Applied when the catalogue is loaded:
+# x, y replaced; x_gdc/y_gdc moved by the catalogue's local GDC Jacobian (jac_*_gdc); covariance mapped through it.
+# Everything downstream (learned GDC correction, floor, epoch distortion, sub-image split) is unchanged.
+_POSITION_OVERRIDES: dict = {}
+
+
+def set_position_overrides(table) -> int:
+    """table: DataFrame / parquet path with obs_id, idx, x_fit, y_fit, cov_xx_px, cov_yy_px, cov_xy_px."""
+    import pandas as _pd
+    t = _pd.read_parquet(table) if isinstance(table, (str, Path)) else table
+    _POSITION_OVERRIDES.clear()
+    for r in t.itertuples():
+        _POSITION_OVERRIDES.setdefault(str(r.obs_id), {})[int(r.idx)] = (float(r.x_fit), float(r.y_fit),
+                                                                       float(r.cov_xx_px), float(r.cov_yy_px), float(r.cov_xy_px))
+    return sum(len(v) for v in _POSITION_OVERRIDES.values())
+
+
+def _apply_overrides(base: str, fd: dict | None, jac) -> int:
+    ov = _POSITION_OVERRIDES.get(base)
+    if not ov or fd is None or jac is None:
+        return 0
+    n = 0
+    for ci, (xf, yf, cxx, cyy, cxy) in ov.items():
+        if ci < 0 or ci >= len(fd["x"]):
+            continue
+        J = np.array([[jac[0][ci], jac[1][ci]], [jac[2][ci], jac[3][ci]]])
+        d = np.array([xf - fd["x"][ci], yf - fd["y"][ci]])
+        g = J @ d
+        C = J @ np.array([[cxx, cxy], [cxy, cyy]]) @ J.T
+        fd["x"][ci], fd["y"][ci] = xf, yf
+        fd["x_gdc"][ci] += g[0]; fd["y_gdc"][ci] += g[1]
+        fd["cov_xx"][ci], fd["cov_yy"][ci], fd["cov_xy"][ci] = C[0, 0], C[1, 1], C[0, 1]
+        n += 1
+    return n
+
+
 def _load_fits_catalog(cat_path: Path) -> dict | None:
     """Load a _flc_catalog.fits file into numpy arrays. Returns None if missing."""
     if not cat_path.exists():
@@ -207,6 +245,8 @@ def _load_fits_catalog(cat_path: Path) -> dict | None:
             "chip_ext": (tbl["chip_ext"].astype(int) if "chip_ext" in tbl.names
                          else np.where(tbl["y"] >= 2048, 4, 1)),
             "sky":    (tbl["sky"].astype(float) if "sky" in tbl.names else None),
+            "_jac":   (tuple(tbl[c].astype(float) for c in ("jac_xx_gdc", "jac_xy_gdc", "jac_yx_gdc", "jac_yy_gdc"))
+                       if "jac_xx_gdc" in tbl.names else None),
         }
 
 
@@ -658,6 +698,10 @@ def load_master_v2(
         if base not in fits_cache:
             cat_path = hst_root / base / f"{base}_flc_catalog.fits"
             fits_cache[base] = _load_fits_catalog(cat_path)
+            if _POSITION_OVERRIDES and fits_cache[base] is not None:
+                _n_ov = _apply_overrides(base, fits_cache[base], fits_cache[base].get("_jac"))
+                if _n_ov:
+                    print(f"    position overrides (model-based galaxy centres): {base}: {_n_ov} rows")
             psf_path = hst_root / base / "psf_params.json"
             if psf_path.exists():
                 with open(psf_path) as f:
