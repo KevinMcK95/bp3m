@@ -4112,6 +4112,7 @@ def main(argv=None):
         use_qso_anchors=not args.no_qso_anchors,
         qso_anchors_csv=[Path(p) for p in args.qso_anchors_csv] if args.qso_anchors_csv else None,
         data_source='master_v2' if args.use_master_v2 else 'v1',
+        pos_corr_model=args.pos_corr_model,      # 2026-10-04: the CLI flag was never passed through (silently ignored)
         hst_max_pm_unc=args.hst_max_pm_unc,
         hst_min_detect=args.hst_min_detect,
         hst_max_per_image=args.hst_max_per_image,
