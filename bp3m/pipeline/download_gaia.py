@@ -269,9 +269,6 @@ def _check_not_truncated(n_rows, what='Gaia query'):
                            f'true count; refusing a truncated catalogue (split the query further)')
 
 
-_ROW_GUARD_EPOCH = 1790654400.0      # 2026-09-29 00:00 EDT, after the MAXREC fix
-
-
 def _n_csv_rows(path) -> int:
     with open(path, 'rb') as f:
         return max(sum(1 for _ in f) - 1, 0)
@@ -281,16 +278,14 @@ def _cached_catalogue_suspect(df, meta_path, area, min_gmag, max_gmag):
     """Reason string if a CACHED catalogue may be truncated at a TAP row limit, else None.
 
     Sidecars written since 2026-10-05 carry row_limit_verified (every query of that download
-    passed _check_not_truncated).  Older catalogues are checked from their content: the total and
+    passed _check_not_truncated).  No date heuristic: the 09-28 guard reached the INSTALLED code
+    only on 10-02 02:35, so download dates prove nothing.  Older catalogues are checked from content: the total and
     every full-area magnitude bin (download_gaia's own _mag_bins) must sit below 100,000 rows -- a
     (patch, bin) query is never larger than its full-area bin, so all bins < 100,000 proves no query
     hit the 100,000 cap.  A bin at or above 100,000 cannot be verified (spatial strips, other
     servers) and is re-queried once; the new sidecar then carries the marker."""
     try:
         if json.loads(Path(meta_path).read_text()).get('row_limit_verified'):
-            return None
-        # downloads since the 09-28 MAXREC fix (1b38390) passed _check_not_truncated at query time
-        if Path(meta_path).stat().st_mtime >= _ROW_GUARD_EPOCH:
             return None
     except Exception:
         pass
