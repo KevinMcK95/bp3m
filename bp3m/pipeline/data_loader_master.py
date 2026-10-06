@@ -264,9 +264,14 @@ def load_master_v2(
     priority_source_indices: "set[int] | None" = None,
     pos_corr_model: "str | Path | None" = None,
     min_stars_split_ccd: "int | None" = None,
+    exclude_images: "set[str] | None" = None,
 ) -> tuple[dict, dict, pd.DataFrame, np.ndarray]:
     """
     Load BP3M v2 inputs from {field_dir}/hst_xmatch/master_combined_v2.csv.
+
+    exclude_images : exposure names (obs ids) whose detections are dropped before loading
+        (epoch / program subset tests, 2026-10-06); sources falling below hst_min_detect
+        without Gaia are dropped like any other detection loss.
 
     pos_corr_model : learned GDC-residual model (bp3m --pos_corr_model), applied in memory
         exactly as the v1 loader does (data_loader_flc): bias evaluated per detection from
@@ -613,6 +618,18 @@ def load_master_v2(
         print(f"  Deduplication: removed {n_stripped} conflicting detections "
               f"({len(valid_recs) - len(dedup_recs)} sources dropped below threshold)")
     valid_recs = dedup_recs
+
+    if exclude_images:
+        _ex = {str(x) for x in exclude_images}; kept = []; n_drop_det = 0
+        for rec in valid_recs:
+            dets = [(sn, i) for sn, i in rec["detections"] if _sub_name_to_base(sn) not in _ex]
+            n_drop_det += len(rec["detections"]) - len(dets)
+            if not dets or (not rec["has_gaia"] and len(dets) < hst_min_detect):
+                continue
+            rec2 = dict(rec); rec2["detections"] = dets; kept.append(rec2)
+        print(f"  exclude_images: {len(_ex)} exposures excluded -> {n_drop_det} detections dropped, "
+              f"{len(valid_recs) - len(kept)} sources lost")
+        valid_recs = kept
 
     # ── Load image metadata ───────────────────────────────────────────────────
     all_sub_names: set[str] = {s for rec in valid_recs for s, _ in rec["detections"]}

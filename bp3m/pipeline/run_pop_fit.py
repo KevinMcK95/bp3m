@@ -2048,6 +2048,7 @@ def _posthoc_sigma_int(bp3m_dir, output_pfr, mu):
 # Galaxy anchors (2026-10-04): master_combined_v2 rows (source_index) of confirmed background galaxies, treated exactly
 # like vetted QSO anchors -- secular-aberration PM prior + zero parallax at the QSO widths, barred from membership.
 # Set from main() (--galaxy_anchors CSV with a source_index column); positions normally come from
+_EXCLUDE_IMAGES = None     # --exclude_images (epoch / program subset tests)
 # --position_overrides (forward-model eGSF centres with calibrated errors).
 _GALAXY_ANCHOR_SI: "set | None" = None
 _GAIA_ERROR_SCALE: float = 1.0      # --gaia_error_scale (1 = unchanged)
@@ -2225,7 +2226,8 @@ def run_pop_fit(
             pos_corr_table=pos_corr_table,
             pos_corr_model=pos_corr_model,
             pos_err_floor=_floor,
-            priority_source_indices=((set(_seed_priority or ()) | set(_GALAXY_ANCHOR_SI or ())) or None))
+            priority_source_indices=((set(_seed_priority or ()) | set(_GALAXY_ANCHOR_SI or ())) or None),
+            exclude_images=_EXCLUDE_IMAGES)
         if imgs is None or len(imgs) == 0:
             raise RuntimeError(f"No usable v2 images found for '{field_name}'.")
         if _GAIA_ERROR_SCALE != 1.0:
@@ -3930,6 +3932,9 @@ def main(argv=None):
     parser.add_argument('--galaxy_anchors', type=str, default=None,
                         help='CSV with source_index (master_combined_v2 rows) of background galaxies used as zero-motion '
                              'anchors: secular-aberration PM + zero-parallax priors (QSO widths), never members (2026-10-04)')
+    parser.add_argument('--exclude_images', type=str, default=None,
+                        help='text file, one exposure name (obs id) per line: their detections are excluded from the '
+                             'v2 master data (epoch / program subset tests, 2026-10-06)')
     parser.add_argument('--position_overrides', type=str, default=None,
                         help='parquet of model-based centres (egsf_fwd: obs_id, idx, x_fit, y_fit, cov_*_px) replacing the '
                              'pypass positions of those catalogue rows when the v2 master data are loaded (2026-10-04)')
@@ -4000,6 +4005,11 @@ def main(argv=None):
         global _GALAXY_ANCHOR_SI
         _GALAXY_ANCHOR_SI = set(pd.read_csv(args.galaxy_anchors).source_index.astype(int))
         print(f"  galaxy anchors: {len(_GALAXY_ANCHOR_SI)} source_index rows from {args.galaxy_anchors}")
+    global _EXCLUDE_IMAGES
+    _EXCLUDE_IMAGES = None
+    if getattr(args, 'exclude_images', None):
+        _EXCLUDE_IMAGES = {l.strip().split()[0] for l in open(args.exclude_images) if l.strip() and not l.startswith('#')}
+        print(f"  exclude_images: {len(_EXCLUDE_IMAGES)} exposures from {args.exclude_images}")
     if getattr(args, 'position_overrides', None):
         from bp3m.pipeline.data_loader_master import set_position_overrides
         print(f"  position overrides: {set_position_overrides(args.position_overrides)} catalogue rows from {args.position_overrides}")
