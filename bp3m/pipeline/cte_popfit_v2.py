@@ -166,7 +166,7 @@ def _project(P, D_all):
     return D_all - np.einsum('nia,ak->nik', P['X'], B)
 
 
-def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None, z_weights=None):
+def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None, z_weights=None, const_mask=None):
     """Shift every non-anchor detection by the FULL CTE displacement (HST positions -> X_c/Y_c, X_mat rebuilt) and
     return the per-image transform change B that keeps the alignment stars' fit unchanged up to the non-representable
     part: X(x - delta) (r + B) ~= X(x) r - delta_perp.  In frozen-r mode the caller adds B to the frozen frame (the
@@ -177,12 +177,20 @@ def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None, z_weights=N
         d = solver._img_data.get(img); p = per.get(img)
         if d is None or p is None:
             continue
+        # stars: the full model (time-constant geometry-like block + time-growing CTE); galaxy anchors: only the
+        # time-constant block (chip geometry applies to every source; stellar CTE does not -- galaxies get their own
+        # measured differential CTE upstream).  user 2026-10-06
         sel = p['ok'] & ~p['anchor'] & (p['gi'] >= 0)
+        anc = p['ok'] & p['anchor'] & (p['gi'] >= 0) if const_mask is not None else np.zeros(d['n'], bool)
         dXc = np.zeros(d['n']); dYc = np.zeros(d['n'])
-        if sel.any():
-            Draw = np.zeros((d['n'], 2, ngrp * 2 * nf)); Draw[sel] = _design_det(p, nf, ngrp, sel)
-            dsky, M = _to_sky(solver, img, r, p, Draw, np.ones(d['n'], bool))
-            dsky = np.einsum('nik,k->ni', dsky, gamma)                            # full sky-frame displacement
+        if sel.any() or anc.any():
+            both = sel | anc
+            Draw = np.zeros((d['n'], 2, ngrp * 2 * nf)); Draw[both] = _design_det(p, nf, ngrp, both)
+            Dsky, M = _to_sky(solver, img, r, p, Draw, np.ones(d['n'], bool))
+            dsky = np.einsum('nik,k->ni', Dsky, gamma)                            # full sky-frame displacement
+            if anc.any():
+                dsky[anc] = np.einsum('nik,k->ni', Dsky[anc], gamma * const_mask)
+            dsky[~both] = 0.0
             dgdc = np.einsum('ij,nj->ni', np.linalg.inv(M), dsky)
             dXc, dYc = dgdc[:, 0], dgdc[:, 1]
             P = _projector(solver, img, r, d, (z_weights or {}).get(img))
@@ -203,7 +211,7 @@ def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None, z_weights=N
 
 
 def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, z_weights=None, sigma_pm=None,
-                   sigma_plx_tot=None, gamma_now=None, sigma_gamma=0.03, ridge=1e-6):
+                   sigma_plx_tot=None, gamma_now=None, sigma_gamma=0.03, ridge=1e-6, C_pop_prior_inv=None):
     """gamma increment from the current residuals, with every eligible star's 5 astrometric parameters marginalised
     (Schur complement).  The star blocks are built HERE from the same z-weighted precisions as the gamma terms plus
     the production priors (Gaia prior, 2p diffuse prior for non-members, population PM/parallax prior for members,
@@ -266,10 +274,19 @@ def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, z_
             Hv[mem, 2, 2] += sigma_pm ** -2; Hv[mem, 3, 3] += sigma_pm ** -2
         if sigma_plx_tot is not None:
             Hv[mem, 4, 4] += sigma_plx_tot ** -2
-        live = np.abs(cross).reshape(len(elig), -1).max(1) > 0
-        tr = np.trace(Hv[live], axis1=1, axis2=2)
-        Hvi = np.linalg.inv(Hv[live] + (1e-12 * tr)[:, None, None] * np.eye(5))
-        H -= np.einsum('nak,nkl,nbl->ab', cross[live], Hvi, cross[live])
+        tr = np.trace(Hv, axis1=1, axis2=2)
+        Hvi = np.linalg.inv(Hv + (1e-12 * tr)[:, None, None] * np.eye(5))
+        H -= np.einsum('nak,nkl,nbl->ab', cross, Hvi, cross)
+        # mu_pop marginalised too (user 10-06: faster convergence): members' PM prior N(mu, sigma_pm) couples every
+        # member to mu.  theta = (gamma, mu); H_mu,v = -sigma_pm^-2 on the PM components of each member.
+        if sigma_pm is not None and mem.any():
+            Cm = np.zeros((2, 5)); Cm[0, 2] = Cm[1, 3] = -sigma_pm ** -2
+            Hm = Hvi[mem]
+            B = -np.einsum('nak,nkl,bl->ab', cross[mem], Hm, Cm)                 # (ngam, 2)
+            Dm = mem.sum() * sigma_pm ** -2 * np.eye(2) - np.einsum('ak,nkl,bl->ab', Cm, Hm, Cm)
+            if C_pop_prior_inv is not None:
+                Dm = Dm + np.asarray(C_pop_prior_inv, float)
+            H -= B @ np.linalg.solve(Dm, B.T)
     H = 0.5 * (H + H.T)
     # Gaussian prior on the TOTAL gamma (sigma_gamma px per coefficient).  With star positions marginalised, a CTE
     # pattern that is constant in time for each star is (nearly) degenerate whenever pointings repeat; without the
@@ -291,7 +308,7 @@ def _conditioned(solve_fn, member_sidx, mu, r, z_weights):
 
 
 def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, member_sidx, mu_pop, r, a_arr,
-               C_vT=None, anchor_sidx=None, sigma_pm=None, sigma_plx_tot=None, sigma_gamma=0.03, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
+               C_vT=None, anchor_sidx=None, sigma_pm=None, sigma_plx_tot=None, sigma_gamma=0.03, C_pop_prior_inv=None, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
     """Returns (r, mu_pop, C_shared, C_vT, a_arr, info).  solve_fn(member_sidx, mu, r, fix_r_arg, z_weights_arg)
     is the caller's pop-fit solve (run_pop_fit._solve) so every prior/anchor/weight is the production one."""
     t_start = time.time()
@@ -311,20 +328,22 @@ def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, m
         return _selftest(solver, image_names, per, groups, nf, solve_fn, member_sidx, mu_pop, r, a_arr, member_mask,
                          fix_r, z_weights, sigma_pm, sigma_plx_tot)
     gamma = np.zeros(ngrp * 2 * nf); C_gam = None; hist = [dict(iter=0, mu=[float(mu_pop[0]), float(mu_pop[1])])]
+    n_const = nf // (time_order + 1)                         # basis order: [time-constant block | tau block]
+    const_mask = ((np.arange(ngrp * 2 * nf) % nf) < n_const).astype(float)
     C_shared = None
     r_base = np.array(r, float).copy()          # frozen frame (fix_r) or current start (free r)
     for it in range(1, n_iter + 1):
         dg, C_gam, nuse = _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, z_weights=z_weights,
                                          sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, gamma_now=gamma,
-                                         sigma_gamma=sigma_gamma)
+                                         sigma_gamma=sigma_gamma, C_pop_prior_inv=C_pop_prior_inv)
         gamma = gamma + dg
         stats = []
-        n_img, dr = _apply(solver, image_names, per, r_base if fix_r else r, gamma, nf, ngrp, stats, z_weights)
+        n_img, dr = _apply(solver, image_names, per, r_base if fix_r else r, gamma, nf, ngrp, stats, z_weights, const_mask)
         mag = np.concatenate(stats) if stats else np.zeros(1)
         if np.percentile(mag, 99) > MAX_SHIFT_PX:              # divergence guard: revert to the no-CTE solution
             print(f"  WARNING: CTE v2 iteration {it} would shift detections by p99 {np.percentile(mag, 99):.3f} px "
                   f"(> {MAX_SHIFT_PX} px) -- diverging; reverting to the uncorrected positions and frame")
-            gamma = np.zeros_like(gamma); _apply(solver, image_names, per, r_base, gamma, nf, ngrp, None, z_weights)
+            gamma = np.zeros_like(gamma); _apply(solver, image_names, per, r_base, gamma, nf, ngrp, None, z_weights, const_mask)
             r = r_base
             _, mu_pop, C_shared, _, _, _, _ = solve_fn(member_sidx, mu_pop, r, fix_r, z_weights)
             C_vT, a_arr = _conditioned(solve_fn, member_sidx, mu_pop, r, z_weights)
@@ -346,7 +365,8 @@ def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, m
     info = dict(groups=groups, n_basis=nf, time_order=time_order, basis='yt*[1,xt] x [1,m,m^2] x [1,tau]',
                 t0={'ACS': 2002.165, 'UVIS': 2009.37}, tau_unit_yr=10.0, y_readout={'top': _Y_READOUT_TOP, 'bot': _Y_READOUT_BOT},
                 y_split={'ACS': 2048.0, 'UVIS': 2047.0}, mag_norm=[m_med, m_sd], gamma=gamma.tolist(), sigma_gamma=sg.tolist(),
-                layout='[group][x block | y block][basis]', sigma_gamma_prior_px=sigma_gamma, history=hist, seconds=round(time.time() - t_start, 1),
+                layout='[group][x block | y block][basis]', sigma_gamma_prior_px=sigma_gamma, n_const_basis=n_const,
+                anchors_get='time-constant block only', mu_marginalised_in_gamma_step=bool(sigma_pm is not None), history=hist, seconds=round(time.time() - t_start, 1),
                 note='gamma fitted on members + alignment stars (anchors and diffuse HST-only non-members excluded); '
                      'displacements projected off each image alignment design; correction = minus the toward-readout shift')
     if output_dir is not None:

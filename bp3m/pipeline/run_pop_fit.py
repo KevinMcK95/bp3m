@@ -3216,7 +3216,7 @@ def run_pop_fit(
             solver, image_names, filtered_spi, star_id_to_idx,
             lambda m, mu, r, fx, z: _solve(m, mu, r, fix_r_arg=fx, z_weights_arg=z),
             member_sidx, mu_pop_current, r_current, _a_cte, C_vT=_CvT_cte,
-            anchor_sidx=_qso_sidx, sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, fix_r=_frozen, z_weights=z_weights_final,
+            anchor_sidx=_qso_sidx, sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, C_pop_prior_inv=C_pop_prior_inv, fix_r=_frozen, z_weights=z_weights_final,
             n_iter=cte_v2_n_iter, time_order=cte_v2_time_order, output_dir=output_pfr)
         if not _cte_info.get('skipped'):
             if not _frozen and _C_cte is not None:
