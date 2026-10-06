@@ -494,7 +494,22 @@ def main(argv=None):
                 extra += ['--hst_members_fit']
             print('bp3m-pop-fit-v2: BP3M_v2_results ran with --hst_align -> --hst_all_fit '
                   '(HST-only detections, members and non-members, constrain the alignment; --no_hst_all_fit to disable)')
-    return _joint_main(argv + extra)
+    rc = _joint_main(argv + extra)
+    # final membership on the notebook-08 panels (user 2026-10-06), alongside the fit's own panels
+    try:
+        def _arg(flag, default=None):
+            for i, a in enumerate(argv):
+                if a == flag and i + 1 < len(argv):
+                    return argv[i + 1]
+                if a.startswith(flag + '='):
+                    return a.split('=', 1)[1]
+            return default
+        if _arg('--name'):
+            from bp3m.pipeline.plot_members_nb08 import plot_popfit_members
+            plot_popfit_members(_arg('--output_dir', '.'), _arg('--name'))
+    except Exception as _e:
+        print(f'  member_selection_nb08style.png failed: {_e}')
+    return rc
 
 
 def _v2_hst_align(argv) -> bool:
