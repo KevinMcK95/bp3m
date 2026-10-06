@@ -259,9 +259,12 @@ def _launch_async(client, query):
     return job
 
 
+_TAP_LIMITS = (100_000, 2_000, 3_000_000, GAIA_MAXREC)
+
+
 def _check_not_truncated(n_rows, what='Gaia query'):
     # a result exactly at a known server limit is almost certainly truncated
-    if n_rows in (100_000, 2_000, 3_000_000, GAIA_MAXREC):
+    if n_rows in _TAP_LIMITS:
         raise RuntimeError(f'{what} returned exactly {n_rows} rows -- a TAP output limit, not the '
                            f'true count; refusing a truncated catalogue (split the query further)')
 
@@ -300,7 +303,13 @@ def _query_mag_bin(args):
     if ind_dir is not None:
         cache_path = Path(ind_dir) / f"{cache_key}_G_{min_g:.4f}_{max_g:.4f}.csv"
         if cache_path.exists():
-            return pd.read_csv(cache_path)
+            _cached = pd.read_csv(cache_path)
+            if len(_cached) not in _TAP_LIMITS:
+                return _cached
+            # a bin cached before the MAXREC fix (2026-09-28) can sit exactly at a TAP
+            # output limit: truncated, not complete -- re-query it
+            print(f"  [Gaia] cached bin {cache_path.name} has exactly {len(_cached)} rows "
+                  f"(a TAP output limit) -- re-querying", flush=True)
 
     print(f"  Bin {n}/{n_total}: querying {label} G {min_g:.2f}–{max_g:.2f} ...",
           flush=True)
@@ -511,15 +520,26 @@ def download_gaia(
     if not force_redownload:
         cache_ok, diffs = _check_cache(out_path, meta_path, current_meta)
         if cache_ok:
-            print(f"[Gaia] Loading cached catalogue: {out_path}")
-            return pd.read_csv(out_path)
+            _cached = pd.read_csv(out_path)
+            if len(_cached) not in _TAP_LIMITS:
+                print(f"[Gaia] Loading cached catalogue: {out_path}")
+                return _cached
+            # catalogues cached before the MAXREC fix (2026-09-28): 93 fields held exactly
+            # 100,000 rows, a spatially patchy subset of the box (found 2026-10-05)
+            print(f"[Gaia] Cached catalogue {out_path.name} has exactly {len(_cached)} rows "
+                  f"(a TAP output limit, i.e. truncated) -- re-downloading")
         elif out_path.exists():
             if diffs == ["no sidecar — cannot verify query match"]:
                 _header = pd.read_csv(out_path, nrows=0)
-                if all(c in _header.columns for c in _DSC_COLS):
+                _cached = (pd.read_csv(out_path)
+                           if all(c in _header.columns for c in _DSC_COLS) else None)
+                if _cached is not None and len(_cached) not in _TAP_LIMITS:
                     print(f"[Gaia] WARNING: cached CSV found but no query sidecar — "
                           f"loading anyway: {out_path}")
-                    return pd.read_csv(out_path)
+                    return _cached
+                elif _cached is not None:
+                    print(f"[Gaia] Cached CSV {out_path.name} has exactly {len(_cached)} rows "
+                          f"(a TAP output limit, i.e. truncated) -- re-downloading")
                 else:
                     print(f"[Gaia] Cached CSV is missing DSC classification columns "
                           f"— re-downloading to add them.")
