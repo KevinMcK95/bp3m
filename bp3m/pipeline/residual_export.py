@@ -403,8 +403,14 @@ def consolidate_field(field_name: str, data_root, indv_root=None, log=print) -> 
     for key, fname in FIELD_FILES.items():
         parts = []
         if keep:
-            old = pd.read_csv(root / fname, dtype={'gaia_id': np.int64} if key != 'images' else None, low_memory=False)
-            parts.append(old[old['image'].astype(str).isin(keep)])
+            try:
+                old = pd.read_csv(root / fname, dtype={'gaia_id': np.int64} if key != 'images' else None, low_memory=False)
+            except pd.errors.EmptyDataError:
+                # a previous consolidation with zero rows (e.g. no header-frame rows in a 3-star field) leaves an
+                # empty gzip; nothing to carry over (2026-10-06: 12 fields failed here on every backlog pass)
+                old = None
+            if old is not None and 'image' in old.columns:
+                parts.append(old[old['image'].astype(str).isin(keep)])
         for i in redo:
             d = root / i
             if key == 'images':
