@@ -41,6 +41,7 @@ import numpy as np
 
 _CAMS = {('ACS', 'WFC'): ('ACS', 2048.0, 2002.165), ('WFC3', 'UVIS'): ('UVIS', 2047.0, 2009.37)}
 _Y_READOUT_TOP, _Y_READOUT_BOT = 4096.0, 0.0
+MAX_SHIFT_PX = 1.0          # p99 applied-shift ceiling; CTE shifts are ~0.01-0.3 px
 
 
 def _year(mjd):
@@ -140,13 +141,15 @@ def _to_sky(solver, img, r, p, D_raw, sel):
     return np.einsum('ij,njk,nkl->nil', M, p['Jg'][sel], D_raw), M
 
 
-def _projector(solver, img, r, d):
+def _projector(solver, img, r, d, z=None):
     """(X_fit, W_fit, pinv) of the image's alignment design for projecting displacement designs."""
     nr = solver.N_R; j = solver.image_names.index(img)
     uf = d['use_for_fit']
     if uf.sum() < nr + 2:
         return None
     Cs = solver._compute_Cs(img, r[j * nr:j * nr + nr]); W = np.linalg.inv(Cs)
+    if z is not None:                                   # soft z-weights exactly as _joint_solve_pop applies them
+        W = W * z[:, None, None]
     X = d['X_mat']; Xf, Wf = X[uf], W[uf]
     H = np.einsum('nia,nij,njb->ab', Xf, Wf, Xf)
     try:
@@ -163,7 +166,7 @@ def _project(P, D_all):
     return D_all - np.einsum('nia,ak->nik', P['X'], B)
 
 
-def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None):
+def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None, z_weights=None):
     """Shift every non-anchor detection by the FULL CTE displacement (HST positions -> X_c/Y_c, X_mat rebuilt) and
     return the per-image transform change B that keeps the alignment stars' fit unchanged up to the non-representable
     part: X(x - delta) (r + B) ~= X(x) r - delta_perp.  In frozen-r mode the caller adds B to the frozen frame (the
@@ -182,7 +185,7 @@ def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None):
             dsky = np.einsum('nik,k->ni', dsky, gamma)                            # full sky-frame displacement
             dgdc = np.einsum('ij,nj->ni', np.linalg.inv(M), dsky)
             dXc, dYc = dgdc[:, 0], dgdc[:, 1]
-            P = _projector(solver, img, r, d)
+            P = _projector(solver, img, r, d, (z_weights or {}).get(img))
             if P is not None:
                 Xf, Wf = P['X'][P['uf']], P['W'][P['uf']]
                 j = solver.image_names.index(img)
@@ -199,33 +202,46 @@ def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None):
     return n_img, dr
 
 
-def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, C_vT=None, ridge=1e-6):
-    """gamma increment from the current residuals.  Each star's 5 astrometric parameters are marginalised (Schur
-    complement with its conditional posterior covariance C_vT from the last solve): a CTE shift that is constant in
-    time for a star is absorbed by its position, a time-growing one by its PM except where the population / Gaia PM
-    prior forbids it -- without this the gamma / star block-descent zig-zags and does not converge."""
+def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, z_weights=None, sigma_pm=None,
+                   sigma_plx_tot=None, ridge=1e-6):
+    """gamma increment from the current residuals, with every eligible star's 5 astrometric parameters marginalised
+    (Schur complement).  The star blocks are built HERE from the same z-weighted precisions as the gamma terms plus
+    the production priors (Gaia prior, 2p diffuse prior for non-members, population PM/parallax prior for members,
+    as _joint_solve_pop), so the reduced system is positive definite by construction.  A CTE shift constant in time
+    for a star is absorbed by its position, a time-growing one by its PM unless the PM prior forbids it."""
     ngam = ngrp * 2 * nf
     H = np.zeros((ngam, ngam)); g = np.zeros(ngam); nuse = np.zeros(ngrp, int)
     elig = np.flatnonzero(member_mask)
-    for img in image_names:                                        # + alignment stars
+    for img in image_names:
         d = solver._img_data.get(img)
         if d is not None:
             elig = np.union1d(elig, d['sidx'][d['use_for_fit']])
     cpos = np.full(solver.n_stars, -1); cpos[elig] = np.arange(len(elig))
-    cross = np.zeros((len(elig), ngam, 5)) if C_vT is not None else None   # sum over detections of D^T W JU
+    cross = np.zeros((len(elig), ngam, 5)); Hd = np.zeros((len(elig), 5, 5))
     nr = solver.N_R
     for img in image_names:
         d = solver._img_data.get(img); p = per.get(img)
-        if d is None or p is None:
+        if d is None:
             continue
-        P = _projector(solver, img, r, d)
+        z = z_weights.get(img) if z_weights else None
+        active = d['use_for_fit'] | d.get('use_for_astrom', d['use_for_fit'])
+        j = solver.image_names.index(img); rj = r[j * nr:j * nr + nr]
+        W = np.linalg.inv(solver._compute_Cs(img, rj))
+        if z is not None:
+            W = W * z[:, None, None]
+        # data precision of every eligible star from ALL its active detections (as the solve sees them)
+        ea = active & (cpos[d['sidx']] >= 0)
+        if ea.any():
+            JU = d['JU'][ea]
+            np.add.at(Hd, cpos[d['sidx'][ea]], np.einsum('nki,nkl,nlj->nij', JU, W[ea], JU))
+        if p is None:
+            continue
+        P = _projector(solver, img, r, d, z)
         if P is None:
             continue
-        active = d['use_for_fit'] | d.get('use_for_astrom', d['use_for_fit'])
         sel = p['ok'] & ~p['anchor'] & (p['gi'] >= 0) & active & (member_mask[d['sidx']] | d['use_for_fit'])
         if sel.sum() < 5:
             continue
-        j = solver.image_names.index(img); rj = r[j * nr:j * nr + nr]
         pred = np.einsum('nij,j->ni', d['X_mat'], rj) - np.einsum('nij,nj->ni', d['JU'], a_arr[d['sidx']])
         ed = solver._ed_disp(img, r)
         if not np.isscalar(ed):
@@ -234,25 +250,34 @@ def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, C_
         Draw = np.zeros((d['n'], 2, ngam)); okd = p['ok'] & ~p['anchor'] & (p['gi'] >= 0)
         Draw[okd] = _design_det(p, nf, ngrp, okd)
         Dsky, _ = _to_sky(solver, img, r, p, Draw, np.ones(d['n'], bool))
-        Dp = -_project(P, Dsky)                                     # residual = -D_perp gamma
-        Ds, Ws, rs = Dp[sel], P['W'][sel], res[sel]
+        Dp = -_project(P, Dsky)                                     # residual = -D_perp gamma + JU dv
+        Ds, Ws, rs = Dp[sel], W[sel], res[sel]
         H += np.einsum('nia,nij,njb->ab', Ds, Ws, Ds)
         g += np.einsum('nia,nij,nj->a', Ds, Ws, rs)
         np.add.at(nuse, p['gi'][sel], 1)
-        if cross is not None:
-            Hx = np.einsum('nia,nij,njk->nak', Ds, Ws, d['JU'][sel])      # residual rises by +JU dv
-            np.add.at(cross, cpos[d['sidx'][sel]], Hx)
-    if cross is not None and len(elig):
-        Cv = C_vT[elig]
-        live = (np.abs(Cv).reshape(len(elig), -1).max(1) > 0) & (np.abs(cross).reshape(len(elig), -1).max(1) > 0)
-        H -= np.einsum('nak,nkl,nbl->ab', cross[live], Cv[live], cross[live])
+        np.add.at(cross, cpos[d['sidx'][sel]], np.einsum('nia,nij,njk->nak', Ds, Ws, d['JU'][sel]))
+    if len(elig):
+        Hv = solver.C_survey_inv[elig].copy() + Hd
+        mem = member_mask[elig]
+        nm2p = ~mem & (solver._C_VG_inv_per_star[elig, 2] > 0)
+        for k in range(5):
+            Hv[nm2p, k, k] += solver._C_VG_inv_per_star[elig[nm2p], k]
+        if sigma_pm is not None:
+            Hv[mem, 2, 2] += sigma_pm ** -2; Hv[mem, 3, 3] += sigma_pm ** -2
+        if sigma_plx_tot is not None:
+            Hv[mem, 4, 4] += sigma_plx_tot ** -2
+        live = np.abs(cross).reshape(len(elig), -1).max(1) > 0
+        tr = np.trace(Hv[live], axis1=1, axis2=2)
+        Hvi = np.linalg.inv(Hv[live] + (1e-12 * tr)[:, None, None] * np.eye(5))
+        H -= np.einsum('nak,nkl,nbl->ab', cross[live], Hvi, cross[live])
+    H = 0.5 * (H + H.T)
     lam = ridge * max(np.trace(H), 1e-30) / ngam
     C = np.linalg.inv(H + lam * np.eye(ngam))
     return C @ g, C, nuse
 
 
 def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, member_sidx, mu_pop, r, a_arr,
-               C_vT=None, anchor_sidx=None, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
+               C_vT=None, anchor_sidx=None, sigma_pm=None, sigma_plx_tot=None, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
     """Returns (r, mu_pop, C_shared, C_vT, a_arr, info).  solve_fn(member_sidx, mu, r, fix_r_arg, z_weights_arg)
     is the caller's pop-fit solve (run_pop_fit._solve) so every prior/anchor/weight is the production one."""
     t_start = time.time()
@@ -270,11 +295,19 @@ def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, m
     C_shared = None
     r_base = np.array(r, float).copy()          # frozen frame (fix_r) or current start (free r)
     for it in range(1, n_iter + 1):
-        dg, C_gam, nuse = _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, C_vT=C_vT)
+        dg, C_gam, nuse = _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, z_weights=z_weights,
+                                         sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot)
         gamma = gamma + dg
         stats = []
-        n_img, dr = _apply(solver, image_names, per, r_base if fix_r else r, gamma, nf, ngrp, stats)
+        n_img, dr = _apply(solver, image_names, per, r_base if fix_r else r, gamma, nf, ngrp, stats, z_weights)
         mag = np.concatenate(stats) if stats else np.zeros(1)
+        if np.percentile(mag, 99) > MAX_SHIFT_PX:              # divergence guard: revert to the no-CTE solution
+            print(f"  WARNING: CTE v2 iteration {it} would shift detections by p99 {np.percentile(mag, 99):.3f} px "
+                  f"(> {MAX_SHIFT_PX} px) -- diverging; reverting to the uncorrected positions and frame")
+            gamma = np.zeros_like(gamma); _apply(solver, image_names, per, r_base, gamma, nf, ngrp, None, z_weights)
+            r = r_base
+            _, mu_pop, C_shared, C_vT, a_arr, _, _ = solve_fn(member_sidx, mu_pop, r, fix_r, z_weights)
+            hist.append(dict(iter=it, reverted=True)); break
         r_use = r_base + dr if fix_r else r
         r_new, mu_new, C_shared, C_vT, a_arr, _, _ = solve_fn(member_sidx, mu_pop, r_use, fix_r, z_weights)
         dmu = float(np.max(np.abs(np.asarray(mu_new) - np.asarray(mu_pop))))
