@@ -269,6 +269,44 @@ def _check_not_truncated(n_rows, what='Gaia query'):
                            f'true count; refusing a truncated catalogue (split the query further)')
 
 
+_ROW_GUARD_EPOCH = 1790654400.0      # 2026-09-29 00:00 EDT, after the MAXREC fix
+
+
+def _n_csv_rows(path) -> int:
+    with open(path, 'rb') as f:
+        return max(sum(1 for _ in f) - 1, 0)
+
+
+def _cached_catalogue_suspect(df, meta_path, area, min_gmag, max_gmag):
+    """Reason string if a CACHED catalogue may be truncated at a TAP row limit, else None.
+
+    Sidecars written since 2026-10-05 carry row_limit_verified (every query of that download
+    passed _check_not_truncated).  Older catalogues are checked from their content: the total and
+    every full-area magnitude bin (download_gaia's own _mag_bins) must sit below 100,000 rows -- a
+    (patch, bin) query is never larger than its full-area bin, so all bins < 100,000 proves no query
+    hit the 100,000 cap.  A bin at or above 100,000 cannot be verified (spatial strips, other
+    servers) and is re-queried once; the new sidecar then carries the marker."""
+    try:
+        if json.loads(Path(meta_path).read_text()).get('row_limit_verified'):
+            return None
+        # downloads since the 09-28 MAXREC fix (1b38390) passed _check_not_truncated at query time
+        if Path(meta_path).stat().st_mtime >= _ROW_GUARD_EPOCH:
+            return None
+    except Exception:
+        pass
+    if len(df) in _TAP_LIMITS:
+        return f'{len(df)} rows = a TAP output limit'
+    if 'gmag' not in df.columns or not len(df):
+        return None
+    edges = np.sort(_mag_bins(min_gmag, max_gmag, area))
+    cnt, _ = np.histogram(df['gmag'].to_numpy(float), bins=edges)
+    if (cnt == 100_000).any():
+        return f'a magnitude bin holds exactly 100,000 rows (TAP limit)'
+    if (cnt >= 100_000).any():
+        return f'a magnitude bin holds {int(cnt.max())} >= 100,000 rows, unverifiable for a pre-2026-10-05 download'
+    return None
+
+
 def _submit_gaia_async(full_q: str, gaia_tap_server: str | None = None) -> pd.DataFrame:
     """Submit one Gaia TAP async job and return the result as a DataFrame."""
     client = _make_gaia_client(gaia_tap_server)
@@ -521,13 +559,15 @@ def download_gaia(
         cache_ok, diffs = _check_cache(out_path, meta_path, current_meta)
         if cache_ok:
             _cached = pd.read_csv(out_path)
-            if len(_cached) not in _TAP_LIMITS:
+            _why = _cached_catalogue_suspect(
+                _cached, meta_path,
+                search_width * search_height * abs(np.cos(np.deg2rad(dec))), min_gmag, _max_gmag)
+            if _why is None:
                 print(f"[Gaia] Loading cached catalogue: {out_path}")
                 return _cached
-            # catalogues cached before the MAXREC fix (2026-09-28): 93 fields held exactly
-            # 100,000 rows, a spatially patchy subset of the box (found 2026-10-05)
-            print(f"[Gaia] Cached catalogue {out_path.name} has exactly {len(_cached)} rows "
-                  f"(a TAP output limit, i.e. truncated) -- re-downloading")
+            # catalogues cached before the MAXREC fix (2026-09-28): 94 fields held a magnitude bin
+            # of exactly 100,000 rows, a spatially patchy subset of the box (found 2026-10-05)
+            print(f"[Gaia] Cached catalogue {out_path.name} may be truncated ({_why}) -- re-downloading")
         elif out_path.exists():
             if diffs == ["no sidecar — cannot verify query match"]:
                 _header = pd.read_csv(out_path, nrows=0)
@@ -625,7 +665,9 @@ def download_gaia(
         meta_path.unlink()
 
     df.to_csv(out_path, index=False)
-    meta_path.write_text(json.dumps(current_meta, indent=2))
+    # every query of this download passed _check_not_truncated (row-limit guard, 2026-10-05)
+    meta_path.write_text(json.dumps(dict(current_meta, row_limit_verified=True, n_rows=int(len(df))),
+                                    indent=2))
 
     import shutil as _shutil
     _shutil.rmtree(ind_dir, ignore_errors=True)
@@ -683,6 +725,10 @@ def download_gaia_qso_candidates(
 
     _ABERR_COLS = ('pmra_aberr_uas', 'pmdec_aberr_uas')
 
+    if (not force_redownload and out_path.exists()
+            and _n_csv_rows(out_path) in _TAP_LIMITS):     # cached before the row-limit guard
+        print(f"[Gaia] Cached {out_path.name} sits exactly at a TAP row limit -- re-downloading")
+        force_redownload = True
     if not force_redownload and out_path.exists():
         result = pd.read_csv(out_path)
         if not all(c in result.columns for c in _ABERR_COLS):
@@ -775,6 +821,10 @@ def download_gaia_galaxy_candidates(
 
     _ABERR_COLS = ('pmra_aberr_uas', 'pmdec_aberr_uas')
 
+    if (not force_redownload and out_path.exists()
+            and _n_csv_rows(out_path) in _TAP_LIMITS):     # cached before the row-limit guard
+        print(f"[Gaia] Cached {out_path.name} sits exactly at a TAP row limit -- re-downloading")
+        force_redownload = True
     if not force_redownload and out_path.exists():
         result = pd.read_csv(out_path)
         if not all(c in result.columns for c in _ABERR_COLS):
