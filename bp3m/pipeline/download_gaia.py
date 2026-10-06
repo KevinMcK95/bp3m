@@ -274,16 +274,16 @@ def _n_csv_rows(path) -> int:
         return max(sum(1 for _ in f) - 1, 0)
 
 
-def _cached_catalogue_suspect(df, meta_path, area, min_gmag, max_gmag):
+def _cached_catalogue_suspect(df, meta_path, area=None, min_gmag=None, max_gmag=None):
     """Reason string if a CACHED catalogue may be truncated at a TAP row limit, else None.
 
-    Sidecars written since 2026-10-05 carry row_limit_verified (every query of that download
-    passed _check_not_truncated).  No date heuristic: the 09-28 guard reached the INSTALLED code
-    only on 10-02 02:35, so download dates prove nothing.  Older catalogues are checked from content: the total and
-    every full-area magnitude bin (download_gaia's own _mag_bins) must sit below 100,000 rows -- a
-    (patch, bin) query is never larger than its full-area bin, so all bins < 100,000 proves no query
-    hit the 100,000 cap.  A bin at or above 100,000 cannot be verified (spatial strips, other
-    servers) and is re-queried once; the new sidecar then carries the marker."""
+    Trusted only when (a) its sidecar carries row_limit_verified (every query of that download
+    passed _check_not_truncated; written since 2026-10-05), or (b) it holds fewer than 100,000
+    rows in total: a Heidelberg-capped magnitude bin contributes exactly 100,000 rows on its own,
+    so a smaller total proves no bin was capped.  Everything else is re-queried once.
+    Recomputing the per-bin histogram was tried and rejected: Sagittarius_dSph (938,877 cached
+    rows, 7,060,384 real) showed a single bin at 100,000 under recomputed edges although most of
+    its bins had been capped -- the download-time edges are not reliably reproducible."""
     try:
         if json.loads(Path(meta_path).read_text()).get('row_limit_verified'):
             return None
@@ -291,14 +291,8 @@ def _cached_catalogue_suspect(df, meta_path, area, min_gmag, max_gmag):
         pass
     if len(df) in _TAP_LIMITS:
         return f'{len(df)} rows = a TAP output limit'
-    if 'gmag' not in df.columns or not len(df):
-        return None
-    edges = np.sort(_mag_bins(min_gmag, max_gmag, area))
-    cnt, _ = np.histogram(df['gmag'].to_numpy(float), bins=edges)
-    if (cnt == 100_000).any():
-        return f'a magnitude bin holds exactly 100,000 rows (TAP limit)'
-    if (cnt >= 100_000).any():
-        return f'a magnitude bin holds {int(cnt.max())} >= 100,000 rows, unverifiable for a pre-2026-10-05 download'
+    if len(df) >= 100_000:
+        return f'{len(df)} rows >= 100,000 without a verified sidecar (a capped bin cannot be excluded)'
     return None
 
 
