@@ -579,6 +579,10 @@ def _parse_args():
                           'psf_delta.npy and psf_perturbation.png for each image.')
     ctl.add_argument('--force_rematch', action='store_true',
                      help='Re-run cross-matching even if matched_gaia.csv already exists')
+    ctl.add_argument('--indv_discover_all_disk', action='store_true',
+                     help='With --fit_indv_images_only: discover candidate images by fully loading EVERY image '
+                          'directory on disk (the pre-2026-10-06 behaviour) instead of the current selection with '
+                          'loading deferred to images that need fitting')
     ctl.add_argument('--retry_failed_xmatch', action='store_true',
                      help='Re-run the cross-match only for images whose xmatch_status is "failed" at the current '
                           'algorithm version (successful matches are kept); 2026-10-06, pairs with the very-wide '
@@ -1479,10 +1483,35 @@ def main():
             from bp3m.data_loader_flc import load_image_data_flc
             from bp3m.data_loader import build_index_maps
 
-            _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
-                output_dir, field, pos_err_floor=args.bp3m_pos_err_floor,
-                gaia_csv=gaia_csv_path)
-            _, _indv_names, _ = build_index_maps(_spi_all, _gaia_all)
+            # Discovery (2026-10-06): by default start from the field's current SELECTION and defer the full
+            # per-image data load (catalogue + matched_gaia + learned-correction evaluation) until after the
+            # resume check, so only images that will actually be fitted are loaded.  The old behaviour --
+            # fully loading EVERY directory on disk to build a name list (M31: 13,716 dirs, ~1 h per rerun) --
+            # is kept for --indv_discover_all_disk / --bp3m_all_images (user wants on-disk discovery).
+            _defer_load = (_bp3m_images is not None and not args.indv_discover_all_disk)
+            if _defer_load:
+                _hst_root_ix = output_dir / field / 'HST' / 'mastDownload' / 'HST'
+                # no matched_gaia.csv -> no Gaia stars -> the full loader would have skipped it too
+                _indv_names = [n for n in sorted(set(_bp3m_images))
+                               if (_hst_root_ix / n / 'matched_gaia.csv').exists()]
+                _imgs_all, _spi_all = {}, {}
+                if args.restrict_filters or args.restrict_instdet:
+                    from astropy.io import fits as _fits_ix
+                    from bp3m.data_loader_flc import _get_filter as _gf_ix
+                    for _n in _indv_names:
+                        try:
+                            _h0 = _fits_ix.getheader(str(_hst_root_ix / _n / f'{_n}_flc.fits'), 0)
+                            _imgs_all[_n] = {'filter': _gf_ix(_h0), 'instrument': str(_h0.get('INSTRUME', '')).strip(),
+                                             'detector': str(_h0.get('DETECTOR', '')).strip()}
+                        except Exception:
+                            _imgs_all[_n] = {}
+                print(f"  Indv discovery: {len(_indv_names)} selected images with a Gaia cross-match "
+                      f"(data loaded later only for images that need fitting; --indv_discover_all_disk for all on-disk)")
+            else:
+                _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
+                    output_dir, field, pos_err_floor=args.bp3m_pos_err_floor,
+                    gaia_csv=gaia_csv_path)
+                _, _indv_names, _ = build_index_maps(_spi_all, _gaia_all)
 
             if _bp3m_images is not None:
                 _req = set(_bp3m_images)
@@ -1501,7 +1530,7 @@ def main():
                     if (_imgs_all[n].get('instrument', '') +
                         _imgs_all[n].get('detector', '')).upper() in _kid
                 ]
-            if args.bp3m_min_stars > 0:
+            if args.bp3m_min_stars > 0 and not _defer_load:
                 _indv_names = [n for n in _indv_names
                                if len(_spi_all[n]) >= args.bp3m_min_stars]
 
@@ -1639,6 +1668,20 @@ def main():
                                       workers=max(1, min(args.n_processes, 8)))
                     except Exception as _exc_ex:
                         print(f"  WARNING: GDC export of cached images failed: {_exc_ex}")
+
+            if _defer_load and _indv_names:
+                # full data load ONLY for images that will be fitted; same cuts as the old discovery
+                _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
+                    output_dir, field, pos_err_floor=args.bp3m_pos_err_floor,
+                    gaia_csv=gaia_csv_path, restrict_images=set(_indv_names))
+                _, _loaded, _ = build_index_maps(_spi_all, _gaia_all)
+                _loaded = set(_loaded)
+                _n_before = len(_indv_names)
+                _indv_names = [n for n in _indv_names if n in _loaded
+                               and (args.bp3m_min_stars <= 0 or len(_spi_all[n]) >= args.bp3m_min_stars)]
+                if len(_indv_names) < _n_before:
+                    print(f"  {_n_before - len(_indv_names)} image(s) dropped after loading "
+                          f"(no usable Gaia stars or < --bp3m_min_stars)")
 
             from datetime import datetime as _dt
             _n_total = len(_indv_names)
