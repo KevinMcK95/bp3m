@@ -579,6 +579,10 @@ def _parse_args():
                           'psf_delta.npy and psf_perturbation.png for each image.')
     ctl.add_argument('--force_rematch', action='store_true',
                      help='Re-run cross-matching even if matched_gaia.csv already exists')
+    ctl.add_argument('--retry_failed_xmatch', action='store_true',
+                     help='Re-run the cross-match only for images whose xmatch_status is "failed" at the current '
+                          'algorithm version (successful matches are kept); 2026-10-06, pairs with the very-wide '
+                          '(1000 px) third attempt for non-Gaia header WCS')
     ctl.add_argument('--no_xmatch_group_pass', action='store_true',
                      help='Skip Step 4c (visit-group completion: failed or sibling-inconsistent '
                           'images rematched from the header error their visit siblings measured)')
@@ -810,6 +814,8 @@ def _run_indv_one(img_name, run_kw, indv_root, extra_cfg):
 
 def main():
     args = _parse_args()
+    if getattr(args, 'retry_failed_xmatch', False):
+        os.environ['BP3M_XMATCH_RETRY_FAILED'] = '1'     # read by cross_match._xmatch_cache_status (pool workers inherit)
     # Learned GDC correction: CLI > $BP3M_HOME/config.toml pos_corr_model > none; "none" disables (arm-A tests)
     if getattr(args, 'pos_corr_model', None) is None:
         args.pos_corr_model = _config_value('pos_corr_model')

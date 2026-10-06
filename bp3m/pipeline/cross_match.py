@@ -20,6 +20,7 @@ once that support is in place.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -101,8 +102,26 @@ def _detach_hardlinked_outputs(roots) -> int:
 
 WIDE_DISCOVERY_OFFSET = 150   # px; second attempt for images that fail at discovery_max_offset
 MARGINAL_FA_PROB = 1e-6       # a first success less significant than this also gets the wide attempt
+# Third attempt (2026-10-06) for images whose header WCS is NOT Gaia-aligned: short (2.5 s) SMC/LMC
+# Cepheid snapshots (programs 14648/15146/17097, WCSNAME IDC_2731450pi) carry header pointing errors
+# of 7-75" (median 27", i.e. 200-1900 px), beyond the 150 px wide window.  Accepted only when the
+# chance-coincidence test is decisive (false-alarm P < VERY_WIDE_FA_PROB).
+VERY_WIDE_DISCOVERY_OFFSET = 1000   # px (40" UVIS, 50" WFC)
+VERY_WIDE_FA_PROB = 1e-6
+
+
+def _header_wcs_gaia_aligned(flc_path) -> bool:
+    """True if the exposure's active WCS is an a-posteriori Gaia solution (WCSNAME contains 'GAIA')."""
+    try:
+        from astropy.io import fits as _fits
+        return 'GAIA' in str(_fits.getval(str(flc_path), 'WCSNAME', ext=1) or '').upper()
+    except Exception:
+        return False
 
 # Current matching-algorithm version (see params_meta note in run_cross_match).
+#   (2026-10-06) very-wide (1000 px) third attempt for non-Gaia header WCS, chance-test gated: deliberately NOT a
+#   version bump (user 2026-10-06) -- it only changes the outcome of images that FAIL at v4, and those are re-run with
+#   --retry_failed_xmatch (BP3M_XMATCH_RETRY_FAILED=1) instead of a full archive rematch.
 XMATCH_ALGO_VERSION = 4
 
 
@@ -170,6 +189,9 @@ def _xmatch_cache_status(hst_root: Path, params_meta: dict
         if st == 'skipped' and 'trailed exposure' in str(saved.get('reason', '')):
             # trailed images are matched since 2026-10-02 (flag only); re-judge old skips
             return 'run', 'previously skipped as trailed (now flag-only)'
+        if st == 'failed' and os.environ.get('BP3M_XMATCH_RETRY_FAILED') == '1':
+            # --retry_failed_xmatch (2026-10-06): re-run only failed images (very-wide third attempt)
+            return 'run', 'previously failed; retry requested'
         if st in ('failed', 'skipped'):
             return 'skip', f"previously {st}: {saved.get('reason', '')}"
         return 'run', f'unknown status: {st}'
@@ -307,6 +329,23 @@ def _match_one(args):
             else:
                 file_updated = _wide_new
             post_mtime = out.stat().st_mtime if out.exists() else None
+        if (not file_updated and max(_off, WIDE_DISCOVERY_OFFSET) < VERY_WIDE_DISCOVERY_OFFSET
+                and kwargs.get('very_wide_retry', True) and not _header_wcs_gaia_aligned(hst_dict['flc'])):
+            _pre3 = out.stat().st_mtime if out.exists() else None
+            process_single_image(hst_dict, gaia_df, discovery_max_offset=VERY_WIDE_DISCOVERY_OFFSET,
+                                 log_mode='a', **_psi_kw)
+            _post3 = out.stat().st_mtime if out.exists() else None
+            if _post3 is not None and _post3 != _pre3:
+                _fap3 = _fap_of()
+                if _fap3 < VERY_WIDE_FA_PROB:
+                    file_updated = True
+                else:   # not decisive at this window size: discard
+                    for _f in ('matched_gaia.csv', 'transformation.csv'):
+                        if (root / _f).exists():
+                            (root / _f).unlink()
+                    with open(root / 'processing_log.txt', 'a') as _lf:
+                        _lf.write(f"  very-wide attempt rejected: chance false-alarm P = {_fap3:.2e} "
+                                  f">= {VERY_WIDE_FA_PROB:g}\n")
         n = len(pd.read_csv(str(out))) if file_updated else 0
         if file_updated and n > 0:
             if params_meta:
