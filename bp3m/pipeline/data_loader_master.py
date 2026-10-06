@@ -956,6 +956,18 @@ def load_master_v2(
 
         ok_pos = np.isfinite(X) & np.isfinite(Y)
 
+        # Per-detection official-GDC Jacobian d(x_gdc,y_gdc)/d(x,y) and chip (CTE phase v2 maps raw-detector CTE
+        # shifts into the GDC frame with these; 2026-10-06).  NaN when the catalogue predates the jac columns.
+        _jcols = {c: np.full(n, np.nan) for c in ("jac_xx_gdc", "jac_xy_gdc", "jac_yx_gdc", "jac_yy_gdc")}
+        _chip = np.full(n, -1, dtype=int)
+        _okc = cidx >= 0
+        if _okc.any():
+            if fits_data.get("_jac") is not None:
+                for _c, _a in zip(_jcols, fits_data["_jac"]):
+                    _jcols[_c][_okc] = np.asarray(_a, float)[cidx[_okc]]
+            if fits_data.get("chip_ext") is not None:
+                _chip[_okc] = np.asarray(fits_data["chip_ext"], int)[cidx[_okc]]
+
         # use_for_alignment: True for Gaia sources that pass position/saturation
         # quality cuts AND were NOT flagged as Phase 6 astrometric outliers.
         # use_for_align_init_flag: True even for Phase-6 outliers — they are real
@@ -979,6 +991,8 @@ def load_master_v2(
             "use_for_align_init_flag": use_for_align_full,
             "use_for_fit":             use_for_align,
             "det_chi2":                det_chi2_arr,
+            "chip_ext":                _chip,
+            **_jcols,
         })
 
         df = df[ok_pos].reset_index(drop=True)

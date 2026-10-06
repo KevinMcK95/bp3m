@@ -82,7 +82,13 @@ def _setup(solver, image_names, stars_per_image, star_id_to_idx, anchor_sidx, ti
         if 'X_c_nocte' not in d:
             d['X_c_nocte'] = np.asarray(d['X_c'], float).copy(); d['Y_c_nocte'] = np.asarray(d['Y_c'], float).copy()
         hi = yr > y_split
-        # raw -> GDC-centred Jacobian per chip (linear fit; the learned/ED corrections it absorbs are << 1%)
+        if 'chip_ext' in df.columns:                       # catalogue chip (4 = WFC1/UVIS1 top) when available
+            ce = np.full(d['n'], -1); ce[rows >= 0] = df['chip_ext'].to_numpy(int)[rows[rows >= 0]]
+            hi = np.where(ce > 0, ce == 4, hi)
+        # raw -> GDC-centred Jacobian: per-chip linear fit as fallback, replaced per detection by the catalogue's
+        # official-GDC jac_*_gdc where present.  The learned GDC model / ED / pseudo-GDC corrections are smooth
+        # additive shifts already contained in X_c (kept untouched here), so whatever GDC corrections the run uses
+        # stay applied and the CTE shift is simply added on top.
         Jg = np.tile(np.eye(2), (d['n'], 1, 1))
         for ch in (True, False):
             m = ok & (hi == ch)
@@ -91,12 +97,18 @@ def _setup(solver, image_names, stars_per_image, star_id_to_idx, anchor_sidx, ti
                 cx = np.linalg.lstsq(A, d['X_c_nocte'][m], rcond=None)[0]
                 cy = np.linalg.lstsq(A, d['Y_c_nocte'][m], rcond=None)[0]
                 Jg[m] = np.array([[cx[0], cx[1]], [cy[0], cy[1]]])
+        n_jac = 0
+        if all(c in df.columns for c in ('jac_xx_gdc', 'jac_xy_gdc', 'jac_yx_gdc', 'jac_yy_gdc')):
+            jj = np.full((d['n'], 4), np.nan); okr = rows >= 0
+            jj[okr] = df[['jac_xx_gdc', 'jac_xy_gdc', 'jac_yx_gdc', 'jac_yy_gdc']].to_numpy(float)[rows[okr]]
+            fin = np.isfinite(jj).all(1)
+            Jg[fin] = jj[fin].reshape(-1, 2, 2); n_jac = int(fin.sum())
         yt = np.abs(yr - np.where(hi, _Y_READOUT_TOP, _Y_READOUT_BOT)) / 2048.0
         g = np.array([f'{cname}{"1" if h else "2"}' for h in hi], dtype=object)    # WFC1/UVIS1 = top chip
         for gg in set(g[ok]):
             groups.setdefault(gg, 0)
         anc = np.array([int(s) in anchors for s in d['sidx']])
-        per[img] = dict(ok=ok, yt=np.clip(yt, 0, 1.1), xt=(xr - 2048.0) / 2048.0, mag=mg, grp=g, Jg=Jg, anchor=anc,
+        per[img] = dict(n_jac=n_jac, ok=ok, yt=np.clip(yt, 0, 1.1), xt=(xr - 2048.0) / 2048.0, mag=mg, grp=g, Jg=Jg, anchor=anc,
                         tau=np.full(d['n'], (_year(meta['hst_time_mjd']) - t0) / 10.0), year=_year(meta['hst_time_mjd']))
         mags.append(mg[ok])
     allm = np.concatenate(mags) if mags else np.array([0.0])
@@ -187,9 +199,20 @@ def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None):
     return n_img, dr
 
 
-def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, ridge=1e-6):
+def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, C_vT=None, ridge=1e-6):
+    """gamma increment from the current residuals.  Each star's 5 astrometric parameters are marginalised (Schur
+    complement with its conditional posterior covariance C_vT from the last solve): a CTE shift that is constant in
+    time for a star is absorbed by its position, a time-growing one by its PM except where the population / Gaia PM
+    prior forbids it -- without this the gamma / star block-descent zig-zags and does not converge."""
     ngam = ngrp * 2 * nf
     H = np.zeros((ngam, ngam)); g = np.zeros(ngam); nuse = np.zeros(ngrp, int)
+    elig = np.flatnonzero(member_mask)
+    for img in image_names:                                        # + alignment stars
+        d = solver._img_data.get(img)
+        if d is not None:
+            elig = np.union1d(elig, d['sidx'][d['use_for_fit']])
+    cpos = np.full(solver.n_stars, -1); cpos[elig] = np.arange(len(elig))
+    cross = np.zeros((len(elig), ngam, 5)) if C_vT is not None else None   # sum over detections of D^T W JU
     nr = solver.N_R
     for img in image_names:
         d = solver._img_data.get(img); p = per.get(img)
@@ -216,13 +239,20 @@ def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, ri
         H += np.einsum('nia,nij,njb->ab', Ds, Ws, Ds)
         g += np.einsum('nia,nij,nj->a', Ds, Ws, rs)
         np.add.at(nuse, p['gi'][sel], 1)
+        if cross is not None:
+            Hx = np.einsum('nia,nij,njk->nak', Ds, Ws, d['JU'][sel])      # residual rises by +JU dv
+            np.add.at(cross, cpos[d['sidx'][sel]], Hx)
+    if cross is not None and len(elig):
+        Cv = C_vT[elig]
+        live = (np.abs(Cv).reshape(len(elig), -1).max(1) > 0) & (np.abs(cross).reshape(len(elig), -1).max(1) > 0)
+        H -= np.einsum('nak,nkl,nbl->ab', cross[live], Cv[live], cross[live])
     lam = ridge * max(np.trace(H), 1e-30) / ngam
     C = np.linalg.inv(H + lam * np.eye(ngam))
     return C @ g, C, nuse
 
 
 def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, member_sidx, mu_pop, r, a_arr,
-               anchor_sidx=None, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
+               C_vT=None, anchor_sidx=None, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
     """Returns (r, mu_pop, C_shared, C_vT, a_arr, info).  solve_fn(member_sidx, mu, r, fix_r_arg, z_weights_arg)
     is the caller's pop-fit solve (run_pop_fit._solve) so every prior/anchor/weight is the production one."""
     t_start = time.time()
@@ -230,16 +260,17 @@ def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, m
     ngrp = len(groups)
     print("\n" + "-" * 60)
     print(f"  CTE phase v2: groups {groups}, {nf} basis terms x 2 directions per group, time_order={time_order}, "
-          f"{len(per)}/{len(image_names)} images with CTE geometry; mag norm ({m_med:.2f}, {m_sd:.2f})")
+          f"{len(per)}/{len(image_names)} images with CTE geometry; mag norm ({m_med:.2f}, {m_sd:.2f}); official-GDC "
+          f"Jacobian per detection for {sum(p['n_jac'] for p in per.values())} detections (others: per-chip linear fit)")
     if ngrp == 0:
         print("  CTE phase v2: no ACS/WFC or WFC3/UVIS detections with raw coordinates -- skipped")
         return r, mu_pop, None, None, a_arr, dict(skipped=True)
     member_mask = np.zeros(solver.n_stars, bool); member_mask[np.asarray(member_sidx, int)] = True
     gamma = np.zeros(ngrp * 2 * nf); C_gam = None; hist = [dict(iter=0, mu=[float(mu_pop[0]), float(mu_pop[1])])]
-    C_shared = C_vT = None
+    C_shared = None
     r_base = np.array(r, float).copy()          # frozen frame (fix_r) or current start (free r)
     for it in range(1, n_iter + 1):
-        dg, C_gam, nuse = _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp)
+        dg, C_gam, nuse = _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, C_vT=C_vT)
         gamma = gamma + dg
         stats = []
         n_img, dr = _apply(solver, image_names, per, r_base if fix_r else r, gamma, nf, ngrp, stats)

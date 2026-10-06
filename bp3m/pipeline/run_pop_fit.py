@@ -3210,12 +3210,12 @@ def run_pop_fit(
         from .cte_popfit_v2 import run_cte_v2
         _mu_nocte = mu_pop_current.copy()
         _frozen = C_shared_joint is None
-        _, _, _, _, _a_cte, _, _ = _solve(member_sidx, mu_pop_current, r_current, fix_r_arg=_frozen,
-                                          z_weights_arg=z_weights_final)
+        _, _, _, _CvT_cte, _a_cte, _, _ = _solve(member_sidx, mu_pop_current, r_current, fix_r_arg=_frozen,
+                                                 z_weights_arg=z_weights_final)
         r_current, mu_pop_current, _C_cte, _, _, _cte_info = run_cte_v2(
             solver, image_names, filtered_spi, star_id_to_idx,
             lambda m, mu, r, fx, z: _solve(m, mu, r, fix_r_arg=fx, z_weights_arg=z),
-            member_sidx, mu_pop_current, r_current, _a_cte,
+            member_sidx, mu_pop_current, r_current, _a_cte, C_vT=_CvT_cte,
             anchor_sidx=_qso_sidx, fix_r=_frozen, z_weights=z_weights_final,
             n_iter=cte_v2_n_iter, time_order=cte_v2_time_order, output_dir=output_pfr)
         if not _cte_info.get('skipped'):
