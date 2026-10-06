@@ -203,7 +203,7 @@ def _apply(solver, image_names, per, r, gamma, nf, ngrp, stats=None, z_weights=N
 
 
 def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, z_weights=None, sigma_pm=None,
-                   sigma_plx_tot=None, ridge=1e-6):
+                   sigma_plx_tot=None, gamma_now=None, sigma_gamma=0.03, ridge=1e-6):
     """gamma increment from the current residuals, with every eligible star's 5 astrometric parameters marginalised
     (Schur complement).  The star blocks are built HERE from the same z-weighted precisions as the gamma terms plus
     the production priors (Gaia prior, 2p diffuse prior for non-members, population PM/parallax prior for members,
@@ -271,13 +271,19 @@ def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, z_
         Hvi = np.linalg.inv(Hv[live] + (1e-12 * tr)[:, None, None] * np.eye(5))
         H -= np.einsum('nak,nkl,nbl->ab', cross[live], Hvi, cross[live])
     H = 0.5 * (H + H.T)
+    # Gaussian prior on the TOTAL gamma (sigma_gamma px per coefficient).  With star positions marginalised, a CTE
+    # pattern that is constant in time for each star is (nearly) degenerate whenever pointings repeat; without the
+    # prior the step fills those directions with noise and the outer loop runs away (Leo_P 10-06).
+    Lp = np.eye(ngam) / sigma_gamma ** 2
+    if gamma_now is not None:
+        g = g - Lp @ gamma_now
     lam = ridge * max(np.trace(H), 1e-30) / ngam
-    C = np.linalg.inv(H + lam * np.eye(ngam))
+    C = np.linalg.inv(H + Lp + lam * np.eye(ngam))
     return C @ g, C, nuse
 
 
 def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, member_sidx, mu_pop, r, a_arr,
-               C_vT=None, anchor_sidx=None, sigma_pm=None, sigma_plx_tot=None, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
+               C_vT=None, anchor_sidx=None, sigma_pm=None, sigma_plx_tot=None, sigma_gamma=0.03, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
     """Returns (r, mu_pop, C_shared, C_vT, a_arr, info).  solve_fn(member_sidx, mu, r, fix_r_arg, z_weights_arg)
     is the caller's pop-fit solve (run_pop_fit._solve) so every prior/anchor/weight is the production one."""
     t_start = time.time()
@@ -296,7 +302,8 @@ def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, m
     r_base = np.array(r, float).copy()          # frozen frame (fix_r) or current start (free r)
     for it in range(1, n_iter + 1):
         dg, C_gam, nuse = _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, z_weights=z_weights,
-                                         sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot)
+                                         sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, gamma_now=gamma,
+                                         sigma_gamma=sigma_gamma)
         gamma = gamma + dg
         stats = []
         n_img, dr = _apply(solver, image_names, per, r_base if fix_r else r, gamma, nf, ngrp, stats, z_weights)
@@ -324,7 +331,7 @@ def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, m
     info = dict(groups=groups, n_basis=nf, time_order=time_order, basis='yt*[1,xt] x [1,m,m^2] x [1,tau]',
                 t0={'ACS': 2002.165, 'UVIS': 2009.37}, tau_unit_yr=10.0, y_readout={'top': _Y_READOUT_TOP, 'bot': _Y_READOUT_BOT},
                 y_split={'ACS': 2048.0, 'UVIS': 2047.0}, mag_norm=[m_med, m_sd], gamma=gamma.tolist(), sigma_gamma=sg.tolist(),
-                layout='[group][x block | y block][basis]', history=hist, seconds=round(time.time() - t_start, 1),
+                layout='[group][x block | y block][basis]', sigma_gamma_prior_px=sigma_gamma, history=hist, seconds=round(time.time() - t_start, 1),
                 note='gamma fitted on members + alignment stars (anchors and diffuse HST-only non-members excluded); '
                      'displacements projected off each image alignment design; correction = minus the toward-readout shift')
     if output_dir is not None:
