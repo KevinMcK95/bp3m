@@ -297,6 +297,10 @@ def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, m
         print("  CTE phase v2: no ACS/WFC or WFC3/UVIS detections with raw coordinates -- skipped")
         return r, mu_pop, None, None, a_arr, dict(skipped=True)
     member_mask = np.zeros(solver.n_stars, bool); member_mask[np.asarray(member_sidx, int)] = True
+    import os as _os
+    if _os.environ.get('CTE_V2_SELFTEST') == '1':
+        return _selftest(solver, image_names, per, groups, nf, solve_fn, member_sidx, mu_pop, r, a_arr, member_mask,
+                         fix_r, z_weights, sigma_pm, sigma_plx_tot)
     gamma = np.zeros(ngrp * 2 * nf); C_gam = None; hist = [dict(iter=0, mu=[float(mu_pop[0]), float(mu_pop[1])])]
     C_shared = None
     r_base = np.array(r, float).copy()          # frozen frame (fix_r) or current start (free r)
@@ -381,3 +385,52 @@ def _plot_trends(solver, image_names, per, r, a_arr, member_mask, path):
         fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True); fig.savefig(path, dpi=110); plt.close(fig)
     except Exception as exc:
         print(f"  WARNING: CTE v2 trend plot failed: {exc}")
+
+
+def _selftest(solver, image_names, per, groups, nf, solve_fn, member_sidx, mu_pop, r, a_arr, member_mask, fix_r,
+              z_weights, sigma_pm, sigma_plx_tot):
+    """CTE_V2_SELFTEST=1: inject a known gamma into the HST positions of the solved state (with the frozen frame absorbing
+    the representable part, as the upstream alignment would), re-solve the stars, and check (1) one gamma step recovers
+    gamma_true, (2) after applying it a second step is ~0.  Prints and returns without changing the solution."""
+    from bp3m.astro_utils import build_X_matrices
+    ngrp = len(groups); ngam = ngrp * 2 * nf
+    g_true = np.zeros(ngam)
+    for gi in range(ngrp):
+        g_true[gi * 2 * nf + nf + 0] = 0.05     # y block, yt term
+        g_true[gi * 2 * nf + nf + 1] = 0.03     # y block, yt * m'
+    print(f"  CTE v2 SELFTEST: injecting gamma_true (y: yt=0.05 px, yt*m'=0.03 px per group), fix_r={fix_r}")
+    keep = {img: (solver._img_data[img]['X_c_nocte'].copy(), solver._img_data[img]['Y_c_nocte'].copy(),
+                  solver._img_data[img]['X_mat'].copy()) for img in per if img in solver._img_data}
+    r0 = np.array(r, float).copy()
+    # positions with CTE: X_c_nocte + delta_true (the apply routine subtracts gamma from X_c_nocte, so a NEGATIVE apply
+    # of g_true adds it), then the frame absorbs the representable part: r_true = r0 + dr
+    n_img, dr = _apply(solver, image_names, per, r0, -g_true, nf, ngrp, None, z_weights)
+    for img in per:
+        d = solver._img_data.get(img)
+        if d is not None:
+            d['X_c_nocte'] = d['X_c'].copy(); d['Y_c_nocte'] = d['Y_c'].copy()
+    r_inj = r0 + dr if fix_r else r0
+    _, mu1, _, _, a1, _, _ = solve_fn(member_sidx, mu_pop, r_inj, fix_r, z_weights)
+    g1, C1, nuse = _fit_increment(solver, image_names, per, r_inj, a1, member_mask, nf, ngrp, z_weights=z_weights,
+                                  sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, gamma_now=np.zeros(ngam), sigma_gamma=1.0)
+    for gi, gname in enumerate(groups):
+        o = gi * 2 * nf + nf
+        print(f"    {gname:6s} n={nuse[gi]:6d}  y[yt]: true 0.050 rec {g1[o]:+.4f} +- {np.sqrt(C1[o, o]):.4f}   "
+              f"y[yt*m]: true 0.030 rec {g1[o + 1]:+.4f} +- {np.sqrt(C1[o + 1, o + 1]):.4f}   max|other| {np.max(np.abs(np.delete(g1[gi*2*nf:(gi+1)*2*nf], [nf, nf + 1]))):.4f}")
+    # apply the recovered gamma and take a second step
+    n_img, dr2 = _apply(solver, image_names, per, r_inj, g1, nf, ngrp, None, z_weights)
+    r_cor = r_inj + dr2 if fix_r else r_inj
+    _, mu2, _, _, a2, _, _ = solve_fn(member_sidx, mu1, r_cor, fix_r, z_weights)
+    g2, _, _ = _fit_increment(solver, image_names, per, r_cor, a2, member_mask, nf, ngrp, z_weights=z_weights,
+                              sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, gamma_now=g1, sigma_gamma=1.0)
+    print(f"    second step after applying the recovered gamma: max|dgamma| = {np.max(np.abs(g2)):.4f} px "
+          f"(should be << 0.05); mu: injected-state {mu1[0]:+.4f},{mu1[1]:+.4f} -> corrected {mu2[0]:+.4f},{mu2[1]:+.4f}")
+    # restore
+    for img, (xc, yc, X) in keep.items():
+        d = solver._img_data[img]; d['X_c_nocte'], d['Y_c_nocte'] = xc, yc; d['X_c'], d['Y_c'] = xc.copy(), yc.copy()
+        Xn = build_X_matrices(xc, yc, X[:, 0, 4], X[:, 0, 5], X[:, 1, 4], X[:, 1, 5], poly_order=solver.poly_order)
+        if getattr(solver, 'fit_chip_offset', False):
+            Xn = solver._append_chip_cols(Xn, d.get('chip_hi'))
+        d['X_mat'] = Xn
+    _, mu_r, C_sh, C_v, a_r, _, _ = solve_fn(member_sidx, mu_pop, r0, fix_r, z_weights)
+    return r0, mu_r, C_sh, C_v, a_r, dict(skipped=True, selftest=True)
