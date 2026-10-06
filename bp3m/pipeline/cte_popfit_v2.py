@@ -413,6 +413,9 @@ def _selftest(solver, image_names, per, groups, nf, solve_fn, member_sidx, mu_po
     keep = {img: (solver._img_data[img]['X_c_nocte'].copy(), solver._img_data[img]['Y_c_nocte'].copy(),
                   solver._img_data[img]['X_mat'].copy()) for img in per if img in solver._img_data}
     r0 = np.array(r, float).copy()
+    # baseline: the step on the UNinjected state (the data already contain real CTE)
+    g0, _, _ = _fit_increment(solver, image_names, per, r0, a_arr, member_mask, nf, ngrp, z_weights=z_weights,
+                              sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, gamma_now=np.zeros(ngam), sigma_gamma=1.0)
     # positions with CTE: X_c_nocte + delta_true (the apply routine subtracts gamma from X_c_nocte, so a NEGATIVE apply
     # of g_true adds it), then the frame absorbs the representable part: r_true = r0 + dr
     n_img, dr = _apply(solver, image_names, per, r0, -g_true, nf, ngrp, None, z_weights)
@@ -426,10 +429,11 @@ def _selftest(solver, image_names, per, groups, nf, solve_fn, member_sidx, mu_po
     _, a1 = _conditioned(solve_fn, member_sidx, mu1, r_inj, z_weights)
     g1, C1, nuse = _fit_increment(solver, image_names, per, r_inj, a1, member_mask, nf, ngrp, z_weights=z_weights,
                                   sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, gamma_now=np.zeros(ngam), sigma_gamma=1.0)
+    sg = np.sqrt(np.diag(C1)); dd = g1 - g0
     for gi, gname in enumerate(groups):
-        o = gi * 2 * nf + nf
-        print(f"    {gname:6s} n={nuse[gi]:6d}  y[yt]: true 0.050 rec {g1[o]:+.4f} +- {np.sqrt(C1[o, o]):.4f}   "
-              f"y[yt*m]: true 0.030 rec {g1[o + 1]:+.4f} +- {np.sqrt(C1[o + 1, o + 1]):.4f}   max|other| {np.max(np.abs(np.delete(g1[gi*2*nf:(gi+1)*2*nf], [nf, nf + 1]))):.4f}")
+        o = gi * 2 * nf + nf; blk = np.delete(np.arange(gi * 2 * nf, (gi + 1) * 2 * nf), [nf, nf + 1])
+        print(f"    {gname:6s} n={nuse[gi]:6d}  injected-minus-baseline  y[yt]: true 0.050 rec {dd[o]:+.4f} +- {sg[o]:.4f}   "
+              f"y[yt*m]: true 0.030 rec {dd[o + 1]:+.4f} +- {sg[o + 1]:.4f}   other terms max|d|/sigma {np.max(np.abs(dd[blk] / sg[blk])):.1f}")
     # apply the recovered gamma and take a second step
     n_img, dr2 = _apply(solver, image_names, per, r_inj, g1, nf, ngrp, None, z_weights)
     r_cor = r_inj + dr2 if fix_r else r_inj
@@ -438,8 +442,11 @@ def _selftest(solver, image_names, per, groups, nf, solve_fn, member_sidx, mu_po
     _, a2 = _conditioned(solve_fn, member_sidx, mu2, r_cor, z_weights)
     g2, _, _ = _fit_increment(solver, image_names, per, r_cor, a2, member_mask, nf, ngrp, z_weights=z_weights,
                               sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, gamma_now=g1, sigma_gamma=1.0)
-    print(f"    second step after applying the recovered gamma: max|dgamma| = {np.max(np.abs(g2)):.4f} px "
-          f"(should be << 0.05); mu: injected-state {mu1[0]:+.4f},{mu1[1]:+.4f} -> corrected {mu2[0]:+.4f},{mu2[1]:+.4f}")
+    z2 = np.abs(g2) / sg
+    print(f"    second step after applying the recovered gamma: max|dgamma|/sigma = {z2.max():.2f}, median {np.median(z2):.2f} "
+          f"(consistent loop: << 1); max|dgamma| on well-measured terms (sigma<0.02 px) = "
+          f"{np.max(np.abs(g2[sg < 0.02])) if (sg < 0.02).any() else float('nan'):.4f} px; "
+          f"mu: injected-state {mu1[0]:+.4f},{mu1[1]:+.4f} -> corrected {mu2[0]:+.4f},{mu2[1]:+.4f}")
     # restore
     for img, (xc, yc, X) in keep.items():
         d = solver._img_data[img]; d['X_c_nocte'], d['Y_c_nocte'] = xc, yc; d['X_c'], d['Y_c'] = xc.copy(), yc.copy()
