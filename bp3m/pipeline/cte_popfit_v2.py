@@ -282,6 +282,14 @@ def _fit_increment(solver, image_names, per, r, a_arr, member_mask, nf, ngrp, z_
     return C @ g, C, nuse
 
 
+def _conditioned(solve_fn, member_sidx, mu, r, z_weights):
+    """Star posteriors (C_vT, a) conditioned on exactly (r, mu).  _joint_solve_pop returns `a` computed at its INPUT
+    (r, mu) while returning UPDATED (r, mu); feeding that stale `a` against the updated frame put every frame / mu change
+    into the CTE residuals (the 10-06 runaway).  A fixed-r call at the current values gives the consistent `a`."""
+    _, _, _, C_vT, a, _, _ = solve_fn(member_sidx, mu, r, True, z_weights)
+    return C_vT, a
+
+
 def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, member_sidx, mu_pop, r, a_arr,
                C_vT=None, anchor_sidx=None, sigma_pm=None, sigma_plx_tot=None, sigma_gamma=0.03, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
     """Returns (r, mu_pop, C_shared, C_vT, a_arr, info).  solve_fn(member_sidx, mu, r, fix_r_arg, z_weights_arg)
@@ -298,6 +306,7 @@ def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, m
         return r, mu_pop, None, None, a_arr, dict(skipped=True)
     member_mask = np.zeros(solver.n_stars, bool); member_mask[np.asarray(member_sidx, int)] = True
     import os as _os
+    C_vT, a_arr = _conditioned(solve_fn, member_sidx, mu_pop, r, z_weights)
     if _os.environ.get('CTE_V2_SELFTEST') == '1':
         return _selftest(solver, image_names, per, groups, nf, solve_fn, member_sidx, mu_pop, r, a_arr, member_mask,
                          fix_r, z_weights, sigma_pm, sigma_plx_tot)
@@ -317,13 +326,15 @@ def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, m
                   f"(> {MAX_SHIFT_PX} px) -- diverging; reverting to the uncorrected positions and frame")
             gamma = np.zeros_like(gamma); _apply(solver, image_names, per, r_base, gamma, nf, ngrp, None, z_weights)
             r = r_base
-            _, mu_pop, C_shared, C_vT, a_arr, _, _ = solve_fn(member_sidx, mu_pop, r, fix_r, z_weights)
+            _, mu_pop, C_shared, _, _, _, _ = solve_fn(member_sidx, mu_pop, r, fix_r, z_weights)
+            C_vT, a_arr = _conditioned(solve_fn, member_sidx, mu_pop, r, z_weights)
             hist.append(dict(iter=it, reverted=True)); break
         r_use = r_base + dr if fix_r else r
-        r_new, mu_new, C_shared, C_vT, a_arr, _, _ = solve_fn(member_sidx, mu_pop, r_use, fix_r, z_weights)
+        r_new, mu_new, C_shared, _, _, _, _ = solve_fn(member_sidx, mu_pop, r_use, fix_r, z_weights)
         dmu = float(np.max(np.abs(np.asarray(mu_new) - np.asarray(mu_pop))))
         r = r_use if fix_r else r_new
         mu_pop = mu_new
+        C_vT, a_arr = _conditioned(solve_fn, member_sidx, mu_pop, r, z_weights)
         hist.append(dict(iter=it, mu=[float(mu_pop[0]), float(mu_pop[1])], dmu=dmu, max_dgamma=float(np.max(np.abs(dg))),
                          n_det_used=nuse.tolist(), shift_median_px=float(np.median(mag)), shift_p99_px=float(np.percentile(mag, 99))))
         print(f"    CTE iter {it}/{n_iter}: mu_pop=({mu_pop[0]:+.4f}, {mu_pop[1]:+.4f})  dmu={dmu:.2e}  "
@@ -410,7 +421,9 @@ def _selftest(solver, image_names, per, groups, nf, solve_fn, member_sidx, mu_po
         if d is not None:
             d['X_c_nocte'] = d['X_c'].copy(); d['Y_c_nocte'] = d['Y_c'].copy()
     r_inj = r0 + dr if fix_r else r0
-    _, mu1, _, _, a1, _, _ = solve_fn(member_sidx, mu_pop, r_inj, fix_r, z_weights)
+    r1, mu1, _, _, _, _, _ = solve_fn(member_sidx, mu_pop, r_inj, fix_r, z_weights)
+    r_inj = r_inj if fix_r else r1
+    _, a1 = _conditioned(solve_fn, member_sidx, mu1, r_inj, z_weights)
     g1, C1, nuse = _fit_increment(solver, image_names, per, r_inj, a1, member_mask, nf, ngrp, z_weights=z_weights,
                                   sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, gamma_now=np.zeros(ngam), sigma_gamma=1.0)
     for gi, gname in enumerate(groups):
@@ -420,7 +433,9 @@ def _selftest(solver, image_names, per, groups, nf, solve_fn, member_sidx, mu_po
     # apply the recovered gamma and take a second step
     n_img, dr2 = _apply(solver, image_names, per, r_inj, g1, nf, ngrp, None, z_weights)
     r_cor = r_inj + dr2 if fix_r else r_inj
-    _, mu2, _, _, a2, _, _ = solve_fn(member_sidx, mu1, r_cor, fix_r, z_weights)
+    r2, mu2, _, _, _, _, _ = solve_fn(member_sidx, mu1, r_cor, fix_r, z_weights)
+    r_cor = r_cor if fix_r else r2
+    _, a2 = _conditioned(solve_fn, member_sidx, mu2, r_cor, z_weights)
     g2, _, _ = _fit_increment(solver, image_names, per, r_cor, a2, member_mask, nf, ngrp, z_weights=z_weights,
                               sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, gamma_now=g1, sigma_gamma=1.0)
     print(f"    second step after applying the recovered gamma: max|dgamma| = {np.max(np.abs(g2)):.4f} px "
