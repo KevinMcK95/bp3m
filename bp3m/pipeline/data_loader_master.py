@@ -222,6 +222,68 @@ def _apply_overrides(base: str, fd: dict | None, jac) -> int:
     return n
 
 
+# Per-band source split (2026-10-06).  HST-only sources whose master row is listed here (galaxy anchors) are split
+# into one solver source per camera/filter band (DETECTOR/FILTER, e.g. WFC/F814W vs UVIS/F814W): each band's
+# eGSF template has its own centre, so positions are only compared across epochs WITHIN a band (equivalent to a
+# free per-band position offset).  The band with the most detections keeps the deterministic id -(si+1); the
+# others get -(si+1) - k*BAND_ID_STRIDE (k = 1, 2, ...).  Bands with < 2 detections are dropped (no motion
+# information).  BAND_SPLIT_IDS maps si -> [(Gaia_id, band, n_det), ...] for the caller (anchor priors).
+BAND_ID_STRIDE = 10**9
+_BAND_SPLIT_SI: set = set()
+BAND_SPLIT_IDS: dict = {}
+_BAND_CACHE: dict = {}
+
+
+def set_band_split(source_indices) -> int:
+    _BAND_SPLIT_SI.clear()
+    _BAND_SPLIT_SI.update(int(s) for s in (source_indices or ()))
+    BAND_SPLIT_IDS.clear()
+    return len(_BAND_SPLIT_SI)
+
+
+def _band_of(hst_root: Path, sub_name: str) -> str:
+    base = _sub_name_to_base(sub_name)
+    if base not in _BAND_CACHE:
+        from astropy.io import fits
+        h = fits.getheader(hst_root / base / f"{base}_flc.fits", 0)
+        filt = next((str(h.get(k, '')).strip() for k in ('FILTER', 'FILTER1', 'FILTER2')
+                     if str(h.get(k, '')).strip().upper().startswith('F')), '?')
+        _BAND_CACHE[base] = f"{str(h.get('DETECTOR', '?')).strip()}/{filt}"
+    return _BAND_CACHE[base]
+
+
+def _split_recs_by_band(recs: list, hst_root: Path) -> list:
+    out, n_split, n_pieces, n_dropped = [], 0, 0, 0
+    for rec in recs:
+        si = int(rec.get("source_index", -1))
+        if rec["has_gaia"] or si not in _BAND_SPLIT_SI:
+            out.append(rec)
+            continue
+        by_band: dict = {}
+        for det in rec["detections"]:
+            by_band.setdefault(_band_of(hst_root, det[0]), ([], []))[0].append(det)
+        for det in rec.get("outlier_detections", []):
+            by_band.setdefault(_band_of(hst_root, det[0]), ([], []))[1].append(det)
+        order = sorted(by_band, key=lambda b: -len(by_band[b][0]))
+        ids = []
+        for k, band in enumerate(order):
+            prim, outl = by_band[band]
+            if len(prim) < 2:
+                n_dropped += len(prim) + len(outl)
+                continue
+            piece = dict(rec)
+            piece["detections"], piece["outlier_detections"] = prim, outl
+            piece["Gaia_id"] = np.int64(-(si + 1) - len(ids) * BAND_ID_STRIDE)
+            ids.append((int(piece["Gaia_id"]), band, len(prim)))
+            out.append(piece)
+        BAND_SPLIT_IDS[si] = ids
+        n_split += len(ids) > 1
+        n_pieces += len(ids)
+    print(f"  Band split: {len(BAND_SPLIT_IDS)} listed sources -> {n_pieces} per-band sources "
+          f"({n_split} span >1 band; {n_dropped} detections in single-detection bands dropped)")
+    return out
+
+
 def _load_fits_catalog(cat_path: Path) -> dict | None:
     """Load a _flc_catalog.fits file into numpy arrays. Returns None if missing."""
     if not cat_path.exists():
@@ -618,6 +680,9 @@ def load_master_v2(
         print(f"  Deduplication: removed {n_stripped} conflicting detections "
               f"({len(valid_recs) - len(dedup_recs)} sources dropped below threshold)")
     valid_recs = dedup_recs
+
+    if _BAND_SPLIT_SI:
+        valid_recs = _split_recs_by_band(valid_recs, hst_root)
 
     if exclude_images:
         _ex = {str(x) for x in exclude_images}; kept = []; n_drop_det = 0

@@ -2439,12 +2439,17 @@ def run_pop_fit(
         from .secular_aberration import secular_aberration_pm
         _mc_g = pd.read_csv(data_root / field_name / 'hst_xmatch' / 'master_combined_v2.csv', usecols=['ra0', 'dec0'], low_memory=False)
         _gi, _gra, _gde = [], [], []
+        from bp3m.pipeline.data_loader_master import BAND_SPLIT_IDS
         for _si in sorted(_GALAXY_ANCHOR_SI):
-            _sx = star_id_to_idx.get(int(-(_si + 1)))
-            if _sx is None or _si >= len(_mc_g):
+            if _si >= len(_mc_g):
                 continue
             _a, _d = secular_aberration_pm(float(_mc_g.ra0.iloc[_si]), float(_mc_g.dec0.iloc[_si]))
-            _gi.append(_sx); _gra.append(float(_a) * 1e-3); _gde.append(float(_d) * 1e-3)
+            # --galaxy_split_bands: every per-band piece of the galaxy is its own zero-motion anchor
+            for _gid in ([g for g, _b, _n in BAND_SPLIT_IDS[_si]] if _si in BAND_SPLIT_IDS else [-(_si + 1)]):
+                _sx = star_id_to_idx.get(int(_gid))
+                if _sx is None:
+                    continue
+                _gi.append(_sx); _gra.append(float(_a) * 1e-3); _gde.append(float(_d) * 1e-3)
         if _gi:
             _qso_sidx = np.concatenate([_qso_sidx, np.array(_gi, int)]) if _qso_sidx is not None else np.array(_gi, int)
             _qso_pmra_mas = np.concatenate([_qso_pmra_mas, _gra]) if _qso_pmra_mas is not None else np.array(_gra)
@@ -3932,6 +3937,10 @@ def main(argv=None):
     parser.add_argument('--galaxy_anchors', type=str, default=None,
                         help='CSV with source_index (master_combined_v2 rows) of background galaxies used as zero-motion '
                              'anchors: secular-aberration PM + zero-parallax priors (QSO widths), never members (2026-10-04)')
+    parser.add_argument('--galaxy_split_bands', action='store_true',
+                        help='split every galaxy anchor into one source per camera/filter band (DETECTOR/FILTER), each '
+                             'anchored at zero motion: per-band eGSF templates are only compared within their band '
+                             '(free per-band position offset; 2026-10-06)')
     parser.add_argument('--exclude_images', type=str, default=None,
                         help='text file, one exposure name (obs id) per line: their detections are excluded from the '
                              'v2 master data (epoch / program subset tests, 2026-10-06)')
@@ -4005,6 +4014,9 @@ def main(argv=None):
         global _GALAXY_ANCHOR_SI
         _GALAXY_ANCHOR_SI = set(pd.read_csv(args.galaxy_anchors).source_index.astype(int))
         print(f"  galaxy anchors: {len(_GALAXY_ANCHOR_SI)} source_index rows from {args.galaxy_anchors}")
+        if getattr(args, 'galaxy_split_bands', False):
+            from bp3m.pipeline.data_loader_master import set_band_split
+            print(f"  galaxy anchors split per camera/filter band: {set_band_split(_GALAXY_ANCHOR_SI)} sources")
     global _EXCLUDE_IMAGES
     _EXCLUDE_IMAGES = None
     if getattr(args, 'exclude_images', None):
