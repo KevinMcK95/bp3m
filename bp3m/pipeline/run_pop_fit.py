@@ -2083,6 +2083,9 @@ def run_pop_fit(
     no_plots: bool = False,
     plot_residuals: bool = False,
     fit_cte: bool = False,
+    fit_cte_v2: bool = False,
+    cte_v2_n_iter: int = 5,
+    cte_v2_time_order: int = 1,
     cte_mag_poly_order: int = 3,
     cte_spatial_order: int = 2,
     cte_time_poly_order: int = 0,
@@ -3200,6 +3203,28 @@ def run_pop_fit(
           f"Nσ_init={_nsig_init(mu_pop_current, C_shared_joint[n_r:, n_r:] if C_shared_joint is not None else np.diag(sigma_mu_joint ** 2)):.2f}")
     print(f"  Final members: {len(member_sidx)}")
 
+    # ── CTE phase v2 (2026-10-06): per-detection chip/camera CTE model, fitted inside the production solve ──
+    # Runs BEFORE the final posterior pass so mu_pop.json, stellar astrometry and the analytic posteriors are all
+    # CTE-corrected; membership and z-weights stay frozen.  See bp3m/pipeline/cte_popfit_v2.py.
+    if fit_cte_v2:
+        from .cte_popfit_v2 import run_cte_v2
+        _mu_nocte = mu_pop_current.copy()
+        _frozen = C_shared_joint is None
+        _, _, _, _, _a_cte, _, _ = _solve(member_sidx, mu_pop_current, r_current, fix_r_arg=_frozen,
+                                          z_weights_arg=z_weights_final)
+        r_current, mu_pop_current, _C_cte, _, _, _cte_info = run_cte_v2(
+            solver, image_names, filtered_spi, star_id_to_idx,
+            lambda m, mu, r, fx, z: _solve(m, mu, r, fix_r_arg=fx, z_weights_arg=z),
+            member_sidx, mu_pop_current, r_current, _a_cte,
+            anchor_sidx=_qso_sidx, fix_r=_frozen, z_weights=z_weights_final,
+            n_iter=cte_v2_n_iter, time_order=cte_v2_time_order, output_dir=output_pfr)
+        if not _cte_info.get('skipped'):
+            if not _frozen and _C_cte is not None:
+                C_shared_joint = _C_cte
+                sigma_mu_joint = np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
+            print(f"  CTE v2: mu_pop ({_mu_nocte[0]:+.4f}, {_mu_nocte[1]:+.4f}) -> "
+                  f"({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr")
+
     # ── Final posterior pass at convergence ───────────────────────────────────
     print("\n  Final posterior pass...")
     _, _, C_shared_final, C_vT_final, v_mean, _, K_img_final = _solve(
@@ -3693,6 +3718,8 @@ def run_pop_fit(
 
     # ── Optional CTE phase ────────────────────────────────────────────────────
     if fit_cte:
+        print("  WARNING: --fit_cte is the July CTE phase (members-only alignment, anchors dropped, no-op on unsplit "
+              "images; review 2026-10-06) -- use --fit_cte_v2")
         from .run_alignment_cte import run_cte_phase_after_popfit
         cte_params, r_cte, mu_pop_cte, _ = run_cte_phase_after_popfit(
             solver=solver,
@@ -3914,6 +3941,12 @@ def main(argv=None):
                         help='After pop-fit convergence, run a CTE phase: warm-start the '
                              'CTE model (γ only, r and μ_pop fixed), then jointly fit '
                              '(r, γ, μ_pop) with alpha and membership frozen.')
+    parser.add_argument('--fit_cte_v2', action='store_true',
+                        help='CTE phase v2 (2026-10-06): per-detection ACS/UVIS chip CTE model (readout distance x mag x '
+                             'time), fitted from members + alignment stars inside the production pop-fit solve (anchors, '
+                             'z-weights, frozen/free r kept), applied before the final posterior pass. Replaces --fit_cte.')
+    parser.add_argument('--cte_v2_n_iter', type=int, default=5, help='CTE v2 outer iterations (default 5)')
+    parser.add_argument('--cte_v2_time_order', type=int, default=1, help='CTE v2 time order: 0 constant, 1 + linear (default)')
     parser.add_argument('--cte_mag_poly_order', type=int, default=3,
                         help='CTE magnitude polynomial order (default 3)')
     parser.add_argument('--cte_spatial_order', type=int, default=2,
@@ -4126,6 +4159,9 @@ def main(argv=None):
         no_plots=args.no_plots,
         plot_residuals=args.plot_residuals,
         fit_cte=args.fit_cte,
+        fit_cte_v2=args.fit_cte_v2,
+        cte_v2_n_iter=args.cte_v2_n_iter,
+        cte_v2_time_order=args.cte_v2_time_order,
         cte_mag_poly_order=args.cte_mag_poly_order,
         cte_spatial_order=args.cte_spatial_order,
         cte_time_poly_order=args.cte_time_poly_order,
