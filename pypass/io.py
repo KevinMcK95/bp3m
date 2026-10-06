@@ -1117,6 +1117,22 @@ def run_photometry_fits(
                 pass
         _peak_mask = mask
 
+        # Opt-in HST noise model (test, 2026-10-06; env PYPASS_NOISE_FROM_ERR=1): per-pixel variance = ERR^2 from the
+        # calibrated FLC (same units as SCI; electrons for FLC -> gain 1), used as the TOTAL noise model in every pass
+        # (pypass then adds only its PSF-model term eps_psf*model).  Default off: production noise model unchanged.
+        _errnoise = None
+        if os.environ.get('PYPASS_NOISE_FROM_ERR') == '1' and 'noise_map' not in kwargs:
+            with fits.open(image_path) as _eh:
+                _e = _eh[sci_ext + 1]
+                if _e.name.upper() == 'ERR' and _e.data is not None and _e.data.shape == data.shape:
+                    _ev = np.asarray(_e.data, dtype=np.float64) ** 2
+                    _okv = np.isfinite(_ev) & (_ev > 0)
+                    _errnoise = np.where(_okv, _ev, np.median(_ev[_okv]) if _okv.any() else 1.0)
+            if verbose:
+                print(f"  Noise model   : HST ERR^2 (sci_ext {sci_ext + 1}) as total variance"
+                      + ("" if _errnoise is not None else "  [ERR not found -> default model]"))
+        _nkw = {'noise_map': _errnoise} if _errnoise is not None else {}
+
         result = run_photometry(
             data=data,
             psf_models=psf_cube,
@@ -1147,6 +1163,7 @@ def run_photometry_fits(
             _classify=False,
             backend=backend,
             conc_limit=conc_limit,
+            **_nkw,
             **kwargs,
         )
         if return_residual or CR_RECOVERY:
@@ -1172,7 +1189,7 @@ def run_photometry_fits(
                     sat_threshold=(sat_threshold if sat_threshold is not None else np.inf),
                     sigma_clip=sigma_clip, sigma_clip_sigma=sigma_clip_sigma, sigma_clip_iter=sigma_clip_iter,
                     return_residual=False, _apply_chi2_inflation=False, _classify=False,
-                    backend=backend, conc_limit=conc_limit, **kwargs)
+                    backend=backend, conc_limit=conc_limit, **_nkw, **kwargs)
             except Exception as _cre:
                 _rec2 = []
                 if verbose:

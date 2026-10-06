@@ -1892,6 +1892,10 @@ def run_photometry(
         mask = np.asarray(mask, dtype=bool)
     if noise_map is not None:
         noise_map = np.asarray(noise_map, dtype=np.float64)
+    # PYPASS_NOISE_FROM_ERR=1 (opt-in test, 2026-10-06): an external noise_map is the TOTAL per-pixel variance (HST ERR^2
+    # already contains every source's Poisson noise) -- the star-aware rebuild must not add star Poisson on top.
+    import os as _os_nm
+    _noise_total = noise_map is not None and _os_nm.environ.get('PYPASS_NOISE_FROM_ERR') == '1'
 
     # Prefilter the entire PSF cube once.  spline_filter is linear, so
     # bilinear combinations of prefiltered arrays equal the prefiltered
@@ -2030,6 +2034,10 @@ def run_photometry(
     def _rebuild_var(label=""):
         """Rebuild the star-aware variance image and update _fit_kw."""
         nonlocal _current_noise_map
+        if _noise_total:
+            _current_noise_map = noise_map
+            _fit_kw['noise_map'] = _current_noise_map
+            return
         _current_noise_map = build_variance_image(
             all_records, psf_cube, xs, ys, psf_scale, data.shape,
             gain, read_noise, x_offset, y_offset,
@@ -2286,7 +2294,7 @@ def run_photometry(
 
     # Build the final star-aware variance image.  Used for chi2 reporting in
     # diagnostics and saved alongside the residual in residual.fits.
-    _final_var_image = build_variance_image(
+    _final_var_image = noise_map if _noise_total else build_variance_image(
         all_records, psf_cube, xs, ys, psf_scale, data.shape,
         gain, read_noise, x_offset, y_offset,
         noise_map=noise_map,
