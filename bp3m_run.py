@@ -1303,12 +1303,10 @@ def main():
     # ── Step 4d: CFHT/UNIONS cross-matching (optional) ───────────────────────
     if args.use_cfht and not args.skip_crossmatch:
         from bp3m.pipeline.cross_match_cfht import run_cross_match_cfht
-        _ra0, _dec0, _sw0, _sh0 = args.pointings[0]
         run_cross_match_cfht(
             output_dir=output_dir, field_name=field,
             cfht_dir=args.cfht_dir,
-            ra=_ra0, dec=_dec0,
-            radius_deg=max(_sw0, _sh0),
+            pointings=args.pointings,
             gaia_csv=gaia_csv_path,
             force=args.force_rematch if hasattr(args, 'force_rematch')
             else False)

@@ -473,7 +473,7 @@ def _cfht_cache_keys(img_dir):
     return {'gdc_id': catalog_gdc_id(cat), 'matched_gaia_md5': md5}, gdc_file
 
 
-def _cfht_cache_status(img_dir, keys, gdc_file):
+def _cfht_cache_status(img_dir, keys, gdc_file, single_pointing=True):
     """('skip'|'run', reason).  Success AND failure are cached in
     xmatch_cfht_status.json; either is redone when a key changes.  A legacy
     matched_cfht.csv (no sidecar) is reused unless its catalogue was re-corrected
@@ -485,7 +485,12 @@ def _cfht_cache_status(img_dir, keys, gdc_file):
             st = _json.loads(sp.read_text())
         except Exception:
             return 'run', 'unreadable status'
-        if st.get('keys') != keys:
+        old_keys = st.get('keys') or {}
+        if 'cfht_exps_md5' not in old_keys and single_pointing:
+            # status written before the per-image exposure key existed: the
+            # single-pointing inventory it used is the current one
+            keys = {k: v for k, v in keys.items() if k != 'cfht_exps_md5'}
+        if old_keys != keys:
             return 'run', 'inputs changed'
         return 'skip', f"previously {st.get('status')}"
     if (img_dir / 'matched_cfht.csv').exists():
@@ -503,19 +508,46 @@ def _write_cfht_status(img_dir, keys, n, err):
         'timestamp': _dt.datetime.now().isoformat(timespec='seconds')}, indent=2))
 
 
+def _image_exposures(img_dir, dets):
+    """Coarse per-image gate: the inventory exposures whose MegaCam mosaic
+    could reach this HST image's centre (transformation.csv ra_cen/dec_cen).
+    Returns (subset of dets, md5 of its sorted expnums) — the md5 is a cache
+    key, so an image is rematched when its candidate exposure list changes."""
+    import hashlib
+    t = read_transformation(img_dir / 'transformation.csv')
+    ra_c, dec_c = float(t['ra_cen']), float(t['dec_cen'])
+    cosd = np.cos(np.radians(dec_c))
+    sep = np.hypot((dets.ra0 - ra_c) * cosd, dets.dec0 - dec_c)
+    sub = dets[sep < MEGACAM_HALF_DEG + 0.1].reset_index(drop=True)
+    ids = ','.join(str(e) for e in sorted(sub.expnum.astype(int)))
+    return sub, hashlib.md5(ids.encode()).hexdigest()
+
+
 def run_cross_match_cfht(output_dir, field_name, cfht_dir,
-                         ra, dec, radius_deg, gaia_csv=None,
-                         make_plots=True, force=False):
+                         ra=None, dec=None, radius_deg=None, gaia_csv=None,
+                         make_plots=True, force=False, pointings=None):
     """Step 4d driver: HST x CFHT/UNIONS cross-match for every PSF-fit image,
     via the shared gaia_cross_match single-image machinery (DELVE-parity
     outputs: per-exposure matched_cfht_<exp>.csv + 10-panel diagnostics +
-    processing logs, plus a union matched_cfht.csv per image)."""
+    processing logs, plus a union matched_cfht.csv per image).
+
+    pointings: list of (ra, dec, search_width, search_height) — the CFHT
+    exposure inventory is the union over all of them (multi-pointing fields,
+    e.g. streams).  Default: the single (ra, dec, radius_deg)."""
     t0 = time.time()
     field_dir = Path(output_dir) / field_name
     hst_root = field_dir / 'HST' / 'mastDownload' / 'HST'
     cfht_dir = Path(cfht_dir)
     print(f'\nStep 4d: HST x CFHT/UNIONS cross-match  (store: {cfht_dir})')
-    dets = cfht_exposure_inventory(cfht_dir, ra, dec, radius_deg)
+    if pointings is None:
+        pointings = [(ra, dec, radius_deg, radius_deg)]
+    inv = [cfht_exposure_inventory(cfht_dir, p_ra, p_dec, max(p_sw, p_sh))
+           for p_ra, p_dec, p_sw, p_sh in pointings]
+    dets = (pd.concat(inv, ignore_index=True).sort_values('sep_deg')
+            .drop_duplicates('expnum').reset_index(drop=True))
+    if len(pointings) > 1:
+        print(f'  inventory over {len(pointings)} pointings: '
+              + ', '.join(str(len(d)) for d in inv) + ' exposures each')
     if not len(dets):
         print('  no CFHT/UNIONS coverage for this field — skipping')
         return []
@@ -546,19 +578,25 @@ def run_cross_match_cfht(output_dir, field_name, cfht_dir,
     todo, why = [], {}
     for d in img_dirs:
         keys, gfile = _cfht_cache_keys(d)
-        act, reason = ('run', 'forced') if force else _cfht_cache_status(d, keys, gfile)
+        try:
+            d_dets, keys['cfht_exps_md5'] = _image_exposures(d, dets)
+        except Exception:
+            d_dets = dets      # no usable centre: let the footprint test decide
+        act, reason = (('run', 'forced') if force else
+                       _cfht_cache_status(d, keys, gfile,
+                                          single_pointing=len(pointings) == 1))
         if act == 'run':
-            todo.append((d, keys)); why[reason] = why.get(reason, 0) + 1
+            todo.append((d, keys, d_dets)); why[reason] = why.get(reason, 0) + 1
     print(f'  {len(img_dirs)} images with Gaia xmatch, {len(todo)} to do'
           + (f"  ({', '.join(f'{v} {k}' for k, v in why.items())})" if why else ''))
     det_cache: dict = {}
     results = []
-    for i, (d, keys) in enumerate(todo, 1):
+    for i, (d, keys, d_dets) in enumerate(todo, 1):
         # clear old products so a failed retry cannot re-read stale per-exposure matches
         for _old in list(d.glob('matched_cfht*.csv')):
             _old.unlink()
         nm, n, n_g, n_f, n_e, err = match_one_image(
-            d, dets, cfht_dir, gl, fill, det_cache, make_plots=make_plots)
+            d, d_dets, cfht_dir, gl, fill, det_cache, make_plots=make_plots)
         _write_cfht_status(d, keys, n, err)
         status = (f'{n} matches ({n_g} Gaia, {n_f} faint) '
                   f'across {n_e} CFHT exposures'
