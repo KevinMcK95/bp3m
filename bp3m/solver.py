@@ -919,8 +919,13 @@ class BP3MSolver:
 
             # Parallax factors: difference between HST epoch and Gaia epoch
             #Gaia has already removed the parallax, so no need to subtract plx at J2016
-            tele_xyz = get_tele_position(hst_time,curr_id='earth')
-            meta['tele_XYZ'] = tele_xyz
+            # Observer position: the loader supplies meta['tele_xyz'] (AU, barycentric
+            # ICRS) for JWST from its header ephemeris; HST uses the Earth centre
+            # (6.9e3 km orbit = 0.05 uas per mas of parallax).
+            tele_xyz = meta.get('tele_xyz')
+            if tele_xyz is None:
+                tele_xyz = get_tele_position(hst_time,curr_id='earth')
+            meta['tele_XYZ'] = np.asarray(tele_xyz, dtype=float)
             d_plx_ra,  d_plx_dec  = get_parallax_factors(ra_g, dec_g, tele_xyz)
 
             # U matrix for each star: (n, 2, 5)

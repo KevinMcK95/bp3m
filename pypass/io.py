@@ -21,18 +21,50 @@ warnings.filterwarnings(
 # PSF auto-detection
 # ---------------------------------------------------------------------------
 
-# Instrument/detector → prefix used in STDPSF filenames
+# Instrument/detector → prefix used in STDPSF/STDGDC filenames.
+# JWST entries (Jay Anderson's JWST1PASS library naming; adapted from Liwen Chen's
+# jwst1pass_py_v2/io.py): one file per detector, NIRCam long-wave detectors are
+# abbreviated NRCAL/NRCBL.
 _DETECTOR_PREFIX = {
     ('ACS',  'WFC'):  'ACSWFC',
     ('ACS',  'HRC'):  'ACSHRC',
     ('ACS',  'SBC'):  'ACSSBC',
     ('WFC3', 'UVIS'): 'WFC3UV',
     ('WFC3', 'IR'):   'WFC3IR',
+    ('MIRI',   'MIRIMAGE'): 'MIRI',
+    ('MIRI',   'MIRIM'):    'MIRI',
+    ('NIRISS', 'NIS'):      'NIRISS',
+    ('NIRCAM', 'NRCA1'): 'NRCA1', ('NIRCAM', 'NRCA2'): 'NRCA2',
+    ('NIRCAM', 'NRCA3'): 'NRCA3', ('NIRCAM', 'NRCA4'): 'NRCA4',
+    ('NIRCAM', 'NRCB1'): 'NRCB1', ('NIRCAM', 'NRCB2'): 'NRCB2',
+    ('NIRCAM', 'NRCB3'): 'NRCB3', ('NIRCAM', 'NRCB4'): 'NRCB4',
+    ('NIRCAM', 'NRCALONG'): 'NRCAL', ('NIRCAM', 'NRCBLONG'): 'NRCBL',
 }
+
+JWST_INSTRUMENTS = {'NIRCAM', 'NIRISS', 'MIRI'}
+
+
+def is_jwst(instrume) -> bool:
+    return str(instrume or '').strip().upper() in JWST_INSTRUMENTS
+
+
+def lib_subdir(instrume, detector):
+    """Directory under lib/STDPSFs (and lib/STDGDCs) holding this detector's files.
+
+    HST: the detector prefix itself (STDPSFs/ACSWFC/).  JWST: one directory per
+    instrument (STDPSFs/NIRCAM/ holds all ten NRC* detectors), the layout written
+    by ``bp3m-setup --telescope JWST``.
+    """
+    instr = str(instrume or '').strip().upper()
+    if is_jwst(instr):
+        return instr
+    return _DETECTOR_PREFIX.get((instr, str(detector or '').strip().upper()), '')
+
 
 # Science and DQ extension pairs, and PSF-grid y-offsets, per chip
 # (sci_ext, dq_ext, y_offset_for_psf_grid)
 # Used only as a fallback when the FITS file cannot be opened to read CCDCHIP.
+# JWST stage-2 _cal files: SCI=1, ERR=2, DQ=3, one detector per file.
 _CHIP_CONFIG = {
     ('ACS',  'WFC'):  [(1, 3, 0.0), (4, 6, 2048.0)],
     ('ACS',  'HRC'):  [(1, 2, 0.0)],
@@ -40,6 +72,7 @@ _CHIP_CONFIG = {
     ('WFC3', 'UVIS'): [(1, 3, 0.0), (4, 6, 2048.0)],
     ('WFC3', 'IR'):   [(1, 2, 0.0)],
 }
+_JWST_CHIP_CONFIG = [(1, 3, 0.0)]
 
 # y_offset (rows of bottom chip) to add to image-y for PSF grid / combined-frame lookup,
 # keyed by (instrume, detector, ccdchip_value).
@@ -194,7 +227,12 @@ def find_gdc(gdc_dir, header):
 
 
 def _extract_filter(header, instrume):
-    """Extract the science filter name from a FITS primary header."""
+    """Extract the science filter name from a FITS primary header.
+
+    JWST: NIRCam and MIRI name the band in FILTER; NIRISS imaging has FILTER=CLEAR
+    and the band in PUPIL (the library files are named by that band), so PUPIL is
+    the next keyword tried after FILTER.
+    """
     # ACS uses FILTER1 / FILTER2; pick the non-CLEAR one
     if instrume in ('ACS', ''):
         for key in ('FILTER1', 'FILTER2'):
@@ -202,7 +240,7 @@ def _extract_filter(header, instrume):
             if val and not val.startswith('CLEAR'):
                 return val
     # WFC3 and most other instruments use FILTER
-    for key in ('FILTER', 'FILTNAM1', 'FILTNAM2'):
+    for key in ('FILTER', 'PUPIL', 'FILTNAM1', 'FILTNAM2'):
         val = header.get(key, '').strip().upper()
         if val and not val.startswith('CLEAR'):
             return val
@@ -224,6 +262,8 @@ def get_chip_config(instrume, detector):
     y_offset is added to image-y to get detector-y for PSF grid lookup.
     """
     key = (instrume.strip().upper(), detector.strip().upper())
+    if is_jwst(key[0]):
+        return list(_JWST_CHIP_CONFIG)
     config = _CHIP_CONFIG.get(key)
     if config is None:
         warnings.warn(f"Unknown instrument/detector {key}; assuming single chip at ext 1.")
@@ -324,6 +364,7 @@ def load_stdpsf(path):
         xs = _read_psf_positions(hdr, 'IPSFX', nx_g)
         ys = _read_psf_positions(hdr, 'JPSFY', ny_g)
         if len(xs) == nx_g and len(ys) == ny_g:
+            psf_raw = _fill_empty_psf_nodes(psf_raw, xs, ys, path)
             return (psf_raw,
                     np.array(xs, dtype=np.float64),
                     np.array(ys, dtype=np.float64),
@@ -340,6 +381,34 @@ def load_stdpsf(path):
     warnings.warn(f"PSF grid positions not found; placing {n_psf} PSFs on "
                   f"a regular {ny_g}×{nx_g} grid.")
     return psf_raw[:ny_g * nx_g], xs_arr, ys_arr, int(psf_scale), (ny_g, nx_g)
+
+
+def _fill_empty_psf_nodes(psf_raw, xs, ys, path=''):
+    """Replace all-zero PSF grid nodes with the nearest populated node.
+
+    STDPSF_MIRI_* tables (3x3 grid) ship node (x=0, y=0) as all zeros (the Lyot /
+    coronagraph corner has no stars); interpolating it into stars nearby pulls the
+    PSF normalisation down and biases their fluxes high (found in the 2026-10 review
+    of jwst1pass_py_v2, which inherits the same tables).  Nodes are ordered
+    y-major (index = iy * nx + ix) as read by load_stdpsf.
+    """
+    nx, ny = len(xs), len(ys)
+    if psf_raw.shape[0] != nx * ny:
+        return psf_raw
+    sums = psf_raw.reshape(nx * ny, -1).sum(axis=1)
+    empty = np.where(~(np.abs(sums) > 0))[0]
+    if empty.size == 0 or empty.size == nx * ny:
+        return psf_raw
+    out = psf_raw.copy()
+    gx = np.array([xs[i % nx] for i in range(nx * ny)], float)
+    gy = np.array([ys[i // nx] for i in range(nx * ny)], float)
+    good = np.setdiff1d(np.arange(nx * ny), empty)
+    for i in empty:
+        j = good[np.argmin(np.hypot(gx[good] - gx[i], gy[good] - gy[i]))]
+        out[i] = psf_raw[j]
+    warnings.warn(f"{os.path.basename(str(path))}: {empty.size} all-zero PSF grid node(s) "
+                  f"replaced by the nearest populated node")
+    return out
 
 
 def _read_psf_positions(hdr, prefix, n):
@@ -738,6 +807,15 @@ def load_image(path, sci_ext=1, dq_ext=None, dq_flags=None):
         noise_info = _get_noise_info(primary_hdr, sci_hdr, instrume)
         mask = _load_dq_mask(hdul, dq_ext, dq_flags)
 
+    # JWST _cal images carry NaN at DO_NOT_USE pixels (32% of a MIRI frame: the Lyot
+    # and coronagraph region): mask them and zero the data so the detection and sky
+    # code never see non-finite values.  Units are left native (MJy/sr); see
+    # run_photometry_fits for how thresholds are converted.
+    bad = ~np.isfinite(data)
+    if bad.any():
+        data = np.where(bad, 0.0, data)
+        mask = bad if mask is None else (mask | bad)
+
     x_offset, y_offset = chip_detector_offsets(instrume, detector, sci_ext, sci_hdr)
     return (data, noise_info['effective_gain'], noise_info['read_noise'],
             mask, x_offset, y_offset)
@@ -780,6 +858,9 @@ def _get_noise_info(primary_hdr, sci_hdr, instrume):
     _electron_bunits = {'ELECTRONS', 'ELECTRONS/S', 'ELECTRON', 'E-', 'E'}
     data_in_electrons = bunit in _electron_bunits
 
+    if is_jwst(instrume):
+        return _get_noise_info_jwst(primary_hdr, sci_hdr, instrume, bunit)
+
     if instrume in ('ACS', 'WFC3'):
         gain_a_raw = primary_hdr.get('ATODGNA', None)
         gain_b_raw = primary_hdr.get('ATODGNB', None)
@@ -814,7 +895,94 @@ def _get_noise_info(primary_hdr, sci_hdr, instrume):
         'data_in_electrons': data_in_electrons,
         'gain_from_header': gain_from_header,
         'rn_from_header':   rn_from_header,
+        'e_per_unit':       effective_gain,   # electrons per image unit (1 for FLC)
+        'exptime':          float(primary_hdr.get('EXPTIME', 0.0) or 0.0),
     }
+
+
+# JWST detector gains (e-/DN) and read noise (e-) behind the MJy/sr -> electron factor.
+# NIRISS: mean of the four amplifier gains Anderson's jwst1pass uses (2.020/1.886/
+# 2.017/2.011; Liwen Chen's jwst1pass_py_v2 value) and its 5 DN read-noise floor;
+# NIRCam 2.05 e-/DN, ~15 e- (her values); MIRI 5.5 e-/DN, 14 e- (JDox; her fork used
+# gain 1.0, treating the pipeline output as gain-corrected, which it is not: ramp
+# slopes are DN/s before PHOTMJSR is applied).  With the ERR^2 noise model these set
+# the electron scale of the detection threshold, flux floors and eps_psf only.
+_JWST_GAIN_E_PER_DN = {'NIRISS': 1.9835, 'NIRCAM': 2.05, 'MIRI': 5.5}
+_JWST_READNOISE_E = {'NIRISS': 5.0 * 1.9835, 'NIRCAM': 15.0, 'MIRI': 14.0}
+
+
+def _get_noise_info_jwst(primary_hdr, sci_hdr, instrume, bunit):
+    """Noise provenance for a JWST stage-2 image (SCI in MJy/sr).
+
+    The calibrated surface brightness S [MJy/sr] relates to the ramp slope r [DN/s]
+    by S = PHOTMJSR * r, so the number of electrons per (MJy/sr) in one pixel is
+        e_per_unit = gain[e-/DN] * EFFEXPTM[s] / PHOTMJSR[(MJy/sr)/(DN/s)]
+    (Liwen Chen's jwst1pass_py_v2 'xfactor' times the gain).  The image stays in
+    MJy/sr; effective_gain = e_per_unit is the gain of the Poisson noise model in
+    those units, and run_photometry_fits uses the same factor to express the
+    electron-based detection threshold and flux floors in image units.
+    """
+    gain = _JWST_GAIN_E_PER_DN.get(instrume, 2.0)
+    rn_e = _JWST_READNOISE_E.get(instrume, 10.0)
+    effexptm = float(primary_hdr.get('EFFEXPTM', 0.0) or 0.0)
+    photmjsr = float((sci_hdr.get('PHOTMJSR', None) if sci_hdr is not None else None) or 0.0)
+    if bunit == 'MJY/SR' and effexptm > 0 and photmjsr > 0:
+        e_per_unit = gain * effexptm / photmjsr
+    elif bunit in ('DN/S', 'ADU/S') and effexptm > 0:
+        e_per_unit = gain * effexptm
+    elif bunit == 'DN':
+        e_per_unit = gain
+    else:
+        e_per_unit = 1.0
+    return {
+        'hardware_gain':    gain,
+        'effective_gain':   e_per_unit,
+        'read_noise':       rn_e,
+        'bunit':            bunit or 'UNKNOWN',
+        'data_in_electrons': False,
+        'gain_from_header': False,
+        'rn_from_header':   False,
+        'e_per_unit':       e_per_unit,
+        'exptime':          effexptm,
+    }
+
+
+# JWST DQ bits that make a pixel unusable for detection, sky and PSF fitting:
+# DO_NOT_USE (1; also the NaN pixels), SATURATED (2), NON_SCIENCE (512), DEAD (1024),
+# HOT (2048), REFERENCE_PIXEL (2^31).  Everything else (JUMP_DET 4, UNRELIABLE_* ,
+# WARM 4096, FLUX_ESTIMATED, ...) stays usable, as HST's warm-pixel bit does.  The
+# raw DQ is still recorded per star in dq_1x1/2x2/3x3.  (One explicit policy for all
+# three instruments; Liwen Chen's jwst1pass_py_v2 masked every non-zero bit for
+# NIRISS/MIRI and only bits 0-1 for NIRCam.)
+JWST_DQ_MASK_BITS = 1 | 2 | 512 | 1024 | 2048 | (1 << 31)
+
+
+def _rescale_records_to_native(records, scale):
+    """Undo the electron-equivalent scaling applied before fitting (JWST only).
+
+    run_photometry_fits fits ``data * scale`` (electrons) so that the detection
+    threshold, the 1 e- flux floors and the noise model keep their electron meaning;
+    this divides every flux-like quantity of the resulting StarRecords by ``scale``
+    so the catalog is in the image's native units (MJy/sr for JWST _cal files).
+    Covariance order is (flux, x, y, sky).  Dimensionless quantities (chi2, qfit,
+    eps_psf, concentration, psf_frac, central_res) and the magnitudes, whose zero
+    point was shifted by 2.5 log10(scale) before the fit, are unchanged.
+    """
+    if scale == 1.0:
+        return
+    s = float(scale)
+    f = np.array([1.0 / s, 1.0, 1.0, 1.0 / s])
+    for r in records:
+        for a in ('flux', 'flux_err', 'sky', 'sky_err', 'peak'):
+            v = getattr(r, a, None)
+            if v is not None:
+                try:
+                    setattr(r, a, v / s)
+                except TypeError:
+                    pass
+        cov = getattr(r, 'cov', None)
+        if cov is not None:
+            r.cov = np.asarray(cov, dtype=float) * np.outer(f, f)
 
 
 def _get_noise_params(hdr, instrume):
@@ -866,6 +1034,15 @@ def chip_detector_offsets(instrume, detector, sci_ext, sci_hdr=None):
     x_off, y_off = _detector_offsets(instr, det, sci_ext)
     if sci_hdr is None:
         return x_off, y_off
+    if is_jwst(instr):
+        # JWST subarrays: SUBSTRT1/2 (1-based) give the subarray origin on the full
+        # detector, which is the frame of the STDPSF grid and the STDGDC table.
+        try:
+            x_off += float(sci_hdr.get('SUBSTRT1', 1) or 1) - 1.0
+            y_off += float(sci_hdr.get('SUBSTRT2', 1) or 1) - 1.0
+        except (TypeError, ValueError):
+            pass
+        return float(x_off), float(y_off)
     ccdchip = sci_hdr.get('CCDCHIP', None)
     try:
         y_off = _CCDCHIP_Y_OFFSET.get((instr, det, int(ccdchip)), y_off)
@@ -925,9 +1102,22 @@ def run_photometry_fits(
     conc_limit=0.9,
     psf_delta=None,
     mag_st_max=28.0,
+    noise_from_err=None,
     **kwargs,
 ):
     """Run PSF-fitting photometry on all science chips of a FITS image.
+
+    Works for HST FLC/FLT files and JWST stage-2 ``_cal`` files (NIRCam, NIRISS,
+    MIRI; one detector per file).  JWST images stay in their native MJy/sr: the
+    fit runs on electron equivalents (``e_per_unit`` from _get_noise_info) so that
+    ``fmin_thresh`` and the flux floors mean electrons on both telescopes, and the
+    records are rescaled back before the catalog is written.  JWST specifics
+    (library naming, PUPIL filter, PIXAR_SR AB zero point, ERR^2 noise, DQ policy)
+    were adapted from Liwen Chen's jwst1pass_py_v2.
+
+    noise_from_err : None | bool.  Use the pipeline ERR extension (squared) as the
+                 total per-pixel variance.  None = JWST yes, HST only with the
+                 PYPASS_NOISE_FROM_ERR=1 environment switch.
 
     Parameters
     ----------
@@ -979,11 +1169,13 @@ def run_photometry_fits(
         _primary_hdr_saved = primary_hdr
 
     det_prefix = _DETECTOR_PREFIX.get((instrume.upper(), detector.upper()), '')
+    _lib_sub = lib_subdir(instrume, detector) or det_prefix
+    _is_jwst = is_jwst(instrume)
 
     # --- Resolve PSF path (with lib_dir fallback) ---
     _psf_path = psf_path
     if _psf_path is None and lib_dir is not None:
-        _psf_path = os.path.join(lib_dir, 'STDPSFs', det_prefix)
+        _psf_path = os.path.join(lib_dir, 'STDPSFs', _lib_sub)
     if _psf_path is None:
         raise ValueError("Must supply psf_path or lib_dir.")
 
@@ -1014,7 +1206,7 @@ def run_photometry_fits(
     gdc = None
     _gdc_path = gdc_path
     if _gdc_path is None and lib_dir is not None:
-        _gdc_dir = os.path.join(lib_dir, 'STDGDCs', det_prefix)
+        _gdc_dir = os.path.join(lib_dir, 'STDGDCs', _lib_sub)
         _gdc_path = find_gdc(_gdc_dir, primary_hdr) if os.path.isdir(_gdc_dir) else None
     elif _gdc_path is not None and os.path.isdir(_gdc_path):
         _gdc_path = find_gdc(_gdc_path, primary_hdr)
@@ -1040,21 +1232,42 @@ def run_photometry_fits(
             _sci_hdr = _hdul[sci_ext].header
         _noise_info = _get_noise_info(_primary_hdr_saved, _sci_hdr, instrume)
 
+        # Electron-equivalent scaling (JWST): the fit runs on data * _e_scale so that
+        # fmin_thresh (e-), the 1 e- flux floors inside fit_star and eps_psf keep their
+        # electron meaning; _rescale_records_to_native divides the results back to the
+        # image's native units (MJy/sr) at the end.  HST FLCs are already in electrons
+        # (_e_scale = 1).  The zero point is shifted by 2.5 log10(_e_scale) so that
+        # the instrumental mag column is defined on native-unit fluxes in both cases.
+        _e_scale = float(_noise_info.get('e_per_unit', 1.0)) if _is_jwst else 1.0
+        if not np.isfinite(_e_scale) or _e_scale <= 0:
+            _e_scale = 1.0
+        _zp_fit = zero_point + (2.5 * np.log10(_e_scale) if _e_scale != 1.0 else 0.0)
+
         # Per-chip gain: respect user override, otherwise use effective_gain from
-        # the science extension header (1.0 for BUNIT=ELECTRONS, hardware_gain for COUNTS).
-        gain_use = gain if gain is not None else _noise_info['effective_gain']
+        # the science extension header (1.0 for BUNIT=ELECTRONS, hardware_gain for COUNTS;
+        # 1.0 for a JWST image once scaled to electrons).
+        gain_use = gain if gain is not None else (1.0 if _is_jwst else _noise_info['effective_gain'])
         rn_use   = read_noise if read_noise is not None else _noise_info['read_noise']
 
         # Photometric calibration zero-points (chip-specific, from science extension header).
-        # PHOTFLAM [erg/cm²/Å/e⁻] and PHOTZPT define STMAG; PHOTPLAM [Å] adds ABMAG.
+        # HST: PHOTFLAM [erg/cm²/Å/e⁻] and PHOTZPT define STMAG; PHOTPLAM [Å] adds ABMAG.
         # EXPTIME is in the primary header.  All quantities may be absent (e.g. drizzled
         # mosaics), in which case the ZP attributes stay NaN and the calibrated mag
         # columns in the output table are filled with NaN.
+        # JWST: fluxes are MJy/sr per pixel, so F_nu[Jy] = flux * PIXAR_SR * 1e6 and
+        # ZP_AB = -2.5 log10(PIXAR_SR * 1e6 / 3631) (Liwen Chen's jwst1pass_py_v2);
+        # STMAG needs F_lambda, i.e. a per-filter pivot wavelength the _cal headers do
+        # not carry, so mag_st stays NaN and mag_ab(_gdc) is the calibrated magnitude.
         _photflam = _sci_hdr.get('PHOTFLAM', None)
         _photzpt  = _sci_hdr.get('PHOTZPT',  -21.10)
         _photplam = _sci_hdr.get('PHOTPLAM', None)
-        _exptime  = float(_primary_hdr_saved.get('EXPTIME', 0.0))
-        if _photflam is not None and _exptime > 0.0:
+        _exptime  = float(_noise_info.get('exptime', 0.0) or 0.0)
+        _pixar_sr = _sci_hdr.get('PIXAR_SR', None)
+        if _is_jwst:
+            _zp_st = np.nan
+            _zp_ab = (-2.5 * np.log10(float(_pixar_sr) * 1e6 / 3631.0)
+                      if _pixar_sr not in (None, 0) else np.nan)
+        elif _photflam is not None and _exptime > 0.0:
             # ZP such that m_ST = -2.5*log10(flux_electrons) + _zp_st
             # (i.e. flux_electrons is total over the exposure, not per second)
             _zp_st = -2.5 * np.log10(_photflam) + _photzpt + 2.5 * np.log10(_exptime)
@@ -1068,9 +1281,14 @@ def run_photometry_fits(
             _zp_st = np.nan
             _zp_ab = np.nan
 
-        # Effective fmin = max(fmin_from_mag(mag_st_max), fmin_thresh).
-        # mag_st_max sets the target depth; fmin_thresh is the hard floor.
-        if np.isfinite(_zp_st):
+        # Effective fmin = max(fmin_from_mag(mag_st_max), fmin_thresh), in electrons.
+        # mag_st_max sets the target depth; fmin_thresh is the hard floor.  For JWST
+        # the magnitude limit is read as an AB limit (mag_ab is the calibrated system)
+        # and converted to electrons with _e_scale.
+        if _is_jwst and np.isfinite(_zp_ab):
+            _fmin_from_mag  = 10 ** ((_zp_ab - mag_st_max) / 2.5) * _e_scale
+            _fmin_effective = max(_fmin_from_mag, fmin_thresh)
+        elif (not _is_jwst) and np.isfinite(_zp_st):
             _fmin_from_mag  = 10 ** ((_zp_st - mag_st_max) / 2.5)
             _fmin_effective = max(_fmin_from_mag, fmin_thresh)
         else:
@@ -1085,9 +1303,18 @@ def run_photometry_fits(
             print(f"\nChip: sci_ext={sci_ext}, dq_ext={dq_ext}, y_offset={y_offset}")
             print(f"  BUNIT         : {_noise_info['bunit']}")
             print(f"  Hardware gain : {_noise_info['hardware_gain']:.4f} e-/DN  [{_g_src}]")
-            print(f"  Noise gain    : {_noise_info['effective_gain']:.4f}{_g_note}")
+            if _is_jwst:
+                print(f"  e- per unit   : {_e_scale:.2f} e- per {_noise_info['bunit']} "
+                      f"(gain x EFFEXPTM {_exptime:.1f}s / PHOTMJSR); fit in electron "
+                      f"equivalents, catalog in {_noise_info['bunit']}")
+            else:
+                print(f"  Noise gain    : {_noise_info['effective_gain']:.4f}{_g_note}")
             print(f"  Read noise    : {_noise_info['read_noise']:.2f} e-  [{_rn_src}]")
-            if not np.isfinite(_zp_st):
+            if _is_jwst and _fmin_from_mag is not None:
+                print(f"  fmin          : {_fmin_effective:.1f} e- = {_fmin_effective / _e_scale:.4f} "
+                      f"{_noise_info['bunit']}  (mag limit {mag_st_max:.2f} AB -> {_fmin_from_mag:.1f} e-, "
+                      f"floor {fmin_thresh:.1f} e-)")
+            elif not np.isfinite(_zp_st):
                 print(f"  fmin          : {_fmin_effective:.1f} e-  "
                       f"(fmin_thresh; mag_st_max={mag_st_max:.2f} ignored — "
                       f"PHOTFLAM/EXPTIME missing)")
@@ -1111,30 +1338,44 @@ def run_photometry_fits(
             try:
                 with fits.open(image_path) as _dqh:
                     _dq_array = np.array(_dqh[dq_ext].data, dtype=np.int32)
-                mask = (_dq_array & ~np.int32(DQ_IGNORE_BITS)) != 0
+                if _is_jwst:
+                    # JWST: mask listed bits only (NaN pixels carry DO_NOT_USE), see JWST_DQ_MASK_BITS
+                    _dqm = (_dq_array & np.int32(JWST_DQ_MASK_BITS & 0x7fffffff)) != 0
+                    _dqm |= _dq_array < 0        # bit 31 (REFERENCE_PIXEL) reads as the sign bit
+                    mask = _dqm | (mask if mask is not None else False)
+                else:
+                    mask = (_dq_array & ~np.int32(DQ_IGNORE_BITS)) != 0
                 _dq_arrays[sci_ext] = _dq_array
             except Exception:
                 pass
         _peak_mask = mask
 
-        # Opt-in HST noise model (test, 2026-10-06; env PYPASS_NOISE_FROM_ERR=1): per-pixel variance = ERR^2 from the
-        # calibrated FLC (same units as SCI; electrons for FLC -> gain 1), used as the TOTAL noise model in every pass
-        # (pypass then adds only its PSF-model term eps_psf*model).  Default off: production noise model unchanged.
+        # Pipeline ERR^2 as the TOTAL per-pixel noise model (pypass then adds only its PSF-model
+        # term eps_psf*model): the JWST default (ramp-fit variance; measured ERR^2/(sci/g) ~ 3.7 on
+        # bright NIRISS pixels, Liwen Chen's jwst1pass_py_v2 choice), opt-in for HST via
+        # noise_from_err / env PYPASS_NOISE_FROM_ERR=1 (test 2026-10-06; production unchanged).
         _errnoise = None
-        if os.environ.get('PYPASS_NOISE_FROM_ERR') == '1' and 'noise_map' not in kwargs:
+        _use_err = noise_from_err if noise_from_err is not None else (
+            _is_jwst or os.environ.get('PYPASS_NOISE_FROM_ERR') == '1')
+        if _use_err and 'noise_map' not in kwargs:
             with fits.open(image_path) as _eh:
-                _e = _eh[sci_ext + 1]
-                if _e.name.upper() == 'ERR' and _e.data is not None and _e.data.shape == data.shape:
-                    _ev = np.asarray(_e.data, dtype=np.float64) ** 2
+                _e = next((h for h in _eh[1:] if h.name.upper() == 'ERR'
+                           and (h.header.get('EXTVER', 1) == _sci_hdr.get('EXTVER', 1))), None)
+                if _e is None and sci_ext + 1 < len(_eh) and _eh[sci_ext + 1].name.upper() == 'ERR':
+                    _e = _eh[sci_ext + 1]
+                if _e is not None and _e.data is not None and _e.data.shape == data.shape:
+                    _ev = np.asarray(_e.data, dtype=np.float64) ** 2 * _e_scale ** 2
                     _okv = np.isfinite(_ev) & (_ev > 0)
                     _errnoise = np.where(_okv, _ev, np.median(_ev[_okv]) if _okv.any() else 1.0)
             if verbose:
-                print(f"  Noise model   : HST ERR^2 (sci_ext {sci_ext + 1}) as total variance"
+                print(f"  Noise model   : pipeline ERR^2 as total variance"
                       + ("" if _errnoise is not None else "  [ERR not found -> default model]"))
-        _nkw = {'noise_map': _errnoise} if _errnoise is not None else {}
+        _nkw = {'noise_map': _errnoise, 'noise_total': True} if _errnoise is not None else {}
+
+        _data_fit = data * _e_scale if _e_scale != 1.0 else data
 
         result = run_photometry(
-            data=data,
+            data=_data_fit,
             psf_models=psf_cube,
             psf_positions=(xs, ys),
             psf_scale=psf_scale,
@@ -1148,17 +1389,18 @@ def run_photometry_fits(
             n_passes=n_passes,
             gain=gain_use,
             read_noise=rn_use,
-            zero_point=zero_point,
+            zero_point=_zp_fit,
             mask=mask,
             peak_mask=_peak_mask,
             verbose=verbose,
             x_offset=x_offset,
             y_offset=y_offset,
-            sat_threshold=(sat_threshold if sat_threshold is not None else np.inf),
+            # JWST saturation lives in DQ bit 2 (masked above); no numeric threshold
+            sat_threshold=(sat_threshold if (sat_threshold is not None and not _is_jwst) else np.inf),
             sigma_clip=sigma_clip,
             sigma_clip_sigma=sigma_clip_sigma,
             sigma_clip_iter=sigma_clip_iter,
-            return_residual=(return_residual or CR_RECOVERY),
+            return_residual=(return_residual or (CR_RECOVERY and not _is_jwst)),
             _apply_chi2_inflation=False,
             _classify=False,
             backend=backend,
@@ -1166,16 +1408,16 @@ def run_photometry_fits(
             **_nkw,
             **kwargs,
         )
-        if return_residual or CR_RECOVERY:
+        if return_residual or (CR_RECOVERY and not _is_jwst):
             records, chip_residual, chip_var = result
             if return_residual:
-                residuals[sci_ext] = chip_residual
-                var_images[sci_ext] = chip_var
+                residuals[sci_ext] = chip_residual / _e_scale if _e_scale != 1.0 else chip_residual
+                var_images[sci_ext] = chip_var / _e_scale ** 2 if _e_scale != 1.0 else chip_var
         else:
             records = result
 
-        # --- CR-flag recovery pass (see CR_RECOVERY) ---
-        if CR_RECOVERY and _dq_array is not None and np.any((_dq_array & 4096) != 0):
+        # --- CR-flag recovery pass (see CR_RECOVERY; HST only: 4096 is WARM in JWST DQ) ---
+        if CR_RECOVERY and not _is_jwst and _dq_array is not None and np.any((_dq_array & 4096) != 0):
             _crm = (_dq_array & 4096) != 0
             _mask2 = (_dq_array & ~np.int32(DQ_IGNORE_BITS | 4096)) != 0
             try:
@@ -1225,6 +1467,7 @@ def run_photometry_fits(
             r._zp_st     = _zp_st
             r._zp_ab     = _zp_ab
             r._exptime   = _exptime
+            r._e_scale   = _e_scale
 
         n_conv = sum(r.converged for r in records)
         all_records.extend(records)
@@ -1254,9 +1497,17 @@ def run_photometry_fits(
               f"{n_star_cand}/{n_tot} sources classified as likely stars "
               f"({100.0 * n_star_cand / max(n_tot, 1):.1f}%)")
 
-    # Apply chi²-inflation once across the combined catalogue
+    # Apply chi²-inflation once across the combined catalogue (fluxes still in the
+    # electron equivalents the fit used; its 1.1 e- cut and the magnitude bins are
+    # consistent with the shifted zero point)
     from .core import inflate_chi2
-    inflate_chi2(all_records, zero_point, verbose=verbose)
+    _zp_fit_all = (all_records[0]._zp_fit if False else None)
+    inflate_chi2(all_records, zero_point + (2.5 * np.log10(getattr(all_records[0], '_e_scale', 1.0))
+                                            if all_records else 0.0), verbose=verbose)
+    # JWST: back to native image units (MJy/sr) for the catalog
+    for _s in {getattr(r, '_e_scale', 1.0) for r in all_records}:
+        if _s != 1.0:
+            _rescale_records_to_native([r for r in all_records if getattr(r, '_e_scale', 1.0) == _s], _s)
 
     # Compute per-star DQ flag summaries (1×1, 2×2, 3×3 windows).
     # Uses the raw DQ integer array so all flag bits are preserved.
@@ -1313,7 +1564,7 @@ def catalog_to_table(records, zero_point=0.0,
              'jac_xx_gdc', 'jac_xy_gdc', 'jac_yx_gdc', 'jac_yy_gdc',
              'ra', 'dec', 'ra_err', 'dec_err',
              'cov_ra_ra', 'cov_dec_dec', 'cov_ra_dec',
-             'mag_st', 'mag_ab', 'mag_st_gdc']
+             'mag_st', 'mag_ab', 'mag_st_gdc', 'mag_ab_gdc']
 
     if not records:
         dtypes = ([float] * 8 +          # x y flux flux_err sky sky_err mag mag_err
@@ -1327,7 +1578,7 @@ def catalog_to_table(records, zero_point=0.0,
                   [int, int, int, bool] +           # n_conc_1x1 n_conc_2x2 n_conc_3x3 is_star_candidate
                   [float, float, float, int] +  # sigma_x/y/f_model chip_ext
                   [float] * 18 +          # x_gdc y_gdc mag_gdc mag_err_gdc cov_gdc jac_gdc ra dec ra_err dec_err cov_radec
-                  [float] * 3)            # mag_st mag_ab mag_st_gdc
+                  [float] * 4)            # mag_st mag_ab mag_st_gdc mag_ab_gdc
         return Table(names=_cols, dtype=dtypes)
 
     def _c(i, j):
@@ -1414,6 +1665,7 @@ def catalog_to_table(records, zero_point=0.0,
     mag_st     = np.where(np.isfinite(_zp_st_arr), _instr_mag + _zp_st_arr, np.nan)
     mag_ab     = np.where(np.isfinite(_zp_ab_arr), _instr_mag + _zp_ab_arr, np.nan)
     mag_st_gdc = np.where(np.isfinite(_zp_st_arr), mag_st + _mc_arr,        np.nan)
+    mag_ab_gdc = np.where(np.isfinite(_zp_ab_arr), mag_ab + _mc_arr,        np.nan)
 
     # RA/Dec uncertainties in arcsec: sqrt(var) * 3600
     cov_ra_ra   = _cov_radec(0, 0)
@@ -1496,12 +1748,20 @@ def catalog_to_table(records, zero_point=0.0,
         'cov_ra_ra':    cov_ra_ra,
         'cov_dec_dec':  cov_dec_dec,
         'cov_ra_dec':   cov_ra_dec,
-        # Calibrated magnitudes (NaN when PHOTFLAM/EXPTIME not available)
+        # Calibrated magnitudes (NaN when PHOTFLAM/EXPTIME not available; JWST has
+        # mag_ab/mag_ab_gdc from PIXAR_SR and no STMAG)
         'mag_st':       mag_st,
         'mag_ab':       mag_ab,
         'mag_st_gdc':   mag_st_gdc,
+        'mag_ab_gdc':   mag_ab_gdc,
     })
     t.meta['ZP']            = zero_point
+    # flux units of the catalog (HST FLC: electrons; JWST _cal: MJy/sr) and the
+    # electron-per-unit factor the fit used for its thresholds
+    _e_scales = {float(getattr(r, '_e_scale', 1.0)) for r in records}
+    if _e_scales:
+        t.meta['E_PER_UNIT'] = max(_e_scales)
+        t.meta['FLUX_UNIT'] = 'MJy/sr' if max(_e_scales) != 1.0 else 'electron'
     # GDC provenance (which table produced x_gdc/y_gdc/cov_*_gdc/jac_*_gdc)
     if gdc_path is not None and os.path.exists(str(gdc_path)):
         t.meta['GDC_FILE'] = os.path.basename(str(gdc_path))
@@ -1552,7 +1812,7 @@ def catalog_to_table(records, zero_point=0.0,
     for col in ('cov_xx', 'cov_yy', 'cov_xy', 'cov_xs', 'cov_ys',
                 'cov_xx_gdc', 'cov_yy_gdc', 'cov_xy_gdc'):
         t[col].unit = 'pix2'
-    for col in ('mag', 'mag_err', 'mag_gdc', 'mag_err_gdc', 'mag_st', 'mag_ab', 'mag_st_gdc'):
+    for col in ('mag', 'mag_err', 'mag_gdc', 'mag_err_gdc', 'mag_st', 'mag_ab', 'mag_st_gdc', 'mag_ab_gdc'):
         t[col].unit = 'mag'
     for col in ('ra', 'dec'):
         t[col].unit = 'deg'

@@ -1837,6 +1837,7 @@ def run_photometry(
     _classify=True,
     backend='auto',
     conc_limit=0.9,
+    noise_total=False,
 ):
     """Find and measure point sources in *data* by PSF fitting.
 
@@ -1892,10 +1893,11 @@ def run_photometry(
         mask = np.asarray(mask, dtype=bool)
     if noise_map is not None:
         noise_map = np.asarray(noise_map, dtype=np.float64)
-    # PYPASS_NOISE_FROM_ERR=1 (opt-in test, 2026-10-06): an external noise_map is the TOTAL per-pixel variance (HST ERR^2
-    # already contains every source's Poisson noise) -- the star-aware rebuild must not add star Poisson on top.
+    # noise_total (JWST default; HST opt-in test via PYPASS_NOISE_FROM_ERR=1, 2026-10-06): an external noise_map is the
+    # TOTAL per-pixel variance (the pipeline ERR^2 already contains every source's Poisson noise) -- the star-aware
+    # rebuild must not add star Poisson on top.
     import os as _os_nm
-    _noise_total = noise_map is not None and _os_nm.environ.get('PYPASS_NOISE_FROM_ERR') == '1'
+    _noise_total = noise_map is not None and (bool(noise_total) or _os_nm.environ.get('PYPASS_NOISE_FROM_ERR') == '1')
 
     # Prefilter the entire PSF cube once.  spline_filter is linear, so
     # bilinear combinations of prefiltered arrays equal the prefiltered

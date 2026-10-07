@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import argparse
 import warnings
@@ -148,23 +149,49 @@ def get_hst_params(flc_file, catalog_file=None):
                     primary_y_offset = 0.0
                     break
         primary_hdr = sci_hdrs.get(primary_extver, ext_header)
+        _is_jwst = instrument.strip().upper() in ('NIRCAM', 'NIRISS', 'MIRI')
         ra_cen  = primary_hdr.get('CRVAL1', 0.0)
         dec_cen = primary_hdr.get('CRVAL2', 0.0)
         x_cen   = primary_hdr.get('CRPIX1', naxis1 / 2.0)
         y_cen   = primary_hdr.get('CRPIX2', naxis2 / 2.0) + primary_y_offset
-        orientat = primary_hdr.get('ORIENTAT', 0.0)
+        # Orientation of +y at the reference pixel: HST writes ORIENTAT; JWST _cal headers
+        # do not, but the CD matrix carries the same angle (atan2(CD1_2, CD2_2); checked
+        # against PA_APER on NIRCam A/B, NIRISS and MIRI frames, 2026-10).
+        orientat = primary_hdr.get('ORIENTAT', None)
+        if orientat is None:
+            try:
+                orientat = float(np.degrees(np.arctan2(float(primary_hdr['CD1_2']), float(primary_hdr['CD2_2']))))
+            except Exception:
+                orientat = float(primary_hdr.get('PA_APER', 0.0) or 0.0)
         _icfg = get_instrument_config(instrument, detector)
         pixel_scale   = _icfg["pixel_scale"]
-        # scale prior centre = instrument constant x this exposure's velocity-aberration factor (as bp3m.data_loader_flc)
+        # scale prior centre = instrument constant x this exposure's velocity-aberration factor (as bp3m.data_loader_flc);
+        # JWST writes the same quantity as VA_SCALE in the SCI header
         try:
-            _vaf = float(primary_hdr.get('VAFACTOR', header0.get('VAFACTOR', 1.0)) or 1.0)
+            _vaf = float(primary_hdr.get('VAFACTOR', primary_hdr.get('VA_SCALE', header0.get('VAFACTOR', 1.0))) or 1.0)
         except (TypeError, ValueError):
             _vaf = 1.0
         if not np.isfinite(_vaf) or abs(_vaf - 1.0) > 5e-4:
             _vaf = 1.0
         initial_scale = _icfg["initial_scale"] * _vaf
 
-        expstart = header0.get('EXPSTART', 51544); obs_epoch_mjd = expstart
+        if _is_jwst:
+            # JWST: mid-exposure epoch (EXPMID = MJD-AVG = EPH_TIME of the observatory
+            # ephemeris in the header) and the observatory's barycentric position
+            # (JWST_X/Y/Z, km, equatorial ICRS; from Liwen Chen's bp3m fork).  L2 is
+            # ~0.01 AU from Earth: a <=1% correction to the parallax factor.
+            obs_epoch_mjd = float(header0.get('EXPMID', 0.0) or 0.0) or 0.5 * (
+                float(header0.get('EXPSTART', 51544)) + float(header0.get('EXPEND', header0.get('EXPSTART', 51544))))
+            try:
+                tele_xyz = np.array([float(primary_hdr['JWST_X']), float(primary_hdr['JWST_Y']),
+                                     float(primary_hdr['JWST_Z'])]) / 149597870.7
+                if not np.all(np.isfinite(tele_xyz)) or not (0.5 < np.linalg.norm(tele_xyz) < 1.5):
+                    tele_xyz = None
+            except Exception:
+                tele_xyz = None
+        else:
+            expstart = header0.get('EXPSTART', 51544); obs_epoch_mjd = expstart
+            tele_xyz = None
 
     # When catalogs contain CHIP{ext}_CRPIX1_GDC / CHIP{ext}_CRPIX2_GDC keys,
     # override (ra/dec/x/y)_cen with those GDC-corrected positions averaged across
@@ -213,6 +240,7 @@ def get_hst_params(flc_file, catalog_file=None):
             "obs_epoch_mjd": obs_epoch_mjd, "orientat": orientat, "orientat_header": orientat_header,
             "naxis1": naxis1, "naxis2": naxis2,
             "instrument": instrument, "detector": detector,
+            "tele_xyz": tele_xyz,     # observatory barycentric position (AU) or None -> Earth
             "chip_dims": {ext: (h.get('NAXIS1'), h.get('NAXIS2')) for ext, h in sci_hdrs.items()}}
 
 def construct_gaia_cov(df, zero_pm=False, fill_pm_plx=None):
@@ -283,7 +311,13 @@ def construct_gaia_cov(df, zero_pm=False, fill_pm_plx=None):
 
     return covs
 
-def propagate_gaia_with_cov(df, target_mjd, zero_pm=False, fill_pm_plx=None):
+def propagate_gaia_with_cov(df, target_mjd, zero_pm=False, fill_pm_plx=None, tele_xyz=None):
+    """Gaia positions and 2x2 sky covariance propagated to target_mjd.
+
+    tele_xyz: observer barycentric position (AU, ICRS) for the parallax factors; None
+    uses the Earth centre (HST's 6.9e3 km orbit is negligible; JWST passes its header
+    ephemeris position, see get_hst_params).
+    """
     ref_epoch = df['ref_epoch'].iloc[0] if 'ref_epoch' in df.columns else 2016.0
     t_hst = Time(target_mjd, format='mjd')
     dt = (t_hst.jyear - ref_epoch)
@@ -305,8 +339,10 @@ def propagate_gaia_with_cov(df, target_mjd, zero_pm=False, fill_pm_plx=None):
 
     # Canonical propagation + parallax factors from bp3m.astro_utils — do NOT
     # re-derive this physics inline (see propagate_gaia_positions docstring).
-    with solar_system_ephemeris.set('builtin'):
-        tele_xyz = get_tele_position(t_hst, curr_id='earth')
+    if tele_xyz is None:
+        with solar_system_ephemeris.set('builtin'):
+            tele_xyz = get_tele_position(t_hst, curr_id='earth')
+    tele_xyz = np.asarray(tele_xyz, dtype=float)
     p_ra_cosdec, p_dec = get_parallax_factors(
         df['ra'].values, df['dec'].values, tele_xyz)
     ra_prop, dec_prop = propagate_gaia_positions(
@@ -1016,7 +1052,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
     solution or the sibling-transferred header error).  The Gaia guess positions are then taken from
     it and the 4P offset search is narrowed to +-guess_max_offset px; every gate is unchanged."""
     start_time = time.time()
-    image_name = os.path.basename(hst['flc']).replace("_flc.fits", "")
+    image_name = re.sub(r'_(flc|flt|cal)\.fits$', '', os.path.basename(hst['flc']))
     log_file, original_stdout = os.path.join(hst['root'], "processing_log.txt"), sys.stdout
     sys.stdout = FileLogger(log_file, log_mode)
     if log_mode == "a":
@@ -1049,7 +1085,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                   f"±{_fill.get('pm_sig', float('nan')):.2f} mas/yr  "
                   f"plx={_fill['plx']:+.3f} ±{_fill.get('plx_sig', float('nan')):.2f} mas")
         ra_prop, dec_prop, Ct = propagate_gaia_with_cov(
-            gaia_df, params['obs_epoch_mjd'], zero_pm=zero_pm,
+            gaia_df, params['obs_epoch_mjd'], zero_pm=zero_pm, tele_xyz=params.get('tele_xyz'),
             fill_pm_plx=_fill)
         dx_deg_full = rd2x(ra_prop, dec_prop, params['ra_cen'], params['dec_cen'])
         dy_deg_full = rd2y(ra_prop, dec_prop, params['ra_cen'], params['dec_cen'])
@@ -1149,8 +1185,17 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 f"Delete the catalog so py1pass will re-run."
             )
         mag_hst = hst_cat['mag_st_gdc'].astype(float)
+        mag_system = 'ST'
+        if not np.any(np.isfinite(mag_hst)) and 'mag_ab_gdc' in hst_cat.dtype.names:
+            # JWST catalogs have no STMAG (no F_lambda zero point in the headers); the
+            # calibrated magnitude is AB from PIXAR_SR.  It plays the same role here
+            # (zero-point estimate, magnitude window, residual_mag) and is written to
+            # the usual hst_mag_st_gdc column with hst_mag_system = 'AB'.
+            mag_hst = hst_cat['mag_ab_gdc'].astype(float)
+            mag_system = 'AB'
         mag_st_hst  = mag_hst   # kept for output saving below
         mag_ab_hst  = hst_cat['mag_ab'].astype(float)     if 'mag_ab'      in hst_cat.dtype.names else None
+        mag_ab_gdc_hst = hst_cat['mag_ab_gdc'].astype(float) if 'mag_ab_gdc' in hst_cat.dtype.names else None
         C_pix_hst = np.zeros((len(x_hst), 2, 2))
         C_pix_hst[:, 0, 0] = hst_cat['cov_xx_gdc'].astype(float) + hst_pix_floor**2
         C_pix_hst[:, 1, 1] = hst_cat['cov_yy_gdc'].astype(float) + hst_pix_floor**2
@@ -1472,6 +1517,9 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             output['hst_mag_st_gdc'] = mag_st_hst[final_matches['h_idx'].values]
         if mag_ab_hst is not None:
             output['hst_mag_ab']     = mag_ab_hst[final_matches['h_idx'].values]
+        if mag_ab_gdc_hst is not None:
+            output['hst_mag_ab_gdc'] = mag_ab_gdc_hst[final_matches['h_idx'].values]
+        output['hst_mag_system']  = np.full(len(final_matches), mag_system)   # system of hst_mag_st_gdc
         output['gaia_source_id'] = gaia_df.iloc[in_field]['source_id'].to_numpy(dtype=np.int64)[final_matches['g_idx'].values]
         output['has_gaia_pms']   = has_gaia_pms[in_field][final_matches['g_idx'].values]
         output['gaia_ra_prop']   = ra_in[final_matches['g_idx'].values]

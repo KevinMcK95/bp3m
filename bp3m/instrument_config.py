@@ -111,8 +111,28 @@ INSTRUMENT_CONFIG = {
         "pixel_scale":  0.128,
         "initial_scale": 1.0,
     },
-    # ── JWST — add entries here as needed, e.g.: ─────────────────────────────
-    # ("NIRCAM", "NRCA1"): {"pixel_scale": 0.031, "initial_scale": 1.0},
+    # ── JWST ─────────────────────────────────────────────────────────────────
+    # One entry per detector (each _cal file is one detector).  pixel_scale = the
+    # sqrt|det CD| of the stage-2 headers (Liwen Chen's measure_pixel_scale.py over
+    # LMC + Draco frames, 2026-08), which reproduces the GDC-frame plate scale of her
+    # bp3m fits to 3e-5..1.6e-4, so initial_scale stays 1 and VA_SCALE (the JWST
+    # VAFACTOR) centres the prior per exposure.  Prior widths are deliberately loose
+    # until calibrated from v1 posteriors as the HST values were (her LMC NIRCam
+    # fits scattered 0.29 deg rms in rotation around a 0.1 deg prior with per-channel
+    # scales; NIRISS showed a fixed +0.12 deg / -0.67% offset that these per-detector
+    # scales and the GDC-frame orientation fit absorb).  Single-chip detectors: no
+    # chip/pair terms.
+    **{(_i, _d): {"pixel_scale": _ps, "initial_scale": 1.0,
+                  "sigma_rot_deg": 0.3, "sigma_scale": 3e-4, "sigma_skew": 1e-4}
+       for (_i, _d, _ps) in [
+           ("NIRCAM", "NRCA1", 0.031227), ("NIRCAM", "NRCA2", 0.030778),
+           ("NIRCAM", "NRCA3", 0.031340), ("NIRCAM", "NRCA4", 0.030900),
+           ("NIRCAM", "NRCB1", 0.030746), ("NIRCAM", "NRCB2", 0.031194),
+           ("NIRCAM", "NRCB3", 0.030872), ("NIRCAM", "NRCB4", 0.031326),
+           ("NIRCAM", "NRCALONG", 0.062906), ("NIRCAM", "NRCBLONG", 0.063001),
+           ("NIRISS", "NIS", 0.065567),
+           ("MIRI", "MIRIMAGE", 0.110913),
+       ]},
 }
 
 # ── Fallback for unknown instruments ──────────────────────────────────────────

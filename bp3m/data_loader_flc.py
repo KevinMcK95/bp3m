@@ -93,8 +93,13 @@ def _load_one_image(work):
     if meta is None:
         return img_name, None, None, False
     pc = _LDR_STATE["pc"]
+    # pos_err_floor: one value, or {'HST': px, 'JWST': px} resolved by the image's
+    # telescope (floors stay in each detector's own pixels, user 2026-10-07)
+    _floor = _LDR_STATE["floor"]
+    if isinstance(_floor, dict):
+        _floor = float(_floor.get(meta.get("telescope", "HST"), _floor.get("HST", _MIN_POS_ERR_PX)))
     stars_df = _build_stars_df(img_dir, img_name, _LDR_STATE["g2i"],
-                               _LDR_STATE["floor"], pos_corr=pc, meta=meta,
+                               _floor, pos_corr=pc, meta=meta,
                                pos_corr_model=_LDR_STATE.get("pcm"))
     matched = (pc is not None and stars_df is not None
                and pc.match(meta.get("instrument", ""),
@@ -128,9 +133,40 @@ def resolve_gaia_csvs(field_path):
             False)
 
 
+# Science-image suffixes per telescope product: HST FLC/FLT, JWST stage-2 CAL.
+_IMAGE_SUFFIXES = ("_flc", "_flt", "_cal")
+_JWST_INSTRUMENTS = {"NIRCAM", "NIRISS", "MIRI"}
+_KM_PER_AU = 149597870.7
+
+
+def _image_file(img_dir: Path, img_name: str) -> "Path | None":
+    """The image's science FITS file ({name}_flc.fits, _flt or _cal), or None."""
+    for s in _IMAGE_SUFFIXES:
+        p = img_dir / f"{img_name}{s}.fits"
+        if p.exists():
+            return p
+    return None
+
+
+def _catalog_file(img_dir: Path, img_name: str) -> "Path | None":
+    """The pypass catalog next to the science image, or None."""
+    for s in _IMAGE_SUFFIXES:
+        p = img_dir / f"{img_name}{s}_catalog.fits"
+        if p.exists():
+            return p
+    return None
+
+
+def _telescope_of(instrument: str) -> str:
+    return "JWST" if str(instrument).strip().upper() in _JWST_INSTRUMENTS else "HST"
+
+
 def _get_filter(h0) -> str:
-    """Return the science filter name, handling ACS (FILTER1/2) and WFC3 (FILTER)."""
+    """Return the science filter name, handling ACS (FILTER1/2), WFC3 (FILTER) and
+    JWST (FILTER; NIRISS imaging has FILTER=CLEAR with the band in PUPIL)."""
     filt = h0.get("FILTER", "")
+    if filt and str(filt).strip().upper() == "CLEAR" and str(h0.get("PUPIL", "")).strip():
+        return str(h0.get("PUPIL", "")).strip()
     if filt:
         return str(filt).strip()
     # ACS: one slot is CLEAR, the other is the science filter
@@ -178,10 +214,10 @@ def _read_image_meta(img_dir: Path, img_name: str,
     HST images whose Gaia cross-match failed but that have a CFHT relative
     alignment (transformation_cfht_<exp>.csv, same schema/frame).
     """
-    flc_path  = img_dir / f"{img_name}_flc.fits"
+    flc_path  = _image_file(img_dir, img_name)
     tran_path = img_dir / (transformation_file or "transformation.csv")
 
-    if not flc_path.exists() or not tran_path.exists():
+    if flc_path is None or not tran_path.exists():
         return None
 
     # ── FITS header ───────────────────────────────────────────────────────────
@@ -192,11 +228,15 @@ def _read_image_meta(img_dir: Path, img_name: str,
         instrument = str(h0.get("INSTRUME", "")).strip()
         detector   = str(h0.get("DETECTOR", "")).strip()
         filt       = _get_filter(h0)
+        telescope  = _telescope_of(instrument)
 
-        # Mid-exposure MJD
+        # Mid-exposure MJD (JWST: EXPSTART/EXPEND exist too; EXPMID is their mean and
+        # the epoch of the observatory ephemeris in the header)
         expstart = float(h0["EXPSTART"])
         expend   = float(h0["EXPEND"])
         hst_time_mjd = 0.5 * (expstart + expend)
+        if telescope == "JWST" and h0.get("EXPMID") is not None:
+            hst_time_mjd = float(h0["EXPMID"])
 
         # Pixel scale and rotation from primary SCI extension CD matrix
         cd11 = float(h1["CD1_1"]); cd12 = float(h1["CD1_2"])
@@ -206,12 +246,27 @@ def _read_image_meta(img_dir: Path, img_name: str,
         # this exposure is initial_scale x VAFACTOR (Leo I 2026-09-30: posterior
         # scale ratio - constant = 1.07 x (VAFACTOR-1), r = 0.99 for ACS; the
         # hst_dist_corr label projection has always used IDCSCALE x VAFACTOR).
+        # JWST writes the same quantity as VA_SCALE.
         try:
-            vafactor = float(h1.get("VAFACTOR", h0.get("VAFACTOR", 1.0)) or 1.0)
+            vafactor = float(h1.get("VAFACTOR", h1.get("VA_SCALE", h0.get("VAFACTOR", 1.0))) or 1.0)
         except (TypeError, ValueError):
             vafactor = 1.0
         if not np.isfinite(vafactor) or abs(vafactor - 1.0) > 5e-4:
             vafactor = 1.0
+
+        # Observer barycentric position for the parallax factors: JWST carries its
+        # ephemeris (JWST_X/Y/Z, km, equatorial ICRS, at EXPMID) in the SCI header;
+        # L2 is ~0.01 AU from Earth (<=1% of the parallax factor).  None -> the
+        # solver uses the Earth centre (HST).  From Liwen Chen's bp3m fork.
+        tele_xyz = None
+        if telescope == "JWST":
+            try:
+                tele_xyz = np.array([float(h1["JWST_X"]), float(h1["JWST_Y"]),
+                                     float(h1["JWST_Z"])]) / _KM_PER_AU
+                if not np.all(np.isfinite(tele_xyz)) or not (0.5 < np.linalg.norm(tele_xyz) < 1.5):
+                    tele_xyz = None
+            except Exception:
+                tele_xyz = None
 
     # ── transformation.csv ───────────────────────────────────────────────────
     tdf = pd.read_csv(tran_path).set_index("parameter")["value"]
@@ -256,7 +311,10 @@ def _read_image_meta(img_dir: Path, img_name: str,
         "off_skew": off_skew,
         # Timing
         "hst_time_mjd": hst_time_mjd,
+        # Observer position (AU, barycentric ICRS) or None for the Earth centre
+        "tele_xyz":     tele_xyz,
         # Instrument
+        "telescope":  telescope,
         "instrument": instrument,
         "detector":   detector,
         "filter":     filt,
@@ -284,8 +342,8 @@ def _read_image_meta(img_dir: Path, img_name: str,
     }
 
     # ── Per-chip pointing from catalog FITS (optional) ────────────────────────
-    cat_path = img_dir / f"{img_name}_flc_catalog.fits"
-    if cat_path.exists():
+    cat_path = _catalog_file(img_dir, img_name)
+    if cat_path is not None:
         try:
             with fits.open(cat_path, memmap=False) as cat_hdu:
                 cat_hdr = cat_hdu[1].header
@@ -342,11 +400,14 @@ def _build_stars_df(img_dir: Path, img_name: str,
         the 19-digit integer.  When None, a direct int64 cast is used (safe
         only when the CSV was written with integer formatting).
     """
-    cat_path   = img_dir / f"{img_name}_flc_catalog.fits"
+    cat_path   = _catalog_file(img_dir, img_name)
     match_path = img_dir / "matched_gaia.csv"
 
-    if not cat_path.exists() or not match_path.exists():
+    if cat_path is None or not match_path.exists():
         return None
+    # The learned GDC-residual model is HST-only (trained on ACS/WFC and WFC3/UVIS)
+    if pos_corr_model is not None and meta is not None and meta.get("telescope", "HST") != "HST":
+        pos_corr_model = None
 
     # ── Source catalog ────────────────────────────────────────────────────────
     with fits.open(cat_path, memmap=False) as cat_hdu:
@@ -371,7 +432,7 @@ def _build_stars_df(img_dir: Path, img_name: str,
         # Learned GDC-residual model (hst_dist_corr Stage 2): evaluated per
         # detection from the catalog row + FLC header, in memory only.
         if pos_corr_model is not None:
-            _hdr = pos_corr_model.read_header(img_dir / f"{img_name}_flc.fits")
+            _hdr = pos_corr_model.read_header(_image_file(img_dir, img_name))
             _mb = pos_corr_model.bias(tbl, _hdr)
             if _mb is not None:
                 cat_xgdc = cat_xgdc - _mb[0]
@@ -519,7 +580,7 @@ def _build_delve_only_stars_df(
         # Learned GDC-residual model (hst_dist_corr Stage 2): evaluated per
         # detection from the catalog row + FLC header, in memory only.
         if pos_corr_model is not None:
-            _hdr = pos_corr_model.read_header(img_dir / f"{img_name}_flc.fits")
+            _hdr = pos_corr_model.read_header(_image_file(img_dir, img_name))
             _mb = pos_corr_model.bias(tbl, _hdr)
             if _mb is not None:
                 cat_xgdc = cat_xgdc - _mb[0]
@@ -649,6 +710,15 @@ def split_images_by_ccd(images, stars_per_image, min_stars_per_ccd: int = 20):
     for img in sorted(images.keys()):
         meta   = images[img]
         df     = stars_per_image[img]
+        # Only the two-chip HST detectors are split.  _get_amp_splits falls back to
+        # the ACS/WFC boundary for any unknown detector, which would cut a single-chip
+        # image (ACS/HRC, WFC3/IR, every JWST detector) at y=2048 whenever both halves
+        # held >= min_stars_per_ccd stars (fix from Liwen Chen's bp3m fork).
+        _key = (meta.get("instrument", "") + meta.get("detector", "")).upper()
+        if _key not in _TWO_CHIP_DETECTORS:
+            new_images[img] = dict(meta)
+            new_spi[img]    = df
+            continue
         y_col  = 'Y_orig' if 'Y_orig' in df.columns else 'Y'
         y_vals = df[y_col].to_numpy(float)
         y_split = _get_amp_splits(meta)["y_split"]
@@ -741,11 +811,15 @@ def load_image_data_flc(data_root, field_name: str,
     """
     data_root  = Path(data_root)
     field_path = data_root / field_name
-    hst_root   = field_path / "HST" / "mastDownload" / "HST"
+    # one root per telescope: {field}/HST/mastDownload/HST, {field}/JWST/mastDownload/JWST
+    image_roots = [field_path / t / "mastDownload" / t for t in ("HST", "JWST")
+                   if (field_path / t / "mastDownload" / t).exists()]
     gaia_dir   = field_path / "Gaia"
 
-    if not hst_root.exists():
-        raise FileNotFoundError(f"HST image directory not found: {hst_root}")
+    if not image_roots:
+        raise FileNotFoundError(
+            f"No image directory found for {field_name}: expected "
+            f"{field_path / 'HST' / 'mastDownload' / 'HST'} or {field_path / 'JWST' / 'mastDownload' / 'JWST'}")
 
     # ── Gaia catalog ──────────────────────────────────────────────────────────
     # Only the gaia_cols subset (below) survives into gaia_catalog, so restrict
@@ -829,7 +903,8 @@ def load_image_data_flc(data_root, field_name: str,
     }
 
     # ── Per-image data ────────────────────────────────────────────────────────
-    img_dirs = sorted(p for p in hst_root.iterdir() if p.is_dir())
+    img_dirs = sorted((p for r in image_roots for p in r.iterdir() if p.is_dir()),
+                      key=lambda p: p.name)
 
     images: dict          = {}
     stars_per_image: dict = {}

@@ -362,6 +362,10 @@ def _parse_args():
                          'refined by the joint tests). Requires indv fits '
                          'run on the SAME cross-match outputs (checked per '
                          'image; mismatches fall back with a warning).')
+    bp.add_argument('--jwst_pos_err_floor', type=float, default=0.05,
+                    help='Positional systematics floor for JWST detections, in JWST pixels, added in '
+                         'quadrature (default 0.05 px, as for HST; floors live on the pixel scale of '
+                         'the PSF/GDC systematics, user 2026-10-07)')
     bp.add_argument('--bp3m_pos_err_floor', type=float, default=0.05,
                     help='Per-detection positional systematics floor in pixels, added '
                          'IN QUADRATURE to the HST uncertainties before BP3M '
@@ -1120,13 +1124,11 @@ def main():
                 **_tel_opts[_tel],
             )
 
-    if any(_t != 'HST' for _t in args.telescopes):
-        # JWST integration in progress (branch jwst-integration): Steps 3-7 still run on
-        # one telescope's HST products only.  Stop here rather than mix telescopes.
-        print("\nJWST: download complete. PSF fitting, cross-matching and alignment for "
-              "JWST are not wired yet (see data_bootes/bp3m/jwst_integration/PLAN.md); "
-              "stopping after Step 2.")
-        return
+    # Image product suffix per telescope (Steps 3+ read the images by this suffix)
+    _im_type_of = {'HST': args.hst_im_type, 'JWST': args.jwst_im_type}
+    _im_type_first = _im_type_of[args.telescope]
+    # Positional systematics floor per telescope, in each detector's own pixels
+    _pos_err_floor_by_tel = {'HST': args.bp3m_pos_err_floor, 'JWST': args.jwst_pos_err_floor}
 
     # Read manifest of selected obsids written by step 2 (persists across runs)
     import json as _json
@@ -1147,9 +1149,9 @@ def main():
         _mast_root = _hst_dir / "mastDownload" / args.telescope.upper()
         _scanned_failed: dict[str, str] = {}
         for _oid in list(_selected_obsids):
-            _flc = _mast_root / _oid / f"{_oid}_{args.hst_im_type.lstrip('_')}.fits"
+            _flc = _mast_root / _oid / f"{_oid}_{_im_type_first.lstrip('_')}.fits"
             if _flc.exists():
-                _reason = _cet(_flc)
+                _reason = _cet(_flc, args.telescope)
                 if _reason:
                     _scanned_failed[_oid] = _reason
         if _scanned_failed:
@@ -1183,10 +1185,10 @@ def main():
         _sel = list(_selected_obsids or [])
         _added = []
         for _d in sorted(_mast_root2.glob('*')) if _mast_root2.exists() else []:
-            _flc = _d / f"{_d.name}_{args.hst_im_type.lstrip('_')}.fits"
+            _flc = _d / f"{_d.name}_{_im_type_first.lstrip('_')}.fits"
             if _d.name in _sel or _d.name in _failed_set or not _flc.exists():
                 continue
-            if _cet2(_flc):
+            if _cet2(_flc, args.telescope):
                 continue
             _sel.append(_d.name); _added.append(_d.name)
         if _added:
@@ -1246,7 +1248,7 @@ def main():
         if not _obsid_to_instdet:
             # Fallback: read FITS headers.
             _mast_root = _hst_dir / "mastDownload" / args.telescope.upper()
-            _im_suffix = args.hst_im_type.lstrip('_') + '.fits'
+            _im_suffix = _im_type_first.lstrip('_') + '.fits'
             for _oid in _restrict:
                 _flc_path = _mast_root / _oid / f"{_oid}_{_im_suffix}"
                 if _flc_path.exists():
@@ -1271,26 +1273,37 @@ def main():
                   "instrument for any obsid — skipping filter for steps 3/4.")
 
     # ── Step 3: PSF fitting ───────────────────────────────────────────────────
+    # One pass per telescope (same pypass engine; JWST io layer in pypass.io).  The
+    # first telescope uses the resolved working set; any further telescope its own
+    # Step-2 manifest.
+    def _manifest_obsids(_tel: str):
+        _m = output_dir / field / _tel / f"{field}_selected_obsids.json"
+        try:
+            return _json.loads(_m.read_text()) if _m.exists() else None
+        except Exception:
+            return None
+
     if not args.skip_psf:
         from bp3m.pipeline.psf_fitting import run_psf_fitting
-        run_psf_fitting(
-            output_dir=output_dir, field_name=field,
-            lib_dir=Path(args.lib_dir),
-            telescope=args.telescope,
-            im_type=args.hst_im_type,
-            n_processes=args.n_processes_psf,
-            verbose=not args.quiet,
-            force_refit=args.force_refit_psf,
-            clean_psf=args.clean_psf,
-            apply_psf_delta=args.apply_psf_delta,
-            n_psf_iter=args.n_psf_iter,
-            parallel=not args.single_image,
-            fmin=args.fmin, fmin_thresh=args.fmin_thresh, mag_st_max=args.mag_st_max, hmin=args.hmin,
-            n_passes=args.n_passes, n_discovery_passes=args.n_discovery_passes,
-            max_iter_fit=args.psf_max_iter,
-            sat_threshold=args.sat_threshold, conc_limit=args.conc_limit,
-            restrict_to_obsids=_restrict,
-        )
+        for _tel in args.telescopes:
+            run_psf_fitting(
+                output_dir=output_dir, field_name=field,
+                lib_dir=Path(args.lib_dir),
+                telescope=_tel,
+                im_type=_im_type_of[_tel],
+                n_processes=args.n_processes_psf,
+                verbose=not args.quiet,
+                force_refit=args.force_refit_psf,
+                clean_psf=args.clean_psf,
+                apply_psf_delta=args.apply_psf_delta,
+                n_psf_iter=args.n_psf_iter,
+                parallel=not args.single_image,
+                fmin=args.fmin, fmin_thresh=args.fmin_thresh, mag_st_max=args.mag_st_max, hmin=args.hmin,
+                n_passes=args.n_passes, n_discovery_passes=args.n_discovery_passes,
+                max_iter_fit=args.psf_max_iter,
+                sat_threshold=args.sat_threshold, conc_limit=args.conc_limit,
+                restrict_to_obsids=_restrict if _tel == args.telescope else _manifest_obsids(_tel),
+            )
 
     if args.reclassify_stars:
         from bp3m.pipeline.psf_fitting import reclassify_psf_catalogs
@@ -1317,32 +1330,35 @@ def main():
         )
 
     # ── Step 4: Cross-matching ────────────────────────────────────────────────
+    # One pass per telescope.  The learned GDC correction model is HST-only: JWST
+    # images are matched on their Anderson GDC positions alone.
     if not args.skip_crossmatch:
         from bp3m.pipeline.cross_match import run_cross_match
-        run_cross_match(
-            pos_corr_model=args.pos_corr_model,
-            output_dir=output_dir, field_name=field,
-            telescope=args.telescope,
-            im_type=args.hst_im_type,
-            n_processes=args.n_processes,
-            hst_pix_floor=args.cross_match_pix_floor,
-            min_matches=args.min_matches,
-            max_mag_diff=args.max_mag_diff,
-            scale_sweep=args.scale_sweep,
-            discovery_max_offset=args.discovery_max_offset,
-            use_resid_floor=args.auto_resid_floor,
-            force_rematch=args.force_rematch,
-            restrict_to_obsids=_restrict,
-            lib_dir=Path(args.lib_dir) if args.lib_dir else None,
-            run_qso_vetting=False,
-            force_validate=getattr(args, 'force_validate', False),
-            group_pass=not getattr(args, 'no_xmatch_group_pass', False),
-            force_group_pass=getattr(args, 'force_xmatch_group_pass', False),
-            prior_sigma_rot_deg=args.prior_sigma_rot_deg,
-            prior_sigma_scale=args.prior_sigma_scale,
-            prior_sigma_skew=args.prior_sigma_skew,
-            init_resid_max=args.xmatch_init_resid_max,
-        )
+        for _tel in args.telescopes:
+            run_cross_match(
+                pos_corr_model=args.pos_corr_model if _tel == 'HST' else None,
+                output_dir=output_dir, field_name=field,
+                telescope=_tel,
+                im_type=_im_type_of[_tel],
+                n_processes=args.n_processes,
+                hst_pix_floor=args.cross_match_pix_floor,
+                min_matches=args.min_matches,
+                max_mag_diff=args.max_mag_diff,
+                scale_sweep=args.scale_sweep,
+                discovery_max_offset=args.discovery_max_offset,
+                use_resid_floor=args.auto_resid_floor,
+                force_rematch=args.force_rematch,
+                restrict_to_obsids=_restrict if _tel == args.telescope else _manifest_obsids(_tel),
+                lib_dir=Path(args.lib_dir) if args.lib_dir else None,
+                run_qso_vetting=False,
+                force_validate=getattr(args, 'force_validate', False),
+                group_pass=not getattr(args, 'no_xmatch_group_pass', False),
+                force_group_pass=getattr(args, 'force_xmatch_group_pass', False),
+                prior_sigma_rot_deg=args.prior_sigma_rot_deg,
+                prior_sigma_scale=args.prior_sigma_scale,
+                prior_sigma_skew=args.prior_sigma_skew,
+                init_resid_max=args.xmatch_init_resid_max,
+            )
 
     # ── Step 4d: CFHT/UNIONS cross-matching (optional) ───────────────────────
     if args.use_cfht and not args.skip_crossmatch:
@@ -1551,7 +1567,7 @@ def main():
                       f"(data loaded later only for images that need fitting; --indv_discover_all_disk for all on-disk)")
             else:
                 _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
-                    output_dir, field, pos_err_floor=args.bp3m_pos_err_floor,
+                    output_dir, field, pos_err_floor=_pos_err_floor_by_tel,
                     gaia_csv=gaia_csv_path)
                 _, _indv_names, _ = build_index_maps(_spi_all, _gaia_all)
 
@@ -1640,7 +1656,7 @@ def main():
                 verbose_tests=args.verbose_tests,
                 use_two_tier=args.two_tier,
                 no_align_prior=args.no_align_prior,
-                pos_err_floor=args.bp3m_pos_err_floor,
+                pos_err_floor=_pos_err_floor_by_tel,
                 plot_residuals=args.plot_residuals,
                 plot_influence=args.plot_influence,
                 gaia_csv=gaia_csv_path,
@@ -1714,7 +1730,7 @@ def main():
             if _defer_load and _indv_names:
                 # full data load ONLY for images that will be fitted; same cuts as the old discovery
                 _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
-                    output_dir, field, pos_err_floor=args.bp3m_pos_err_floor,
+                    output_dir, field, pos_err_floor=_pos_err_floor_by_tel,
                     gaia_csv=gaia_csv_path, restrict_images=set(_indv_names))
                 _, _loaded, _ = build_index_maps(_spi_all, _gaia_all)
                 _loaded = set(_loaded)
@@ -1863,7 +1879,7 @@ def main():
                 verbose_tests=args.verbose_tests,
                 use_two_tier=args.two_tier,
                 no_align_prior=args.no_align_prior,
-                pos_err_floor=args.bp3m_pos_err_floor,
+                pos_err_floor=_pos_err_floor_by_tel,
                 use_indv_outputs=args.use_indv_outputs,
                 test_hysteresis_delta=args.test_hysteresis_delta,
                 min_align_demote=args.min_align_demote,
@@ -1961,7 +1977,7 @@ def main():
                 verbose_tests=args.verbose_tests,
                 use_two_tier=args.two_tier,
                 no_align_prior=args.no_align_prior,
-                pos_err_floor=args.bp3m_pos_err_floor,
+                pos_err_floor=_pos_err_floor_by_tel,
                 use_indv_outputs=args.use_indv_outputs,
                 bp3m_dir=_joint_bp3m_dir,
                 pos_corr_table=args.pos_corr_table,

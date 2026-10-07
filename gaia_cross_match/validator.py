@@ -39,6 +39,9 @@ from collections import defaultdict
 def _science_filter(h0):
     # WFC3 (and other single-wheel instruments) use a single FILTER keyword.
     single = h0.get('FILTER', '').strip()
+    if single and single.upper() == 'CLEAR' and h0.get('PUPIL', '').strip():
+        # JWST NIRISS imaging: filter wheel CLEAR, the band sits in the pupil wheel
+        return h0.get('PUPIL', '').strip()
     if single:
         return single
     # ACS uses two filter wheels (FILTER1/FILTER2); return the non-CLEAR one.
@@ -50,7 +53,9 @@ def _science_filter(h0):
 def load_image_data(image_dir, image_name):
     matched_path   = os.path.join(image_dir, 'matched_gaia.csv')
     transform_path = os.path.join(image_dir, 'transformation.csv')
-    flc_paths      = glob.glob(os.path.join(image_dir, '*_flc.fits'))
+    flc_paths      = (glob.glob(os.path.join(image_dir, '*_flc.fits'))
+                      or glob.glob(os.path.join(image_dir, '*_flt.fits'))
+                      or glob.glob(os.path.join(image_dir, '*_cal.fits')))   # JWST stage-2 product
     if not (os.path.exists(matched_path) and
             os.path.exists(transform_path) and flc_paths):
         return None
@@ -61,7 +66,7 @@ def load_image_data(image_dir, image_name):
     with fits.open(flc_paths[0]) as h:
         h0 = h[0].header
         h1 = h[1].header
-        exptime  = float(h0.get('EXPTIME', 1.0))
+        exptime  = float(h0.get('EXPTIME', h0.get('EFFEXPTM', 1.0)) or 1.0)
         filt     = _science_filter(h0)
         instrume = h0.get('INSTRUME', '').strip()
         detector = h0.get('DETECTOR', '').strip()
@@ -91,15 +96,23 @@ def load_image_data(image_dir, image_name):
     }
 
 
-def find_processed_images(target, data_dir):
-    hst_root = os.path.join(data_dir, target, 'HST')
+def find_processed_images(target, data_dir, telescopes=('HST', 'JWST')):
+    """Cross-matched images of a field from every telescope root present
+    ({target}/HST, {target}/JWST).  HST and JWST filter names never coincide, so
+    the per-filter zero-point graphs below never mix telescopes; the field-level
+    cross_match_catalog.csv covers both (filter_camera keeps them apart)."""
     images = {}
-    for root, dirs, files in os.walk(hst_root):
-        name = os.path.basename(root)
-        if f'{name}_flc_catalog.fits' in files and 'matched_gaia.csv' in files:
-            data = load_image_data(root, name)
-            if data is not None:
-                images[name] = data
+    for tel in telescopes:
+        tel_root = os.path.join(data_dir, target, tel)
+        if not os.path.isdir(tel_root):
+            continue
+        for root, dirs, files in os.walk(tel_root):
+            name = os.path.basename(root)
+            has_cat = any(f'{name}{s}_catalog.fits' in files for s in ('_flc', '_flt', '_cal'))
+            if has_cat and 'matched_gaia.csv' in files:
+                data = load_image_data(root, name)
+                if data is not None:
+                    images[name] = data
     return images
 
 

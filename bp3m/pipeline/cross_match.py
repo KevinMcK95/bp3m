@@ -34,11 +34,14 @@ from bp3m.instrument_config import (
 
 
 def _find_image_folders(output_dir: Path, field_name: str,
-                         telescope: str = 'HST', im_type: str = '_flc') -> list[dict]:
+                         telescope: str = 'HST', im_type: str | None = None) -> list[dict]:
     """
     Return list of dicts with keys {root, catalog, flc} for each image that
-    has both an FLC FITS file and a matching _catalog.fits.
+    has both a science FITS file and a matching _catalog.fits.  The key is named
+    'flc' for every telescope (JWST: the _cal.fits file).
     """
+    if im_type is None:
+        im_type = '_cal' if telescope.upper() == 'JWST' else '_flc'
     root = (Path(output_dir) / field_name / telescope.upper()
             / "mastDownload" / telescope.upper())
     folders = []
@@ -456,16 +459,16 @@ def run_cross_match(
     -------
     List of matched_gaia.csv paths
     """
-    if telescope.upper() != 'HST':
+    if telescope.upper() not in ('HST', 'JWST'):
         raise NotImplementedError(
-            "Cross-matching for non-HST telescopes is not yet implemented. "
-            "JWST support is planned once gaia_cross_match handles JWST headers."
-        )
+            f"Cross-matching for telescope '{telescope}' is not implemented (HST, JWST).")
+    if im_type is None:
+        im_type = '_cal' if telescope.upper() == 'JWST' else '_flc'
 
     from gaia_cross_match.cross_match import load_gaia_data
 
     print("\n" + "─"*50)
-    print("Step 4: Cross-matching HST ↔ Gaia")
+    print(f"Step 4: Cross-matching {telescope.upper()} ↔ Gaia")
     print("─"*50)
 
     gaia_df = load_gaia_data(field_name, str(Path(output_dir)))
@@ -532,6 +535,11 @@ def run_cross_match(
         print(f"  cross-match with learned GDC correction {pos_corr_model}: priors rot {prior_sigma_rot_deg} deg, scale {prior_sigma_scale}, skew {prior_sigma_skew}")
 
     def _group_pass():
+        if telescope.upper() != 'HST':
+            # Step 4c groups exposures by HST visit / guide-star / WCSNAME header keys;
+            # the JWST equivalents (PROGRAM/OBSERVTN/VISIT, no WCSNAME) are not wired yet.
+            print(f"\n  Step 4c: visit-group completion not yet available for {telescope.upper()} — skipped")
+            return 0
         if not group_pass:
             return 0
         from .xmatch_groups import run_group_pass

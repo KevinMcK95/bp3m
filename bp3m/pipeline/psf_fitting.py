@@ -61,6 +61,24 @@ _HST_DEFAULTS = dict(
     backend='auto',
 )
 
+# JWST stage-2 _cal images (NIRCam / NIRISS / MIRI), fitted by the same pypass engine
+# (JWST io layer adapted from Liwen Chen's jwst1pass_py_v2).  Same electron-based
+# detection threshold as HST (pypass fits electron equivalents and writes the
+# catalog in MJy/sr); mag_st_max is read as an AB limit (JWST has no STMAG).
+# half_width 5 (11x11 window): the undersampled NIRCam SW / NIRISS PSF has wings and
+# the cruciform that a 7x7 window would truncate (her choice; Fortran jwst1pass also
+# fits wider than hst1pass).  hmin stays 4: in pypass it is only the detection
+# non-maximum-suppression radius (her fork's hmin=5 also culled the catalogue).
+# sat_threshold None: JWST saturation is a DQ bit, masked in pypass.io.
+_JWST_DEFAULTS = dict(_HST_DEFAULTS, half_width=5, sat_threshold=None)
+
+
+def _defaults_for(telescope: str) -> dict:
+    return _JWST_DEFAULTS if str(telescope).upper() == 'JWST' else _HST_DEFAULTS
+
+
+_DEFAULT_IM_TYPE = {'HST': '_flc', 'JWST': '_cal'}
+
 
 class _FITSRecord:
     """Minimal duck-typed StarRecord built from a FITS catalog table row.
@@ -392,7 +410,7 @@ def reclassify_psf_catalogs(
     output_dir: Path,
     field_name: str,
     telescope: str = 'HST',
-    im_type: str = '_flc',
+    im_type: str | None = None,
     conc_limit: float | None = None,
     restrict_to_obsids: list[str] | None = None,
     psf_dir: Path | None = None,
@@ -653,7 +671,7 @@ def remeasure_psf_perturbation(
     field_name: str,
     lib_dir: Path,
     telescope: str = 'HST',
-    im_type: str = '_flc',
+    im_type: str | None = None,
     restrict_to_obsids: list[str] | None = None,
     psf_dir: Path | None = None,
     half_width: int | None = None,
@@ -705,8 +723,8 @@ def remeasure_psf_perturbation(
     from astropy.io import fits as _fits
     from astropy.table import Table
 
-    _hw   = half_width if half_width is not None else _HST_DEFAULTS['half_width']
-    _fmin = fmin_thresh if fmin_thresh is not None else _HST_DEFAULTS['fmin_thresh']
+    _hw   = half_width if half_width is not None else _defaults_for(telescope)['half_width']
+    _fmin = fmin_thresh if fmin_thresh is not None else _defaults_for(telescope)['fmin_thresh']
 
     from .download_hst import find_flc_images
     images = find_flc_images(output_dir, field_name, telescope=telescope,
@@ -963,9 +981,11 @@ def _get_image_header_info(img_path):
         instrume = hdr.get('INSTRUME', '?').strip()
         detector = hdr.get('DETECTOR', '').strip()
         instdet  = f"{instrume}/{detector}" if detector else instrume
-        exptime  = float(hdr.get('EXPTIME', 0))
+        # HST EXPTIME; JWST effective exposure time EFFEXPTM
+        exptime  = float(hdr.get('EXPTIME', hdr.get('EFFEXPTM', 0)) or 0)
         # Match _extract_filter logic in pypass/io.py:
-        # ACS has two filter wheels — pick the non-CLEAR one.
+        # ACS has two filter wheels — pick the non-CLEAR one; NIRISS imaging has
+        # FILTER=CLEAR and the band in PUPIL.
         filt = '?'
         if instrume.upper() in ('ACS', ''):
             for _key in ('FILTER1', 'FILTER2'):
@@ -973,17 +993,21 @@ def _get_image_header_info(img_path):
                 if _v and not _v.startswith('CLEAR'):
                     filt = _v; break
         if filt == '?':
-            for _key in ('FILTER', 'FILTNAM1', 'FILTNAM2', 'FILTER1', 'FILTER2'):
+            for _key in ('FILTER', 'PUPIL', 'FILTNAM1', 'FILTNAM2', 'FILTER1', 'FILTER2'):
                 _v = hdr.get(_key, '').strip().upper()
                 if _v and not _v.startswith('CLEAR'):
                     filt = _v; break
         photflam = float(sci_hdr['PHOTFLAM']) if sci_hdr and 'PHOTFLAM' in sci_hdr else None
         photzpt  = float(sci_hdr.get('PHOTZPT', -21.10)) if sci_hdr else -21.10
+        pixar_sr = float(sci_hdr['PIXAR_SR']) if sci_hdr and 'PIXAR_SR' in sci_hdr else None
+        photmjsr = float(sci_hdr['PHOTMJSR']) if sci_hdr and 'PHOTMJSR' in sci_hdr else None
         return {'instdet': instdet, 'filter': filt, 'exptime': exptime,
-                'photflam': photflam, 'photzpt': photzpt}
+                'photflam': photflam, 'photzpt': photzpt,
+                'pixar_sr': pixar_sr, 'photmjsr': photmjsr, 'instrume': instrume.upper()}
     except Exception:
         return {'instdet': '?', 'filter': '?', 'exptime': 0,
-                'photflam': None, 'photzpt': -21.10}
+                'photflam': None, 'photzpt': -21.10,
+                'pixar_sr': None, 'photmjsr': None, 'instrume': '?'}
 
 
 def _effective_fmin(info: dict, params: dict) -> str:
@@ -993,6 +1017,19 @@ def _effective_fmin(info: dict, params: dict) -> str:
     photflam    = info.get('photflam')
     photzpt     = info.get('photzpt', -21.10)
     exptime     = info.get('exptime', 0)
+    pixar_sr    = info.get('pixar_sr')
+    photmjsr    = info.get('photmjsr')
+    if pixar_sr and photmjsr and exptime > 0:
+        # JWST: mag limit is AB; electrons per MJy/sr = gain * EFFEXPTM / PHOTMJSR (pypass.io)
+        try:
+            import math
+            from pypass.io import _JWST_GAIN_E_PER_DN
+            gain = _JWST_GAIN_E_PER_DN.get(info.get('instrume', ''), 2.0)
+            zp_ab = -2.5 * math.log10(pixar_sr * 1e6 / 3631.0)
+            fmin_from_mag = 10 ** ((zp_ab - mag_st_max) / 2.5) * gain * exptime / photmjsr
+            return f"{max(fmin_from_mag, fmin_thresh):.0f}"
+        except Exception:
+            pass
     if photflam and exptime > 0:
         try:
             import math
@@ -1253,15 +1290,23 @@ def _fit_one_image(args):
         if _sky_vals.size > 0:
             _med_sky = float(np.median(_sky_vals))
             _exptime = params_meta.get('exptime', None)
-            if _exptime is None:
-                try:
-                    from astropy.io import fits as _fits_sk
-                    _exptime = float(_fits_sk.getval(str(image_path), 'EXPTIME', ext=0))
-                except Exception:
-                    _exptime = None
+            _is_jwst_img = False
+            try:
+                from astropy.io import fits as _fits_sk
+                _h0_sk = _fits_sk.getheader(str(image_path), 0)
+                _is_jwst_img = str(_h0_sk.get('INSTRUME', '')).strip().upper() in ('NIRCAM', 'NIRISS', 'MIRI')
+                if _exptime is None:
+                    _exptime = float(_h0_sk.get('EXPTIME', _h0_sk.get('EFFEXPTM', 0.0)) or 0.0) or None
+            except Exception:
+                pass
             _sky_per_sec = _med_sky / _exptime if (_exptime and _exptime > 0) else None
-            _sky_warn = (_sky_per_sec is not None and _sky_per_sec < 0.005) or \
-                        (_sky_per_sec is None and _med_sky < 2.0)
+            if _is_jwst_img:
+                # MJy/sr surface brightness: the HST counts/s thresholds do not apply;
+                # only a non-positive median sky is suspicious
+                _sky_warn = _med_sky <= 0.0
+            else:
+                _sky_warn = (_sky_per_sec is not None and _sky_per_sec < 0.005) or \
+                            (_sky_per_sec is None and _med_sky < 2.0)
             if _sky_warn:
                 print(f"  WARNING: [{img_name}] anomalously low sky — "
                       f"median sky = {_med_sky:.2f} counts"
@@ -1616,7 +1661,7 @@ def run_psf_fitting(
     field_name: str,
     lib_dir: Path,
     telescope: str = 'HST',
-    im_type: str = '_flc',
+    im_type: str | None = None,
     n_processes: int = -1,
     verbose: bool = True,
     force_refit: bool = False,
@@ -1677,11 +1722,13 @@ def run_psf_fitting(
     -------
     List of output catalog FITS paths
     """
-    if telescope.upper() != 'HST':
+    if telescope.upper() not in _DEFAULT_IM_TYPE:
         raise NotImplementedError(
-            "PSF fitting for non-HST telescopes is not yet implemented. "
-            "JWST support is planned once py1pass is updated for JWST headers."
+            f"PSF fitting for telescope '{telescope}' is not implemented "
+            f"(supported: {sorted(_DEFAULT_IM_TYPE)})."
         )
+    if im_type is None:
+        im_type = _DEFAULT_IM_TYPE[telescope.upper()]
 
     # psf_dir parameter retained for API compatibility but no longer needed;
     # pypass is installed as a package.
@@ -1713,8 +1760,8 @@ def run_psf_fitting(
     warnings.filterwarnings('ignore', message='.*not multiple of 2880.*')
     warnings.filterwarnings('ignore', message='.*greater than 8 characters.*')
 
-    # Build parameter dict from defaults + any overrides.
-    params = dict(_HST_DEFAULTS)
+    # Build parameter dict from the telescope's defaults + any overrides.
+    params = dict(_defaults_for(telescope))
     if fmin is not None:
         # fmin directly sets the pypass flux threshold, overriding both
         # mag_st_max (set to 99 so fmin_from_mag ≈ 0) and fmin_thresh.
@@ -2007,8 +2054,10 @@ def run_psf_fitting(
 
             try:
                 from astropy.io import fits as _fits_hdr
-                _et = float(_fits_hdr.getval(str(img), 'EXPTIME', ext=0))
-                _et_str = f"  EXPTIME={_et:.1f}s"
+                _h0_et = _fits_hdr.getheader(str(img), 0)
+                _et_key = 'EXPTIME' if 'EXPTIME' in _h0_et else 'EFFEXPTM'
+                _et = float(_h0_et[_et_key])
+                _et_str = f"  {_et_key}={_et:.1f}s"
             except Exception:
                 _et_str = ""
             print(f"\n── [{img_i}/{n_work}] {field_name}  {img.name}{_et_str} ──────────────────────────────────")

@@ -1589,13 +1589,16 @@ def _parse_polygons(s_region: str) -> list[np.ndarray]:
 
 
 def find_flc_images(output_dir: Path, field_name: str,
-                    telescope: str = 'HST', im_type: str = '_flc') -> list[Path]:
+                    telescope: str = 'HST', im_type: str | None = None) -> list[Path]:
     """
-    Return sorted list of downloaded FLC FITS paths for a field.
+    Return sorted list of downloaded science image paths for a field.
 
     Expected structure:
         {output_dir}/{field}/{telescope}/mastDownload/{telescope}/{obs_id}/{obs_id}_flc.fits
+    (JWST: ..._cal.fits).  im_type None selects the telescope default (_DEFAULT_IM_TYPE).
     """
+    if im_type is None:
+        im_type = _DEFAULT_IM_TYPE.get(telescope.upper(), '_flc')
     root = Path(output_dir) / field_name / telescope.upper() / "mastDownload" / telescope.upper()
     suffix = f"{im_type}.fits"
     found = sorted(root.rglob(f"*{suffix}")) if root.exists() else []

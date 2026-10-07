@@ -179,6 +179,11 @@ def run_alignment(  # noqa: C901
     )
     print(f"  run_bp3m command:\n    {_cmd}")
 
+    # pos_err_floor may be per telescope ({'HST': px, 'JWST': px}); the loader
+    # resolves it per image, the HST-only CFHT paths below take the HST value.
+    _pef_hst = (float(pos_err_floor.get('HST', 0.05)) if isinstance(pos_err_floor, dict)
+                else pos_err_floor)
+
     # ── Load data ─────────────────────────────────────────────────────────────
     print(f"\n  Loading FLC pipeline data for '{field_name}'...")
     imgs, stars_per_image, gaia_catalog = load_image_data_flc(
@@ -333,7 +338,7 @@ def run_alignment(  # noqa: C901
                        [['hst_index', 'star_id']]
                        .rename(columns={'star_id': 'gaia_source_id'}))
                 _extra = _bsd(_hst_root / _img_nm, _img_nm, None,
-                              pos_err_floor, meta=imgs.get(_base[0]),
+                              _pef_hst, meta=imgs.get(_base[0]),
                               match_override=_ov)
                 if _extra is None or not len(_extra):
                     continue
@@ -355,7 +360,7 @@ def run_alignment(  # noqa: C901
             # brought back onto the frame via transformation_cfht_<exp>.csv
             fimgs, fstars = build_fallback_hst_images(
                 data_root / field_name, _cm,
-                pos_err_floor=pos_err_floor, pos_corr_table=pos_corr_table,
+                pos_err_floor=_pef_hst, pos_corr_table=pos_corr_table,
                 pos_corr_model=pos_corr_model)
             if fimgs:
                 imgs.update(fimgs)
