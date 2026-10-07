@@ -311,7 +311,9 @@ def _match_one(args):
             except Exception:
                 return 1.0
         _marginal = file_updated and _fap_of() > MARGINAL_FA_PROB
-        if (not file_updated or _marginal) and _off < WIDE_DISCOVERY_OFFSET and not _is_jwst:
+        # JWST: the wide retry stays available (early-mission headers can be 2" off: M92 ERS 1334, 2022-06);
+        # the chance-coincidence test and the Step-4c sibling-consistency gate guard against spurious solutions
+        if (not file_updated or _marginal) and _off < WIDE_DISCOVERY_OFFSET:
             # a marginal first success (e.g. 7 pairs vs 1.3 by chance) can hide the real solution
             # outside the default window: run the wide attempt and keep the more significant one
             import shutil as _sh

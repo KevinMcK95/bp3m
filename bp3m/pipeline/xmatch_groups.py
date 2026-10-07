@@ -154,17 +154,40 @@ def low_n_suspect(member, max_n: int = LOW_N_MAX, max_offset_mas: float = LOW_N_
     return bool(E['offset_mas'] > max_offset_mas), E
 
 
-def jwst_header_bad(member) -> bool:
-    """JWST member whose Gaia solution sits > JWST_MAX_HEADER_OFFSET_MAS from its (Gaia-tied) header: spurious
-    (Draco program 4513 module B: 0.3-1.5" offsets from diffraction-spike detections of saturated Gaia stars)."""
+JWST_HDR_STRONG_N = 20          # a far-from-header solution this well matched is real (M92 ERS 2022-06: 2" offsets, 40-94 matches)
+JWST_HDR_STRONG_FA = 1e-15
+JWST_HDR_AGREE_MAS = 150.0      # far-from-header solutions that agree with a sibling this well share a real header error
+
+
+def _jwst_header_E(member):
     if getattr(member, 'telescope', 'HST') != 'JWST' or not getattr(member, 'ok', False) or member.trans is None:
-        return False
+        return None
     from gaia_cross_match import sibling_seed as ss
     try:
-        E = member.E or ss.measure_header_error(member.params, member.trans, member.xr, member.yr)
+        return member.E or ss.measure_header_error(member.params, member.trans, member.xr, member.yr)
     except Exception:
+        return None
+
+
+def jwst_header_bad(member, group=None) -> bool:
+    """JWST member whose Gaia solution sits > JWST_MAX_HEADER_OFFSET_MAS from its (Gaia-tied) header AND is not
+    corroborated: spurious solutions (Draco program 4513 module B: 0.3-1.5" offsets from diffraction-spike
+    detections of saturated Gaia stars, 6-11 'matches', inconsistent between dithers) are demoted, while a
+    genuine large header error (M92 ERS 1334, 2022-06-20: all frames of the visit off by (-1846, -696) mas with
+    40-94 matches, FA 1e-62..1e-267) is kept because it is strongly matched and shared by the siblings."""
+    E = _jwst_header_E(member)
+    if E is None or E['offset_mas'] <= JWST_MAX_HEADER_OFFSET_MAS:
         return False
-    return bool(E['offset_mas'] > JWST_MAX_HEADER_OFFSET_MAS)
+    fa = float(member.trans.get('chance_fa_prob', 1.0)) if isinstance(member.trans, dict) else 1.0
+    if member.n >= JWST_HDR_STRONG_N and fa < JWST_HDR_STRONG_FA:
+        return False
+    for s in (group or []):
+        if s is member:
+            continue
+        Es = _jwst_header_E(s)
+        if Es is not None and np.hypot(Es['tx'] - E['tx'], Es['ty'] - E['ty']) < JWST_HDR_AGREE_MAS:
+            return False
+    return True
 
 
 def affine_from_trans(tr: dict, c) -> tuple:
@@ -228,7 +251,7 @@ def classify(group: list, zp_ref: dict | None = None) -> dict:
     A success whose zero point (Gaia G - STMAG) is inconsistent with its filter is a suspect
     whatever its siblings say: spurious solutions match faint junk and sit ~10 mag off."""
     zp_ref = zp_ref or {}
-    hdr_bad = {m.name: jwst_header_bad(m) for m in group}
+    hdr_bad = {m.name: jwst_header_bad(m, group) for m in group}
     sane = {m.name: (m.ok and zp_sane(m.zp, zp_ref.get(m.filt), m.n) and not hdr_bad[m.name]) for m in group}
     info = {}
     for m in group:
