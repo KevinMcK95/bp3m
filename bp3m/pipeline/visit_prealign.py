@@ -283,6 +283,7 @@ EPOCH_FRAME_FLOOR_MAS = 2.0
 
 EPOCH_SIG_PM_RELAX = 2.0    # mas/yr: used when fewer than EPOCH_MIN_REF stars pass EPOCH_SIG_PM_MAX (sparse fields, JWST 2026-10-07)
 EPOCH_MIN_REF = 100
+EPOCH_MIN_REF_DENSE = 2000   # reference size wanted before the PM-quality cut stops relaxing
 
 
 def _epoch_reference(v2_dir, t_obs):
@@ -291,8 +292,13 @@ def _epoch_reference(v2_dir, t_obs):
     sp = np.hypot(s.sigma_pmra_bp3m, s.sigma_pmdec_bp3m) / np.sqrt(2)
     good = np.isfinite(s.pmra_bp3m) & np.isfinite(s.delta_racosdec_bp3m)
     sel = (sp < EPOCH_SIG_PM_MAX) & good
-    if sel.sum() < EPOCH_MIN_REF:          # e.g. And XIV: 32 Gaia stars, HST-only sigma_PM 0.5-2 mas/yr
-        sel = (sp < EPOCH_SIG_PM_RELAX) & good
+    # sparse fields (And XIV: 32 Gaia stars, HST-only sigma_PM 0.5-2 mas/yr): relax the PM-quality cut step by
+    # step until the reference holds >= EPOCH_MIN_REF_DENSE stars -- a 63" NIRCam SW frame needs >= 10 of them
+    # (2026-10-07 first pass: 79/139 JWST frames had 0-6 reference stars in their footprint)
+    for _relax in (EPOCH_SIG_PM_RELAX, 3.0, 5.0):
+        if sel.sum() >= EPOCH_MIN_REF_DENSE:
+            break
+        sel = (sp < _relax) & good
     s = s[sel]
     cosd = np.cos(np.radians(s.dec.to_numpy()))
     dt = t_obs - s.Gaia_time.to_numpy(float)
