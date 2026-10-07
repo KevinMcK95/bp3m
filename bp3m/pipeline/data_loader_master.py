@@ -878,6 +878,13 @@ def load_master_v2(
         flux_arr    = np.full(n, np.nan)
         cidx        = np.full(n, -1, dtype=int)
 
+        # positional floor in this image's own pixels (pos_err_floor may be per telescope)
+        if isinstance(pos_err_floor, dict):
+            _mt = (base_meta_cache.get(_sub_name_to_base(sub_name)) or {}).get("telescope", "HST")
+            _floor_img = float(pos_err_floor.get(str(_mt).upper(), pos_err_floor.get("HST", _MIN_POS_ERR_PX)))
+        else:
+            _floor_img = float(pos_err_floor)
+
         for k, r in enumerate(recs_img):
             ci = r["cat_idx"]
             gaia_ids[k]   = r["Gaia_id"]
@@ -891,8 +898,8 @@ def load_master_v2(
             cxx = fits_data["cov_xx"][ci]
             cyy = fits_data["cov_yy"][ci]
             cxy = fits_data["cov_xy"][ci]
-            sx = np.sqrt(max(cxx, 0.0) + pos_err_floor**2)
-            sy = np.sqrt(max(cyy, 0.0) + pos_err_floor**2)
+            sx = np.sqrt(max(cxx, 0.0) + _floor_img**2)
+            sy = np.sqrt(max(cyy, 0.0) + _floor_img**2)
             denom = sx * sy
             rho = float(np.clip(cxy / denom if denom > 0 else 0.0, -0.9999, 0.9999))
 
