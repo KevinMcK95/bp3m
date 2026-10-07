@@ -50,6 +50,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from astropy.io import fits
+# image/catalog lookup shared with the v1 loader: HST (_flc) and JWST (_cal) products,
+# one root per telescope ({field}/{TEL}/mastDownload/{TEL})
+from bp3m.data_loader_flc import image_roots, find_image_dir, _image_file, _catalog_file
 from astropy.time import Time as AstropyTime
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
@@ -97,6 +100,8 @@ _SOLVER_XO = _SOLVER_YO = 2048.0
 
 def _get_filter(h0) -> str:
     filt = h0.get('FILTER', '')
+    if filt and str(filt).strip().upper() == 'CLEAR' and str(h0.get('PUPIL', '')).strip():
+        return str(h0.get('PUPIL', '')).strip()      # JWST NIRISS imaging: band in PUPIL
     if filt:
         return str(filt).strip()
     f1 = str(h0.get('FILTER1', '')).strip()
@@ -504,8 +509,8 @@ def _load_all_detections(field_dir: Path,
             base   = sub_name
             suffix = None
 
-        img_dir  = hst_root / base
-        cat_path = img_dir / f'{base}_flc_catalog.fits'
+        img_dir  = find_image_dir(hst_root, base)
+        cat_path = _catalog_file(img_dir, base) or img_dir / f'{base}_flc_catalog.fits'
         # prealigned solutions are per exposure (one affine for both chips): match the sub-image's base name
         tran_csv = img_dir / ('transformation_prealign.csv' if (sub_name in _prealigned or base in _prealigned)
                               else 'transformation.csv')
@@ -550,7 +555,7 @@ def _load_all_detections(field_dir: Path,
         flt = instrument = detector = 'UNKNOWN'
         epoch_mjd = np.nan
         y_split   = 2048
-        flc_path  = img_dir / f'{base}_flc.fits'
+        flc_path  = _image_file(img_dir, base) or img_dir / f'{base}_flc.fits'
         if flc_path.exists():
             try:
                 with fits.open(flc_path, memmap=False) as hdu:
@@ -855,7 +860,7 @@ def _indv_solution(field_dir: Path, hst_root: Path, sub_name: str, n_r: int):
     try:
         cfg = _js.load(open(d / 'run_config.json'))
         md5 = cfg.get('matched_gaia_md5')
-        mg = hst_root / base / 'matched_gaia.csv'
+        mg = find_image_dir(hst_root, base) / 'matched_gaia.csv'
         if md5 and (not mg.exists() or _hl.md5(mg.read_bytes()).hexdigest() != md5):
             return None
         it = pd.read_csv(d / 'image_transformations.csv')
@@ -940,7 +945,7 @@ def _compute_gaia_zp_per_image(hst_root: Path, image_names: list[str]) -> dict[s
     from tqdm import tqdm
     for base in tqdm(sorted(bases_seen), desc="  Computing Gaia ZP", unit="img",
                      dynamic_ncols=True):
-        img_dir    = hst_root / base
+        img_dir    = find_image_dir(hst_root, base)
         match_path = img_dir / 'matched_gaia.csv'
         if not match_path.exists():
             continue
@@ -957,7 +962,7 @@ def _compute_gaia_zp_per_image(hst_root: Path, image_names: list[str]) -> dict[s
             continue
 
         # Read filter for grouping
-        flc_path = img_dir / f'{base}_flc.fits'
+        flc_path = _image_file(img_dir, base) or img_dir / f'{base}_flc.fits'
         if flc_path.exists():
             try:
                 with fits.open(flc_path, memmap=False) as h:
@@ -4692,7 +4697,8 @@ def run_hst_crossmatch(
             sub_img_meta4: dict[str, tuple[float, float, float]] = {}
             sub_img_xoyo4: dict[str, tuple[float, float]] = {}
             pscale4 = 50.0  # ACS/WFC default; overwritten per image below
-            for img_dir4 in sorted(hst_root4.iterdir()):
+            for img_dir4 in sorted((p for r in image_roots(field_dir) for p in r.iterdir() if p.is_dir()),
+                                   key=lambda p: p.name):
                 t4 = img_dir4 / ('transformation_prealign.csv' if img_dir4.name in _prealigned4 else 'transformation.csv')
                 if not t4.exists():
                     continue
@@ -4715,7 +4721,7 @@ def run_hst_crossmatch(
                     base4 = img_dir4.name
 
                     # Per-chip Xo/Yo from FITS catalog header (CHIP{n}_CRPIX_GDC)
-                    cat4 = img_dir4 / f'{base4}_flc_catalog.fits'
+                    cat4 = _catalog_file(img_dir4, base4) or img_dir4 / f'{base4}_flc_catalog.fits'
                     _cp_lo4, _cp_hi4 = _read_chip_xoyo(cat4)
 
                     sub_img_meta4[base4] = (ra4, dec4, ps4)

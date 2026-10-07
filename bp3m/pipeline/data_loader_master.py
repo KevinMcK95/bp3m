@@ -245,8 +245,11 @@ def _band_of(hst_root: Path, sub_name: str) -> str:
     base = _sub_name_to_base(sub_name)
     if base not in _BAND_CACHE:
         from astropy.io import fits
-        h = fits.getheader(hst_root / base / f"{base}_flc.fits", 0)
-        filt = next((str(h.get(k, '')).strip() for k in ('FILTER', 'FILTER1', 'FILTER2')
+        from bp3m.data_loader_flc import find_image_dir, _image_file
+        _d = find_image_dir(hst_root, base)
+        h = fits.getheader(_image_file(_d, base) or _d / f"{base}_flc.fits", 0)
+        # PUPIL covers JWST NIRISS imaging (FILTER=CLEAR, band in PUPIL)
+        filt = next((str(h.get(k, '')).strip() for k in ('FILTER', 'PUPIL', 'FILTER1', 'FILTER2')
                      if str(h.get(k, '')).strip().upper().startswith('F')), '?')
         _BAND_CACHE[base] = f"{str(h.get('DETECTOR', '?')).strip()}/{filt}"
     return _BAND_CACHE[base]
@@ -382,6 +385,7 @@ def load_master_v2(
         pos_corr_model = None
     _ensure_bp3m()
     from bp3m.data_loader_flc import _read_image_meta  # private but stable
+    from bp3m.data_loader_flc import find_image_dir, _image_file, _catalog_file
 
     data_root  = Path(data_root)
     field_dir  = data_root / field_name
@@ -722,7 +726,7 @@ def load_master_v2(
                          unit="img", dynamic_ncols=True):
         base = _sub_name_to_base(sub_name)
         if base not in base_meta_cache:
-            img_dir = hst_root / base
+            img_dir = find_image_dir(hst_root, base)
             base_meta_cache[base] = _read_image_meta(
                 img_dir, base, transformation_file=('transformation_prealign.csv' if base in _prealigned else None))
         meta = base_meta_cache[base]
@@ -778,13 +782,14 @@ def load_master_v2(
     def _get_fits(sub_name: str) -> tuple[dict | None, int]:
         base = _sub_name_to_base(sub_name)
         if base not in fits_cache:
-            cat_path = hst_root / base / f"{base}_flc_catalog.fits"
+            _idir = find_image_dir(hst_root, base)
+            cat_path = _catalog_file(_idir, base) or _idir / f"{base}_flc_catalog.fits"
             fits_cache[base] = _load_fits_catalog(cat_path)
             if _POSITION_OVERRIDES and fits_cache[base] is not None:
                 _n_ov = _apply_overrides(base, fits_cache[base], fits_cache[base].get("_jac"))
                 if _n_ov:
                     print(f"    position overrides (model-based galaxy centres): {base}: {_n_ov} rows")
-            psf_path = hst_root / base / "psf_params.json"
+            psf_path = find_image_dir(hst_root, base) / "psf_params.json"
             if psf_path.exists():
                 with open(psf_path) as f:
                     hw = int(json.load(f).get("half_width", 3))
@@ -929,13 +934,19 @@ def load_master_v2(
             _sel = np.isfinite(X) & np.isfinite(Y) & (cidx >= 0)
             if _sel.any():
                 if _base not in _pcm_hdr:
-                    _pcm_hdr[_base] = _pcm.read_header(hst_root / _base / f"{_base}_flc.fits")
+                    _ipath = _image_file(find_image_dir(hst_root, _base), _base)
+                    # the learned GDC model is HST-only: no correction for JWST exposures
+                    from astropy.io import fits as _fits_pcm
+                    _inst = str(_fits_pcm.getheader(_ipath, 0).get('INSTRUME', '')).strip().upper() if _ipath else ''
+                    _pcm_hdr[_base] = (_pcm.read_header(_ipath)
+                                       if _ipath is not None and _inst not in ('NIRCAM', 'NIRISS', 'MIRI') else None)
                 _ci = cidx[_sel]
                 _cols = [fits_data["x"][_ci], fits_data["y"][_ci], fits_data["chip_ext"][_ci], fits_data["mag"][_ci]]
                 _names = ["x", "y", "chip_ext", "mag"]
                 if fits_data.get("sky") is not None:
                     _cols.append(fits_data["sky"][_ci]); _names.append("sky")
-                _mb = _pcm.bias(np.rec.fromarrays(_cols, names=_names), _pcm_hdr[_base])
+                _mb = (_pcm.bias(np.rec.fromarrays(_cols, names=_names), _pcm_hdr[_base])
+                       if _pcm_hdr[_base] is not None else None)
                 if _mb is not None:
                     X[_sel] = X[_sel] - _mb[0]
                     Y[_sel] = Y[_sel] - _mb[1]

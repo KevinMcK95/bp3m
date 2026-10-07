@@ -157,6 +157,27 @@ def _catalog_file(img_dir: Path, img_name: str) -> "Path | None":
     return None
 
 
+def image_roots(field_dir) -> list:
+    """Existing per-telescope image roots of a field: {field}/HST/mastDownload/HST and
+    {field}/JWST/mastDownload/JWST (in that order)."""
+    field_dir = Path(field_dir)
+    return [field_dir / t / "mastDownload" / t for t in ("HST", "JWST")
+            if (field_dir / t / "mastDownload" / t).is_dir()]
+
+
+def find_image_dir(root_or_field, base: str) -> Path:
+    """Directory of image *base* in a field.  *root_or_field* is either the field
+    directory or one telescope root ({field}/{TEL}/mastDownload/{TEL}); every
+    telescope root is searched, so v2 code written against a single HST root finds
+    JWST exposures too.  Falls back to the HST path when the image is absent."""
+    p = Path(root_or_field)
+    field_dir = p.parents[2] if p.name in ("HST", "JWST") and p.parent.name == "mastDownload" else p
+    for r in image_roots(field_dir):
+        if (r / base).is_dir():
+            return r / base
+    return field_dir / "HST" / "mastDownload" / "HST" / base
+
+
 def _telescope_of(instrument: str) -> str:
     return "JWST" if str(instrument).strip().upper() in _JWST_INSTRUMENTS else "HST"
 

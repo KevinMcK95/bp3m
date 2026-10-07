@@ -397,6 +397,25 @@ def make_plots(solver, images, gaia_catalog,
         _TIER_C = {'gaia_hst': 'tab:blue', 'gaia_cfht_hst': 'tab:green',
                    'gaia_cfht': 'tab:purple', 'cfht_hst': 'tab:orange'}
 
+    # Telescope provenance (joint HST+JWST runs): colour and label the Gaia-prior
+    # stars by which telescopes contributed detections (solver.gaia_n_used_by_tel),
+    # as the DELVE / CFHT provenance groups do (user 2026-10-07).
+    _by_tel = getattr(solver, 'gaia_n_used_by_tel', {}) or {}
+    _tel_groups = [('Gaia only', np.ones(solver.n_stars, bool), 'grey')]
+    if len(_by_tel) > 1:
+        _nz = {t: (a > 0) for t, a in _by_tel.items()}
+        _tels = sorted(_nz)
+        _TEL_C = {'HST': 'grey', 'JWST': 'tab:red'}
+        _tel_groups = []
+        if len(_tels) == 2:
+            _a, _b = _tels
+            _tel_groups.append((f'Gaia+{_a}+{_b}', _nz[_a] & _nz[_b], 'tab:green'))
+            _tel_groups.append((f'Gaia+{_a}', _nz[_a] & ~_nz[_b], _TEL_C.get(_a, 'tab:blue')))
+            _tel_groups.append((f'Gaia+{_b}', ~_nz[_a] & _nz[_b], _TEL_C.get(_b, 'tab:purple')))
+        else:
+            for _t in _tels:
+                _tel_groups.append((f'Gaia+{_t}', _nz[_t], _TEL_C.get(_t, 'tab:blue')))
+
     for ax, gaia_pm, bp3m_pm_g, sig_g, sig_b_g, d_pm, d_sig, comp in zip(
             [ax_pmra, ax_pmdec],
             [pmra_gaia,   pmdec_gaia],
@@ -440,12 +459,16 @@ def make_plots(solver, images, gaia_catalog,
                                 xerr=d_sig[_dm], yerr=sig_b_g[_dm],
                                 fmt='D', ms=4, lw=0.5, alpha=0.5, color='dodgerblue',
                                 label='DELVE PM (for Gaia+DELVE)', zorder=3)
-            # Gaia-only stars (foreground, zorder=4)
-            if _gaia_only_nq.any():
-                ax.errorbar(gaia_pm[_gaia_only_nq], bp3m_pm_g[_gaia_only_nq],
-                            xerr=sig_g[_gaia_only_nq], yerr=sig_b_g[_gaia_only_nq],
-                            fmt='o', ms=3, lw=0.5, alpha=0.5, color='grey',
-                            label='Gaia only', zorder=4)
+            # Gaia-prior stars without DELVE (foreground, zorder=4), split by the
+            # telescopes that contributed detections in a joint run
+            for _zg, (_glab, _gmask, _gcol) in enumerate(_tel_groups):
+                _gm = _gaia_only_nq & _gmask
+                if _gm.any():
+                    ax.errorbar(gaia_pm[_gm], bp3m_pm_g[_gm],
+                                xerr=sig_g[_gm], yerr=sig_b_g[_gm],
+                                fmt='o', ms=3, lw=0.5, alpha=0.5, color=_gcol,
+                                label=f'{_glab} ({int(_gm.sum())})' if len(_tel_groups) > 1 else _glab,
+                                zorder=4 + _zg)
 
         # Axis limits from Gaia-prior stars only (DELVE-only can blow up the axes)
         gaia_x = np.concatenate([

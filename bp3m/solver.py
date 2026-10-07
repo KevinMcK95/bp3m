@@ -479,6 +479,8 @@ class BP3MSolver:
         self.gaia_trustworthy = np.isnan(ruwe) | (ruwe <= 1.4)
         self.gaia_g  = g["gmag"].to_numpy(float)
         self.gaia_n_hst_used = np.zeros(len(self.gaia_g)).astype(int)
+        # per-telescope detection counts (HST / JWST), same bookkeeping as gaia_n_hst_used
+        self.gaia_n_used_by_tel: dict = {}
         self.gaia_ra  = g["ra"].to_numpy(float)
         self.gaia_dec = g["dec"].to_numpy(float)
         self.gaia_time  = Time(g["Gaia_time"].fillna(2016.0).to_numpy(float),format='jyear',scale='tcb')
@@ -865,6 +867,18 @@ class BP3MSolver:
 
     # ── Geometry precomputation ────────────────────────────────────────────────
 
+    def _count_used(self, img, star_idx):
+        """Count one used detection per star in *img*: total (gaia_n_hst_used, the
+        historical name) and per telescope (gaia_n_used_by_tel['HST'|'JWST'], from the
+        loader's meta['telescope']; per-telescope columns in stellar_astrometry.csv and
+        telescope-coloured result plots, user 2026-10-07)."""
+        self.gaia_n_hst_used[star_idx] += 1
+        tel = str(self.images[img].get('telescope', 'HST')).upper()
+        arr = self.gaia_n_used_by_tel.get(tel)
+        if arr is None:
+            arr = self.gaia_n_used_by_tel[tel] = np.zeros(len(self.gaia_n_hst_used), dtype=int)
+        arr[star_idx] += 1
+
     def _precompute_geometry(self):
         """
         For each image, precompute all star-level geometric quantities that
@@ -873,7 +887,7 @@ class BP3MSolver:
         print("Precomputing geometry...")
         self._img_data = {}
 
-        self.gaia_n_hst_used[:] = 0
+        self.gaia_n_hst_used[:] = 0; self.gaia_n_used_by_tel = {}
 
         for img in self.image_names:
             meta  = self.images[img]
@@ -1030,7 +1044,7 @@ class BP3MSolver:
                     print(f"    {img}: rejected {n_rej}/{n_before} stars with "
                           f"initial residual > {_INIT_RESID_CLIP_PX:.0f} px")
 
-            self.gaia_n_hst_used[sidx[good_for_fitting]] += 1
+            self._count_used(img, sidx[good_for_fitting])
 
             self._img_data[img] = {
                 "sidx"           : sidx,              # (n,) global star indices
@@ -1190,7 +1204,7 @@ class BP3MSolver:
         import astropy.units as u
         from astropy.time import Time
 
-        self.gaia_n_hst_used[:] = 0
+        self.gaia_n_hst_used[:] = 0; self.gaia_n_used_by_tel = {}
         nr = self.N_R
         for j_idx, img in enumerate(self.image_names):
             d = self._img_data.get(img)
@@ -1204,7 +1218,7 @@ class BP3MSolver:
             use_astrom = d.get("use_for_astrom", use_align)
             n       = d["n"]
 
-            self.gaia_n_hst_used[sidx[use_align | use_astrom]] += 1
+            self._count_used(img, sidx[use_align | use_astrom])
 
             pscale   = meta["orig_pixel_scale"]
 
@@ -3028,7 +3042,7 @@ class BP3MSolver:
         resid_hst      = self.compute_residuals(r_hat, v_hat)
         _MEDIAN_CHI2_2 = 2.0 * np.log(2.0)
 
-        self.gaia_n_hst_used[:] = 0
+        self.gaia_n_hst_used[:] = 0; self.gaia_n_used_by_tel = {}
         info = []
         n_use_changed = 0
 
@@ -3241,7 +3255,7 @@ class BP3MSolver:
 
             self._img_data[img]["use_for_fit"] = np.asarray(new_use)
             use_any = new_use | new_use_astrom
-            self.gaia_n_hst_used[sidx[use_any]] += 1
+            self._count_used(img, sidx[use_any])
             n_astrom_only = int((use_any & ~new_use).sum())
             info.append((img, int(new_use.sum()), len(new_use), alpha_j, alpha_raw, n_astrom_only))
 

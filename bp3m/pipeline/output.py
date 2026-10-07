@@ -43,9 +43,15 @@ def print_field_summary(output_dir: Path, field_name: str) -> None:
         stars = pd.read_csv(stars_csv)
         print(f"\n  BP3M results:")
         print(f"    Stars fitted:   {len(stars):,}")
+        if 'n_images_used' in stars.columns:
+            print(f"    Median N_images: {np.median(stars['n_images_used']):.0f}")
         if 'n_hst_used' in stars.columns:
             med_hst = np.median(stars['n_hst_used'])
             print(f"    Median N_HST:   {med_hst:.0f}")
+        for _c in [c for c in stars.columns if c.startswith('n_') and c.endswith('_used')
+                   and c not in ('n_hst_used', 'n_images_used')]:
+            print(f"    Median {_c[2:-5].upper():<9}: {np.median(stars[_c]):.0f}  "
+                  f"({int((stars[_c] > 0).sum())} stars with {_c[2:-5].upper()} detections)")
         if 'sigma_pmra_bp3m' in stars.columns and 'sigma_pmdec_bp3m' in stars.columns:
             sig_pm = 0.5 * (stars['sigma_pmra_bp3m'].median()
                             + stars['sigma_pmdec_bp3m'].median())
@@ -124,7 +130,7 @@ def pm_comparison_table(stars: pd.DataFrame,
     cols_gaia = [gaia_id_col, 'pmra', 'pmdec', 'pmra_error', 'pmdec_error']
     cols_gaia = [c for c in cols_gaia if c in gaia.columns]
 
-    cols_stars = [stars_id_col, 'gmag', 'n_hst_used',
+    cols_stars = [stars_id_col, 'gmag', 'n_hst_used', 'n_jwst_used', 'n_images_used',
                   'pmra_bp3m', 'pmdec_bp3m',
                   'sigma_pmra_bp3m', 'sigma_pmdec_bp3m']
     cols_stars = [c for c in cols_stars if c in stars.columns]

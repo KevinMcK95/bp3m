@@ -1119,7 +1119,16 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
 
     # 2. Stellar astrometry
     g = gaia_catalog.copy()
-    g['n_hst_used'] = solver.gaia_n_hst_used  # detections used for alignment OR astrometry
+    # n_images_used: detections used for alignment OR astrometry over every telescope;
+    # n_hst_used / n_jwst_used: the per-telescope split (an HST-only run keeps
+    # n_hst_used == n_images_used, as before the JWST integration).
+    _by_tel = getattr(solver, 'gaia_n_used_by_tel', {}) or {}
+    g['n_images_used'] = solver.gaia_n_hst_used
+    g['n_hst_used'] = _by_tel['HST'] if 'HST' in _by_tel else (
+        solver.gaia_n_hst_used if not _by_tel else np.zeros(solver.n_stars, dtype=int))
+    for _tel, _arr in _by_tel.items():
+        if _tel != 'HST':
+            g[f'n_{_tel.lower()}_used'] = _arr
 
     # Per-star alignment detection count
     n_align = np.zeros(solver.n_stars, dtype=int)
