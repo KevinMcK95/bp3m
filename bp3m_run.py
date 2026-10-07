@@ -139,8 +139,15 @@ def _parse_args():
 
     # ── HST ───────────────────────────────────────────────────────────────────
     h = p.add_argument_group('HST / telescope options')
-    h.add_argument('--telescope', type=str, default='HST',
-                   help='Telescope (default HST; JWST planned)')
+    h.add_argument('--telescope', type=str, nargs='+', default=['HST'],
+                   help='Telescope(s): HST (default), JWST, or both (--telescope HST JWST). '
+                        'Each telescope downloads to its own {field}/{TEL}/ root. '
+                        'JWST is currently supported through Step 2 (MAST download); '
+                        'PSF fitting, cross-matching and alignment follow (JWST work '
+                        'adapted from Liwen Chen\'s bp3m fork).')
+    h.add_argument('--target_name', type=str, nargs='+', default=None,
+                   help='Keep only MAST observations whose target_name contains one of '
+                        'these substrings (case-insensitive), e.g. LMC-ASTROMETRIC-FIELD')
     h.add_argument('--hst_filters', type=str, nargs='+', default=None,
                    help='Required filters, e.g. F814W F606W F850LP '
                         '(default: all filters with PSF+GDC in lib_dir). '
@@ -151,6 +158,12 @@ def _parse_args():
                    help='Minimum average exposure time per image set (s)')
     h.add_argument('--hst_exptime_max', type=float, default=np.inf,
                    help='Maximum average exposure time per image set (s)')
+    h.add_argument('--jwst_im_type', type=str, default='_cal',
+                   help='JWST image product: _cal (default; stage-2 per-detector exposures)')
+    h.add_argument('--jwst_exptime_min', type=float, default=2.0,
+                   help='Minimum effective exposure time per JWST exposure (s)')
+    h.add_argument('--jwst_exptime_max', type=float, default=np.inf,
+                   help='Maximum effective exposure time per JWST exposure (s)')
     h.add_argument('--time_baseline', type=float, default=None,
                    help='Minimum HST–Gaia time baseline in days (default: no limit)')
     h.add_argument('--obs_date_min', type=str, default=None,
@@ -617,7 +630,22 @@ def _parse_args():
                           'multiple images simultaneously with one core each, which '
                           'gives much higher throughput when fitting >10 images.')
 
-    return p.parse_args()
+    args = p.parse_args()
+    # --telescope HST JWST / --telescope HST,JWST / --telescope jwst -> ['HST', 'JWST'];
+    # args.telescope stays a single string (the first telescope) for the pipeline steps
+    # that still handle one telescope at a time.  (Parsing rule from Liwen Chen's fork.)
+    _tels: list[str] = []
+    for _t in args.telescope:
+        for _u in str(_t).split(','):
+            _u = _u.strip().upper()
+            if _u and _u not in _tels:
+                _tels.append(_u)
+    _bad = [t for t in _tels if t not in ('HST', 'JWST')]
+    if _bad:
+        p.error(f"--telescope: unsupported telescope(s) {_bad}; choose from HST, JWST")
+    args.telescopes = _tels or ['HST']
+    args.telescope = args.telescopes[0]
+    return args
 
 
 _FIELD_IDS_ALL = 'all'   # sentinel: download all without prompting
@@ -1058,31 +1086,47 @@ def main():
                 from bp3m.pipeline.explore_utils import load_gaia_catalog
                 gaia_df = load_gaia_catalog(_candidates[0])
         _extra_pt = args.pointings[1:] if len(args.pointings) > 1 else None
-        download_hst_images(
-            ra=args.ra, dec=args.dec,
-            search_width=args.search_width, search_height=args.search_height,
-            output_dir=output_dir, field_name=field,
-            hst_filters=args.hst_filters,
-            t_exptime_min=args.hst_exptime_min,
-            t_exptime_max=args.hst_exptime_max,
-            time_baseline_days=args.time_baseline,
-            obs_date_min=args.obs_date_min,
-            obs_date_max=args.obs_date_max,
-            im_type=args.hst_im_type,
-            telescope=args.telescope,
-            instruments=args.instruments,
-            lib_dir=Path(args.lib_dir),
-            gaia_df=gaia_df,
-            field_ids=_parse_field_ids(args.field_ids),
-            quiet=args.quiet,
-            force_redownload=args.force_redownload_hst,
-            mast_refresh_days=args.mast_refresh_days,
-            skip_mast_download=args.skip_mast_download,
-            n_processes=args.n_processes,
-            extra_pointings=_extra_pt,
-            delve_csv_path=delve_csv_path,
-            include_recent=args.include_proprietary,
-        )
+        # One MAST search + download per telescope, each into {field}/{TEL}/ with its
+        # own obs table and manifest (per-telescope exposure-time limits and product).
+        _tel_opts = {
+            'HST':  dict(im_type=args.hst_im_type,  t_exptime_min=args.hst_exptime_min,
+                         t_exptime_max=args.hst_exptime_max),
+            'JWST': dict(im_type=args.jwst_im_type, t_exptime_min=args.jwst_exptime_min,
+                         t_exptime_max=args.jwst_exptime_max),
+        }
+        for _tel in args.telescopes:
+            download_hst_images(
+                ra=args.ra, dec=args.dec,
+                search_width=args.search_width, search_height=args.search_height,
+                output_dir=output_dir, field_name=field,
+                hst_filters=args.hst_filters,
+                time_baseline_days=args.time_baseline,
+                obs_date_min=args.obs_date_min,
+                obs_date_max=args.obs_date_max,
+                telescope=_tel,
+                instruments=args.instruments,
+                lib_dir=Path(args.lib_dir),
+                gaia_df=gaia_df,
+                field_ids=_parse_field_ids(args.field_ids),
+                quiet=args.quiet,
+                force_redownload=args.force_redownload_hst,
+                mast_refresh_days=args.mast_refresh_days,
+                skip_mast_download=args.skip_mast_download,
+                n_processes=args.n_processes,
+                extra_pointings=_extra_pt,
+                delve_csv_path=delve_csv_path if _tel == 'HST' else None,
+                include_recent=args.include_proprietary,
+                target_name=args.target_name,
+                **_tel_opts[_tel],
+            )
+
+    if any(_t != 'HST' for _t in args.telescopes):
+        # JWST integration in progress (branch jwst-integration): Steps 3-7 still run on
+        # one telescope's HST products only.  Stop here rather than mix telescopes.
+        print("\nJWST: download complete. PSF fitting, cross-matching and alignment for "
+              "JWST are not wired yet (see data_bootes/bp3m/jwst_integration/PLAN.md); "
+              "stopping after Step 2.")
+        return
 
     # Read manifest of selected obsids written by step 2 (persists across runs)
     import json as _json

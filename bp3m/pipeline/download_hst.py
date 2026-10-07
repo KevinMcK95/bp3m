@@ -30,20 +30,45 @@ from astroquery.mast import Observations
 from tqdm import tqdm   # module level: the force-redownload path used it before the local import (UnboundLocalError)
 
 
-# Instruments supported per telescope (MAST instrument_name values)
+# Instruments supported per telescope (MAST instrument_name values).
+# JWST support adapted from Liwen Chen's bp3m fork (download_jwst.py / download_hst.py,
+# 2026-06..09): instrument names, the mode-qualified MAST query names, the post-Gaia
+# time-window logic and the JWST failed-observation header rules come from there.
 _INSTRUMENTS = {
     'HST':  ['ACS/WFC', 'WFC3/UVIS', 'ACS/HRC'],
-    'JWST': ['NIRCAM', 'NIRISS'],   # placeholder — extend when py1pass/cross-match support JWST
+    'JWST': ['NIRCAM', 'NIRISS', 'MIRI'],
 }
 
-# Map MAST instrument_name → STDPSFs/STDGDCs subdirectory name
+# MAST's instrument_name for JWST imaging is mode-qualified ('NIRCAM/IMAGE'); the bare
+# name matches nothing in query_criteria (Liwen Chen: instrument_name=['MIRI'] -> 0 rows,
+# ['MIRI/IMAGE'] -> thousands).  Only the query uses these; the returned rows are
+# normalised back to the bare name by _bare_instrument().
+_JWST_INSTRUMENT_NAME_MAST = {
+    'NIRCAM': 'NIRCAM/IMAGE',
+    'NIRISS': 'NIRISS/IMAGE',
+    'MIRI':   'MIRI/IMAGE',
+}
+
+# Default image product per telescope: HST calibrated, CTE-corrected exposures; JWST
+# stage-2 calibrated per-detector exposures (one _cal.fits per detector per exposure).
+_DEFAULT_IM_TYPE = {'HST': '_flc', 'JWST': '_cal'}
+
+# Map MAST instrument_name → STDPSFs/STDGDCs subdirectory name (bp3m-setup layout:
+# one directory per instrument, JWST files flattened into NIRCAM/NIRISS/MIRI).
 _INST_TO_LIBDIR = {
     'ACS/WFC':   'ACSWFC',
     'WFC3/UVIS': 'WFC3UV',
     'ACS/HRC':   'ACSHRC',
     'NIRCAM':    'NIRCAM',
     'NIRISS':    'NIRISS',
+    'MIRI':      'MIRI',
 }
+
+
+def _bare_instrument(name) -> str:
+    """'NIRCAM/IMAGE' -> 'NIRCAM'; HST names ('ACS/WFC') are returned unchanged."""
+    s = str(name)
+    return s.split('/')[0] if s.endswith('/IMAGE') else s
 
 # Default Gaia DR3 reference epoch as MJD (2017-05-28)
 _GAIA_DR3_MJD = Time('2017-05-28').mjd
@@ -69,6 +94,12 @@ def _clean_mast_filter(raw: str) -> str:
     We split on ';', drop any token that is empty or starts with 'CLEAR', and
     return the first remaining token.  Falls back to the raw string if nothing
     survives the filter.
+
+    JWST uses the same rule: NIRCam strings are 'FILTER;PUPIL' and the PSF/GDC
+    library is keyed on the filter wheel (first token; a filter+pupil pair such as
+    'F150W2;F162M' has no library entry and is dropped by the PSF+GDC gate),
+    NIRISS strings are 'CLEAR;F200W' (filter wheel CLEAR, the pupil carries the
+    band, which is what the library uses), MIRI strings are a single token.
     """
     tokens = [t.strip() for t in raw.split(';')]
     science = [t for t in tokens if t and not t.upper().startswith('CLEAR')]
@@ -84,7 +115,7 @@ def _make_query_params(
     hst_filters, t_exptime_min, t_exptime_max,
     time_baseline_days, date_second_epoch_mjd,
     obs_date_min, obs_date_max, im_type, telescope, instruments,
-    lib_dir,
+    lib_dir, target_name=None,
 ) -> dict:
     return {
         "ra":                    ra,
@@ -103,6 +134,8 @@ def _make_query_params(
         "instruments":           sorted(instruments) if instruments else None,
         "lib_dir":               str(lib_dir) if lib_dir else None,
         "download_aux":          True,
+        "target_name":           (sorted(target_name) if isinstance(target_name, (list, tuple))
+                                  else target_name) if target_name else None,
     }
 
 
@@ -164,6 +197,10 @@ def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
             parts = f.stem.split('_')
             if 'VFRAME' in parts or parts[-1] == 'vintage':
                 continue
+            if f.stat().st_size < 2880:
+                # an HTML error page saved under a .fits name (seen in a JWST library
+                # copy) must not count as availability
+                continue
             if len(parts) >= 3:
                 gdc_filters.add(_normalise_filter(parts[-1]))
 
@@ -187,20 +224,32 @@ def search_mast(
     date_second_epoch_mjd: float = _GAIA_DR3_MJD,
     obs_date_min: str | None = None,
     obs_date_max: str | None = None,
-    im_type: str = '_flc',
+    im_type: str | None = None,
     telescope: str = 'HST',
     instruments: list[str] | None = None,
     available_combos: dict[str, set[str]] | None = None,
     include_recent: bool = False,
+    target_name: list[str] | str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Query MAST for science images of a sky region.
+    Query MAST for science images of a sky region (one telescope per call).
 
     include_recent: keep observations taken within the last year (normally cut, since
     they are usually still exclusive-access); for proprietary data with a MAST login.
+    target_name   : keep only observations whose MAST target_name contains one of these
+                    substrings (case-insensitive); e.g. the LMC calibration fields.
+
+    Telescope differences (JWST logic from Liwen Chen's fork): JWST queries use the
+    mode-qualified instrument names, keep only the CAL product (no DRZ/SPT/JIT/JIF),
+    count exposures per detector-independent exposure stem, and — because every JWST
+    image postdates the Gaia DR3 epoch — a time_baseline_days requirement raises the
+    earliest allowed date instead of lowering the latest one; t_baseline is reported
+    as a positive number of years after the Gaia epoch.
 
     Parameters
     ----------
+    im_type         : product suffix; None selects the telescope default
+                      (_DEFAULT_IM_TYPE: '_flc' for HST, '_cal' for JWST).
     time_baseline_days: minimum HST–Gaia time baseline in days. None means no
                         minimum (all images up to date_second_epoch_mjd are kept).
     obs_date_min    : earliest observation date to include (ISO string, e.g. '2005-01-01').
@@ -216,7 +265,11 @@ def search_mast(
     obs_table          : one row per observation set (with i_exptime, t_baseline)
     data_products_table: one row per image file (with URI, parent_obsid, …)
     """
-    allowed_inst = _INSTRUMENTS.get(telescope.upper())
+    tel = telescope.upper()
+    is_jwst = tel == 'JWST'
+    if im_type is None:
+        im_type = _DEFAULT_IM_TYPE.get(tel, '_flc')
+    allowed_inst = _INSTRUMENTS.get(tel)
     if allowed_inst is None:
         raise ValueError(f"Unsupported telescope '{telescope}'. "
                          f"Choose from {list(_INSTRUMENTS)}")
@@ -244,10 +297,18 @@ def search_mast(
                                               for i in allowed_inst
                                               if i in available_combos]) or set())
         if not hst_filters:
-            hst_filters = ['F435W', 'F475W', 'F555W', 'F606W',
-                           'F625W', 'F658N', 'F775W', 'F814W', 'F850LP']
+            if is_jwst:
+                # filters with both a PSF and a GDC in the STScI JWST1PASS library (2026-10)
+                hst_filters = ['F070W', 'F090W', 'F115W', 'F140M', 'F150W', 'F158M', 'F182M',
+                               'F200W', 'F210M', 'F212N', 'F277W', 'F356W', 'F380M', 'F430M',
+                               'F444W', 'F480M', 'F560W', 'F770W', 'F1000W']
+            else:
+                hst_filters = ['F435W', 'F475W', 'F555W', 'F606W',
+                               'F625W', 'F658N', 'F775W', 'F814W', 'F850LP']
     if project is None:
-        project = [telescope]
+        project = [tel]
+    # MAST needs the mode-qualified JWST instrument names in the query
+    query_inst = [_JWST_INSTRUMENT_NAME_MAST.get(i, i) for i in allowed_inst] if is_jwst else allowed_inst
 
     # Shrink box slightly to avoid edge artefacts
     cos_dec = np.cos(np.deg2rad(dec))
@@ -258,18 +319,23 @@ def search_mast(
     dec1 = dec - search_height / 2 + margin_dec
     dec2 = dec + search_height / 2 - margin_dec
 
-    # When time_baseline_days is None, keep all images up to the Gaia epoch
-    if time_baseline_days is not None:
-        t_max_mjd = _GAIA_DR3_MJD - time_baseline_days
-    elif include_recent:
-        t_max_mjd = Time.now().mjd + 1.0
-    else:
-        t_max_mjd = (Time.now()-366*u.day).mjd
-
     # Build MAST time bounds
     t_min_bound = 0
     if obs_date_min is not None:
         t_min_bound = Time(obs_date_min).mjd
+
+    # Latest date: the last year is exclusive-access unless include_recent.  For HST a
+    # time-baseline requirement lowers the latest date (images predate Gaia DR3); for
+    # JWST (all images after the Gaia epoch) it raises the earliest date instead.
+    if include_recent:
+        t_max_mjd = Time.now().mjd + 1.0
+    else:
+        t_max_mjd = (Time.now()-366*u.day).mjd
+    if time_baseline_days is not None:
+        if is_jwst:
+            t_min_bound = max(t_min_bound, _GAIA_DR3_MJD + time_baseline_days)
+        else:
+            t_max_mjd = _GAIA_DR3_MJD - time_baseline_days
 
     print(f"  Querying MAST (this can take a minute)...")
     import time as _time
@@ -279,10 +345,10 @@ def search_mast(
         try:
             obs_raw = Observations.query_criteria(
                 dataproduct_type=['image'],
-                obs_collection=[telescope],
+                obs_collection=[tel],
                 s_ra=[ra1, ra2],
                 s_dec=[dec1, dec2],
-                instrument_name=allowed_inst,
+                instrument_name=query_inst,
                 t_max=[t_min_bound, t_max_mjd],
                 filters=hst_filters,
                 project=project,
@@ -313,25 +379,43 @@ def search_mast(
                 _delay2 *= 2
             else:
                 raise
-    im_sub   = im_type[1:].upper()   # '_flc' → 'FLC'
-    _AUX_TYPES = {'SPT', 'JIT', 'JIF'}
+    im_sub   = im_type[1:].upper()   # '_flc' → 'FLC', '_cal' → 'CAL'
+    _AUX_TYPES = {'SPT', 'JIT', 'JIF'} if not is_jwst else set()
     _sub = prod_raw['productSubGroupDescription']
     _aux_mask = (_sub == 'SPT') | (_sub == 'JIT') | (_sub == 'JIF')
-    mask = (
-        ((_sub == im_sub) | (_sub == 'DRZ') | _aux_mask) &
-        (prod_raw['obs_collection'] == telescope)
-    )
+    if is_jwst:
+        # JWST: the per-detector CAL exposures only (no DRZ equivalent, no HST support files)
+        mask = (_sub == im_sub) & (prod_raw['obs_collection'] == tel)
+    else:
+        mask = (
+            ((_sub == im_sub) | (_sub == 'DRZ') | _aux_mask) &
+            (prod_raw['obs_collection'] == tel)
+        )
     prod_df = prod_raw[mask].to_pandas()
     obs_df  = obs_raw.to_pandas()
+    # 'NIRCAM/IMAGE' -> 'NIRCAM' so library combos, tables and --instruments agree
+    if is_jwst and 'instrument_name' in obs_df.columns:
+        obs_df['instrument_name'] = obs_df['instrument_name'].map(_bare_instrument)
 
     # Drop HAP pipeline products
     prod_df = prod_df[~prod_df['project'].str.contains('HAP', na=False)]
 
-    # Count exposures per observation to compute individual exposure time
-    n_exp = (prod_df[prod_df['productSubGroupDescription'] == im_sub]
-             .groupby('parent_obsid')['parent_obsid']
-             .count()
-             .rename('n_exp'))
+    # Count exposures per observation to compute individual exposure time.
+    # HST: one FLC per exposure, MAST t_exptime = total over the exposures.
+    # JWST: one CAL file per DETECTOR per exposure (NIRCam: 8-10 files per dither) while
+    # MAST t_exptime is the total per detector over the dithers (Draco 04513: 601 s =
+    # 4 x EFFEXPTM 150 s), so count distinct exposure stems (file name without the
+    # detector suffix), not files.
+    _im_rows = prod_df[prod_df['productSubGroupDescription'] == im_sub]
+    if is_jwst:
+        _stem = (_im_rows['productFilename'].astype(str)
+                 .str.replace(r'_[a-z0-9]+_cal\.fits$', '', regex=True))
+        n_exp = (_im_rows.assign(_stem=_stem)
+                 .groupby('parent_obsid')['_stem'].nunique().rename('n_exp'))
+    else:
+        n_exp = (_im_rows.groupby('parent_obsid')['parent_obsid']
+                 .count()
+                 .rename('n_exp'))
     obs_df['obsid'] = obs_df['obsid'].astype(str)
     n_exp.index = n_exp.index.astype(str)
     obs_df = obs_df.merge(n_exp.rename_axis('obsid'), on='obsid', how='inner')
@@ -340,9 +424,32 @@ def search_mast(
     obs_time = Time(obs_df['t_max'].values, format='mjd')
     obs_time.format = 'iso'; obs_time.out_subfmt = 'date'
     obs_df['obs_time']   = obs_time.value
+    # years between the image and the Gaia epoch, positive for both telescopes
+    _sign = -1.0 if is_jwst else 1.0
     obs_df['t_baseline'] = np.round(
-        (date_second_epoch_mjd - obs_df['t_max'].values) / 365.2422, 2)
+        _sign * (date_second_epoch_mjd - obs_df['t_max'].values) / 365.2422, 2)
     obs_df['filters'] = obs_df['filters'].apply(_clean_mast_filter)
+
+    if target_name:
+        _names = [target_name] if isinstance(target_name, str) else list(target_name)
+        _tgt = obs_df['target_name'].astype(str)
+        _keep = np.zeros(len(obs_df), dtype=bool)
+        for _n in _names:
+            _keep |= _tgt.str.contains(_n, case=False, na=False, regex=False).to_numpy()
+        print(f"  target_name filter {_names}: {int(_keep.sum())}/{len(obs_df)} observations kept")
+        obs_df = obs_df[_keep]
+
+    # Without a MAST login, exclusive-access products cannot be downloaded: drop them
+    # here so they do not count as selected images (Liwen Chen's fork; with a token the
+    # 366-day rule / --include_proprietary decides instead).
+    if not _MAST_LOGGED_IN and 'dataRights' in prod_df.columns:
+        _priv = prod_df['dataRights'].astype(str).str.upper().ne('PUBLIC')
+        if _priv.any():
+            _priv_obs = set(prod_df.loc[_priv, 'parent_obsid'].astype(str))
+            print(f"  {int(_priv.sum())} exclusive-access product(s) in {len(_priv_obs)} observation(s) "
+                  f"dropped (no MAST login)")
+            prod_df = prod_df[~_priv]
+            obs_df = obs_df[~obs_df['obsid'].astype(str).isin(_priv_obs)]
 
     # Merge exposure-time info into products table
     meta = obs_df[['obsid', 'i_exptime', 'filters', 't_baseline', 's_ra', 's_dec']]
@@ -455,7 +562,7 @@ def download_hst_images(
     date_second_epoch_mjd: float = _GAIA_DR3_MJD,
     obs_date_min: str | None = None,
     obs_date_max: str | None = None,
-    im_type: str = '_flc',
+    im_type: str | None = None,
     telescope: str = 'HST',
     instruments: list[str] | None = None,
     lib_dir: str | Path | None = None,
@@ -469,9 +576,11 @@ def download_hst_images(
     extra_pointings: "list[tuple[float, float, float, float]] | None" = None,
     delve_csv_path: 'str | Path | None' = None,
     include_recent: bool = False,
+    target_name: list[str] | str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Search MAST for images of a field and download them.
+    Search MAST for images of a field and download them (one telescope per call;
+    bp3m_run loops over --telescope HST JWST so each telescope keeps its own root).
 
     Creates:
         {output_dir}/{field_name}/{telescope}/mastDownload/{telescope}/{obs_id}/...
@@ -501,6 +610,8 @@ def download_hst_images(
     """
     mast_login()
     tel_upper  = telescope.upper()
+    if im_type is None:
+        im_type = _DEFAULT_IM_TYPE.get(tel_upper, '_flc')
     hst_dir    = Path(output_dir) / field_name / tel_upper
     hst_dir.mkdir(parents=True, exist_ok=True)
     obs_csv    = hst_dir / f"{field_name}_obs.csv"
@@ -531,6 +642,7 @@ def download_hst_images(
             hst_filters, t_exptime_min, t_exptime_max,
             time_baseline_days, date_second_epoch_mjd,
             obs_date_min, obs_date_max, im_type, telescope, instruments, lib_dir,
+            target_name=target_name,
         )
 
     current_params_list = [_pparams(*p) for p in all_pointings]
@@ -602,6 +714,7 @@ def download_hst_images(
                 instruments=instruments,
                 available_combos=available_combos,
                 include_recent=include_recent,
+                target_name=target_name,
             )
 
         if n_pointings == 1:
@@ -812,7 +925,7 @@ def download_hst_images(
                 # Verdict made under older rules (no-HDRLET rule, no calibration-exposure
                 # rule; 2026-10-01): re-judge from the primary header only (the FITS
                 # structure was already verified for this size+mtime).
-                _cr = _check_exptime(dest)
+                _cr = _check_exptime(dest, tel_upper)
                 return spec, 'verified', _cr, [disk_size, st.st_mtime_ns, _cr, _VERIFY_RULES]
 
             # Full FITS verify + failed-observation check in one open.
@@ -820,21 +933,9 @@ def download_hst_images(
             try:
                 with fits.open(dest, memmap=True) as hdul:
                     hdul.verify('exception')
-                    h0        = hdul[0].header
-                    exptime   = h0.get('EXPTIME',  None)
-                    expflag   = h0.get('EXPFLAG',  'NORMAL').strip()
-                    imagetyp  = str(h0.get('IMAGETYP', 'EXT') or 'EXT').strip().upper()
-                    targname  = str(h0.get('TARGNAME', '') or '').strip()
+                    fail_reason = _failed_reason(hdul[0].header, tel_upper)
             except Exception as e:
                 return spec, 'broken', f"FITS error: {e}", None
-
-            fail_reason = None
-            if imagetyp != 'EXT':     # see _check_exptime: internal lamps / darks
-                fail_reason = f"calibration exposure (IMAGETYP='{imagetyp}', TARGNAME='{targname}')"
-            elif exptime == 0:
-                fail_reason = "EXPTIME=0"
-            elif expflag and expflag != 'NORMAL':
-                fail_reason = f"EXPFLAG={expflag!r}"
 
             new_entry = [disk_size, st.st_mtime_ns, fail_reason, _VERIFY_RULES]
             return spec, 'verified', fail_reason, new_entry
@@ -958,7 +1059,7 @@ def download_hst_images(
                 dest = mast_root_nd / obs_id / fname
                 if not dest.exists():
                     continue
-                fail_reason = _check_exptime(dest)
+                fail_reason = _check_exptime(dest, tel_upper)
                 if fail_reason:
                     print(f"  WARNING: {fname} is a failed observation ({fail_reason}) — "
                           f"skipping all downstream steps.")
@@ -969,6 +1070,11 @@ def download_hst_images(
             print(f"  NOTE: {len(failed_obsids)} failed observation(s) excluded from processing: "
                   + ", ".join(sorted(failed_obsids)))
         _write_selected_obsids(prod_df, hst_dir, field_name, im_type, failed_obsids)
+
+    if tel_upper != 'HST':
+        # SPT/JIT/JIF support files, jitter summaries and guide-star tables are HST
+        # products; JWST pointing/guiding diagnostics are not used yet.
+        return obs_df, prod_df
 
     # Download auxiliary products (SPT/JIT/JIF) — no PSF cache invalidation.
     _aux_types = {'SPT', 'JIT', 'JIF'}
@@ -1558,10 +1664,52 @@ def _invalidate_psf_cache(flc_path: Path) -> None:
 _VERIFY_RULES = 2
 
 
-def _check_exptime(flc_path: Path) -> str | None:
-    """Return a failure reason string if the FLC file is a failed observation, else None.
+def _failed_reason_jwst(h0) -> str | None:
+    """JWST failed-observation rules on a primary header (Liwen Chen's bp3m fork):
+    1. EFFEXPTM == 0        — no effective exposure time collected;
+    2. ENG_QUAL != 'OK'     — guide-star / engineering problem during the exposure;
+    3. DATAPROB == True     — pipeline flagged a data problem;
+    4. VISITSTA != 'SUCCESSFUL' — the visit did not complete.
+    """
+    effexptm = h0.get('EFFEXPTM', None)
+    eng_qual = str(h0.get('ENG_QUAL', '') or '').strip()
+    dataprob = h0.get('DATAPROB', False)
+    visitsta = str(h0.get('VISITSTA', '') or '').strip()
+    if effexptm is not None and float(effexptm) == 0.0:
+        return "EFFEXPTM=0.0"
+    if eng_qual and eng_qual != 'OK':
+        return f"ENG_QUAL='{eng_qual}'"
+    if dataprob is True or str(dataprob).strip().upper() in ('T', 'TRUE'):
+        return "DATAPROB=True"
+    if visitsta and visitsta != 'SUCCESSFUL':
+        return f"VISITSTA='{visitsta}'"
+    return None
 
-    Checks two conditions in priority order (file is kept on disk in all cases):
+
+def _failed_reason_hst(h0) -> str | None:
+    """HST failed-observation rules on a primary header; see _check_exptime."""
+    exptime = h0.get('EXPTIME', None)
+    expflag = str(h0.get('EXPFLAG', '') or '').strip()
+    imagetyp = str(h0.get('IMAGETYP', 'EXT') or 'EXT').strip().upper()
+    targname = str(h0.get('TARGNAME', '') or '').strip()
+    if imagetyp != 'EXT':
+        return f"calibration exposure (IMAGETYP='{imagetyp}', TARGNAME='{targname}')"
+    if exptime is not None and float(exptime) == 0.0:
+        return f"EXPTIME=0.0 (EXPFLAG='{expflag}')" if expflag else "EXPTIME=0.0"
+    if expflag and expflag != 'NORMAL':
+        return f"EXPFLAG='{expflag}'"
+    return None
+
+
+def _failed_reason(h0, telescope: str = 'HST') -> str | None:
+    return _failed_reason_jwst(h0) if telescope.upper() == 'JWST' else _failed_reason_hst(h0)
+
+
+def _check_exptime(flc_path: Path, telescope: str = 'HST') -> str | None:
+    """Return a failure reason string if the image is a failed observation, else None.
+
+    JWST images use _failed_reason_jwst (EFFEXPTM, ENG_QUAL, DATAPROB, VISITSTA).
+    HST checks three conditions in priority order (file is kept on disk in all cases):
     1. EXPTIME == 0 — shutter open but no real sky signal (e.g. EXCESSIVE DOWNTIME).
     2. EXPFLAG != 'NORMAL' — any non-nominal exposure flag indicates compromised data.
        Known values seen in practice:
@@ -1581,18 +1729,8 @@ def _check_exptime(flc_path: Path) -> str | None:
     """
     from astropy.io import fits
     try:
-        with fits.open(flc_path, memmap=False) as hdul:
-            exptime = hdul[0].header.get('EXPTIME', None)
-            expflag = hdul[0].header.get('EXPFLAG', '').strip()
-            imagetyp = str(hdul[0].header.get('IMAGETYP', 'EXT') or 'EXT').strip().upper()
-            targname = str(hdul[0].header.get('TARGNAME', '') or '').strip()
-        if imagetyp != 'EXT':
-            return f"calibration exposure (IMAGETYP='{imagetyp}', TARGNAME='{targname}')"
-        if exptime is not None and float(exptime) == 0.0:
-            reason = f"EXPTIME=0.0 (EXPFLAG='{expflag}')" if expflag else "EXPTIME=0.0"
-            return reason
-        if expflag and expflag != 'NORMAL':
-            return f"EXPFLAG='{expflag}'"
+        h0 = fits.getheader(flc_path, 0)
+        return _failed_reason(h0, telescope)
     except Exception:
         pass
     return None
@@ -1631,6 +1769,7 @@ def _print_obs_table(obs_df: pd.DataFrame) -> None:
     display_cols = {
         'field_id':      'ID',
         'proposal_id':   'PropID',
+        'target_name':   'Target',
         'obs_time':      'Date',
         'instrument_name': 'Instrument',
         'filters':       'Filter',
