@@ -90,7 +90,9 @@ def _load_one_image(work):
     img_dir_str, img_name = work
     img_dir = Path(img_dir_str)
     meta = _read_image_meta(img_dir, img_name)
-    if meta is None and (img_dir / "transformation_prealign.csv").exists():
+    # a failed / demoted re-match can leave a STALE transformation.csv without matched_gaia.csv
+    _unmatched = meta is None or not (img_dir / "matched_gaia.csv").exists()
+    if _unmatched and (img_dir / "transformation_prealign.csv").exists():
         # JWST frame without a Gaia solution but with a sibling-predicted transformation
         # (xmatch_groups.write_jwst_sibling_prealign): admitted with ZERO stars; the solver's
         # link prior (bp3m.jwst_links) ties its transformation to the matched detectors of
