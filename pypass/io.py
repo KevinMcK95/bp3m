@@ -948,13 +948,19 @@ def _get_noise_info_jwst(primary_hdr, sci_hdr, instrume, bunit):
 
 
 # JWST DQ bits that make a pixel unusable for detection, sky and PSF fitting:
-# DO_NOT_USE (1; also the NaN pixels), SATURATED (2), NON_SCIENCE (512), DEAD (1024),
-# HOT (2048), REFERENCE_PIXEL (2^31).  Everything else (JUMP_DET 4, UNRELIABLE_* ,
-# WARM 4096, FLUX_ESTIMATED, ...) stays usable, as HST's warm-pixel bit does.  The
-# raw DQ is still recorded per star in dq_1x1/2x2/3x3.  (One explicit policy for all
-# three instruments; Liwen Chen's jwst1pass_py_v2 masked every non-zero bit for
-# NIRISS/MIRI and only bits 0-1 for NIRCam.)
+# DO_NOT_USE (1; also the NaN pixels), NON_SCIENCE (512), DEAD (1024), HOT (2048),
+# REFERENCE_PIXEL (2^31).  Everything else (JUMP_DET 4, UNRELIABLE_*, WARM 4096,
+# FLUX_ESTIMATED, ...) stays usable, as HST's warm-pixel bit does.  The raw DQ is still
+# recorded per star in dq_1x1/2x2/3x3.  (One explicit policy for all three instruments;
+# Liwen Chen's jwst1pass_py_v2 masked every non-zero bit for NIRISS/MIRI and only bits
+# 0-1 for NIRCam.)
+# SATURATED (2) stays masked.  Tested 2026-10-07 (And XIV nrcb1, G = 18.4): the SATURATED-but-
+# not-DO_NOT_USE pixels of a bright star carry calwebb slope estimates that are NOT valid
+# fluxes (a 7x6 flagged block with values 20-50 MJy/sr around a 1161 MJy/sr core), so keeping
+# them changes nothing for the fit and would bias it.  Recovering these stars needs a wing-fit
+# pass (seed from the SAT blob, larger window, masked core) -- see the saturated-anchor plan.
 JWST_DQ_MASK_BITS = 1 | 2 | 512 | 1024 | 2048 | (1 << 31)
+JWST_DQ_SATURATED = 2
 
 
 def _rescale_records_to_native(records, scale):
@@ -1522,6 +1528,14 @@ def run_photometry_fits(
         _chip_dq = _dq_arrays.get(sci_ext)
         if _chip_recs and _chip_dq is not None:
             compute_dq_stats(_chip_recs, _chip_dq)
+            if is_jwst(instrume):
+                # JWST n_sat = masked (DO_NOT_USE | SATURATED) pixels in the fit window, the analogue of
+                # HST's count above sat_threshold (no numeric threshold exists for MJy/sr data)
+                _ny, _nx = _chip_dq.shape; _hw = int(half_width)
+                _lost = (_chip_dq & np.int32(1 | JWST_DQ_SATURATED)) != 0
+                for _r in _chip_recs:
+                    _xi, _yi = int(round(float(_r.x))), int(round(float(_r.y)))
+                    _r.n_sat = int(_lost[max(_yi - _hw, 0):_yi + _hw + 1, max(_xi - _hw, 0):_xi + _hw + 1].sum())
 
     # Apply GDC and WCS corrections
     _apply_gdc_wcs(all_records, gdc, image_path, chips, instrume, detector,
