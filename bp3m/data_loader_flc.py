@@ -1383,7 +1383,10 @@ def load_image_data_flc(data_root, field_name: str,
     # wins, and downstream completeness checks then under-count the field.
     if summary_rows and restrict_images is None:
         summary_df  = pd.DataFrame(summary_rows)
-        summary_path = hst_root.parent.parent / "image_transformation_summaries.csv"
+        # legacy location {field}/HST/ (the HST root's grandparent); hst_root no longer exists since the
+        # loader iterates image_roots (HST + JWST) -- pop-fit v1 on And_XIV_JWST_dev hit the NameError
+        summary_path = field_path / "HST" / "image_transformation_summaries.csv"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_df.to_csv(summary_path, index=False)
         print(f"  Image summary written to '{summary_path}'")
 
