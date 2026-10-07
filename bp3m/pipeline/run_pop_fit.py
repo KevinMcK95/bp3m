@@ -1864,6 +1864,29 @@ def _read_member_seed(path):
     return [int(g) for g in _seed['gaia_source_id'].values], set()
 
 
+def match_seed_by_position(seed, master, tol_mas: float = 150.0):
+    """Boolean mask over *master* rows (needs ra0/dec0 columns) for seed rows that carry ra0/dec0: nearest-neighbour
+    match within tol_mas.  Returns None when the seed has no positions.  source_index is re-assigned whenever the
+    master catalogue is rebuilt (every bp3m-v2 pass), so position is the only stable key (2026-10-07; And XIV /
+    And XVII seeds selected on one v2 pass and fitted on the next)."""
+    if seed is None or not {'ra0', 'dec0'} <= set(seed.columns) or not {'ra0', 'dec0'} <= set(master.columns):
+        return None
+    s = seed[np.isfinite(pd.to_numeric(seed['ra0'], errors='coerce')) & np.isfinite(pd.to_numeric(seed['dec0'], errors='coerce'))]
+    if not len(s):
+        return None
+    from scipy.spatial import cKDTree
+    dec0 = float(np.nanmedian(master['dec0'])); c = np.cos(np.radians(dec0))
+    M = np.column_stack([master['ra0'].to_numpy(float) * c, master['dec0'].to_numpy(float)]) * 3.6e6
+    S = np.column_stack([s['ra0'].to_numpy(float) * c, s['dec0'].to_numpy(float)]) * 3.6e6
+    ok = np.all(np.isfinite(M), axis=1)
+    d, j = cKDTree(M[ok]).query(S, distance_upper_bound=tol_mas)
+    hit = np.isfinite(d)
+    mask = np.zeros(len(master), bool); mask[np.where(ok)[0][j[hit]]] = True
+    print(f"  member seed: {int(hit.sum())}/{len(s)} seed rows matched by position (<= {tol_mas:g} mas); "
+          f"{int((~hit).sum())} unmatched")
+    return mask
+
+
 def _resolve_member_seed(data_root, field_name, data_source, member_seed_csv,
                          use_member_seed, freeze_member_seed):
     """--use_member_seed / --freeze_member_seed: auto-locate the CSV written by

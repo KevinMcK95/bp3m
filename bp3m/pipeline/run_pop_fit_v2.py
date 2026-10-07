@@ -364,10 +364,16 @@ def _catalog_main(argv=None):
             raise SystemExit(f"member seed not found: {seed_path}")
         seed = pd.read_csv(seed_path)
         seed_member = np.zeros(len(df), bool)
-        if 'source_index' in seed.columns:
+        from bp3m.pipeline.run_pop_fit import match_seed_by_position
+        _pos = match_seed_by_position(seed, df)        # (bool mask | None) -- seeds with ra0/dec0 (2026-10-07)
+        if _pos is not None:
+            seed_member |= _pos
+        elif 'source_index' in seed.columns:
             si = pd.to_numeric(seed['source_index'], errors='coerce').dropna()
             seed_member[np.intersect1d(si.astype(int),
                                        df['source_index'])] = True
+            print("  WARNING: member seed has no ra0/dec0 -> matched by source_index, which is only valid if the"
+                  " master catalogue has not been rebuilt since the selection")
         if 'gaia_source_id' in seed.columns:
             gids = pd.to_numeric(seed['gaia_source_id'],
                                  errors='coerce').fillna(0).astype(np.int64)
