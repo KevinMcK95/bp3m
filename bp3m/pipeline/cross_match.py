@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import numpy as np
 import pandas as pd
 
 from bp3m.instrument_config import (
@@ -237,6 +238,44 @@ _WORKER_GAIA_DF = None
 _WORKER_GAIA_PATH = None
 
 
+
+GAIA_SUBSET_MARGIN_ARCSEC = 90.0   # beyond the image half-diagonal: header errors (GSC-era HST ~1", early JWST 2.6"),
+                                    # the very-wide 300 px offset search (~15-20") and Gaia PM propagation (<0.3")
+
+
+def _gaia_subset_for_image(image_path, gaia_df, margin_arcsec: float = GAIA_SUBSET_MARGIN_ARCSEC):
+    """Rows of *gaia_df* within (image half-diagonal + margin) of the image centre, from the SCI header WCS
+    keywords only (no catalogue read).  Workers used to load the WHOLE field catalogue each (12 workers x a
+    7e6-row bulge catalogue = tens of GB, user 2026-10-07); a 63" NIRCam or 3.4' ACS frame needs a few hundred
+    rows.  Falls back to the full table if the header cannot be parsed."""
+    try:
+        from astropy.io import fits as _fits
+        ra_c, dec_c, rad = [], [], 0.0
+        with _fits.open(image_path, memmap=True) as hd:
+            scis = [h for h in hd if h.name.upper() == 'SCI' and h.header.get('NAXIS', 0) == 2] or [hd[1]]
+            for h in scis:
+                hh = h.header
+                nx, ny = float(hh['NAXIS1']), float(hh['NAXIS2'])
+                cd = np.array([[hh.get('CD1_1', hh.get('CDELT1', 0.0) * hh.get('PC1_1', 1.0)), hh.get('CD1_2', hh.get('CDELT1', 0.0) * hh.get('PC1_2', 0.0))],
+                               [hh.get('CD2_1', hh.get('CDELT2', 0.0) * hh.get('PC2_1', 0.0)), hh.get('CD2_2', hh.get('CDELT2', 0.0) * hh.get('PC2_2', 1.0))]], float)
+                crpix = np.array([hh.get('CRPIX1', nx / 2), hh.get('CRPIX2', ny / 2)], float)
+                corners = np.array([[0.5, 0.5], [nx + 0.5, 0.5], [0.5, ny + 0.5], [nx + 0.5, ny + 0.5]]) - crpix
+                off = corners @ cd.T                                   # deg in the tangent plane about CRVAL
+                ra0, dec0 = float(hh['CRVAL1']), float(hh['CRVAL2'])
+                ra_c.append(ra0 + float(off[:, 0].mean()) / max(np.cos(np.radians(dec0)), 1e-6)); dec_c.append(dec0 + float(off[:, 1].mean()))
+                rad = max(rad, float(np.hypot(off[:, 0] - off[:, 0].mean(), off[:, 1] - off[:, 1].mean()).max()))
+        ra_m, dec_m = float(np.mean(ra_c)), float(np.mean(dec_c))
+        if len(ra_c) > 1:       # two-chip images: radius about the common centre
+            rad += float(max(np.hypot((np.array(ra_c) - ra_m) * np.cos(np.radians(dec_m)), np.array(dec_c) - dec_m)))
+        r_deg = rad + margin_arcsec / 3600.0
+        ra = gaia_df['ra'].to_numpy(float); de = gaia_df['dec'].to_numpy(float)
+        dra = (ra - ra_m + 180.0) % 360.0 - 180.0
+        sep = np.hypot(dra * np.cos(np.radians(dec_m)), de - dec_m)
+        sub = gaia_df[sep <= r_deg]
+        return sub if len(sub) else gaia_df.iloc[0:0]
+    except Exception:
+        return gaia_df
+
 def _pool_init(gaia_path):
     # Workers receive a PATH, not the DataFrame: shipping the ~10^5-row
     # catalogue through the pool pipes deadlocked at worker-respawn waves
@@ -255,8 +294,10 @@ def _get_worker_gaia():
 
 def _match_one(args):
     """Worker: cross-match one image. Returns (image_name, n_matched, error)."""
-    if len(args) == 3:          # sequential path passes the df directly
+    if len(args) == 3:          # the df (now the per-image Gaia subset) is passed directly
         hst_dict, gaia_df, kwargs = args
+        if gaia_df is None or len(gaia_df) == 0:
+            gaia_df = _get_worker_gaia() if _WORKER_GAIA_PATH else gaia_df
     else:
         hst_dict, kwargs = args
         gaia_df = _get_worker_gaia()
@@ -652,9 +693,14 @@ def run_cross_match(
     results = []
     if n_processes > 1 and len(work) > 1:
         import multiprocessing as _mp
+        # Each task carries only the Gaia rows near its image (user 2026-10-07): the per-worker copy of the
+        # full field catalogue (7e6 rows for the bulge / M22 fields) was the memory hog of the lanes.
+        _subs = [_gaia_subset_for_image(w[0]['flc'], gaia_df) for w in work]
+        _ns = np.array([len(x) for x in _subs])
+        print(f"  Gaia rows per image task: median {int(np.median(_ns))}, max {int(_ns.max())} (of {len(gaia_df)})")
         _gaia_cache = (Path(output_dir) / field_name / "Gaia"
                        / ".xmatch_gaia_worker_cache.pkl")
-        gaia_df.to_pickle(_gaia_cache)
+        gaia_df.to_pickle(_gaia_cache)      # fallback only (empty-subset tasks reload the full table)
         try:
             # NOTE: no max_tasks_per_child — mid-pool worker respawn under
             # forkserver deadlocks at exactly n_workers x 25 tasks (observed
@@ -669,8 +715,8 @@ def run_cross_match(
                         mp_context=_mp.get_context("forkserver"),
                         initializer=_pool_init,
                         initargs=(str(_gaia_cache),)) as ex:
-                    futures = {ex.submit(_match_one, (w[0], w[2])): w
-                               for w in _batch}
+                    futures = {ex.submit(_match_one, (w[0], _subs[_b0 + _k], w[2])): w
+                               for _k, w in enumerate(_batch)}
                     for fut in as_completed(futures):
                         name, n, err = fut.result()
                         if err:
