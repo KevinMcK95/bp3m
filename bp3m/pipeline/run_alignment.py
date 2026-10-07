@@ -232,6 +232,7 @@ def run_alignment(  # noqa: C901
         image_names = [
             n for n in image_names
             if int(stars_per_image[n]["use_for_alignment"].sum()) >= bp3m_min_stars
+            or imgs[n].get("prealign_only", False)      # JWST frames held by the visit link prior
         ]
         dropped = before - len(image_names)
         if dropped:

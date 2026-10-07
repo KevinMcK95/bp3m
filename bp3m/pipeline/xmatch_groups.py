@@ -30,6 +30,8 @@ ZP_TOL_MAG = 2.5         # zero point (Gaia G - calibrated STMAG) within this of
 ZP_FLOOR_MAG = -6.0      # no reference for the filter: spurious matches to faint junk sit at ~ -10
 ZP_REF_MIN_MATCHES = 10
 ZP_GATE_MAX_N = 20       # chance (spurious) solutions only happen at low N; >= this the zero point is not used
+JWST_MAX_HEADER_OFFSET_MAS = 300.0   # JWST headers are Gaia-tied (FGS, GSC 2.4.2+): a solution this far off is spurious
+PREALIGN_MAX_SPREAD_PX = 3.0         # sibling consensus must agree this well to pre-align an unmatched JWST frame
 
 
 def filter_key(flc) -> tuple:
@@ -152,6 +154,19 @@ def low_n_suspect(member, max_n: int = LOW_N_MAX, max_offset_mas: float = LOW_N_
     return bool(E['offset_mas'] > max_offset_mas), E
 
 
+def jwst_header_bad(member) -> bool:
+    """JWST member whose Gaia solution sits > JWST_MAX_HEADER_OFFSET_MAS from its (Gaia-tied) header: spurious
+    (Draco program 4513 module B: 0.3-1.5" offsets from diffraction-spike detections of saturated Gaia stars)."""
+    if getattr(member, 'telescope', 'HST') != 'JWST' or not getattr(member, 'ok', False) or member.trans is None:
+        return False
+    from gaia_cross_match import sibling_seed as ss
+    try:
+        E = member.E or ss.measure_header_error(member.params, member.trans, member.xr, member.yr)
+    except Exception:
+        return False
+    return bool(E['offset_mas'] > JWST_MAX_HEADER_OFFSET_MAS)
+
+
 def affine_from_trans(tr: dict, c) -> tuple:
     """transformation.csv (g = M (h - s_o) + t_o) -> (M, t) with g = M (h - c) + t."""
     M = np.array([[tr['A'], tr['B']], [tr['C'], tr['D']]])
@@ -213,7 +228,8 @@ def classify(group: list, zp_ref: dict | None = None) -> dict:
     A success whose zero point (Gaia G - STMAG) is inconsistent with its filter is a suspect
     whatever its siblings say: spurious solutions match faint junk and sit ~10 mag off."""
     zp_ref = zp_ref or {}
-    sane = {m.name: (m.ok and zp_sane(m.zp, zp_ref.get(m.filt), m.n)) for m in group}
+    hdr_bad = {m.name: jwst_header_bad(m) for m in group}
+    sane = {m.name: (m.ok and zp_sane(m.zp, zp_ref.get(m.filt), m.n) and not hdr_bad[m.name]) for m in group}
     info = {}
     for m in group:
         others = [s for s in group if s is not m and s.E is not None and sane[s.name]]
@@ -222,7 +238,7 @@ def classify(group: list, zp_ref: dict | None = None) -> dict:
         if not m.ok:
             cls = 'failed'
         elif not sane[m.name]:
-            cls = 'suspect'
+            cls = 'suspect'          # zero point off for its filter, or (JWST) too far from the Gaia-tied header
         elif m.E is None:
             cls = 'weak'
         else:
@@ -232,7 +248,7 @@ def classify(group: list, zp_ref: dict | None = None) -> dict:
                 if cons[2] >= 2 or big_other >= max(10, 2 * m.n):
                     cls = 'suspect'
         info[m.name] = dict(cls=cls, cons=cons, disagree_px=d, zp=m.zp, zp_ref=zp_ref.get(m.filt),
-                            zp_bad=bool(m.ok and not sane[m.name]))
+                            zp_bad=bool(m.ok and not sane[m.name] and not hdr_bad[m.name]), hdr_bad=bool(hdr_bad[m.name]))
     # a 'weak' member is also suspect when it disagrees with a consistent consensus
     for m in group:
         i = info[m.name]
@@ -503,14 +519,15 @@ def run_group_pass(folders: list, gaia_df: pd.DataFrame, match_kwargs: dict, par
                 if i['cls'] in ('failed', 'suspect'):
                     if cons is None:
                         results.setdefault(m.name, dict(cls=i['cls'], result='no trusted sibling', n_before=m.n, n_after=m.n,
-                                                        zp_bad=i.get('zp_bad', False), zp=i.get('zp'), zp_ref=i.get('zp_ref')))
+                                                        zp_bad=i.get('zp_bad', False), hdr_bad=i.get('hdr_bad', False), zp=i.get('zp'), zp_ref=i.get('zp_ref')))
                         continue
                     guess, reason = cons[0], f"{i['cls']}: seeded from {cons[2]} sibling(s)"
                 else:
                     guess = m.affine if (i['cls'] == 'trusted' or cons is None) else cons[0]
                     k = _recoverable(m, guess, master, gaia_df)
                     if k == 0:
-                        results.setdefault(m.name, dict(cls=i['cls'], result='complete (no recoverable master stars)', n_before=m.n, n_after=m.n))
+                        results.setdefault(m.name, dict(cls=i['cls'], result='complete (no recoverable master stars)', n_before=m.n, n_after=m.n,
+                                                        hdr_bad=i.get('hdr_bad', False)))
                         continue
                     reason = f"{i['cls']}: {k} missing master star(s) with a detection <{RECOVER_PX} px"
                 hst = {'root': str(m.root), 'flc': m.flc, 'catalog': m.catalog}
@@ -544,7 +561,7 @@ def run_group_pass(folders: list, gaia_df: pd.DataFrame, match_kwargs: dict, par
         for k, (root, tmp, n_new, err) in enumerate(sorted(outs), 1):
             m, i, guess, reason, gi, master = ctx[root]; tmp = Path(tmp)
             note = dict(version=GROUP_PASS_VERSION, round=rnd, cls=i['cls'], reason=reason, n_before=m.n, n_after=m.n,
-                        zp_bad=i.get('zp_bad', False), zp=i.get('zp'), zp_ref=i.get('zp_ref'))
+                        zp_bad=i.get('zp_bad', False), hdr_bad=i.get('hdr_bad', False), zp=i.get('zp'), zp_ref=i.get('zp_ref'))
             res = 'rejected'
             if err:
                 note['result'] = f'error: {err}'
@@ -586,19 +603,21 @@ def run_group_pass(folders: list, gaia_df: pd.DataFrame, match_kwargs: dict, par
     for fs in todo:
         for f in fs:
             r = Path(f['root']); nm = r.name; note = results.get(nm)
-            if not note or not note.get('zp_bad') or note.get('result') == 'accepted':
+            if not note or not (note.get('zp_bad') or note.get('hdr_bad')) or note.get('result') == 'accepted':
                 continue
             note['demoted'] = True; n_demoted += 1
-            log(f"    [{_ts()}] {nm}: zero point {note.get('zp'):+.2f} vs {note.get('zp_ref')} for its filter and no "
-                f"sibling-consistent re-solution -> demoted to failed")
+            if note.get('hdr_bad'):
+                _why = f"solution > {JWST_MAX_HEADER_OFFSET_MAS:.0f} mas from its Gaia-tied JWST header (spurious)"
+            else:
+                _why = f"zero point {note.get('zp'):+.2f} vs {note.get('zp_ref')} for its filter"
+            log(f"    [{_ts()}] {nm}: {_why} and no sibling-consistent re-solution -> demoted to failed")
             if apply:
                 for fn in ('matched_gaia.csv', 'transformation.csv'):
                     if (r / fn).exists():
                         (r / fn).rename(r / fn.replace('.csv', '_rejected_zp.csv'))
                 st = _status(r)
                 _write_status(r, {'status': 'failed', 'n_matched': 0, 'params': st.get('params'),
-                                  'reason': f"zero point {note.get('zp'):+.2f} inconsistent with its filter "
-                                            f"(spurious solution); visit-group completion could not re-solve it",
+                                  'reason': f"{_why} (spurious solution); visit-group completion could not re-solve it",
                                   'group_pass': note})
                 n_changed += 1
     # record the final per-group signature in every member, so an unchanged group is skipped next time
@@ -620,3 +639,52 @@ def run_group_pass(folders: list, gaia_df: pd.DataFrame, match_kwargs: dict, par
     log(f"  [{_ts()}] visit-group completion done: {acc} image(s) improved ({rec_fail} failed recovered, "
         f"{rec_sus} suspect re-solved), {n_demoted} spurious solution(s) demoted, {gain:+d} matched stars in total")
     return n_changed
+
+
+# ---------------------------------------------------------------------------
+# JWST: sibling-predicted transformations for frames without a Gaia solution (2026-10-07)
+# ---------------------------------------------------------------------------
+
+def write_jwst_sibling_prealign(folders: list, log=print) -> int:
+    """For every JWST frame of a visit group WITHOUT a usable Gaia solution (cross-match failed, or demoted as
+    spurious) write <image>/transformation_prealign.csv: the transformation.csv-schema affine predicted from the
+    trusted siblings' consensus header error (the frame's own header + the visit's shared error).  The v1 loader
+    admits such frames with zero stars and the solver's link prior (bp3m.jwst_links) ties their transformation to
+    the matched detectors of the visit; v2 then couples them through the faint HST/JWST-common stars.  In the
+    sparse M31-satellite fields (And XIV: 125/154 frames unmatched) the G < 19 Gaia stars are saturated in the
+    300 s NIRCam frames, so this is the only way the SW detectors enter the solve.  Returns the number written;
+    stale files of frames that have their own good solution are removed."""
+    groups = light_groups(folders, None)
+    n_written = n_removed = n_nocons = 0
+    for fs in groups:
+        ms = [m for m in (Member(f) for f in fs) if not m.empty and getattr(m, 'telescope', 'HST') == 'JWST']
+        if not ms:
+            continue
+        info = classify(ms, {})
+        trusted = [m for m in ms if info[m.name]['cls'] == 'trusted']
+        for m in ms:
+            pre = m.root / 'transformation_prealign.csv'
+            if m.ok and info[m.name]['cls'] != 'suspect':
+                if pre.exists():
+                    pre.unlink(); n_removed += 1
+                continue
+            cons = consensus(m, [s for s in trusted if s is not m])
+            if cons is None or cons[1] > PREALIGN_MAX_SPREAD_PX:
+                n_nocons += 1
+                if pre.exists():
+                    pre.unlink(); n_removed += 1
+                continue
+            (M, t), spread, n_sib = cons
+            A_, B_, C_, D_ = M[0, 0], M[0, 1], M[1, 0], M[1, 1]
+            fr = m.params
+            vals = dict(A=A_, B=B_, C=C_, D=D_, xs_o=m.c[0], ys_o=m.c[1], xt_o=t[0], yt_o=t[1],
+                        ratio=float(np.sqrt(abs(A_ * D_ - B_ * C_))), rot_deg=float(np.degrees(np.arctan2(B_ - C_, A_ + D_))),
+                        on_skew=0.5 * (A_ - D_), off_skew=0.5 * (B_ + C_), zp=np.nan,
+                        ra_cen=fr['ra_cen'], dec_cen=fr['dec_cen'], x_cen=fr['x_cen'], y_cen=fr['y_cen'],
+                        pixel_scale=fr['pixel_scale'], orientat=fr['orientat'], prealign_anchor=np.nan,
+                        n_match=0, rms_px=float(spread), n_siblings=int(n_sib), prealign_source='jwst_visit_siblings')
+            pd.DataFrame({'parameter': list(vals), 'value': list(vals.values())}).to_csv(pre, index=False)
+            n_written += 1
+    log(f"  [{_ts()}] JWST sibling pre-alignment: {n_written} unmatched frame(s) given a sibling-predicted "
+        f"transformation_prealign.csv ({n_nocons} without a consistent sibling consensus, {n_removed} stale file(s) removed)")
+    return n_written

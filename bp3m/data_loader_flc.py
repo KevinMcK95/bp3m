@@ -90,6 +90,15 @@ def _load_one_image(work):
     img_dir_str, img_name = work
     img_dir = Path(img_dir_str)
     meta = _read_image_meta(img_dir, img_name)
+    if meta is None and (img_dir / "transformation_prealign.csv").exists():
+        # JWST frame without a Gaia solution but with a sibling-predicted transformation
+        # (xmatch_groups.write_jwst_sibling_prealign): admitted with ZERO stars; the solver's
+        # link prior (bp3m.jwst_links) ties its transformation to the matched detectors of
+        # its visit.  HST prealign files are consumed by v2 only (visit_prealign.load_prealign).
+        _m = _read_image_meta(img_dir, img_name, transformation_file="transformation_prealign.csv")
+        if _m is not None and str(_m.get("telescope", "HST")).upper() == "JWST":
+            _m["prealign_only"] = True
+            return img_name, _m, _empty_stars_df(), False
     if meta is None:
         return img_name, None, None, False
     pc = _LDR_STATE["pc"]
@@ -548,6 +557,17 @@ def _build_stars_df(img_dir: Path, img_name: str,
     return df
 
 
+def _empty_stars_df() -> pd.DataFrame:
+    """stars_df with no rows (prealign-only JWST frames); same columns/dtypes as _build_stars_df."""
+    return pd.DataFrame({
+        "Gaia_id": np.array([], dtype=np.int64), "X": np.array([], float), "Y": np.array([], float),
+        "X_orig": np.array([], float), "Y_orig": np.array([], float),
+        "x_hst_err": np.array([], float), "y_hst_err": np.array([], float), "xy_hst_corr": np.array([], float),
+        "q_hst": np.array([], float), "mag": np.array([], float),
+        "use_for_alignment": np.array([], bool), "use_for_fit": np.array([], bool),
+    })
+
+
 def _build_delve_only_stars_df(
     img_dir: Path,
     img_name: str,
@@ -978,14 +998,15 @@ def load_image_data_flc(data_root, field_name: str,
             continue
         if _corr_matched:
             _n_corr_imgs.append(img_name)
-        if stars_df is None or len(stars_df) == 0:
+        _prealign_only = bool(meta.get("prealign_only", False))
+        if (stars_df is None or len(stars_df) == 0) and not _prealign_only:
             skipped.append(img_name)
             continue
 
         # Keep only stars that are in the Gaia catalog
         in_gaia = stars_df["Gaia_id"].isin(gaia_id_set)
         stars_df = stars_df[in_gaia].reset_index(drop=True)
-        if len(stars_df) == 0:
+        if len(stars_df) == 0 and not _prealign_only:
             skipped.append(img_name)
             continue
 
@@ -1036,6 +1057,10 @@ def load_image_data_flc(data_root, field_name: str,
         print(f"  Pseudo-GDC applied to {len(_n_corr_imgs)}/{len(images)} "
               f"loaded images (others: no matching inst/det/filter)")
 
+    _n_pre = sum(1 for m in images.values() if m.get("prealign_only"))
+    if _n_pre:
+        print(f"  {_n_pre} JWST frame(s) admitted with a sibling-predicted transformation and no Gaia stars "
+              f"(transformation_prealign.csv; geometry from the visit link prior)")
     if skipped:
         print(f"  Skipped {len(skipped)} directories (missing required files): "
               f"{skipped}")

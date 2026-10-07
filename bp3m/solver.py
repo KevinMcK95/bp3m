@@ -915,12 +915,15 @@ class BP3MSolver:
             df    = self.stars_per_image[img]
             mask  = df["Gaia_id"].isin(self.star_id_to_idx)
             df    = df[mask].copy().reset_index(drop=True)
-            if len(df) == 0:
+            if len(df) == 0 and not meta.get("prealign_only", False):
                 self._img_data[img] = None
                 continue
+            # prealign-only JWST frame (data_loader_flc, 2026-10-07): n = 0 — the entry is built with empty
+            # arrays so the header prior and the visit link coupling (bp3m.jwst_links) define its
+            # transformation; _solve_one_pass adds no data terms for n == 0.
 
             n = len(df)
-            sidx = np.array([self.star_id_to_idx[gid] for gid in df["Gaia_id"]])
+            sidx = np.array([self.star_id_to_idx[gid] for gid in df["Gaia_id"]], dtype=int)
 
             ra0, dec0 = meta["ra0"], meta["dec0"]
             # Initialize rolling tangent-point accumulator (reset each fit call)
@@ -1628,7 +1631,7 @@ class BP3MSolver:
             # Images dropped due to insufficient non-2p alignment stars are
             # excluded entirely: no H_vv, no H_rr data, no Schur correction.
             # Still add the prior so the H_rr block is not zero.
-            if dropped:
+            if dropped or int(d.get("n", 0)) == 0:      # n == 0: prealign-only JWST frame (link prior only)
                 H_rr[cs:cs+nr, cs:cs+nr] += d["C_r_prior_inv"]
                 K_img[img] = None
                 continue

@@ -104,6 +104,11 @@ def _detach_hardlinked_outputs(roots) -> int:
 
 
 WIDE_DISCOVERY_OFFSET = 150   # px; second attempt for images that fail at discovery_max_offset
+# JWST (2026-10-07): the FGS guide-star headers are good to ~0.1" (Draco: 5-50 mas), so the 4P offset search is
+# capped at 10 px (SW 0.31", LW 0.63") and the wide / very-wide retries are skipped.  With the 50 px window the
+# diffraction-spike / wing detections of the SATURATED Gaia stars (G < 19 saturates in 300 s NIRCam frames)
+# reproduced the Gaia pattern at a 0.3-1.5" offset and passed with 6-11 'matches' (Draco program 4513, module B).
+JWST_DISCOVERY_MAX_OFFSET = 10
 MARGINAL_FA_PROB = 1e-6       # a first success less significant than this also gets the wide attempt
 # Third attempt (2026-10-06) for images whose header WCS is NOT Gaia-aligned: short (2.5 s) SMC/LMC
 # Cepheid snapshots (programs 14648/15146/17097, WCSNAME IDC_2731450pi) carry header pointing errors
@@ -292,6 +297,7 @@ def _match_one(args):
             pos_corr_model=kwargs.get('pos_corr_model', None),
         )
         _off = kwargs.get('discovery_max_offset', 50)
+        _is_jwst = str(kwargs.get('telescope', 'HST')).upper() == 'JWST'   # no wide retries: header is Gaia-tied
         process_single_image(hst_dict, gaia_df, discovery_max_offset=_off, **_psi_kw)
         post_mtime = out.stat().st_mtime if out.exists() else None
         file_updated = post_mtime is not None and post_mtime != pre_mtime
@@ -305,7 +311,7 @@ def _match_one(args):
             except Exception:
                 return 1.0
         _marginal = file_updated and _fap_of() > MARGINAL_FA_PROB
-        if (not file_updated or _marginal) and _off < WIDE_DISCOVERY_OFFSET:
+        if (not file_updated or _marginal) and _off < WIDE_DISCOVERY_OFFSET and not _is_jwst:
             # a marginal first success (e.g. 7 pairs vs 1.3 by chance) can hide the real solution
             # outside the default window: run the wide attempt and keep the more significant one
             import shutil as _sh
@@ -332,7 +338,7 @@ def _match_one(args):
             else:
                 file_updated = _wide_new
             post_mtime = out.stat().st_mtime if out.exists() else None
-        if (not file_updated and max(_off, WIDE_DISCOVERY_OFFSET) < VERY_WIDE_DISCOVERY_OFFSET
+        if (not file_updated and not _is_jwst and max(_off, WIDE_DISCOVERY_OFFSET) < VERY_WIDE_DISCOVERY_OFFSET
                 and kwargs.get('very_wide_retry', True) and not _header_wcs_gaia_aligned(hst_dict['flc'])):
             _pre3 = out.stat().st_mtime if out.exists() else None
             process_single_image(hst_dict, gaia_df, discovery_max_offset=VERY_WIDE_DISCOVERY_OFFSET,
@@ -496,6 +502,9 @@ def run_cross_match(
     if _n_det:
         print(f"  Detached {_n_det} hard-linked cross-match output file(s) (shared with a field copy) before rewriting")
 
+    if telescope.upper() == 'JWST' and discovery_max_offset > JWST_DISCOVERY_MAX_OFFSET:
+        print(f"  JWST: 4P offset search capped at +-{JWST_DISCOVERY_MAX_OFFSET} px (Gaia-tied FGS headers; was {discovery_max_offset})")
+        discovery_max_offset = JWST_DISCOVERY_MAX_OFFSET
     params_meta = {
         # Matching-algorithm version: bump on any change to the matching
         # LOGIC (not just parameters) so every cached result in the archive
@@ -546,14 +555,21 @@ def run_cross_match(
                'discovery_max_offset': discovery_max_offset, 'use_resid_floor': use_resid_floor,
                'prior_sigma_rot_deg': prior_sigma_rot_deg, 'prior_sigma_scale': prior_sigma_scale,
                'prior_sigma_skew': prior_sigma_skew, 'init_resid_max': init_resid_max,
-               'pos_corr_model': (str(pos_corr_model) if pos_corr_model else None)}
+               'pos_corr_model': (str(pos_corr_model) if pos_corr_model else None),
+               'telescope': telescope.upper()}
         print("\n  Step 4c: visit-group completion (sibling-seeded rematch of failed / inconsistent images)")
         try:
-            return run_group_pass(
+            _n_changed = run_group_pass(
                 folders, gaia_df, _kw,
                 lambda m: dict(params_meta, gdc_id=catalog_gdc_id(m.catalog)), dict(params_meta),
                 n_processes=n_processes, force=force_group_pass,
                 cache_path=Path(output_dir) / field_name / telescope.upper() / 'visit_groups_cache.json')
+            if telescope.upper() == 'JWST':
+                # frames with no (or a demoted) Gaia solution: sibling-predicted transformation_prealign.csv so the
+                # loader admits them with zero stars and the solver link prior determines their geometry
+                from .xmatch_groups import write_jwst_sibling_prealign
+                write_jwst_sibling_prealign(folders, log=print)
+            return _n_changed
         except Exception as _ge:
             import traceback
             print(f"  WARNING: visit-group completion failed — {_ge}")
@@ -609,6 +625,7 @@ def run_cross_match(
             'prior_sigma_skew':     prior_sigma_skew,
             'init_resid_max':       init_resid_max,
             'pos_corr_model':       (str(pos_corr_model) if pos_corr_model else None),
+            'telescope':            telescope.upper(),
         }))
 
     if skipped:
