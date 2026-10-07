@@ -52,7 +52,7 @@ import pandas as pd
 from astropy.io import fits
 # image/catalog lookup shared with the v1 loader: HST (_flc) and JWST (_cal) products,
 # one root per telescope ({field}/{TEL}/mastDownload/{TEL})
-from bp3m.data_loader_flc import image_roots, find_image_dir, _image_file, _catalog_file
+from bp3m.data_loader_flc import image_roots, find_image_dir, _image_file, _catalog_file, _telescope_of
 from astropy.time import Time as AstropyTime
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
@@ -354,7 +354,12 @@ def _load_all_detections(field_dir: Path,
         _run_cfg = _json_cfg.load(open(bp3m_dir / 'run_config.json'))
     except Exception:
         pass
-    _floor = float(_run_cfg.get('pos_err_floor') or 0.0)
+    _floor_cfg = _run_cfg.get('pos_err_floor') or 0.0     # float, or {'HST': px, 'JWST': px} (per-telescope floors, 2026-10-07)
+    _floor = _floor_cfg if not isinstance(_floor_cfg, dict) else float(_floor_cfg.get('HST', 0.0) or 0.0)
+    def _floor_of(instrument):
+        if isinstance(_floor_cfg, dict):
+            return float(_floor_cfg.get(_telescope_of(str(instrument)), _floor_cfg.get('HST', 0.0)) or 0.0)
+        return float(_floor_cfg or 0.0)
     _pc_set, _pcm = None, None
     if _run_cfg.get('pos_corr_table'):
         from bp3m.pos_corr import PseudoGDCSet
@@ -362,7 +367,7 @@ def _load_all_detections(field_dir: Path,
     if _run_cfg.get('pos_corr_model'):
         from bp3m.pos_corr_basis import make_pos_corr
         _pcm = make_pos_corr(str(_run_cfg['pos_corr_model']))
-    print(f"  position model from {bp3m_dir.name}/run_config.json: floor {_floor} px, "
+    print(f"  position model from {bp3m_dir.name}/run_config.json: floor {_floor_cfg} px, "
           f"pos_corr_table {'yes' if _pc_set else 'none'}, "
           f"pos_corr_model {_run_cfg.get('pos_corr_model') or 'none'}")
 
@@ -621,10 +626,13 @@ def _load_all_detections(field_dir: Path,
                 _am = _pcm.area_mag(tbl, _hdr_pcm)
                 if _am is not None:
                     _dm_area = np.nan_to_num(_am, nan=0.0)
-        if _floor > 0:
-            cat_cov_xx = cat_cov_xx + _floor ** 2
-            cat_cov_yy = cat_cov_yy + _floor ** 2
-        cat_mag_cal = np.asarray(tbl['mag_st_gdc'], float) + _dm_area
+        _fl = _floor_of(instrument)          # this detector's own pixels
+        if _fl > 0:
+            cat_cov_xx = cat_cov_xx + _fl ** 2
+            cat_cov_yy = cat_cov_yy + _fl ** 2
+        # JWST catalogues carry AB magnitudes (mag_ab_gdc; no STMAG): use them when mag_st_gdc is empty
+        _mcol = 'mag_st_gdc' if np.isfinite(np.asarray(tbl['mag_st_gdc'], float)).any() or 'mag_ab_gdc' not in tbl.dtype.names else 'mag_ab_gdc'
+        cat_mag_cal = np.asarray(tbl[_mcol], float) + _dm_area
         cat_qfit = np.asarray(tbl['qfit'],  float)
         cat_chi2 = np.asarray(tbl['chi2'],  float)
         cat_nsat = np.asarray(tbl['n_sat'], int)
