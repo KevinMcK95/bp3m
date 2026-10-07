@@ -535,11 +535,9 @@ def run_cross_match(
         print(f"  cross-match with learned GDC correction {pos_corr_model}: priors rot {prior_sigma_rot_deg} deg, scale {prior_sigma_scale}, skew {prior_sigma_skew}")
 
     def _group_pass():
-        if telescope.upper() != 'HST':
-            # Step 4c groups exposures by HST visit / guide-star / WCSNAME header keys;
-            # the JWST equivalents (PROGRAM/OBSERVTN/VISIT, no WCSNAME) are not wired yet.
-            print(f"\n  Step 4c: visit-group completion not yet available for {telescope.upper()} — skipped")
-            return 0
+        # HST: visit / guide-star / WCSNAME header keys.  JWST (2026-10-07): PROGRAM / OBSERVTN / VISIT /
+        # GDSTARID — every detector of every dither of a visit is a sibling (bp3m.visit_groups), so the
+        # NIRCam SW frames that see 0-3 Gaia stars are seeded from the LW / NIRISS frames of the same visit.
         if not group_pass:
             return 0
         from .xmatch_groups import run_group_pass

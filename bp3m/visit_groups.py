@@ -5,6 +5,14 @@ Group key per exposure, read from <img>_spt.fits (falls back to the FLC primary 
     PROPOSID, OBSET_ID (visit), DGESTAR + SGESTAR (dominant / roll guide stars), PA_V3 (binned to
     PA_TOL deg), and a time chain: consecutive exposures of a group must be within GAP_DAYS of each other.
 Exposures with GUIDEACT other than FINE LOCK, or with a missing guide-star id, are never grouped.
+
+JWST (2026-10-07, jwst-integration): a stage-2 ``_cal`` file is ONE detector of one exposure, and every
+detector of every dither of a visit shares the same FGS guide star (GDSTARID) and attitude, so the group
+key is PROGRAM / OBSERVTN / VISIT / GDSTARID (+ GS_V3_PA binned); all NIRCam SW + LW detectors and the
+NIRISS parallel of the visit are siblings.  ``root`` is the full file stem (``jw..._nrca1``) because the
+rootname prefix alone (``jw01305003001``) is shared by the whole visit.  Measured on the Draco joint run:
+within a visit the fitted pointing deviation agrees to 1.5-4 mas across the detectors of a module and
+to 1-3 mas across dithers; module A vs B and NIRISS vs NIRCam differ by a visit-constant 5-15 / 30-50 mas.
 """
 from __future__ import annotations
 import glob, os
@@ -13,6 +21,21 @@ import numpy as np
 PA_TOL = 0.02        # deg — within-visit PA_V3 scatter is < 0.005 deg; a re-acquisition on new stars changes it more
 GAP_DAYS = 2.0       # a visit rarely spans more than a day; larger gaps mean a new acquisition
 _KEYS = ('PROPOSID', 'OBSET_ID', 'DGESTAR', 'SGESTAR', 'PA_V3', 'EXPSTART', 'GUIDEACT', 'ROOTNAME', 'INSTRUME', 'FILTER', 'FILTER1', 'FILTER2')
+_JWST_KEYS = ('TELESCOP', 'PROGRAM', 'OBSERVTN', 'VISIT', 'VISIT_ID', 'GDSTARID', 'GS_V3_PA', 'EXPSTART', 'INSTRUME',
+              'DETECTOR', 'MODULE', 'CHANNEL', 'FILTER', 'PUPIL', 'EXP_TYPE')
+_IMAGE_SUFFIXES = ('_flc', '_flt', '_cal', '_c0m')
+
+
+def image_stem(path: str) -> str:
+    """File stem without the product suffix: HST 'ic2z01ehq' (rootname), JWST 'jw01305003001_02101_00001_nrca1'."""
+    stem = os.path.basename(path)
+    if stem.endswith('.fits'):
+        stem = stem[:-5]
+    for suf in _IMAGE_SUFFIXES:
+        if stem.endswith(suf):
+            stem = stem[:-len(suf)]
+            break
+    return stem
 
 
 def exposure_meta(flc_path: str) -> dict:
@@ -20,6 +43,16 @@ def exposure_meta(flc_path: str) -> dict:
     d = os.path.dirname(flc_path); root = os.path.basename(flc_path).split('_')[0]
     spt = os.path.join(d, f'{root}_spt.fits')
     out = {}
+    try:
+        h0 = fits.getheader(flc_path, 0)
+    except Exception:
+        h0 = {}
+    if str(h0.get('TELESCOP', '')).strip().upper() == 'JWST':
+        for k in _JWST_KEYS:
+            if h0.get(k) is not None:
+                out[k] = h0.get(k)
+        out['root'] = image_stem(flc_path).lower()
+        return out
     for p in ((spt,) if os.path.exists(spt) else ()) + (flc_path,):
         try:
             h = fits.getheader(p, 0)
@@ -32,8 +65,19 @@ def exposure_meta(flc_path: str) -> dict:
     return out
 
 
+def is_jwst_meta(m: dict) -> bool:
+    return str(m.get('TELESCOP', '')).strip().upper() == 'JWST'
+
+
 def group_key(m: dict):
     """Hashable key or None when the exposure must stay alone."""
+    if is_jwst_meta(m):
+        gs = str(m.get('GDSTARID', '') or '').strip()
+        if not gs or not m.get('VISIT_ID'):
+            return None
+        pa = m.get('GS_V3_PA')
+        pa_bin = int(round(float(pa) / PA_TOL)) if pa is not None else None
+        return ('JWST', str(m.get('PROGRAM', '')), str(m.get('OBSERVTN', '')), str(m.get('VISIT', '')), gs, pa_bin)
     dg, sg = str(m.get('DGESTAR', '') or '').strip(), str(m.get('SGESTAR', '') or '').strip()
     if not dg or str(m.get('GUIDEACT', 'FINE LOCK')).upper().find('FINE') < 0:
         return None

@@ -385,6 +385,14 @@ def _parse_args():
                     help='Plate skew prior width (default 1e-4 without a correction model, 1e-5 with --pos_corr_model; pre-2026-09-30: 2e-4)')
     bp.add_argument('--prior_sigma_pointing', type=float, default=None,
                     help='Pointing offset prior width in mas (default 5000.0)')
+    bp.add_argument('--jwst_link', choices=['none', 'module', 'visit'], default='visit',
+                    help='Couple the transformation DEVIATIONS of the JWST detectors of one visit (bp3m.jwst_links): '
+                         "'module' ties the SW+LW detectors of a NIRCam module across the dithers (5 mas / 3.6\" / 1e-4), "
+                         "'visit' (default) adds a loose tie across modules and the NIRISS parallel (25 mas); 'none' = independent frames")
+    bp.add_argument('--jwst_link_sigma_module_mas', type=float, default=None,
+                    help='Pointing width (mas) of the visit x module link prior (default 5)')
+    bp.add_argument('--jwst_link_sigma_visit_mas', type=float, default=None,
+                    help='Pointing width (mas) of the whole-visit link prior (default 25)')
     bp.add_argument('--inflate_alpha_max', type=float, default=3.0,
                     help='Per-iteration cap on the alpha error-inflation multiplier (default 3.0; '
                          'pre-2026-08-05 default was 10.0)')
@@ -1211,6 +1219,14 @@ def main():
     _bp3m_images = args.bp3m_images
     if _bp3m_images is None and not args.bp3m_all_images and _selected_obsids is not None:
         _bp3m_images = _selected_obsids
+        # joint runs: the working set is the union of every telescope's Step-2 manifest
+        for _tel in args.telescopes[1:]:
+            _m_tel = output_dir / field / _tel / f"{field}_selected_obsids.json"
+            try:
+                _extra = _json.loads(_m_tel.read_text()) if _m_tel.exists() else []
+            except Exception:
+                _extra = []
+            _bp3m_images = list(_bp3m_images) + [o for o in _extra if o not in set(_bp3m_images)]
     # _restrict is what we pass as restrict_to_obsids to every step from 3 on.
     _restrict = _bp3m_images  # may be None (→ process all on-disk images)
 
@@ -1648,6 +1664,9 @@ def main():
                 prior_sigma_scale=args.prior_sigma_scale,
                 prior_sigma_skew=args.prior_sigma_skew,
                 prior_sigma_pointing=args.prior_sigma_pointing,
+                jwst_link=args.jwst_link,
+                jwst_link_sigma_module_mas=args.jwst_link_sigma_module_mas,
+                jwst_link_sigma_visit_mas=args.jwst_link_sigma_visit_mas,
                 inflate_alpha_max=args.inflate_alpha_max,
                 influence_k=args.influence_k,
                 influence_floor_sr=args.influence_floor_sr,
@@ -1871,6 +1890,9 @@ def main():
                 prior_sigma_scale=args.prior_sigma_scale,
                 prior_sigma_skew=args.prior_sigma_skew,
                 prior_sigma_pointing=args.prior_sigma_pointing,
+                jwst_link=args.jwst_link,
+                jwst_link_sigma_module_mas=args.jwst_link_sigma_module_mas,
+                jwst_link_sigma_visit_mas=args.jwst_link_sigma_visit_mas,
                 inflate_alpha_max=args.inflate_alpha_max,
                 influence_k=args.influence_k,
                 influence_floor_sr=args.influence_floor_sr,
@@ -1969,6 +1991,9 @@ def main():
                 prior_sigma_scale=args.prior_sigma_scale,
                 prior_sigma_skew=args.prior_sigma_skew,
                 prior_sigma_pointing=args.prior_sigma_pointing,
+                jwst_link=args.jwst_link,
+                jwst_link_sigma_module_mas=args.jwst_link_sigma_module_mas,
+                jwst_link_sigma_visit_mas=args.jwst_link_sigma_visit_mas,
                 inflate_alpha_max=args.inflate_alpha_max,
                 influence_k=args.influence_k,
                 influence_floor_sr=args.influence_floor_sr,

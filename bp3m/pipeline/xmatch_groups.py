@@ -112,6 +112,7 @@ class Member:
             self.xr = (float(np.percentile(x[okp], 1)), float(np.percentile(x[okp], 99)))
             self.yr = (float(np.percentile(y[okp], 1)), float(np.percentile(y[okp], 99)))
         self.wcsname = str(fits.getheader(self.flc, 1).get('WCSNAME', ''))
+        self.telescope = str(fits.getheader(self.flc, 0).get('TELESCOP', 'HST')).strip().upper() or 'HST'
         self.ids, self.trans, self.affine, self.E = set(), None, None, None
         self.filt = filter_key(self.flc); self.zp = float('nan')
         if self.ok:
@@ -141,7 +142,8 @@ def low_n_suspect(member, max_n: int = LOW_N_MAX, max_offset_mas: float = LOW_N_
     from gaia_cross_match import sibling_seed as ss
     if not getattr(member, 'ok', False) or member.n > max_n or member.trans is None:
         return False, None
-    if not any(k in str(member.wcsname).upper() for k in GAIA_TIED_WCS):
+    # JWST headers are always Gaia-tied (FGS guide stars from GSC 2.4.2+; no WCSNAME keyword)
+    if getattr(member, 'telescope', 'HST') != 'JWST' and not any(k in str(member.wcsname).upper() for k in GAIA_TIED_WCS):
         return False, None
     try:
         E = member.E or ss.measure_header_error(member.params, member.trans, member.xr, member.yr)

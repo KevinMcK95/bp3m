@@ -197,6 +197,18 @@ def _make_pair_coupling_inv(meta_hi, poly_order=1,
     return C_pair_inv
 
 
+def _make_link_coupling_inv(meta, sigmas: dict, poly_order=1, n_chip=0):
+    """C_link_inv (N_R x N_R) for a JWST exposure/visit link (bp3m.jwst_links): the DEVIATION of a
+    linked frame from its group mean ~ N(0, Sigma) in (rotation, scale, on/off skew, Δα0, Δδ0);
+    poly / chip terms uncoupled.  Same construction as the hi/lo chip-pair prior, linearised at
+    this frame's own header rotation (the detectors of a visit differ by < 1 deg, so the J mismatch
+    between partners is negligible against the widths)."""
+    return _make_pair_coupling_inv(meta, poly_order,
+                                   sigma_pair_rot_deg=sigmas['rot_deg'], sigma_pair_scale=sigmas['scale'],
+                                   sigma_pair_skew=sigmas['skew'], sigma_pair_pointing=sigmas['pointing_mas'],
+                                   n_chip=n_chip)
+
+
 # ── Option-5 health gate + backstop ceiling on the adaptive thresholds ───────
 #
 # _adapt_thresh returns p50 + k*(p50-p16), floored but otherwise UNCAPPED, so a
@@ -276,6 +288,7 @@ class BP3MSolver:
                  prior_sigma_pair_skew=None, prior_sigma_pair_pointing=None,
                  use_pair_prior=False, prior_sigma_poly_px=None,
                  fit_chip_offset=False, prior_sigma_chip_px=None,
+                 jwst_link='visit', jwst_link_sigma_module_mas=None, jwst_link_sigma_visit_mas=None,
                  fit_epoch_distortion=False, epoch_dist_order=3,
                  epoch_gap_days=180.0, epoch_dist_sigma_mas=10.0,
                  epoch_breaks=None, epoch_dist_min_images=3,
@@ -326,6 +339,14 @@ class BP3MSolver:
         self._prior_sigma_pair_scale    = prior_sigma_pair_scale    if prior_sigma_pair_scale    is not None else _SIGMA_PAIR_SCALE
         self._prior_sigma_pair_skew     = prior_sigma_pair_skew     if prior_sigma_pair_skew     is not None else _SIGMA_PAIR_SKEW
         self._prior_sigma_pair_pointing = prior_sigma_pair_pointing if prior_sigma_pair_pointing is not None else _SIGMA_PAIR_POINTING
+        # JWST exposure / visit linking (bp3m.jwst_links): coupling prior on the deviations of the
+        # detectors of one visit (module level tight, visit level loose); 'none' disables it.
+        self._jwst_link = str(jwst_link or 'none').lower()
+        self._jwst_link_sigma_module_mas = jwst_link_sigma_module_mas
+        self._jwst_link_sigma_visit_mas  = jwst_link_sigma_visit_mas
+        self._link_pairs: list = []          # (i, j, C_link/n, r_prior_i - r_prior_j)
+        self._link_groups: list = []
+        self._linked_images: set = set()     # never demoted to astrometry-only / frozen r
 
         self.images = images
         self.stars_per_image = stars_per_image
@@ -1154,6 +1175,41 @@ class BP3MSolver:
                       f"skew={self._prior_sigma_pair_skew}, "
                       f"point={self._prior_sigma_pair_pointing}mas)")
 
+        # ── JWST exposure / visit links (bp3m.jwst_links) ───────────────────────
+        self._link_pairs, self._link_groups, self._linked_images = [], [], set()
+        if self._jwst_link != 'none':
+            from .jwst_links import link_groups as _link_groups
+            self._link_groups = _link_groups(self.image_names, self.images, level=self._jwst_link,
+                                             sigma_module_mas=self._jwst_link_sigma_module_mas,
+                                             sigma_visit_mas=self._jwst_link_sigma_visit_mas)
+            n_pairs = 0
+            for grp in self._link_groups:
+                mem = [i for i in grp['members'] if self._img_data.get(self.image_names[i]) is not None]
+                if len(mem) < 2:
+                    continue
+                n_m = len(mem)
+                for a_i in range(n_m):
+                    i = mem[a_i]; d_i = self._img_data[self.image_names[i]]
+                    C_i = _make_link_coupling_inv(self.images[self.image_names[i]], grp['sigmas'],
+                                                  self.poly_order, self.N_CHIP) / n_m
+                    for j in mem[a_i + 1:]:
+                        d_j = self._img_data[self.image_names[j]]
+                        self._link_pairs.append((i, j, C_i, d_i['r_prior'] - d_j['r_prior']))
+                        n_pairs += 1
+                self._linked_images.update(self.image_names[i] for i in mem)
+            if self._link_groups:
+                n_mod = sum(g['level'] == 'module' for g in self._link_groups)
+                n_vis = sum(g['level'] == 'visit' for g in self._link_groups)
+                from .jwst_links import LINK_SIGMAS as _LS
+                sm = self._jwst_link_sigma_module_mas if self._jwst_link_sigma_module_mas is not None else _LS['module']['pointing_mas']
+                sv = self._jwst_link_sigma_visit_mas if self._jwst_link_sigma_visit_mas is not None else _LS['visit']['pointing_mas']
+                print(f"  JWST link prior ({self._jwst_link}): {n_mod} visit x module group(s)"
+                      + (f" + {n_vis} visit group(s)" if n_vis else "")
+                      + f", {len(self._linked_images)} frames, {n_pairs} pairs; sigma_point module={sm:g} mas"
+                      + (f", visit={sv:g} mas" if n_vis else "")
+                      + f"; rot/scale/skew {_LS['module']['rot_deg']:g} deg / {_LS['module']['scale']:g} / {_LS['module']['skew']:g} (module)")
+                print("    linked frames are never demoted to astrometry-only (their r follows the group)")
+
     def _append_chip_cols(self, X_mat, chip_hi):
         """Append the two 8p chip-offset columns to an (n, 2, N_R-2) design block."""
         n = X_mat.shape[0]
@@ -1631,6 +1687,13 @@ class BP3MSolver:
             H_rr[lo_cs:lo_cs+nr, lo_cs:lo_cs+nr] += C_cp
             H_rr[hi_cs:hi_cs+nr, lo_cs:lo_cs+nr] -= C_cp
             H_rr[lo_cs:lo_cs+nr, hi_cs:hi_cs+nr] -= C_cp
+        # ── JWST exposure / visit links: same block structure on the deviations ──
+        for i_idx, j_idx2, C_lk, _dp in self._link_pairs:
+            i_cs, j_cs = i_idx * nr, j_idx2 * nr
+            H_rr[i_cs:i_cs+nr, i_cs:i_cs+nr] += C_lk
+            H_rr[j_cs:j_cs+nr, j_cs:j_cs+nr] += C_lk
+            H_rr[i_cs:i_cs+nr, j_cs:j_cs+nr] -= C_lk
+            H_rr[j_cs:j_cs+nr, i_cs:i_cs+nr] -= C_lk
 
         # ── Invert H_vv → C_vT ────────────────────────────────────────────────
         try:
@@ -1793,6 +1856,12 @@ class BP3MSolver:
             diff = r_current[hi_cs:hi_cs+nr] - r_current[lo_cs:lo_cs+nr]
             rhs[hi_cs:hi_cs+nr] -= C_cp @ diff
             rhs[lo_cs:lo_cs+nr] += C_cp @ diff
+        # ── JWST links: pull toward the partner's current DEVIATION (r - r_prior) ──
+        for i_idx, j_idx2, C_lk, dprior in self._link_pairs:
+            i_cs, j_cs = i_idx * nr, j_idx2 * nr
+            diff = (r_current[i_cs:i_cs+nr] - r_current[j_cs:j_cs+nr]) - dprior
+            rhs[i_cs:i_cs+nr] -= C_lk @ diff
+            rhs[j_cs:j_cs+nr] += C_lk @ diff
 
         # ── Solve for Δr, then r_hat = r_current + Δr ─────────────────────────
         # Diagonal preconditioning: the (a,b,c,d) columns have scale ~2048 px
@@ -2450,7 +2519,7 @@ class BP3MSolver:
                                 self._align_demoted.discard(_img)
                                 print(f"    {_img}: re-promoted to alignment "
                                       f"({_n_fit} admitted stars)")
-                        elif _n_fit < min_align_demote:
+                        elif _n_fit < min_align_demote and _img not in self._linked_images:
                             self._align_demoted.add(_img)
                             print(f"    {_img}: only {_n_fit} alignment stars "
                                   f"— demoted to astrometry-only (r frozen)")
