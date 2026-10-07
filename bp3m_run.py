@@ -1227,6 +1227,24 @@ def main():
             except Exception:
                 _extra = []
             _bp3m_images = list(_bp3m_images) + [o for o in _extra if o not in set(_bp3m_images)]
+    # An explicit --bp3m_images list must never resurrect a FAILED observation (2026-10-07: an And XVII
+    # footprint subset carried four EXPTIME=0 'EXCESSIVE DOWNTIME' ACS exposures past the Step-2 filter and
+    # pypass fitted them).  Drop anything listed in any telescope's failed-observation manifest.
+    if args.bp3m_images is not None and _bp3m_images:
+        _failed_all: dict = {}
+        for _tel in args.telescopes:
+            _fm = output_dir / field / _tel / f"{field}_failed_obsids.json"
+            try:
+                _fj = _json.loads(_fm.read_text()) if _fm.exists() else {}
+                _failed_all.update(_fj if isinstance(_fj, dict) else {o: 'failed' for o in _fj})
+            except Exception:
+                pass
+        _drop = [o for o in _bp3m_images if o in _failed_all]
+        if _drop:
+            print(f"\nWARNING: --bp3m_images lists {len(_drop)} failed observation(s); dropped from the working set:")
+            for _o in _drop:
+                print(f"    {_o}: {_failed_all[_o]}")
+            _bp3m_images = [o for o in _bp3m_images if o not in _failed_all]
     # _restrict is what we pass as restrict_to_obsids to every step from 3 on.
     _restrict = _bp3m_images  # may be None (→ process all on-disk images)
 
