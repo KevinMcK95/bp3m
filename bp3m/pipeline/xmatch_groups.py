@@ -528,8 +528,9 @@ def run_group_pass(folders: list, gaia_df: pd.DataFrame, match_kwargs: dict, par
             try:
                 with ProcessPoolExecutor(max_workers=min(n_processes, len(tasks)), mp_context=_mp.get_context('forkserver'),
                                          initializer=_pool_init, initargs=(str(cache),)) as ex:
-                    from bp3m.pipeline.cross_match import _gaia_subset_for_image
-                    futs = [ex.submit(_group_task, t + (_gaia_subset_for_image(t[0]['flc'], gaia_df),)) for t in tasks]
+                    from bp3m.pipeline.cross_match import _gaia_subset_for_image, gaia_unit_tree
+                    _tree = gaia_unit_tree(gaia_df)
+                    futs = [ex.submit(_group_task, t + (_gaia_subset_for_image(t[0]['flc'], gaia_df, tree=_tree),)) for t in tasks]
                     for fu in as_completed(futs):
                         outs.append(fu.result())
             finally:
