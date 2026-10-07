@@ -332,6 +332,16 @@ def run_alignment(  # noqa: C901
             # so each faint star is constrained by both instruments' epochs.
             from bp3m.data_loader_flc import _build_stars_df as _bsd
             _hst_root = data_root / field_name / 'HST' / 'mastDownload' / 'HST'
+            # Same position corrections as the Gaia-matched detections of these images (2026-10-07,
+            # And II --use_cfht: uncorrected faint stars + GDC-corrected Gaia stars scattered the
+            # cfht_hst tier's PMs by 1-4 mas/yr and erased the member cluster).
+            _pc_app, _pcm_app = None, None
+            if pos_corr_table is not None:
+                from bp3m.pos_corr import PseudoGDCSet as _PGS
+                _pc_app = _PGS(pos_corr_table)
+            if pos_corr_model:
+                from bp3m.pos_corr_basis import make_pos_corr as _mpc
+                _pcm_app = _mpc(pos_corr_model)
             _n_app = 0
             for _img_nm, _g in _cm[~_cm.is_gaia].groupby('hst_image'):
                 _base = [n for n in filtered_spi
@@ -343,7 +353,8 @@ def run_alignment(  # noqa: C901
                        .rename(columns={'star_id': 'gaia_source_id'}))
                 _extra = _bsd(_hst_root / _img_nm, _img_nm, None,
                               _pef_hst, meta=imgs.get(_base[0]),
-                              match_override=_ov)
+                              match_override=_ov, pos_corr=_pc_app,
+                              pos_corr_model=_pcm_app)
                 if _extra is None or not len(_extra):
                     continue
                 for _bn in _base:
