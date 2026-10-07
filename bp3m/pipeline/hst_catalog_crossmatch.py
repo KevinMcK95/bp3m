@@ -4657,6 +4657,15 @@ def run_hst_crossmatch(
                 _n_infl = 0
                 for _j4, _nm4 in enumerate(transform_df4['image_name'].astype(str)):
                     if _nm4 in _pre_only4 or _nm4.replace('_hi', '').replace('_lo', '') in _pre_only4:
+                        # epoch-anchored frames (visit_prealign.run_epoch_anchor, aligned on the v2 catalogue) are
+                        # accurate to a few mas: no inflation; only the visit-sibling predictions get the floors
+                        try:
+                            _src4 = pd.read_csv(find_image_dir(field_dir, _nm4.replace('_hi', '').replace('_lo', '')) / 'transformation_prealign.csv'
+                                                ).set_index('parameter')['value'].get('prealign_source', 'jwst_visit_siblings')
+                        except Exception:
+                            _src4 = 'jwst_visit_siblings'
+                        if str(_src4) != 'jwst_visit_siblings':
+                            continue
                         _cs = _j4 * n_r4
                         C_r_full[_cs:_cs + 4, _cs:_cs + 4] += np.eye(4) * PREALIGN_LINEAR_FLOOR ** 2
                         C_r_full[_cs + 4, _cs + 4] += PREALIGN_POINTING_FLOOR_MAS ** 2

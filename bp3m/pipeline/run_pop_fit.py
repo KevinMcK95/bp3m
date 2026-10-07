@@ -2168,17 +2168,22 @@ def run_pop_fit(
         print(f"  pos_corr_model: {pos_corr_model}")
 
     _v1_hp = v1_cfg.get('prior_hyperparams', {})
-    v1_prior_sigma_rot_deg       = _v1_hp.get('sigma_rot_deg',           None)
-    v1_prior_sigma_scale         = _v1_hp.get('sigma_scale',              None)
-    v1_prior_sigma_skew          = _v1_hp.get('sigma_skew',               None)
-    v1_prior_sigma_pointing      = _v1_hp.get('sigma_pointing_mas',       None)
+    # 2026-10-07: only EXPLICIT v1 CLI overrides are forwarded (run_config 'prior_cli_overrides'); the resolved
+    # globals are the ACS defaults and overrode the per-instrument widths (UVIS, JWST) in the pop-fit solve.
+    _v1_cli = v1_cfg.get('prior_cli_overrides') or {}
+    if 'prior_cli_overrides' not in v1_cfg and _v1_hp:
+        print("  priors: v1 run_config predates prior_cli_overrides -> per-instrument widths (as v1 used them)")
+    v1_prior_sigma_rot_deg       = _v1_cli.get('prior_sigma_rot_deg',       None)
+    v1_prior_sigma_scale         = _v1_cli.get('prior_sigma_scale',         None)
+    v1_prior_sigma_skew          = _v1_cli.get('prior_sigma_skew',          None)
+    v1_prior_sigma_pointing      = _v1_cli.get('prior_sigma_pointing',      None)
     v1_use_pair_prior            = _v1_hp.get('use_pair_prior',             False)
     v1_fit_chip_offset           = bool(v1_cfg.get('fit_chip_offset', False))   # 8p: mirror the v1 layout
     v1_prior_sigma_chip_px       = _v1_hp.get('sigma_chip_px',             None)
-    v1_prior_sigma_pair_rot_deg  = _v1_hp.get('sigma_pair_rot_deg',        None)
-    v1_prior_sigma_pair_scale    = _v1_hp.get('sigma_pair_scale',           None)
-    v1_prior_sigma_pair_skew     = _v1_hp.get('sigma_pair_skew',            None)
-    v1_prior_sigma_pair_pointing = _v1_hp.get('sigma_pair_pointing_mas',    None)
+    v1_prior_sigma_pair_rot_deg  = _v1_cli.get('prior_sigma_pair_rot_deg',  None)
+    v1_prior_sigma_pair_scale    = _v1_cli.get('prior_sigma_pair_scale',    None)
+    v1_prior_sigma_pair_skew     = _v1_cli.get('prior_sigma_pair_skew',     None)
+    v1_prior_sigma_pair_pointing = _v1_cli.get('prior_sigma_pair_pointing', None)
 
     print("\n" + "─" * 60)
     print("BP3M pop-fit: population PM fitting")

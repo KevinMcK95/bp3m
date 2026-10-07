@@ -123,12 +123,17 @@ def run_visit_prealign(field_dir, v1_dir=None, force=False) -> int:
     field_dir = Path(field_dir); F = field_dir.name
     v1_dir = Path(v1_dir) if v1_dir else field_dir / 'BP3M_results'
     out = field_dir / 'hst_xmatch' / 'prealign'; out.mkdir(parents=True, exist_ok=True)
-    folders = _find_image_folders(field_dir.parent, F)
-    try:
-        sel = set(json.loads((field_dir / 'HST' / f'{F}_selected_obsids.json').read_text()))
-        folders = [f for f in folders if Path(f['root']).name in sel]
-    except Exception:
-        pass
+    # HST and JWST frames (2026-10-07): the sibling-predicted JWST frames of a Gaia-starved field are the main
+    # customers -- their visit-sibling placement is only good to 20-100 mas, which v2's residual cut cannot absorb
+    folders = []
+    for _tel in ('HST', 'JWST'):
+        _f = _find_image_folders(field_dir.parent, F, telescope=_tel)
+        try:
+            sel = set(json.loads((field_dir / _tel / f'{F}_selected_obsids.json').read_text()))
+            _f = [f for f in _f if Path(f['root']).name in sel]
+        except Exception:
+            pass
+        folders += _f
     v1 = pd.read_csv(v1_dir / 'image_transformations.csv') if (v1_dir / 'image_transformations.csv').exists() else pd.DataFrame()
     C1 = np.load(v1_dir / 'C_r.npy') if (v1_dir / 'C_r.npy').exists() else None
     v1_ok, v1_blk = {}, {}
@@ -276,11 +281,19 @@ EPOCH_VOTE_PX = 40.0        # header WCS error searched by the offset vote (px; 
 EPOCH_FRAME_FLOOR_MAS = 2.0
 
 
+EPOCH_SIG_PM_RELAX = 2.0    # mas/yr: used when fewer than EPOCH_MIN_REF stars pass EPOCH_SIG_PM_MAX (sparse fields, JWST 2026-10-07)
+EPOCH_MIN_REF = 100
+
+
 def _epoch_reference(v2_dir, t_obs):
     """Well-measured stars of a v2 catalogue (stellar_astrometry.csv) propagated to epoch t_obs: (ra, dec, sig_mas)."""
     s = pd.read_csv(Path(v2_dir) / 'stellar_astrometry.csv', low_memory=False)
     sp = np.hypot(s.sigma_pmra_bp3m, s.sigma_pmdec_bp3m) / np.sqrt(2)
-    s = s[(sp < EPOCH_SIG_PM_MAX) & np.isfinite(s.pmra_bp3m) & np.isfinite(s.delta_racosdec_bp3m)]
+    good = np.isfinite(s.pmra_bp3m) & np.isfinite(s.delta_racosdec_bp3m)
+    sel = (sp < EPOCH_SIG_PM_MAX) & good
+    if sel.sum() < EPOCH_MIN_REF:          # e.g. And XIV: 32 Gaia stars, HST-only sigma_PM 0.5-2 mas/yr
+        sel = (sp < EPOCH_SIG_PM_RELAX) & good
+    s = s[sel]
     cosd = np.cos(np.radians(s.dec.to_numpy()))
     dt = t_obs - s.Gaia_time.to_numpy(float)
     ra = s.ra.to_numpy() + (s.delta_racosdec_bp3m.to_numpy() + s.pmra_bp3m.to_numpy() * dt) / (cosd * 3.6e6)
@@ -305,12 +318,17 @@ def run_epoch_anchor(field_dir, v2_dir=None) -> int:
     if not (v2_dir / 'stellar_astrometry.csv').exists():
         print(f"  epoch anchor: no v2 catalogue at {v2_dir}; skipped"); return 0
     out = field_dir / 'hst_xmatch' / 'prealign'; out.mkdir(parents=True, exist_ok=True)
-    folders = _find_image_folders(field_dir.parent, F)
-    try:
-        sel = set(json.loads((field_dir / 'HST' / f'{F}_selected_obsids.json').read_text()))
-        folders = [f for f in folders if Path(f['root']).name in sel]
-    except Exception:
-        pass
+    # HST and JWST frames (2026-10-07): the sibling-predicted JWST frames of a Gaia-starved field are the main
+    # customers -- their visit-sibling placement is only good to 20-100 mas, which v2's residual cut cannot absorb
+    folders = []
+    for _tel in ('HST', 'JWST'):
+        _f = _find_image_folders(field_dir.parent, F, telescope=_tel)
+        try:
+            sel = set(json.loads((field_dir / _tel / f'{F}_selected_obsids.json').read_text()))
+            _f = [f for f in _f if Path(f['root']).name in sel]
+        except Exception:
+            pass
+        folders += _f
     mem, suspect = {}, set()
     for f in folders:
         try:
@@ -363,8 +381,11 @@ def run_epoch_anchor(field_dir, v2_dir=None) -> int:
             if not ok_fit or m.sum() < EPOCH_MIN_MATCH:
                 report.append(dict(image=T.name, status=f'not aligned (vote peak {int(Hh[k])})')); continue
             rms = float(np.sqrt(np.mean(res ** 2)))
-            if rms > MAX_RMS_PX:
-                report.append(dict(image=T.name, status=f'rms {rms:.3f} px too large')); continue
+            # the reference positions carry sigma_PM x dt (several mas for HST-only stars at the JWST epochs):
+            # accept an rms up to 3x their median error in this frame's pixels
+            _rms_max = max(MAX_RMS_PX, 3.0 * float(np.median(sig_r[j[m]])) / (float(fr['pixel_scale']) * 1000.0))
+            if rms > _rms_max:
+                report.append(dict(image=T.name, status=f'rms {rms:.3f} px too large (limit {_rms_max:.3f})')); continue
             sig_frame = max(EPOCH_FRAME_FLOOR_MAS, float(np.median(sig_r[j[m]])) / np.sqrt(m.sum()))
             frame_block = np.zeros((6, 6)); frame_block[4, 4] = frame_block[5, 5] = sig_frame ** 2
             row, C = _v1_row(T.name, fr, M, t, c, cov6, xr, yr, frame_block)
@@ -376,7 +397,7 @@ def run_epoch_anchor(field_dir, v2_dir=None) -> int:
                         on_skew=0.5 * (A_ - D_), off_skew=0.5 * (B_ + C_), zp=np.nan,
                         ra_cen=fr['ra_cen'], dec_cen=fr['dec_cen'], x_cen=fr['x_cen'], y_cen=fr['y_cen'],
                         pixel_scale=fr['pixel_scale'], orientat=fr['orientat'], prealign_anchor=np.nan,
-                        n_match=int(m.sum()), rms_px=rms)
+                        n_match=int(m.sum()), rms_px=rms, prealign_source='epoch_v2')
             pd.DataFrame({'parameter': list(vals), 'value': list(vals.values())}).to_csv(T.root / 'transformation_prealign.csv', index=False)
             report.append(dict(image=T.name, anchor='epoch:v2', n_match=int(m.sum()), rms_px=round(rms, 4), vote_peak=int(Hh[k]),
                                header_offset_px=np.round(off, 2).tolist(), sigma_frame_mas=round(sig_frame, 2),

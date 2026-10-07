@@ -1430,6 +1430,19 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
             'jwst_link_groups':        [dict(label=g['label'], level=g['level'], n=len(g['members']), sigmas=g['sigmas'])
                                         for g in getattr(solver, '_link_groups', [])],
         },
+        # Explicit CLI prior overrides only (2026-10-07).  prior_hyperparams above holds the RESOLVED global
+        # defaults; forwarding those to v2 / pop-fit as overrides replaced every per-instrument width
+        # (UVIS 0.02 deg, JWST 0.3 deg / 3e-4) by the ACS defaults.  Downstream stages forward only this.
+        'prior_cli_overrides': {k: v for k, v in {
+            'prior_sigma_rot_deg':       getattr(solver, '_sigma_rot_deg_cli', None),
+            'prior_sigma_scale':         getattr(solver, '_sigma_scale_cli', None),
+            'prior_sigma_skew':          getattr(solver, '_sigma_skew_cli', None),
+            'prior_sigma_pointing':      getattr(solver, '_sigma_pointing_cli', None),
+            'prior_sigma_pair_rot_deg':  getattr(solver, '_sigma_pair_rot_deg_cli', None),
+            'prior_sigma_pair_scale':    getattr(solver, '_sigma_pair_scale_cli', None),
+            'prior_sigma_pair_skew':     getattr(solver, '_sigma_pair_skew_cli', None),
+            'prior_sigma_pair_pointing': getattr(solver, '_sigma_pair_pointing_cli', None),
+        }.items() if v is not None},
         # Per-image prior: mean vector r_prior and precision matrix C_r_prior_inv
         # (C_r_prior_inv varies per image because the Jacobian depends on rotation)
         'image_priors': {

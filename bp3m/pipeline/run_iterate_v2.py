@@ -218,12 +218,16 @@ def main():
     # given here (2026-10-02, user: v2 must use what v1 used).  run_alignment_v2 still applies the
     # corrected skew width when a model is set and v1 recorded nothing.
     _hp = _v1_cfg.get('prior_hyperparams') or {}
-    _prior_kw = {k_out: _hp[k_in] for k_in, k_out in (
-        ('sigma_rot_deg', 'prior_sigma_rot_deg'), ('sigma_scale', 'prior_sigma_scale'),
-        ('sigma_skew', 'prior_sigma_skew'), ('sigma_pointing_mas', 'prior_sigma_pointing'),
-        ('sigma_pair_rot_deg', 'prior_sigma_pair_rot_deg'), ('sigma_pair_scale', 'prior_sigma_pair_scale'),
-        ('sigma_pair_skew', 'prior_sigma_pair_skew'), ('sigma_pair_pointing_mas', 'prior_sigma_pair_pointing'),
-        ('use_pair_prior', 'use_pair_prior')) if _hp.get(k_in) is not None}
+    # 2026-10-07: forward only the EXPLICIT v1 CLI overrides (run_config 'prior_cli_overrides').  The resolved
+    # globals in prior_hyperparams are the ACS defaults and used to override every per-instrument width
+    # (UVIS rotation, JWST 0.3 deg / 3e-4 scale) in the v2 solve; with None the solver takes the per-image
+    # instrument_config widths exactly as v1 did.  Older run_configs (no key) forward nothing for the same reason.
+    _cli = _v1_cfg.get('prior_cli_overrides')
+    _prior_kw = {k: v for k, v in (_cli or {}).items() if v is not None}
+    if _hp.get('use_pair_prior'):
+        _prior_kw['use_pair_prior'] = True
+    if _cli is None and _hp:
+        print("  alignment priors: v1 run_config predates prior_cli_overrides -> per-instrument widths (as v1 used them)")
     if args.prior_sigma_chip_px is None and _hp.get('sigma_chip_px') is not None:
         args.prior_sigma_chip_px = _hp['sigma_chip_px']
     if _prior_kw:
