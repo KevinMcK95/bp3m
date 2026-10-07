@@ -404,7 +404,7 @@ def _group_task(args):
     hst, kw, guess, tmp, gaia_df = args
     import shutil
     from gaia_cross_match.cross_match import process_single_image
-    if gaia_df is None:
+    if gaia_df is None or len(gaia_df) == 0:
         from bp3m.pipeline.cross_match import _get_worker_gaia
         gaia_df = _get_worker_gaia()
     import os, time as _time
@@ -570,7 +570,8 @@ def run_group_pass(folders: list, gaia_df: pd.DataFrame, match_kwargs: dict, par
             try:
                 with ProcessPoolExecutor(max_workers=min(n_processes, len(tasks)), mp_context=_mp.get_context('forkserver'),
                                          initializer=_pool_init, initargs=(str(cache),)) as ex:
-                    futs = [ex.submit(_group_task, t + (None,)) for t in tasks]
+                    from bp3m.pipeline.cross_match import _gaia_subset_for_image
+                    futs = [ex.submit(_group_task, t + (_gaia_subset_for_image(t[0]['flc'], gaia_df),)) for t in tasks]
                     for fu in as_completed(futs):
                         outs.append(fu.result())
             finally:
