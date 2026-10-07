@@ -251,7 +251,14 @@ GAIA_SUBSET_MARGIN_ARCSEC = 90.0   # beyond the image half-diagonal: header erro
                                     # the very-wide 300 px offset search (~15-20") and Gaia PM propagation (<0.3")
 
 
-def _gaia_subset_for_image(image_path, gaia_df, margin_arcsec: float = GAIA_SUBSET_MARGIN_ARCSEC):
+def gaia_unit_tree(gaia_df):
+    """cKDTree on the unit vectors of the catalogue positions (for _gaia_subset_for_image)."""
+    from scipy.spatial import cKDTree
+    ra = np.radians(gaia_df['ra'].to_numpy(float)); de = np.radians(gaia_df['dec'].to_numpy(float))
+    return cKDTree(np.column_stack([np.cos(de) * np.cos(ra), np.cos(de) * np.sin(ra), np.sin(de)]))
+
+
+def _gaia_subset_for_image(image_path, gaia_df, margin_arcsec: float = GAIA_SUBSET_MARGIN_ARCSEC, tree=None):
     """Rows of *gaia_df* within (image half-diagonal + margin) of the image centre, from the SCI header WCS
     keywords only (no catalogue read).  Workers used to load the WHOLE field catalogue each (12 workers x a
     7e6-row bulge catalogue = tens of GB, user 2026-10-07); a 63" NIRCam or 3.4' ACS frame needs a few hundred
@@ -276,6 +283,10 @@ def _gaia_subset_for_image(image_path, gaia_df, margin_arcsec: float = GAIA_SUBS
         if len(ra_c) > 1:       # two-chip images: radius about the common centre
             rad += float(max(np.hypot((np.array(ra_c) - ra_m) * np.cos(np.radians(dec_m)), np.array(dec_c) - dec_m)))
         r_deg = rad + margin_arcsec / 3600.0
+        if tree is not None:          # unit-vector KD-tree built once per field: ms per image instead of 0.3-0.7 s on 1.8e6 rows
+            c = np.array([np.cos(np.radians(dec_m)) * np.cos(np.radians(ra_m)), np.cos(np.radians(dec_m)) * np.sin(np.radians(ra_m)), np.sin(np.radians(dec_m))])
+            idx = tree.query_ball_point(c, 2.0 * np.sin(np.radians(r_deg) / 2.0))
+            return gaia_df.iloc[np.sort(np.asarray(idx, int))]
         ra = gaia_df['ra'].to_numpy(float); de = gaia_df['dec'].to_numpy(float)
         dra = (ra - ra_m + 180.0) % 360.0 - 180.0
         sep = np.hypot(dra * np.cos(np.radians(dec_m)), de - dec_m)
@@ -720,7 +731,8 @@ def run_cross_match(
         import multiprocessing as _mp
         # Each task carries only the Gaia rows near its image (user 2026-10-07): the per-worker copy of the
         # full field catalogue (7e6 rows for the bulge / M22 fields) was the memory hog of the lanes.
-        _subs = [_gaia_subset_for_image(w[0]['flc'], gaia_df) for w in work]
+        _tree = gaia_unit_tree(gaia_df)
+        _subs = [_gaia_subset_for_image(w[0]['flc'], gaia_df, tree=_tree) for w in work]
         _ns = np.array([len(x) for x in _subs])
         print(f"  Gaia rows per image task: median {int(np.median(_ns))}, max {int(_ns.max())} (of {len(gaia_df)})")
         _gaia_cache = (Path(output_dir) / field_name / "Gaia"
