@@ -572,6 +572,22 @@ def prealign_only_images(field_dir) -> set:
     return out
 
 
+def sibling_only_images(field_dir) -> set:
+    """prealign-only images whose transformation_prealign.csv is a visit-SIBLING prediction (no Gaia match, no
+    epoch anchor).  Their geometry is only good to 20-100 mas; in a v2 solve they carry no PM information (their
+    stars have no other epoch there) but, through the visit link prior, they drag the anchored siblings of their
+    module off the HST-propagated frame (And XIV 2026-10-07: 1 mas/yr member-PM drift per anchoring pass)."""
+    out = set()
+    for name in prealign_only_images(field_dir):
+        try:
+            v = pd.read_csv(find_image_dir(Path(field_dir), name) / "transformation_prealign.csv").set_index("parameter")["value"]
+            if str(v.get("prealign_source", "jwst_visit_siblings")) == "jwst_visit_siblings":
+                out.add(name)
+        except Exception:
+            out.add(name)
+    return out
+
+
 def _empty_stars_df() -> pd.DataFrame:
     """stars_df with no rows (prealign-only JWST frames); same columns/dtypes as _build_stars_df."""
     return pd.DataFrame({

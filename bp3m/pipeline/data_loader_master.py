@@ -688,6 +688,19 @@ def load_master_v2(
     if _BAND_SPLIT_SI:
         valid_recs = _split_recs_by_band(valid_recs, hst_root)
 
+    # v2 (2026-10-07): sibling-predicted JWST frames without a Gaia match or an epoch anchor are excluded from the
+    # solve -- they add no PM information and their 20-100 mas placement drags anchored siblings through the
+    # visit links.  BP3M_KEEP_SIBLING_FRAMES=1 keeps them (diagnostics).
+    try:
+        import os as _os
+        if _os.environ.get('BP3M_KEEP_SIBLING_FRAMES', '0') != '1':
+            from bp3m.data_loader_flc import sibling_only_images as _sib_only
+            _sib = _sib_only(field_dir)
+            if _sib:
+                print(f"  {len(_sib)} sibling-predicted JWST frame(s) without Gaia match / epoch anchor excluded from the v2 solve")
+                exclude_images = set(str(x) for x in (exclude_images or [])) | _sib
+    except Exception as _e_sib:
+        print(f"  (sibling-only frame exclusion skipped: {_e_sib})")
     if exclude_images:
         _ex = {str(x) for x in exclude_images}; kept = []; n_drop_det = 0
         for rec in valid_recs:
