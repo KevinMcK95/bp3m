@@ -5498,24 +5498,10 @@ def _plot_cmds(combined_df: pd.DataFrame, gaia_df: Optional[pd.DataFrame],
         'DELVEg': 473, 'DELVEr': 642, 'DELVEi': 784, 'DELVEz': 926,
     }
 
-    # JWST (NIRCam / NIRISS / MIRI) and HST WFC3/IR filter names encode the wavelength in units of
-    # 10 nm (F277W = 2.77 um, F1000W = 10 um), unlike the HST UV/optical names (F814W = 814 nm);
-    # without this the CMD / colour-colour panels put F277W bluewards of F606W (user 2026-10-07).
-    _X10 = {'F070W', 'F090W', 'F115W', 'F140M', 'F150W', 'F150W2', 'F162M', 'F164N', 'F182M', 'F187N', 'F200W',
-            'F210M', 'F212N', 'F250M', 'F277W', 'F300M', 'F322W2', 'F323N', 'F335M', 'F356W', 'F360M', 'F405N',
-            'F410M', 'F430M', 'F444W', 'F460M', 'F466N', 'F470N', 'F480M', 'F380M',          # NIRCam / NIRISS
-            'F560W', 'F770W', 'F1000W', 'F1130W', 'F1280W', 'F1500W', 'F1800W', 'F2100W', 'F2550W',  # MIRI
-            'F098M', 'F105W', 'F110W', 'F125W', 'F126N', 'F127M', 'F128N', 'F130N', 'F132N', 'F139M', 'F140W',
-            'F153M', 'F160W', 'F164N', 'F167N'}                                             # WFC3/IR
-
     def _wl(band: str) -> float:
-        if band in _WL:
-            return _WL[band]
-        import re
-        m = re.search(r'(\d{3,4})', band)
-        if not m:
-            return 1000.0
-        return float(m.group(1)) * (10.0 if band.upper() in _X10 else 1.0)
+        # shared helper: JWST / WFC3-IR names are in 10 nm units (F277W = 2.77 um), user 2026-10-07
+        from bp3m.filters import filter_wavelength_nm
+        return _WL[band] if band in _WL else filter_wavelength_nm(band, default=1000.0)
 
     # ── Collect HST magnitude columns ────────────────────────────────────────
     mag_cols   = sorted(c for c in combined_df.columns if c.startswith('mag_wmean_'))

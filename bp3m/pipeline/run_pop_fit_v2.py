@@ -175,8 +175,9 @@ def _shrink_members(pm, C, member, mu, sigma_pm):
 # ── plots ─────────────────────────────────────────────────────────────────────
 
 def _mag_bands(df: pd.DataFrame) -> list:
-    return sorted(c.replace('mag_wmean_', '')
-                  for c in df.columns if c.startswith('mag_wmean_'))
+    """Band labels blue -> red (bp3m.filters: JWST / IR names are in 10 nm units)."""
+    from bp3m.filters import sort_bands
+    return sort_bands(c.replace('mag_wmean_', '') for c in df.columns if c.startswith('mag_wmean_'))
 
 
 def _plot_results(df, member, eligible, mu, plots_dir: Path):

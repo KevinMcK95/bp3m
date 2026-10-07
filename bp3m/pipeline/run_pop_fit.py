@@ -1605,7 +1605,8 @@ def _plot_member_selection_panels(
            'F438W': 438, 'F475W': 475, 'F555W': 555, 'F606W': 606,
            'F625W': 625, 'F775W': 775, 'F814W': 814, 'F850LP': 900,
            'F110W': 1100, 'F125W': 1250, 'F160W': 1600}
-    bands = sorted(hst_mags, key=lambda b: _WL.get(b.split('/')[0].upper(), 9999))
+    from bp3m.filters import filter_wavelength_nm as _fwl   # JWST / IR names are in 10 nm units
+    bands = sorted(hst_mags, key=lambda b: _WL.get(b.split('/')[0].upper(), _fwl(b)))
 
     def _n_joint(*arrs):
         m = np.ones(n, bool)
