@@ -92,6 +92,10 @@ MJD_YR = 365.25       # days per year
 _MJD_J2000  = 51544.5                   # J2000.0 in MJD
 _MJD0_YR    = _MJD_J2000 / MJD_YR      # ≈ 141.12  (J2000 in epoch_yr units)
 
+# Sibling-predicted (prealign-only) JWST frames in the phase-4 per-source fit (see run_hst_crossmatch)
+PREALIGN_POINTING_FLOOR_MAS = 100.0   # mas
+PREALIGN_LINEAR_FLOOR = 1e-3          # a,b,c,d (0.06 deg / 0.1 % -> ~1 SW px at the detector edge)
+
 # Centering pivot used by BP3M solver (hardcoded in solver.py line 308)
 _SOLVER_XO = _SOLVER_YO = 2048.0
 
@@ -4640,6 +4644,26 @@ def run_hst_crossmatch(
             C_r_full, transform_df4, n_r4 = _strip_chip_offset_cols(bp3m_dir, C_r_full, transform_df4, n_r4)
             poly_order4   = _infer_poly_order(n_r4)
             transform_df4, C_r_full, _prealigned4 = _append_prealign(field_dir, transform_df4, C_r_full, n_r4, bp3m_dir)
+            # JWST sibling-predicted (prealign-only) frames: their transformation is only as good as the visit's few
+            # Gaia anchors (And XIV 2026-10-07: 20-100 mas offsets and 50-85 mas scatter against the HST positions of
+            # the same stars), so the phase-4 per-source fit flagged every one of their detections -- and then the
+            # HST detections of the same sources -- as outliers (2605 HST+JWST sources lost, n_detect_fit = 0).
+            # Inflate their covariance (pointing + linear-term floors) so they enter the fit with honest weight; the
+            # v2 alignment (--hst_align) then re-solves their transformations on the common faint stars and the
+            # refinement cross-match sees the tightened C_r.  The matching stage (phase 1-2) is unchanged.
+            from bp3m.data_loader_flc import prealign_only_images as _pre_only_fn4
+            _pre_only4 = _pre_only_fn4(field_dir)
+            if _pre_only4 and n_r4 >= 6:
+                _n_infl = 0
+                for _j4, _nm4 in enumerate(transform_df4['image_name'].astype(str)):
+                    if _nm4 in _pre_only4 or _nm4.replace('_hi', '').replace('_lo', '') in _pre_only4:
+                        _cs = _j4 * n_r4
+                        C_r_full[_cs:_cs + 4, _cs:_cs + 4] += np.eye(4) * PREALIGN_LINEAR_FLOOR ** 2
+                        C_r_full[_cs + 4, _cs + 4] += PREALIGN_POINTING_FLOOR_MAS ** 2
+                        C_r_full[_cs + 5, _cs + 5] += PREALIGN_POINTING_FLOOR_MAS ** 2
+                        _n_infl += 1
+                print(f"  Phase 4: covariance of {_n_infl} sibling-predicted (prealign-only) sub-image(s) inflated by "
+                      f"{PREALIGN_POINTING_FLOOR_MAS:g} mas pointing / {PREALIGN_LINEAR_FLOOR:g} linear floors")
             # Demoted (astrometry-only) images: their own indv solution + covariance, as in the loader
             # (otherwise every PM through a deep, Gaia-saturated image is nulled by its 5" prior).
             _hst_root4 = field_dir / 'HST' / 'mastDownload' / 'HST'
@@ -5470,13 +5494,24 @@ def _plot_cmds(combined_df: pd.DataFrame, gaia_df: Optional[pd.DataFrame],
         'DELVEg': 473, 'DELVEr': 642, 'DELVEi': 784, 'DELVEz': 926,
     }
 
+    # JWST (NIRCam / NIRISS / MIRI) and HST WFC3/IR filter names encode the wavelength in units of
+    # 10 nm (F277W = 2.77 um, F1000W = 10 um), unlike the HST UV/optical names (F814W = 814 nm);
+    # without this the CMD / colour-colour panels put F277W bluewards of F606W (user 2026-10-07).
+    _X10 = {'F070W', 'F090W', 'F115W', 'F140M', 'F150W', 'F150W2', 'F162M', 'F164N', 'F182M', 'F187N', 'F200W',
+            'F210M', 'F212N', 'F250M', 'F277W', 'F300M', 'F322W2', 'F323N', 'F335M', 'F356W', 'F360M', 'F405N',
+            'F410M', 'F430M', 'F444W', 'F460M', 'F466N', 'F470N', 'F480M', 'F380M',          # NIRCam / NIRISS
+            'F560W', 'F770W', 'F1000W', 'F1130W', 'F1280W', 'F1500W', 'F1800W', 'F2100W', 'F2550W',  # MIRI
+            'F098M', 'F105W', 'F110W', 'F125W', 'F126N', 'F127M', 'F128N', 'F130N', 'F132N', 'F139M', 'F140W',
+            'F153M', 'F160W', 'F164N', 'F167N'}                                             # WFC3/IR
+
     def _wl(band: str) -> float:
         if band in _WL:
             return _WL[band]
-        # Try to parse e.g. F606W → 606
         import re
         m = re.search(r'(\d{3,4})', band)
-        return float(m.group(1)) if m else 1000.0
+        if not m:
+            return 1000.0
+        return float(m.group(1)) * (10.0 if band.upper() in _X10 else 1.0)
 
     # ── Collect HST magnitude columns ────────────────────────────────────────
     mag_cols   = sorted(c for c in combined_df.columns if c.startswith('mag_wmean_'))
