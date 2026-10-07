@@ -559,6 +559,19 @@ def _build_stars_df(img_dir: Path, img_name: str,
     return df
 
 
+def prealign_only_images(field_dir) -> set:
+    """Image names whose solve metadata lives in transformation_prealign.csv: a sibling-predicted frame
+    (JWST visit siblings, xmatch_groups.write_jwst_sibling_prealign) with NO Gaia match of its own.  v1 admits
+    them with zero stars (prealign_only) and v2 (hst_catalog_crossmatch / data_loader_master) must read the
+    same file, since the v1 offsets refer to it."""
+    out = set()
+    for r in image_roots(Path(field_dir)):
+        for d in r.iterdir():
+            if d.is_dir() and (d / "transformation_prealign.csv").exists() and not (d / "matched_gaia.csv").exists():
+                out.add(d.name)
+    return out
+
+
 def _empty_stars_df() -> pd.DataFrame:
     """stars_df with no rows (prealign-only JWST frames); same columns/dtypes as _build_stars_df."""
     return pd.DataFrame({

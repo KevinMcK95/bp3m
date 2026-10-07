@@ -722,6 +722,11 @@ def load_master_v2(
                             - _override)
     except Exception:
         _prealigned = set()
+    try:        # JWST sibling-predicted frames (no Gaia match): their v1 solution refers to transformation_prealign.csv
+        from bp3m.data_loader_flc import prealign_only_images as _pre_only_fn
+        _prealigned = set(_prealigned) | _pre_only_fn(field_dir)
+    except Exception:
+        pass
     for sub_name in tqdm(sorted(all_sub_names), desc="  Loading image metadata",
                          unit="img", dynamic_ncols=True):
         base = _sub_name_to_base(sub_name)

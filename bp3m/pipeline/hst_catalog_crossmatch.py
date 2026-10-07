@@ -378,6 +378,11 @@ def _load_all_detections(field_dir: Path,
     C_r, transform_df, n_r = _strip_chip_offset_cols(bp3m_dir, C_r, transform_df, n_r)
     poly_order   = _infer_poly_order(n_r)
     transform_df, C_r, _prealigned = _append_prealign(field_dir, transform_df, C_r, n_r, bp3m_dir)
+    from bp3m.data_loader_flc import prealign_only_images as _pre_only_fn
+    _pre_only = _pre_only_fn(field_dir)          # JWST sibling-predicted frames: v1 solved them on transformation_prealign.csv
+    if _pre_only:
+        _prealigned = set(_prealigned) | _pre_only
+        print(f"  {len(_pre_only)} sibling-predicted (prealign-only) frame(s) read their metadata from transformation_prealign.csv")
 
     # Epoch-distortion correction from the v1 fit (None if not fitted):
     # detections are corrected at load time (x' = x + R^{-1} B d) so every
