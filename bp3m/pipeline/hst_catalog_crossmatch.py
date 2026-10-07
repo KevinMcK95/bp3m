@@ -4736,7 +4736,11 @@ def run_hst_crossmatch(
             pscale4 = 50.0  # ACS/WFC default; overwritten per image below
             for img_dir4 in sorted((p for r in image_roots(field_dir) for p in r.iterdir() if p.is_dir()),
                                    key=lambda p: p.name):
-                t4 = img_dir4 / ('transformation_prealign.csv' if img_dir4.name in _prealigned4 else 'transformation.csv')
+                # sibling-predicted JWST frames (_pre_only4) solved on transformation_prealign.csv; without this they
+                # fell back to the FIELD tangent point and the last HST pixel scale and every detection in them
+                # projected to garbage (And XIV 2026-10-07: all 2600 HST+JWST sources flagged as outliers)
+                _use_pre4 = img_dir4.name in _prealigned4 or img_dir4.name in _pre_only4
+                t4 = img_dir4 / ('transformation_prealign.csv' if _use_pre4 else 'transformation.csv')
                 if not t4.exists():
                     continue
                 try:
