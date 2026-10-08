@@ -1059,7 +1059,10 @@ GUESS_SEED_RADIUS_PX = 1.5   # direct association radius around a guess-predicte
 # associate Gaia and HST directly at the header prediction first; the normal gates (refinement, plausibility,
 # chance test) decide, and discovery runs only if that fails.  Env BP3M_XMATCH_HEADER_FIRST=0 disables it.
 HEADER_SEED_RADIUS_PX = 2.0
-HEADER_PLAUS_FAP = 1e-10      # beyond the header-label window a solution must beat this chance probability
+HEADER_PLAUS_FAP = 1e-10
+TRIANGLES = os.environ.get('BP3M_XMATCH_TRIANGLES', '1') != '0'
+TRI_REQUIRE = os.environ.get('BP3M_XMATCH_TRI_REQUIRE', '1') != '0'   # low-N solutions need triangle support
+TRI_AGREE_PX = 4.0           # a solution 'has triangle support' if it maps the header centre within this of one      # beyond the header-label window a solution must beat this chance probability
 HEADER_FIRST = os.environ.get('BP3M_XMATCH_HEADER_FIRST', '1') != '0'
 # Header-neighbourhood scan (2026-10-08): instead of trusting the header point, score every offset within a
 # window set by the header's WCS provenance with a TIGHT association (1 px cells, magnitude-consistent), take the
@@ -1118,6 +1121,97 @@ def _header_scan_offset(hst_d, gaia_f, window_px, max_mag_diff, min_peak=5):
         & (dm >= mb[k[2]]) & (dm < mb[min(k[2] + 2, len(mb) - 1)])
     n_bg = float(np.median(S[S > 0])) if np.any(S > 0) else 0.0
     return float(np.median(dx[m])), float(np.median(dy[m])), n_peak, n_bg
+
+
+# Low-N geometric candidates (2026-10-08, user: GaiaHub's triangle matching for N_trust < ~20).  With few trusted
+# Gaia stars the offset vote rests on 3-4 coincident pairs; a matched TRIANGLE (shape, size, orientation and
+# magnitudes all consistent) is far harder to produce by chance.  Rotation and scale are held near the header
+# (Gaia guesses are already in the header pixel frame), so the invariants are absolute side lengths and the
+# orientation of the longest side, not only ratios.
+TRI_MAX_TRUST = 20           # use triangles when the clean 5p Gaia count in the footprint is below this
+TRI_N_GAIA = 20              # brightest Gaia stars used to form triangles
+TRI_N_HST = 120              # brightest HST sources used to form triangles
+TRI_LEN_TOL = 0.004          # fractional side-length tolerance (scale near header + position errors)
+TRI_ROT_TOL_DEG = 0.5        # orientation tolerance of the longest side
+TRI_MIN_SIDE_PX = 30.0       # ignore tiny triangles (orientation undefined)
+TRI_DM_TOL = 1.0             # the three Gaia-HST magnitude differences must agree within this
+
+
+def _tri_build(x, y, idx):
+    """Triangles over points idx: canonical vertex order (A opposite the shortest side, C opposite the longest),
+    side lengths (L1<=L2<=L3), longest-side angle, parity; triangles with two nearly equal sides are skipped."""
+    from itertools import combinations
+    T = np.array(list(combinations(idx, 3)), int)
+    if len(T) == 0:
+        return None
+    P = np.stack([np.column_stack([x[T[:, k]], y[T[:, k]]]) for k in range(3)], axis=1)   # (n,3,2)
+    opp = np.stack([np.hypot(*(P[:, 2] - P[:, 1]).T), np.hypot(*(P[:, 0] - P[:, 2]).T), np.hypot(*(P[:, 1] - P[:, 0]).T)], 1)
+    o = np.argsort(opp, axis=1)                                     # vertex order by length of the opposite side
+    L = np.take_along_axis(opp, o, 1)
+    ok = (L[:, 0] >= TRI_MIN_SIDE_PX) & (np.diff(L, axis=1).min(axis=1) > 2 * TRI_LEN_TOL * L[:, 2])
+    T, P, o, L = T[ok], P[ok], o[ok], L[ok]
+    V = np.take_along_axis(T, o, 1)                                 # (A, B, C) original indices
+    Pa, Pb, Pc = (np.take_along_axis(P, o[:, k][:, None, None].repeat(2, 2), 1)[:, 0] for k in range(3))
+    ang = np.degrees(np.arctan2(*(Pb - Pa)[:, ::-1].T))            # longest side is A-B (opposite C)
+    par = np.sign((Pb - Pa)[:, 0] * (Pc - Pa)[:, 1] - (Pb - Pa)[:, 1] * (Pc - Pa)[:, 0])
+    return dict(V=V, L=L, ang=ang, par=par)
+
+
+def _triangle_offsets(hst_d, gaia_f, seed_mask, max_mag_diff, top=3):
+    """Offset hypotheses (dx, dy, n_tri, n_support) from geometrically matched Gaia/HST triangles, best first."""
+    gx, gy, gm = gaia_f['xguess'], gaia_f['yguess'], gaia_f['mag']
+    hx, hy, hm = np.asarray(hst_d['x'], float), np.asarray(hst_d['y'], float), np.asarray(hst_d['mag'], float)
+    q = np.asarray(hst_d.get('qfit', np.zeros(len(hx))), float)
+    okh = np.isfinite(hx) & np.isfinite(hy) & np.isfinite(hm) & ~(q > 0.5)
+    if okh.sum() < 3:
+        return []
+    # Gaia stars predicted INSIDE the detector footprint, 5p and 2p alike: the clean-5p 'trusted' set of a sparse
+    # field is mostly bright stars just off the chip, while the stars that match are faint 2p ones (jb5x36tpq:
+    # 6 of 7 trusted stars off-chip, 4 of 5 matches non-trusted).
+    pad = 30.0
+    x0, x1, y0, y1 = hx[okh].min() - pad, hx[okh].max() + pad, hy[okh].min() - pad, hy[okh].max() + pad
+    gi = np.where(np.isfinite(gx) & np.isfinite(gy) & np.isfinite(gm) & (gx > x0) & (gx < x1) & (gy > y0) & (gy < y1))[0]
+    if len(gi) < 3:
+        return []
+    gi = gi[np.argsort(gm[gi])][:TRI_N_GAIA]
+    hi = np.where(okh)[0]
+    hi = hi[np.argsort(hm[hi])][:TRI_N_HST]
+    G, H = _tri_build(gx, gy, gi), _tri_build(hx, hy, hi)
+    if G is None or H is None or len(G['L']) == 0 or len(H['L']) == 0:
+        return []
+    tree = KDTree(H['L'])
+    hyp = []
+    for k in range(len(G['L'])):
+        cand = tree.query_ball_point(G['L'][k], r=TRI_LEN_TOL * G['L'][k, 2] * 1.8)
+        for j in cand:
+            if np.any(np.abs(H['L'][j] / G['L'][k] - 1) > TRI_LEN_TOL * 2) or H['par'][j] != G['par'][k]:
+                continue
+            da = (H['ang'][j] - G['ang'][k] + 180) % 360 - 180
+            if abs(da) > TRI_ROT_TOL_DEG:
+                continue
+            ga, ha = G['V'][k], H['V'][j]
+            dm = gm[ga] - hm[ha]
+            if np.ptp(dm) > TRI_DM_TOL:
+                continue
+            hyp.append((float(np.mean(hx[ha] - gx[ga])), float(np.mean(hy[ha] - gy[ga])), float(np.median(dm))))
+    if not hyp:
+        return []
+    Hy = np.array(hyp)
+    key = np.round(Hy[:, :2] / 2.0).astype(int)
+    _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+    order = np.argsort(-cnt)
+    tree_h = KDTree(np.column_stack([hx[okh], hy[okh]])); hm_ok = hm[okh]
+    out = []
+    for c in order[:10]:
+        m = inv.ravel() == c
+        dx, dy, zp = (float(np.median(Hy[m, i])) for i in range(3))
+        d, j = tree_h.query(np.column_stack([gx + dx, gy + dy]), k=1, distance_upper_bound=2.5)
+        okp = np.isfinite(d)
+        sup = int(np.sum(okp & (np.abs((gm - hm_ok[np.minimum(j, len(hm_ok) - 1)]) - zp) < TRI_DM_TOL)))
+        out.append((dx, dy, int(cnt[c]), sup))
+    out.sort(key=lambda r: (-r[3], -r[2]))
+    return [r for r in out if r[3] >= 3][:top]
+
 
 
 def _guess_direct_seed(guess_affine, params, hst_d, gaia_f, max_mag_diff, min_matches,
@@ -1429,6 +1523,8 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             else:
                 print("  Guess-seeded association found < 3 pairs -> narrowed 4P discovery")
         _scan_seed = None
+        _extra_seeds = []
+        _tri, _n_trust = [], None
         _win_as = params.get('header_scan_arcsec')
         if best is None and guess_affine is None and HEADER_FIRST and _win_as:
             _win_px = float(_win_as) / float(params['pixel_scale'])
@@ -1448,6 +1544,22 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 if _scan_seed is not None:
                     _scan_seed['_full_idx'] = True
                     _scan_seed['q'], _scan_seed['m'] = 'scan', float('nan')
+                    _extra_seeds.append(_scan_seed)
+        _hx_ok = np.isfinite(x_hst) & np.isfinite(y_hst)
+        _n_trust = int(np.sum((gaia_field['xguess'] > x_hst[_hx_ok].min()) & (gaia_field['xguess'] < x_hst[_hx_ok].max())
+                              & (gaia_field['yguess'] > y_hst[_hx_ok].min()) & (gaia_field['yguess'] < y_hst[_hx_ok].max())))
+        if best is None and guess_affine is None and TRIANGLES and 3 <= _n_trust < TRI_MAX_TRUST:
+            _tri = _triangle_offsets(hst_data_all_disc, gaia_field, in_clean & in_has_pms, max_mag_diff)
+            _s0 = float(params['initial_scale']); _c0 = np.array([params['x_cen'], params['y_cen']])
+            print(f"  Triangle candidates ({_n_trust} Gaia in the footprint < {TRI_MAX_TRUST}): "
+                  + (', '.join(f"dx={a:+.1f} dy={b:+.1f} px ({n} triangles, {sp} stars)" for a, b, n, sp in _tri) or 'none'))
+            for _a, _b, _ntri, _sup in _tri:
+                _sd = _guess_direct_seed((_s0 * np.eye(2), _c0 - _s0 * np.array([_a, _b])), params, hst_data_all_disc,
+                                         gaia_field, max_mag_diff, 3, radius_px=2.5)
+                if _sd is not None:
+                    _sd['_full_idx'] = True
+                    _sd['q'], _sd['m'] = f'tri{_ntri}', float('nan')
+                    _extra_seeds.append(_sd)
         for _tier_name, _seed_mask, _hst_d, _stars_only in ([] if best is not None else _disc_tiers):
             _n_seed = int(_seed_mask.sum())
             if _n_seed < 3:
@@ -1470,9 +1582,8 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 _used_stars_only = _stars_only
                 break
             print(f"  4P Discovery failed [{_tier_name}] — trying next tier...")
-        if best is None and _scan_seed is not None:
-            best, used_tier = _scan_seed, 'header scan only (discovery failed at all tiers)'
-            _scan_seed = None
+        if best is None and _extra_seeds:
+            best, used_tier = _extra_seeds.pop(0), 'header scan / triangle seed (discovery failed at all tiers)'
         if best is None:
             print(f"Finished {image_name}: 4P Discovery failed at all tiers.", file=original_stdout)
             return
@@ -1596,8 +1707,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
 
 
         _cands = [best] + list(best.get('_alternatives', []))[:MAX_DISCOVERY_CANDIDATES - 1]
-        if _scan_seed is not None:
-            _cands = _cands + [_scan_seed]
+        _cands = _cands + [c for c in _extra_seeds if c is not best]
         _results = []
         for _k, _cand in enumerate(_cands):
             if len(_cands) > 1:
@@ -1620,6 +1730,20 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 if not _good:
                     _results = [dict(reason=f"solution {_off_as(_implaus[0]):.2f}\" from a {params['wcsname'] or 'JWST'} header "
                                             f"(window {_win_as}\") and only P={_implaus[0]['_fap']:.1e} against chance — implausible")]
+        if TRIANGLES and TRI_REQUIRE and _good and _n_trust is not None and _n_trust < TRI_MAX_TRUST:
+            _c0 = np.array([params['x_cen'], params['y_cen']]); _s0 = float(params['initial_scale'])
+            def _gc(r):
+                return np.array([r['A'] * (_c0[0] - r['xs_o']) + r['B'] * (_c0[1] - r['ys_o']) + r['xt_o'],
+                                 r['C'] * (_c0[0] - r['xs_o']) + r['D'] * (_c0[1] - r['ys_o']) + r['yt_o']])
+            _tri_pts = [_c0 - _s0 * np.array([a, b]) for a, b, _n, _sp in _tri]
+            _sup = [r for r in _good if any(np.hypot(*(_gc(r) - tp)) < TRI_AGREE_PX for tp in _tri_pts)]
+            if len(_sup) < len(_good):
+                print(f"  Triangle check ({_n_trust} Gaia in the footprint): {len(_good) - len(_sup)} of {len(_good)} "
+                      f"significant solution(s) have no geometric (triangle) support -> dropped")
+            if not _sup:
+                _results = [dict(reason=f"no triangle-supported solution ({_n_trust} Gaia in the footprint; "
+                                        f"{len(_good)} vote-only solution(s) unconfirmed)")]
+            _good = _sup
         if not _good:
             print(f"Finished {image_name}: {_results[0]['reason']}", file=original_stdout)
             return
