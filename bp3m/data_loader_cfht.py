@@ -55,12 +55,19 @@ def _union_find(edges):
     return {n: find(n) for n in parent}
 
 
-def collect_cfht_matches(field_dir: Path) -> pd.DataFrame:
-    """All matched_cfht rows across the field's HST images, one table."""
+def collect_cfht_matches(field_dir: Path, images=None) -> pd.DataFrame:
+    """All matched_cfht rows across the field's HST images, one table.
+
+    images : optional set of image names; when given, match tables of image directories outside it
+             (earlier / larger selections of the same field) are ignored -- their rows would otherwise
+             attach CFHT observations and fallback HST detections that the current run never cross-matched
+             (2026-10-08)."""
     field_dir = Path(field_dir)
     hst_root = field_dir / 'HST' / 'mastDownload' / 'HST'
     frames = []
     for d in sorted(hst_root.iterdir()):
+        if images is not None and d.name not in images:
+            continue
         f = d / 'matched_cfht.csv'
         if not f.exists():
             continue
