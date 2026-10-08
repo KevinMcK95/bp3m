@@ -420,14 +420,19 @@ def match_one_image(img_dir, dets, cfht_dir, gaia_lookup, fill, det_cache,
             m['cfht_ext'] = (sid // 10**6) % 100
             m['cfht_src_index'] = sid % 10**6
             m['cfht_mjd'] = float(ext_df.cfht_mjd.iloc[0])
+            # Gaia labels of the matched CFHT sources, keyed by (ext, src_index): src_index restarts at
+            # 0 on every CCD, so a dict keyed by src_index alone handed the Gaia id of CCD A's source k
+            # to CCD B's source k (Ursa Minor 2026-10-08, Pedro: 295 of 740 good Gaia stars flagged
+            # once CFHT was added -- each carried an observation of a different star 2-4 mag off on
+            # another CCD; 2994 of 21897 double-labelled rows disagreed with the HST-side Gaia id).
             gaia_ids = {}
             for key in {( int(expnum), int(e)) for e in m['cfht_ext']}:
                 dc = det_cache.get(key)
                 if dc is not None and len(dc[1]):
-                    gaia_ids.update(dict(zip(dc[1].src_index,
-                                             dc[1].gaia_source_id)))
-            m['gaia_source_id'] = [gaia_ids.get(int(i), '')
-                                   for i in m['cfht_src_index']]
+                    gaia_ids.update({(key[1], int(s)): g for s, g in
+                                     zip(dc[1].src_index, dc[1].gaia_source_id)})
+            m['gaia_source_id'] = [gaia_ids.get((int(e), int(i)), '')
+                                   for e, i in zip(m['cfht_ext'], m['cfht_src_index'])]
             parts.append((expnum, m, None))
             n_total += len(m)
         else:
@@ -470,7 +475,9 @@ def _cfht_cache_keys(img_dir):
         pass
     mg = img_dir / 'matched_gaia.csv'
     md5 = hashlib.md5(mg.read_bytes()).hexdigest() if mg.exists() else None
-    return {'gdc_id': catalog_gdc_id(cat), 'matched_gaia_md5': md5}, gdc_file
+    # label_version 2 (2026-10-08): Gaia labels keyed by (ext, src_index); bumping it makes every cached
+    # CFHT match 'inputs changed' so the wrong labels are redone without --force flags
+    return {'gdc_id': catalog_gdc_id(cat), 'matched_gaia_md5': md5, 'cfht_label_version': 2}, gdc_file
 
 
 def _cfht_cache_status(img_dir, keys, gdc_file, single_pointing=True):
