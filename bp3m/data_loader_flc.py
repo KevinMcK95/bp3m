@@ -317,6 +317,21 @@ def _read_image_meta(img_dir: Path, img_name: str,
 
     orig_pixel_scale_mas = pscale_arcsec * 1000.0   # mas/pix
 
+    # Scale prior centre: HST = instrument constant x VAFACTOR (Leo I calibration); JWST = the GDC
+    # frame's plate scale from the header WCS, measured by the cross-match and written to
+    # transformation.csv / transformation_prealign.csv as 'initial_scale' (2026-10-07; the
+    # per-detector constant x VA_SCALE mispredicted it by up to 3e-4 for NIRISS).  One definition for
+    # the cross-match, v1, v2 and both pop-fit loaders.
+    initial_scale_ratio = get_instrument_config(instrument, detector)["initial_scale"] * vafactor
+    scale_prior_source = "config_va"
+    if telescope == "JWST" and "initial_scale" in tdf.index:
+        try:
+            _isr = float(tdf["initial_scale"])
+            if np.isfinite(_isr) and 0.9 < _isr < 1.1:
+                initial_scale_ratio = _isr; scale_prior_source = "wcs_gdc"
+        except (TypeError, ValueError):
+            pass
+
     meta = {
         # Pointing / tangent point
         "ra0":  ra_cen,
@@ -335,7 +350,8 @@ def _read_image_meta(img_dir: Path, img_name: str,
         # sigma widths.  Sourced from instrument_config so cross-match and the
         # BP3M solver always use consistent values.  Solver uses these as
         # per-image defaults; explicit CLI overrides take precedence.
-        "initial_scale_ratio": get_instrument_config(instrument, detector)["initial_scale"] * vafactor,
+        "initial_scale_ratio": initial_scale_ratio,
+        "scale_prior_source":  scale_prior_source,
         "vafactor":            vafactor,
         **{k: v for k, v in get_instrument_config(instrument, detector).items()
            if k.startswith("sigma_")},
@@ -1092,6 +1108,11 @@ def load_image_data_flc(data_root, field_name: str,
     if _n_pre:
         print(f"  {_n_pre} JWST frame(s) admitted with a sibling-predicted transformation and no Gaia stars "
               f"(transformation_prealign.csv; geometry from the visit link prior)")
+    _n_jw = sum(1 for m in images.values() if str(m.get("telescope", "HST")).upper() == "JWST")
+    if _n_jw:
+        _n_wcs = sum(1 for m in images.values() if m.get("scale_prior_source") == "wcs_gdc")
+        print(f"  JWST scale prior centre: header-WCS GDC-frame scale for {_n_wcs}/{_n_jw} frame(s)"
+              + (f" (config x VA_SCALE for the other {_n_jw - _n_wcs}: no 'initial_scale' in their transformation file)" if _n_wcs < _n_jw else ""))
     if skipped:
         print(f"  Skipped {len(skipped)} directories (missing required files): "
               f"{skipped}")

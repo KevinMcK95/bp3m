@@ -707,6 +707,7 @@ def write_jwst_sibling_prealign(folders: list, log=print) -> int:
                         on_skew=0.5 * (A_ - D_), off_skew=0.5 * (B_ + C_), zp=np.nan,
                         ra_cen=fr['ra_cen'], dec_cen=fr['dec_cen'], x_cen=fr['x_cen'], y_cen=fr['y_cen'],
                         pixel_scale=fr['pixel_scale'], orientat=fr['orientat'], prealign_anchor=np.nan,
+                        initial_scale=fr.get('initial_scale', np.nan), initial_scale_header=fr.get('initial_scale_header', np.nan),
                         n_match=0, rms_px=float(spread), n_siblings=int(n_sib), prealign_source='jwst_visit_siblings')
             pd.DataFrame({'parameter': list(vals), 'value': list(vals.values())}).to_csv(pre, index=False)
             n_written += 1

@@ -115,8 +115,10 @@ INSTRUMENT_CONFIG = {
     # One entry per detector (each _cal file is one detector).  pixel_scale = the
     # sqrt|det CD| of the stage-2 headers (Liwen Chen's measure_pixel_scale.py over
     # LMC + Draco frames, 2026-08), which reproduces the GDC-frame plate scale of her
-    # bp3m fits to 3e-5..1.6e-4, so initial_scale stays 1 and VA_SCALE (the JWST
-    # VAFACTOR) centres the prior per exposure.  Prior widths are deliberately loose
+    # bp3m fits to 3e-5..1.6e-4.  2026-10-07: the per-exposure prior CENTRE is no longer
+    # pixel_scale x VA_SCALE but the GDC frame's own plate scale from the header WCS (SIP),
+    # measured by the cross-match (gaia_cross_match.cross_match._scale_in_gdc_frame) and
+    # carried in transformation.csv 'initial_scale'; pixel_scale is only the nominal unit.  Prior widths are deliberately loose
     # until calibrated from v1 posteriors as the HST values were (her LMC NIRCam
     # fits scattered 0.29 deg rms in rotation around a 0.1 deg prior with per-channel
     # scales; NIRISS showed a fixed +0.12 deg / -0.67% offset that these per-detector

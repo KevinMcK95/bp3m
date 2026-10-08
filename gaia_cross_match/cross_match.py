@@ -89,6 +89,35 @@ def get_chip_config(instrume, detector):
 
 
 ORIENTAT_FIT_MAX_DEG = 1.0      # never move the orientation further than this from ORIENTAT
+SCALE_FIT_MAX_FRAC = 5e-3       # never move the JWST scale prior centre further than this from config x VA_SCALE
+
+
+def _scale_in_gdc_frame(catalog_file, ra_cen, dec_cen):
+    """Plate scale (mas per GDC pixel) of the GDC-corrected frame implied by the catalogue's header WCS:
+    affine fit of the tangent-plane offsets of the pypass RA/Dec (full header WCS incl. its SIP distortion)
+    against x_gdc/y_gdc.  The GDC tables map raw pixels into a frame with its own linear term relative to
+    the header CD matrix (NIRCam +2..7e-4 SW / +1.5..2e-3 LW, NIRISS -1..-4e-4, MIRI -3e-4 in scale and
+    0.1-0.2 deg in rotation, 2026-10-07: M92/M4/Draco), so the per-exposure prior centre must be measured
+    in the GDC frame rather than taken as a per-detector constant x VA_SCALE (that mispredicted NIRISS by
+    up to 3e-4).  None if it cannot be determined."""
+    t = fits.getdata(catalog_file)
+    ra = np.asarray(t['ra'], float); de = np.asarray(t['dec'], float)
+    xg = np.asarray(t['x_gdc'], float); yg = np.asarray(t['y_gdc'], float)
+    ok = np.isfinite(ra) & np.isfinite(de) & np.isfinite(xg) & np.isfinite(yg)
+    if ok.sum() < 10:
+        return None
+    idx = np.where(ok)[0]
+    if len(idx) > 3000:
+        idx = idx[np.linspace(0, len(idx) - 1, 3000).astype(int)]
+    xi = rd2x(ra[idx], de[idx], ra_cen, dec_cen) * 3.6e6      # mas
+    eta = rd2y(ra[idx], de[idx], ra_cen, dec_cen) * 3.6e6
+    X = np.column_stack([xg[idx], yg[idx], np.ones(len(idx))])
+    try:
+        M = np.linalg.lstsq(X, np.column_stack([xi, eta]), rcond=None)[0][:2].T
+    except np.linalg.LinAlgError:
+        return None
+    s = float(np.sqrt(abs(np.linalg.det(M))))
+    return s if np.isfinite(s) and s > 0 else None
 
 
 def _orientat_in_gdc_frame(catalog_file, ra_cen, dec_cen, x_cen, y_cen, pixel_scale, orientat):
@@ -234,9 +263,24 @@ def get_hst_params(flc_file, catalog_file=None):
                 orientat = _ori
         except Exception:
             pass
+    # JWST: the scale prior centre is the GDC frame's own plate scale from the header WCS (SIP), not the
+    # per-detector constant x VA_SCALE (2026-10-07; see _scale_in_gdc_frame).  Propagates through
+    # transformation.csv ('initial_scale') to the v1/v2/pop-fit loaders and the prealign writers.
+    initial_scale_header = initial_scale
+    scale_source = 'config_va'
+    if _is_jwst and catalog_file is not None:
+        try:
+            _s = _scale_in_gdc_frame(catalog_file, ra_cen, dec_cen)
+            if _s is not None:
+                _isr = _s / 1000.0 / pixel_scale
+                if abs(_isr - initial_scale_header) <= SCALE_FIT_MAX_FRAC:
+                    initial_scale = float(_isr); scale_source = 'wcs_gdc'
+        except Exception:
+            pass
 
     return {"ra_cen": ra_cen, "dec_cen": dec_cen, "x_cen": x_cen, "y_cen": y_cen,
             "pixel_scale": pixel_scale, "initial_scale": initial_scale,
+            "initial_scale_header": initial_scale_header, "scale_source": scale_source,
             "obs_epoch_mjd": obs_epoch_mjd, "orientat": orientat, "orientat_header": orientat_header,
             "naxis1": naxis1, "naxis2": naxis2,
             "instrument": instrument, "detector": detector,
@@ -1547,6 +1591,9 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                                params['x_cen'], params['y_cen'],
                                params['pixel_scale'], params['orientat']]
         trans_out.add_row(['n_chance_expected', _lam]); trans_out.add_row(['chance_fa_prob', _fap])
+        # scale prior centre used here (numeric only: read_transformation float()s every value)
+        trans_out.add_row(['initial_scale', params['initial_scale']])
+        trans_out.add_row(['initial_scale_header', params.get('initial_scale_header', params['initial_scale'])])
         trans_out.write(os.path.join(hst['root'], "transformation.csv"), format='ascii.csv', overwrite=True)
         print(f"Finished {image_name}: Found {len(final_matches)} matches in {time.time()-start_time:.2f}s.", file=original_stdout)
 

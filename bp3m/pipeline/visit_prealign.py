@@ -191,6 +191,7 @@ def run_visit_prealign(field_dir, v1_dir=None, force=False) -> int:
                     sib = ss.load_sibling(A.flc, A.catalog, A.root / 'transformation.csv',
                                           __import__('gaia_cross_match.cross_match', fromlist=['get_hst_params']).get_hst_params)
                     fr = {k: T.params[k] for k in ('ra_cen', 'dec_cen', 'x_cen', 'y_cen', 'pixel_scale', 'orientat')}
+                    fr.update({k: T.params[k] for k in ('initial_scale', 'initial_scale_header') if k in T.params})
                     hT = np.column_stack([T.cat['x_gdc'][it_], T.cat['y_gdc'][it_]]).astype(float)
                     xr = (float(np.percentile(T.cat['x_gdc'][it_], 1)), float(np.percentile(T.cat['x_gdc'][it_], 99)))
                     yr = (float(np.percentile(T.cat['y_gdc'][it_], 1)), float(np.percentile(T.cat['y_gdc'][it_], 99)))
@@ -220,6 +221,7 @@ def run_visit_prealign(field_dir, v1_dir=None, force=False) -> int:
                                         on_skew=0.5 * (A_ - D_), off_skew=0.5 * (B_ + C_), zp=np.nan,
                                         ra_cen=fr['ra_cen'], dec_cen=fr['dec_cen'], x_cen=fr['x_cen'], y_cen=fr['y_cen'],
                                         pixel_scale=fr['pixel_scale'], orientat=fr['orientat'], prealign_anchor=np.nan,
+                        initial_scale=fr.get('initial_scale', np.nan), initial_scale_header=fr.get('initial_scale_header', np.nan),
                                         n_match=int(m.sum()), rms_px=rms)
                             pd.DataFrame({'parameter': list(vals), 'value': list(vals.values())}).to_csv(
                                 T.root / 'transformation_prealign.csv', index=False)
@@ -361,6 +363,7 @@ def run_epoch_anchor(field_dir, v2_dir=None) -> int:
             t_obs = 2000.0 + (float(fits.getheader(T.flc, 0)['EXPSTART']) - 51544.5) / 365.25
             ra_r, de_r, sig_r = _epoch_reference(v2_dir, t_obs)
             fr = {k: T.params[k] for k in ('ra_cen', 'dec_cen', 'x_cen', 'y_cen', 'pixel_scale', 'orientat')}
+            fr.update({k: T.params[k] for k in ('initial_scale', 'initial_scale_header') if k in T.params})
             gA = np.column_stack(ss.sky_to_frame(ra_r, de_r, fr))
             hT = np.column_stack([T.cat['x_gdc'][it_], T.cat['y_gdc'][it_]]).astype(float)
             xr = (float(np.percentile(hT[:, 0], 1)), float(np.percentile(hT[:, 0], 99)))
@@ -403,6 +406,7 @@ def run_epoch_anchor(field_dir, v2_dir=None) -> int:
                         on_skew=0.5 * (A_ - D_), off_skew=0.5 * (B_ + C_), zp=np.nan,
                         ra_cen=fr['ra_cen'], dec_cen=fr['dec_cen'], x_cen=fr['x_cen'], y_cen=fr['y_cen'],
                         pixel_scale=fr['pixel_scale'], orientat=fr['orientat'], prealign_anchor=np.nan,
+                        initial_scale=fr.get('initial_scale', np.nan), initial_scale_header=fr.get('initial_scale_header', np.nan),
                         n_match=int(m.sum()), rms_px=rms, prealign_source='epoch_v2')
             pd.DataFrame({'parameter': list(vals), 'value': list(vals.values())}).to_csv(T.root / 'transformation_prealign.csv', index=False)
             report.append(dict(image=T.name, anchor='epoch:v2', n_match=int(m.sum()), rms_px=round(rms, 4), vote_peak=int(Hh[k]),

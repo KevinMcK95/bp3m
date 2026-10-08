@@ -97,6 +97,8 @@ def frame_geometry(ph, h1, cat_hdr1) -> dict:
     crpix, ra_cen, dec_cen = refpix(cat_hdr1, h1)
     icfg = get_instrument_config(str(ph.get('INSTRUME')), str(ph.get('DETECTOR')))
     vaf = float(h1.get('VAFACTOR', ph.get('VAFACTOR', 1.0)) or 1.0)
+    # HST only (Anderson GDC frame, IDCSCALE x VAFACTOR).  JWST labels, when built, must take the GDC-frame
+    # scale from transformation.csv 'initial_scale' (header-WCS measured, 2026-10-07), not this product.
     pscale_deg = icfg['pixel_scale'] * icfg['initial_scale'] * vaf / 3600.0   # deg/px in Anderson's GDC frame
     orientat = float(h1.get('ORIENTAT', 0.0))
     th = np.radians(-orientat); R0 = np.array([[np.cos(th), np.sin(th)], [-np.sin(th), np.cos(th)]])
