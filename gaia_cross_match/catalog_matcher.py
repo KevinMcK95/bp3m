@@ -3,6 +3,41 @@ from scipy.ndimage import gaussian_filter
 from scipy.spatial import KDTree
 from itertools import combinations, permutations
 
+
+
+def _kde_hist(dx, dy, sx, sy, w, xed, yed, n_levels=8):
+    """Deterministic Gaussian KDE of pair offsets on the (xed, yed) grid (2026-10-08): replaces the Monte-Carlo
+    draws (10 or 5 random samples per pair), which made sparse images flip between solutions and failures from
+    run to run and made the result depend on the random seed.  Each pair is a 2-D Gaussian (sx, sy) of total
+    weight w; sigmas are quantised into n_levels log-spaced levels per axis, pair centres are histogrammed per
+    (sx, sy) level and convolved with that level's Gaussian (exact up to the sigma quantisation)."""
+    bx = float(xed[1] - xed[0]); by = float(yed[1] - yed[0])
+    hist = np.zeros((len(xed) - 1, len(yed) - 1))
+    if len(dx) == 0:
+        return hist
+    def levels(s):
+        s = np.clip(np.asarray(s, float), 1e-3, None)
+        lo, hi = np.log(s.min()), np.log(s.max())
+        if hi - lo < 1e-6:
+            return np.zeros(len(s), int), np.array([float(s[0])])
+        e = np.linspace(lo, hi, n_levels + 1)
+        k = np.clip(np.digitize(np.log(s), e) - 1, 0, n_levels - 1)
+        return k, np.exp(0.5 * (e[:-1] + e[1:]))
+    kx, cx = levels(sx); ky, cy = levels(sy)
+    for a in np.unique(kx):
+        for b in np.unique(ky[kx == a]):
+            m = (kx == a) & (ky == b)
+            h, _, _ = np.histogram2d(dx[m], dy[m], bins=[xed, yed], weights=w[m])
+            hist += gaussian_filter(h, sigma=(cx[a] / bx, cy[b] / by), mode='constant', truncate=4.0)
+    return hist
+
+def _kde_seed():
+    """Seed of the Monte-Carlo KDE draws in the offset histograms (2026-10-08).  They were unseeded, so the same
+    image could give a different peak on every run: sparse images alternated between a 3-4-match solution and a
+    failure.  Fixed by default; env BP3M_KDE_SEED overrides (seed-sensitivity tests)."""
+    import os
+    return int(os.environ.get('BP3M_KDE_SEED', '20261008'))
+
 def get_inv_2x2(C):
     """Vectorized 2x2 matrix inversion."""
     det = C[:, 0, 0] * C[:, 1, 1] - C[:, 0, 1] * C[:, 1, 0]
@@ -238,14 +273,7 @@ def find_offset(x1, y1, m1, x2, y2, m2, cov1=None, cov2=None,
         # and barely contribute to the peak even though they spread over many bins.
         pair_weight = 1.0 / (sx_v * sy_v)
 
-        n_draws = 10
-        rng = np.random.default_rng()
-        samp_x = (dx_v + sx_v * rng.standard_normal((n_draws, len(dx_v)))).ravel()
-        samp_y = (dy_v + sy_v * rng.standard_normal((n_draws, len(dy_v)))).ravel()
-        in_range = (np.abs(samp_x) <= max_offset) & (np.abs(samp_y) <= max_offset)
-        w = np.repeat(pair_weight / n_draws, n_draws)
-        hist, _, _ = np.histogram2d(samp_x[in_range], samp_y[in_range],
-                                    bins=[xed, yed], weights=w[in_range])
+        hist = _kde_hist(dx_v, dy_v, sx_v, sy_v, pair_weight, xed, yed)
 
         suppress = max(10, int(5 * float(np.median(sx_v[sx_v < 2.0])) / bin_size) if np.any(sx_v < 2.0) else 10)
     else:
@@ -307,7 +335,6 @@ def find_scale_and_offset(x1, y1, m1, x2, y2, m2, cov1=None, cov2=None,
     best_score = -1.0
     best_ds = 0.0
     best_hist = np.zeros((n_bins, n_bins))
-    rng = np.random.default_rng()
 
     for ds in np.linspace(ds_range[0], ds_range[1], n_scales):
         dx_corr = dx_raw - ds * dx1_cen
@@ -320,13 +347,7 @@ def find_scale_and_offset(x1, y1, m1, x2, y2, m2, cov1=None, cov2=None,
             dx_v, dy_v = dx_corr[mask], dy_corr[mask]
             sx_v, sy_v = sig_x[mask], sig_y[mask]
             pair_weight = 1.0 / (sx_v * sy_v)
-            n_draws = 5
-            samp_x = (dx_v + sx_v * rng.standard_normal((n_draws, len(dx_v)))).ravel()
-            samp_y = (dy_v + sy_v * rng.standard_normal((n_draws, len(dy_v)))).ravel()
-            in_range = (np.abs(samp_x) <= max_offset) & (np.abs(samp_y) <= max_offset)
-            w = np.repeat(pair_weight / n_draws, n_draws)
-            hist, _, _ = np.histogram2d(samp_x[in_range], samp_y[in_range],
-                                        bins=[xed, yed], weights=w[in_range])
+            hist = _kde_hist(dx_v, dy_v, sx_v, sy_v, pair_weight, xed, yed)
         else:
             hist, _, _ = np.histogram2d(dx_corr[mask], dy_corr[mask], bins=[xed, yed])
             hist = gaussian_filter(hist, sigma=1.5)

@@ -281,6 +281,8 @@ def get_hst_params(flc_file, catalog_file=None):
     return {"ra_cen": ra_cen, "dec_cen": dec_cen, "x_cen": x_cen, "y_cen": y_cen,
             "pixel_scale": pixel_scale, "initial_scale": initial_scale,
             "initial_scale_header": initial_scale_header, "scale_source": scale_source,
+            "wcsname": str(primary_hdr.get('WCSNAME', '') or ''),
+            "header_scan_arcsec": header_scan_window_arcsec(primary_hdr.get('WCSNAME', ''), 'JWST' if _is_jwst else 'HST'),
             "obs_epoch_mjd": obs_epoch_mjd, "orientat": orientat, "orientat_header": orientat_header,
             "naxis1": naxis1, "naxis2": naxis2,
             "instrument": instrument, "detector": detector,
@@ -687,147 +689,152 @@ def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, di
                 ds_range=(-0.02, 0.02) if scale_sweep else (0.0, 0.0), n_scales=41 if scale_sweep else 1,
                 return_histogram=True
             )
-            dx_off, dy_off, _peak_score = offset_peaks[0]
-            xg_tier = xg_s + best_ds * (xg_s - params['x_cen']) + dx_off
-            yg_tier = yg_s + best_ds * (yg_s - params['y_cen']) + dy_off
+            # every top peak of the tier's offset histogram seeds its own 4P solution (2026-10-08): with the
+            # deterministic KDE a chance peak can outrank the true one in every tier; the random draws used to
+            # surface the true one only some of the time.  Candidates are then clustered and chance-tested.
+            for dx_off, dy_off, _peak_score in offset_peaks[:DISCOVERY_PEAKS_PER_TIER]:
+                if _peak_score <= 0:
+                    continue
+                xg_tier = xg_s + best_ds * (xg_s - params['x_cen']) + dx_off
+                yg_tier = yg_s + best_ds * (yg_s - params['y_cen']) + dy_off
 
-            # Try 40px (tight prior) then 100px (header fallback)
-            valid_seed = False
-            for cur_rad in [40.0, 100.0]:
-                tree_h_tier = KDTree(np.column_stack([hst_d['x'][h_idx_tier], hst_d['y'][h_idx_tier]]))
-                dists, h_idxs_tier = tree_h_tier.query(np.column_stack([xg_tier, yg_tier]), k=1, distance_upper_bound=cur_rad)
-                valid_idx = dists < cur_rad
-                if np.sum(valid_idx) >= 3:
-                    valid_seed = True
-                    break
-            if not valid_seed:
-                _dbg['valid_seed_fail'] += 1
-                if debug_verbose and _dbg['valid_seed_fail'] <= 3:
-                    n40 = np.sum(dists < 40.0)
-                    n100 = np.sum(dists < 100.0)
-                    print(f"    DBG valid_seed fail q<{qlim} m<{mlim:.1f}: "
-                          f"peak=({dx_off:.1f},{dy_off:.1f}) score={_peak_score:.3f}, "
-                          f"n_hst={np.sum(h_mask)}, @40px={n40}, @100px={n100}")
-                continue
+                # Try 40px (tight prior) then 100px (header fallback)
+                valid_seed = False
+                for cur_rad in [40.0, 100.0]:
+                    tree_h_tier = KDTree(np.column_stack([hst_d['x'][h_idx_tier], hst_d['y'][h_idx_tier]]))
+                    dists, h_idxs_tier = tree_h_tier.query(np.column_stack([xg_tier, yg_tier]), k=1, distance_upper_bound=cur_rad)
+                    valid_idx = dists < cur_rad
+                    if np.sum(valid_idx) >= 3:
+                        valid_seed = True
+                        break
+                if not valid_seed:
+                    _dbg['valid_seed_fail'] += 1
+                    if debug_verbose and _dbg['valid_seed_fail'] <= 3:
+                        n40 = np.sum(dists < 40.0)
+                        n100 = np.sum(dists < 100.0)
+                        print(f"    DBG valid_seed fail q<{qlim} m<{mlim:.1f}: "
+                              f"peak=({dx_off:.1f},{dy_off:.1f}) score={_peak_score:.3f}, "
+                              f"n_hst={np.sum(h_mask)}, @40px={n40}, @100px={n100}")
+                    continue
 
-            # Greedy 1-to-1 cleanup using log-probability cost
-            h_v_full = h_idx_tier[h_idxs_tier[valid_idx]]
-            g_v_seed = np.where(valid_idx)[0]
-            dx = hst_d['x'][h_v_full] - xg_tier[g_v_seed]
-            dy = hst_d['y'][h_v_full] - yg_tier[g_v_seed]
-            C_tot_seed = Cg_s[g_v_seed] + hst_d['C'][h_v_full]
-            costs_seed = compute_logprob_cost(dx, dy, C_tot_seed)
-            mdf_seed = pd.DataFrame({'g_seed': g_v_seed, 'h_full': h_v_full, 'c': costs_seed})\
-                         .sort_values('c').drop_duplicates('h_full').drop_duplicates('g_seed')
-            if len(mdf_seed) < 3:
-                _dbg['dedup<3'] += 1
-                if debug_verbose and _dbg['dedup<3'] <= 3:
-                    print(f"    DBG dedup<3 q<{qlim} m<{mlim:.1f}: {np.sum(valid_idx)} pairs → {len(mdf_seed)} after dedup")
-                continue
+                # Greedy 1-to-1 cleanup using log-probability cost
+                h_v_full = h_idx_tier[h_idxs_tier[valid_idx]]
+                g_v_seed = np.where(valid_idx)[0]
+                dx = hst_d['x'][h_v_full] - xg_tier[g_v_seed]
+                dy = hst_d['y'][h_v_full] - yg_tier[g_v_seed]
+                C_tot_seed = Cg_s[g_v_seed] + hst_d['C'][h_v_full]
+                costs_seed = compute_logprob_cost(dx, dy, C_tot_seed)
+                mdf_seed = pd.DataFrame({'g_seed': g_v_seed, 'h_full': h_v_full, 'c': costs_seed})\
+                             .sort_values('c').drop_duplicates('h_full').drop_duplicates('g_seed')
+                if len(mdf_seed) < 3:
+                    _dbg['dedup<3'] += 1
+                    if debug_verbose and _dbg['dedup<3'] <= 3:
+                        print(f"    DBG dedup<3 q<{qlim} m<{mlim:.1f}: {np.sum(valid_idx)} pairs → {len(mdf_seed)} after dedup")
+                    continue
 
-            h_b_idx = mdf_seed['h_full'].values
-            g_b_full_idx = seed_idx[mdf_seed['g_seed'].values]
-            xh_b, yh_b = hst_d['x'][h_b_idx], hst_d['y'][h_b_idx]
-            xg_b, yg_b = gaia_f['x'][g_b_full_idx], gaia_f['y'][g_b_full_idx]
-            mag_diffs = gaia_f['mag'][g_b_full_idx] - hst_d['mag'][h_b_idx]
-            curr_keep = np.ones(len(xh_b), dtype=bool)
-            if np.sum(gaia_f['has_pms'][g_b_full_idx]) >= 3:
-                curr_keep = gaia_f['has_pms'][g_b_full_idx].copy()
-            zp = np.median(mag_diffs[curr_keep])
-            cur_M = np.eye(2)
-
-            # Iterative 4P fit with sigma rejection
-            for _ in range(5):
-                res_4p, _, C_params, _ = fit_4p_weighted(
-                    xh_b[curr_keep], yh_b[curr_keep],
-                    xg_b[curr_keep], yg_b[curr_keep],
-                    hst_d['C'][h_b_idx[curr_keep]],
-                    gaia_f['C'][g_b_full_idx[curr_keep]],
-                    initial_M=cur_M,
-                    scale_prior=params['initial_scale'],
-                    scale_sigma=sigma_scale if sigma_scale is not None else SIGMA_SCALE,
-                    rot_sigma=np.radians(sigma_rot_deg if sigma_rot_deg is not None else SIGMA_ROT_DEG))
-                A, B, C, D, xs_o, ys_o, xt_o, yt_o = res_4p
-                cur_M = np.array([[A, B], [C, D]])
-
-                xh_p, yh_p = apply_affine(xh_b, yh_b, A, B, C, D, xs_o, ys_o, xt_o, yt_o)
-                dx_v, dy_v = xg_b - xh_p, yg_b - yh_p
-                C_proj = np.einsum('ij,njk,lk->nil', cur_M, hst_d['C'][h_b_idx], cur_M)
-                dxh_v, dyh_v = xh_b - xs_o, yh_b - ys_o
-                J = np.zeros((len(dxh_v), 2, 4))
-                J[:, 0, 0], J[:, 0, 1], J[:, 0, 2] = dxh_v, -dyh_v, 1.0
-                J[:, 1, 0], J[:, 1, 1], J[:, 1, 3] = dyh_v, dxh_v, 1.0
-                C_model = np.einsum('nij,jk,nlk->nil', J, C_params, J)
-                # Add a 1px discovery floor so chi2/cost are on a consistent
-                # scale regardless of Gaia quality (5p vs 2p) or star brightness.
-                # Correct matches have small pixel residuals → negative costs;
-                # false matches have large residuals → positive costs.
-                # The floor does not affect sigma rejection (which uses ds_4p).
-                _disc_floor = np.eye(2)[np.newaxis] * 1.0**2
-                C_tot_v = gaia_f['C'][g_b_full_idx] + C_proj + C_model + _disc_floor
-                sigs_v = compute_mahalanobis(dx_v, dy_v, C_tot_v)
-                costs_v = compute_logprob_cost(dx_v, dy_v, C_tot_v)
-                chi2 = np.sum(sigs_v[curr_keep])
-                cost = np.sum(costs_v[curr_keep])
-
-                ds_4p = np.sqrt(dx_v**2 + dy_v**2)
-                finite_dists = np.isfinite(ds_4p)
-                p16, p50 = np.nanpercentile(ds_4p[finite_dists & curr_keep], [16, 50])
-                thresh = min(max(p50 + 3*(p50-p16), 1), cur_rad)
-                if not np.isfinite(thresh):
-                    thresh = cur_rad
-
-                # Discovery sigma-rejection uses only the pixel-distance threshold.
-                # Gaia formal uncertainties (~0.01px) are far smaller than the
-                # multi-pixel residuals expected from a noisy 4-5 pair 4P fit, so a
-                # Mahalanobis threshold (sigs_v < 5) would always reject all pairs.
-                # The scale/rotation sanity check below catches spurious transforms.
-                good_v = (ds_4p < thresh) & (np.abs(mag_diffs - zp) < max_mag_diff)
-                if np.sum(good_v) < 3:
-                    break
-                if np.all(curr_keep == good_v):
-                    break
-                curr_keep[:] = good_v
+                h_b_idx = mdf_seed['h_full'].values
+                g_b_full_idx = seed_idx[mdf_seed['g_seed'].values]
+                xh_b, yh_b = hst_d['x'][h_b_idx], hst_d['y'][h_b_idx]
+                xg_b, yg_b = gaia_f['x'][g_b_full_idx], gaia_f['y'][g_b_full_idx]
+                mag_diffs = gaia_f['mag'][g_b_full_idx] - hst_d['mag'][h_b_idx]
+                curr_keep = np.ones(len(xh_b), dtype=bool)
+                if np.sum(gaia_f['has_pms'][g_b_full_idx]) >= 3:
+                    curr_keep = gaia_f['has_pms'][g_b_full_idx].copy()
                 zp = np.median(mag_diffs[curr_keep])
+                cur_M = np.eye(2)
 
-            g_b_full_idx = g_b_full_idx[curr_keep]
-            h_b_idx = h_b_idx[curr_keep]
-            if np.sum(good_v) < 3:
-                _dbg['sigma_rej<3'] += 1
-                if debug_verbose and _dbg['sigma_rej<3'] <= 3:
-                    print(f"    DBG sigma_rej<3 q<{qlim} m<{mlim:.1f}: "
-                          f"{len(mdf_seed)} pairs → {np.sum(good_v)} after rejection "
-                          f"(dists={np.round(np.sqrt(dx_v**2+dy_v**2),1).tolist()})")
-                continue
+                # Iterative 4P fit with sigma rejection
+                for _ in range(5):
+                    res_4p, _, C_params, _ = fit_4p_weighted(
+                        xh_b[curr_keep], yh_b[curr_keep],
+                        xg_b[curr_keep], yg_b[curr_keep],
+                        hst_d['C'][h_b_idx[curr_keep]],
+                        gaia_f['C'][g_b_full_idx[curr_keep]],
+                        initial_M=cur_M,
+                        scale_prior=params['initial_scale'],
+                        scale_sigma=sigma_scale if sigma_scale is not None else SIGMA_SCALE,
+                        rot_sigma=np.radians(sigma_rot_deg if sigma_rot_deg is not None else SIGMA_ROT_DEG))
+                    A, B, C, D, xs_o, ys_o, xt_o, yt_o = res_4p
+                    cur_M = np.array([[A, B], [C, D]])
 
-            scale_fit = np.sqrt(A*D - B*C)
-            rot_fit = np.degrees(np.arctan2(B - C, A + D))
-            _scale_ok = 0.98*params['initial_scale'] <= scale_fit <= 1.02*params['initial_scale']
-            _rot_ok = abs(rot_fit) < 0.2
-            if not (_scale_ok and _rot_ok):
-                _dbg['scale_rot_fail'] += 1
-                if debug_verbose and _dbg['scale_rot_fail'] <= 5:
-                    print(f"    DBG scale/rot fail q<{qlim} m<{mlim:.1f}: "
-                          f"scale={scale_fit:.4f} (need {0.98*params['initial_scale']:.4f}–{1.02*params['initial_scale']:.4f}), "
-                          f"rot={rot_fit:.3f}° (need |rot|<0.2°)")
-            if _scale_ok and _rot_ok:
-                red_chi2 = chi2 / (2*len(h_b_idx) - 4)
-                red_cost = cost / len(h_b_idx)
-                zp_tier = np.median(gaia_f['mag'][g_b_full_idx] - hst_d['mag'][h_b_idx])
-                discovered.append({
-                    'A': A, 'B': B, 'C': C, 'D': D,
-                    'xs_o': xs_o, 'ys_o': ys_o, 'xt_o': xt_o, 'yt_o': yt_o,
-                    'n_match': len(h_b_idx), 'red_chi2': red_chi2, 'red_cost': red_cost,
-                    'q': qlim, 'm': mlim, 'zp': zp_tier,
-                    'h_v': h_b_idx, 'g_v': g_b_full_idx,
-                    'best_ds': best_ds,
-                    'offset_peaks': offset_peaks,
-                    'offset_hist': tier_hist, 'offset_xed': tier_xed, 'offset_yed': tier_yed,
-                })
-                peaks_str = "  |  ".join(f"dx={dx:.1f},dy={dy:.1f}(s={s:.2f})" for dx, dy, s in offset_peaks)
-                print(f"    q<{qlim} m<{mlim:.1f}: {len(h_b_idx)} stars, red_chi2={red_chi2:.3f}, "
-                      f"red_cost={red_cost:.2f}, zp={zp_tier:.3f}, scale={scale_fit:.6f}, rot={rot_fit:.4f} | "
-                      f"offsets(ds={best_ds:+.4f}): {peaks_str}")
+                    xh_p, yh_p = apply_affine(xh_b, yh_b, A, B, C, D, xs_o, ys_o, xt_o, yt_o)
+                    dx_v, dy_v = xg_b - xh_p, yg_b - yh_p
+                    C_proj = np.einsum('ij,njk,lk->nil', cur_M, hst_d['C'][h_b_idx], cur_M)
+                    dxh_v, dyh_v = xh_b - xs_o, yh_b - ys_o
+                    J = np.zeros((len(dxh_v), 2, 4))
+                    J[:, 0, 0], J[:, 0, 1], J[:, 0, 2] = dxh_v, -dyh_v, 1.0
+                    J[:, 1, 0], J[:, 1, 1], J[:, 1, 3] = dyh_v, dxh_v, 1.0
+                    C_model = np.einsum('nij,jk,nlk->nil', J, C_params, J)
+                    # Add a 1px discovery floor so chi2/cost are on a consistent
+                    # scale regardless of Gaia quality (5p vs 2p) or star brightness.
+                    # Correct matches have small pixel residuals → negative costs;
+                    # false matches have large residuals → positive costs.
+                    # The floor does not affect sigma rejection (which uses ds_4p).
+                    _disc_floor = np.eye(2)[np.newaxis] * 1.0**2
+                    C_tot_v = gaia_f['C'][g_b_full_idx] + C_proj + C_model + _disc_floor
+                    sigs_v = compute_mahalanobis(dx_v, dy_v, C_tot_v)
+                    costs_v = compute_logprob_cost(dx_v, dy_v, C_tot_v)
+                    chi2 = np.sum(sigs_v[curr_keep])
+                    cost = np.sum(costs_v[curr_keep])
+
+                    ds_4p = np.sqrt(dx_v**2 + dy_v**2)
+                    finite_dists = np.isfinite(ds_4p)
+                    p16, p50 = np.nanpercentile(ds_4p[finite_dists & curr_keep], [16, 50])
+                    thresh = min(max(p50 + 3*(p50-p16), 1), cur_rad)
+                    if not np.isfinite(thresh):
+                        thresh = cur_rad
+
+                    # Discovery sigma-rejection uses only the pixel-distance threshold.
+                    # Gaia formal uncertainties (~0.01px) are far smaller than the
+                    # multi-pixel residuals expected from a noisy 4-5 pair 4P fit, so a
+                    # Mahalanobis threshold (sigs_v < 5) would always reject all pairs.
+                    # The scale/rotation sanity check below catches spurious transforms.
+                    good_v = (ds_4p < thresh) & (np.abs(mag_diffs - zp) < max_mag_diff)
+                    if np.sum(good_v) < 3:
+                        break
+                    if np.all(curr_keep == good_v):
+                        break
+                    curr_keep[:] = good_v
+                    zp = np.median(mag_diffs[curr_keep])
+
+                g_b_full_idx = g_b_full_idx[curr_keep]
+                h_b_idx = h_b_idx[curr_keep]
+                if np.sum(good_v) < 3:
+                    _dbg['sigma_rej<3'] += 1
+                    if debug_verbose and _dbg['sigma_rej<3'] <= 3:
+                        print(f"    DBG sigma_rej<3 q<{qlim} m<{mlim:.1f}: "
+                              f"{len(mdf_seed)} pairs → {np.sum(good_v)} after rejection "
+                              f"(dists={np.round(np.sqrt(dx_v**2+dy_v**2),1).tolist()})")
+                    continue
+
+                scale_fit = np.sqrt(A*D - B*C)
+                rot_fit = np.degrees(np.arctan2(B - C, A + D))
+                _scale_ok = 0.98*params['initial_scale'] <= scale_fit <= 1.02*params['initial_scale']
+                _rot_ok = abs(rot_fit) < 0.2
+                if not (_scale_ok and _rot_ok):
+                    _dbg['scale_rot_fail'] += 1
+                    if debug_verbose and _dbg['scale_rot_fail'] <= 5:
+                        print(f"    DBG scale/rot fail q<{qlim} m<{mlim:.1f}: "
+                              f"scale={scale_fit:.4f} (need {0.98*params['initial_scale']:.4f}–{1.02*params['initial_scale']:.4f}), "
+                              f"rot={rot_fit:.3f}° (need |rot|<0.2°)")
+                if _scale_ok and _rot_ok:
+                    red_chi2 = chi2 / (2*len(h_b_idx) - 4)
+                    red_cost = cost / len(h_b_idx)
+                    zp_tier = np.median(gaia_f['mag'][g_b_full_idx] - hst_d['mag'][h_b_idx])
+                    discovered.append({
+                        'A': A, 'B': B, 'C': C, 'D': D,
+                        'xs_o': xs_o, 'ys_o': ys_o, 'xt_o': xt_o, 'yt_o': yt_o,
+                        'n_match': len(h_b_idx), 'red_chi2': red_chi2, 'red_cost': red_cost,
+                        'q': qlim, 'm': mlim, 'zp': zp_tier,
+                        'h_v': h_b_idx, 'g_v': g_b_full_idx,
+                        'best_ds': best_ds,
+                        'offset_peaks': offset_peaks,
+                        'offset_hist': tier_hist, 'offset_xed': tier_xed, 'offset_yed': tier_yed,
+                    })
+                    peaks_str = "  |  ".join(f"dx={dx:.1f},dy={dy:.1f}(s={s:.2f})" for dx, dy, s in offset_peaks)
+                    print(f"    q<{qlim} m<{mlim:.1f}: {len(h_b_idx)} stars, red_chi2={red_chi2:.3f}, "
+                          f"red_cost={red_cost:.2f}, zp={zp_tier:.3f}, scale={scale_fit:.6f}, rot={rot_fit:.4f} | "
+                          f"offsets(ds={best_ds:+.4f}): {peaks_str}")
 
     if not discovered:
         if debug_verbose:
@@ -881,7 +888,8 @@ def chance_significance(n_real, counts):
 
 
 DISCOVERY_AGREE_PX = 3.0    # two tier solutions agree if they map the footprint within this
-MAX_DISCOVERY_CANDIDATES = 4   # distinct discovery clusters evaluated end to end
+MAX_DISCOVERY_CANDIDATES = 6   # distinct discovery clusters evaluated end to end (4 -> 6 with 3 peaks per tier, 2026-10-08)
+DISCOVERY_PEAKS_PER_TIER = 3   # offset-histogram peaks per tier that seed a 4P solution
 
 
 def _select_discovery(discovered, params):
@@ -1045,9 +1053,75 @@ PLAUS_NSIG = 5.0              # ... plus this many fitted sigmas (low-N solution
 CR_SEED_CONC = 1.05          # concentration above which a detection is too sharp for the PSF
 CR_SEED_QFIT = 0.10          # ... only when the PSF fit is also poor (qfit above this)
 GUESS_SEED_RADIUS_PX = 1.5   # direct association radius around a guess-predicted Gaia position
+# Header-first seed (2026-10-08, legacy_bulge_00: 966 of 2277 images -- mostly deep 2012-14 ACS frames with
+# ~90k detections -- failed because the offset-histogram vote had no peak above the chance floor, although
+# their Gaia-tied header WCS was within ~1 px).  When the header WCS is Gaia-tied (WCSNAME contains GAIA),
+# associate Gaia and HST directly at the header prediction first; the normal gates (refinement, plausibility,
+# chance test) decide, and discovery runs only if that fails.  Env BP3M_XMATCH_HEADER_FIRST=0 disables it.
+HEADER_SEED_RADIUS_PX = 2.0
+HEADER_PLAUS_FAP = 1e-10      # beyond the header-label window a solution must beat this chance probability
+HEADER_FIRST = os.environ.get('BP3M_XMATCH_HEADER_FIRST', '1') != '0'
+# Header-neighbourhood scan (2026-10-08): instead of trusting the header point, score every offset within a
+# window set by the header's WCS provenance with a TIGHT association (1 px cells, magnitude-consistent), take the
+# peak, and hand it to the direct-association seed.  Windows from the archive census of solid solutions
+# (chance P < 1e-10; 67k images): Gaia-tied p99 0.34", 2MASS 0.33", GSC2.4.2 0.48-2.7", GSC2.4.0 2.9",
+# HSC 3.0 8.3"; JWST (FGS on GSC 3.2) 2.0" (commissioning-era M92 2.6").  Headers without an a-posteriori
+# solution (bare IDC_*, OPUS: p99 38") keep the offset-histogram discovery.
+def header_scan_window_arcsec(wcsname, telescope='HST'):
+    w = str(wcsname or '').upper()
+    if telescope == 'JWST':
+        return 3.0
+    if 'GAIA' in w or '2MASS' in w:
+        return 1.0
+    if 'GSC242' in w:
+        return 3.0
+    if 'GSC240' in w:
+        return 5.0
+    if 'HSC' in w:
+        return 10.0
+    return None
 
 
-def _guess_direct_seed(guess_affine, params, hst_d, gaia_f, max_mag_diff, min_matches):
+def _header_scan_offset(hst_d, gaia_f, window_px, max_mag_diff, min_peak=5):
+    """(dx, dy, n_peak, n_bg) of the best HST-minus-guess offset within +-window_px, from a tight 3-D
+    (dx, dy, dm) histogram of all Gaia-HST pairs in the window (1 px x 1 px x 0.5 mag cells, 2x2x2 summed);
+    None if the peak has fewer than min_peak pairs."""
+    hx, hy, hm = np.asarray(hst_d['x'], float), np.asarray(hst_d['y'], float), np.asarray(hst_d['mag'], float)
+    gx, gy, gm = np.asarray(gaia_f['xguess'], float), np.asarray(gaia_f['yguess'], float), np.asarray(gaia_f['mag'], float)
+    ok = np.isfinite(hx) & np.isfinite(hy) & np.isfinite(hm)
+    hx, hy, hm = hx[ok], hy[ok], hm[ok]
+    if len(hx) == 0 or len(gx) == 0:
+        return None
+    tree = KDTree(np.column_stack([hx, hy]))
+    lists = tree.query_ball_point(np.column_stack([gx, gy]), r=float(window_px) * 1.415)
+    gi = np.repeat(np.arange(len(gx)), [len(l) for l in lists])
+    hi = np.fromiter((j for l in lists for j in l), int, count=len(gi))
+    if len(gi) < min_peak:
+        return None
+    dx, dy, dm = hx[hi] - gx[gi], hy[hi] - gy[gi], gm[gi] - hm[hi]
+    sel = (np.abs(dx) <= window_px) & (np.abs(dy) <= window_px) & np.isfinite(dm)
+    dx, dy, dm = dx[sel], dy[sel], dm[sel]
+    if len(dx) < min_peak:
+        return None
+    nb = int(np.ceil(window_px)) * 2 + 1
+    eb = np.linspace(-window_px - 0.5, window_px + 0.5, nb + 1)
+    mlo, mhi = np.nanpercentile(dm, 1), np.nanpercentile(dm, 99)
+    mb = np.arange(mlo - 0.5, mhi + 1.0, 0.5)
+    H, _ = np.histogramdd(np.column_stack([dx, dy, dm]), bins=(eb, eb, mb))
+    S = H.copy()
+    S[:-1] += H[1:]; S[:, :-1] += S[:, 1:].copy(); S[:, :, :-1] += S[:, :, 1:].copy()
+    k = np.unravel_index(int(np.argmax(S)), S.shape)
+    n_peak = int(S[k])
+    if n_peak < min_peak:
+        return None
+    m = (dx >= eb[k[0]]) & (dx < eb[min(k[0] + 2, nb)]) & (dy >= eb[k[1]]) & (dy < eb[min(k[1] + 2, nb)]) \
+        & (dm >= mb[k[2]]) & (dm < mb[min(k[2] + 2, len(mb) - 1)])
+    n_bg = float(np.median(S[S > 0])) if np.any(S > 0) else 0.0
+    return float(np.median(dx[m])), float(np.median(dy[m])), n_peak, n_bg
+
+
+def _guess_direct_seed(guess_affine, params, hst_d, gaia_f, max_mag_diff, min_matches,
+                       radius_px=GUESS_SEED_RADIUS_PX):
     """Seed pairs straight from a trusted guess transform (visit-group completion): each Gaia
     source's predicted HST position takes the nearest HST source within GUESS_SEED_RADIUS_PX
     (widened by its propagated Gaia error), one-to-one, magnitude-consistent.  Bypasses the
@@ -1056,7 +1130,7 @@ def _guess_direct_seed(guess_affine, params, hst_d, gaia_f, max_mag_diff, min_ma
     M, t = np.asarray(guess_affine[0], float), np.asarray(guess_affine[1], float)
     c = np.array([params['x_cen'], params['y_cen']])
     h = np.einsum('ij,nj->ni', np.linalg.inv(M), np.column_stack([gaia_f['x'], gaia_f['y']]) - t) + c
-    rad = np.maximum(GUESS_SEED_RADIUS_PX, 3.0 * np.asarray(gaia_f['err'], float))
+    rad = np.maximum(radius_px, 3.0 * np.asarray(gaia_f['err'], float))
     tree = KDTree(np.column_stack([hst_d['x'], hst_d['y']]))
     d, j = tree.query(h, k=4, distance_upper_bound=float(np.max(rad)))
     rows = []
@@ -1354,6 +1428,26 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                       f"-> 6P refinement")
             else:
                 print("  Guess-seeded association found < 3 pairs -> narrowed 4P discovery")
+        _scan_seed = None
+        _win_as = params.get('header_scan_arcsec')
+        if best is None and guess_affine is None and HEADER_FIRST and _win_as:
+            _win_px = float(_win_as) / float(params['pixel_scale'])
+            _off = _header_scan_offset(hst_data_all_disc, gaia_field, _win_px, max_mag_diff)
+            if _off is None:
+                print(f"  Header scan ({params['wcsname'] or 'JWST'}; +-{_win_as}\" = +-{_win_px:.0f} px): no peak -> 4P discovery")
+            else:
+                _dx, _dy, _npk, _nbg = _off
+                _s0 = float(params['initial_scale'])
+                _c0 = np.array([params['x_cen'], params['y_cen']])
+                _scan_seed = _guess_direct_seed((_s0 * np.eye(2), _c0 - _s0 * np.array([_dx, _dy])), params, hst_data_all_disc,
+                                                gaia_field, max_mag_diff, max(5, int(min_matches)), radius_px=HEADER_SEED_RADIUS_PX)
+                print(f"  Header scan ({params['wcsname'] or 'JWST'}; +-{_win_as}\" = +-{_win_px:.0f} px): peak at "
+                      f"dx={_dx:+.2f} dy={_dy:+.2f} px with {_npk} pairs (median occupied cell {_nbg:.1f}); "
+                      + (f"{_scan_seed['n_match']} direct pairs -> extra candidate (chosen by chance probability against discovery)"
+                         if _scan_seed is not None else "< 5 direct pairs -> discovery only"))
+                if _scan_seed is not None:
+                    _scan_seed['_full_idx'] = True
+                    _scan_seed['q'], _scan_seed['m'] = 'scan', float('nan')
         for _tier_name, _seed_mask, _hst_d, _stars_only in ([] if best is not None else _disc_tiers):
             _n_seed = int(_seed_mask.sum())
             if _n_seed < 3:
@@ -1376,6 +1470,9 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 _used_stars_only = _stars_only
                 break
             print(f"  4P Discovery failed [{_tier_name}] — trying next tier...")
+        if best is None and _scan_seed is not None:
+            best, used_tier = _scan_seed, 'header scan only (discovery failed at all tiers)'
+            _scan_seed = None
         if best is None:
             print(f"Finished {image_name}: 4P Discovery failed at all tiers.", file=original_stdout)
             return
@@ -1388,7 +1485,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             # Seed indices from 4P discovery index into the HST dataset used for that
             # tier.  For the stars-only round, remap to full-array indices; for the
             # all-sources round they are already full-array indices.
-            if _used_stars_only:
+            if _used_stars_only and not cand.get('_full_idx'):
                 best_all = {**cand, 'h_v': star_indices[cand['h_v']]}
             else:
                 best_all = cand
@@ -1499,12 +1596,30 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
 
 
         _cands = [best] + list(best.get('_alternatives', []))[:MAX_DISCOVERY_CANDIDATES - 1]
+        if _scan_seed is not None:
+            _cands = _cands + [_scan_seed]
         _results = []
         for _k, _cand in enumerate(_cands):
             if len(_cands) > 1:
                 print(f"  --- candidate {_k + 1}/{len(_cands)}: q<{_cand['q']} m<{_cand['m']:.1f} ({_cand['n_match']} seeds) ---")
             _results.append(_evaluate(_cand))
         _good = [r for r in _results if r['ok']]
+        # header-provenance plausibility (2026-10-08): a solution farther from the header than its WCS label ever
+        # shows in solid solutions (the scan window) must be highly significant; marginal far-off solutions in
+        # sparse fields (archive census: 933 suspect 'successes', e.g. Gaia-tied headers at 2-6") are rejected.
+        if _win_as and _good:
+            _ps = float(params['pixel_scale'])
+            def _off_as(r):
+                return float(np.hypot(r['xt_o'] - r['xs_o'], r['yt_o'] - r['ys_o'])) * _ps
+            _implaus = [r for r in _good if _off_as(r) > float(_win_as) and r['_fap'] > HEADER_PLAUS_FAP]
+            if _implaus:
+                for r in _implaus:
+                    print(f"  Rejected: {_off_as(r):.2f}\" from a {params['wcsname'] or 'JWST'} header (window {_win_as}\") "
+                          f"with only P={r['_fap']:.1e} against chance")
+                _good = [r for r in _good if r not in _implaus]
+                if not _good:
+                    _results = [dict(reason=f"solution {_off_as(_implaus[0]):.2f}\" from a {params['wcsname'] or 'JWST'} header "
+                                            f"(window {_win_as}\") and only P={_implaus[0]['_fap']:.1e} against chance — implausible")]
         if not _good:
             print(f"Finished {image_name}: {_results[0]['reason']}", file=original_stdout)
             return
