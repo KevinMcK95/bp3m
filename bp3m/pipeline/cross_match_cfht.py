@@ -501,9 +501,10 @@ def _cfht_cache_status(img_dir, keys, gdc_file, single_pointing=True):
             return 'run', 'inputs changed'
         return 'skip', f"previously {st.get('status')}"
     if (img_dir / 'matched_cfht.csv').exists():
-        if 'OFFICIAL' in str(gdc_file or ''):
-            return 'run', 'legacy match on a re-corrected catalogue'
-        return 'skip', 'legacy match'
+        # 2026-10-08: a legacy match (no sidecar) predates cfht_label_version 2 and carries the wrong
+        # Gaia labels (src_index keyed per exposure); redo it once -- the sidecar then caches it.
+        # (ursa_minor_1 copy: 148 of 269 match files were legacy and kept 1105 wrong labels alive.)
+        return 'run', 'legacy match predates cfht_label_version 2'
     return 'run', 'never attempted'
 
 

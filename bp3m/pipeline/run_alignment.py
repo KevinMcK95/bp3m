@@ -288,7 +288,19 @@ def run_alignment(  # noqa: C901
         from bp3m.data_loader_cfht import (assign_faint_star_ids,
                                            build_fallback_hst_images)
         import pandas as _pd_c
-        _cm = collect_cfht_matches(data_root / field_name)
+        # only the images of THIS run: the current MAST selection (incl. Gaia-failed images that the
+        # CFHT fallback may admit) plus whatever is loaded; stale directories of earlier selections are
+        # ignored (2026-10-08)
+        _sel = None
+        try:
+            import json as _json_c
+            _sel_p = data_root / field_name / 'HST' / f'{field_name}_selected_obsids.json'
+            if _sel_p.exists():
+                _sel = set(map(str, _json_c.loads(_sel_p.read_text())))
+                _sel |= {n[:-3] if n.endswith(('_hi', '_lo')) else n for n in imgs}
+        except Exception:
+            _sel = None
+        _cm = collect_cfht_matches(data_root / field_name, images=_sel)
         if len(_cm):
             _cm = assign_faint_star_ids(_cm)
             cimgs, cstars, faint_cat = build_cfht_images(
