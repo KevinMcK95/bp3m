@@ -283,6 +283,7 @@ def get_hst_params(flc_file, catalog_file=None):
             "initial_scale_header": initial_scale_header, "scale_source": scale_source,
             "wcsname": str(primary_hdr.get('WCSNAME', '') or ''),
             "header_scan_arcsec": header_scan_window_arcsec(primary_hdr.get('WCSNAME', ''), 'JWST' if _is_jwst else 'HST'),
+            "near_header_arcsec": near_header_arcsec(primary_hdr.get('WCSNAME', ''), 'JWST' if _is_jwst else 'HST'),
             "obs_epoch_mjd": obs_epoch_mjd, "orientat": orientat, "orientat_header": orientat_header,
             "naxis1": naxis1, "naxis2": naxis2,
             "instrument": instrument, "detector": detector,
@@ -1071,6 +1072,23 @@ HEADER_FIRST = os.environ.get('BP3M_XMATCH_HEADER_FIRST', '1') != '0'
 # (chance P < 1e-10; 67k images): Gaia-tied p99 0.34", 2MASS 0.33", GSC2.4.2 0.48-2.7", GSC2.4.0 2.9",
 # HSC 3.0 8.3"; JWST (FGS on GSC 3.2) 2.0" (commissioning-era M92 2.6").  Headers without an a-posteriori
 # solution (bare IDC_*, OPUS: p99 38") keep the offset-histogram discovery.
+def near_header_arcsec(wcsname, telescope='HST'):
+    """Radius within which a low-N solution is a priori plausible for this header provenance (about twice the
+    90th percentile of solid solutions, archive census 2026-10-08); None = no such prior (unfitted headers)."""
+    w = str(wcsname or '').upper()
+    if telescope == 'JWST':
+        return 1.0
+    if 'GAIA' in w or '2MASS' in w:
+        return 0.5
+    if 'GSC242' in w:
+        return 0.7
+    if 'GSC240' in w:
+        return 2.5
+    if 'HSC' in w:
+        return 1.0
+    return None
+
+
 def header_scan_window_arcsec(wcsname, telescope='HST'):
     w = str(wcsname or '').upper()
     if telescope == 'JWST':
@@ -1747,13 +1765,19 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             else:
                 # no triangle support: only very significant vote solutions survive (690-image test: genuine low-N
                 # solutions had P <= 4e-14, the spurious 'suspects' P >= 1.7e-10)
-                _strong = [r for r in _good if r['_fap'] <= TRI_STRONG_FAP]
+                # ... or lie where the header provenance says it should (COSMOS 2026-10-09: genuine 3-5-match
+                # solutions 0.1-0.7\" from GSC/HSC/Gaia-tied headers were dropped; the false locks sit 1.1-2.8\" out)
+                _near = params.get('near_header_arcsec'); _ps = float(params['pixel_scale'])
+                def _oa(r):
+                    return float(np.hypot(r['xt_o'] - r['xs_o'], r['yt_o'] - r['ys_o'])) * _ps
+                _strong = [r for r in _good if r['_fap'] <= TRI_STRONG_FAP or (_near is not None and _oa(r) <= _near)]
                 if len(_strong) < len(_good):
                     print(f"  Triangle check ({_n_trust} Gaia in the footprint): no triangle support; "
-                          f"{len(_good) - len(_strong)} vote-only solution(s) with P > {TRI_STRONG_FAP:.0e} dropped")
+                          f"{len(_good) - len(_strong)} vote-only solution(s) with P > {TRI_STRONG_FAP:.0e} and > "
+                          f"{_near}\" from the header dropped")
                 if not _strong:
-                    _results = [dict(reason=f"no triangle-supported solution and no vote solution with P <= {TRI_STRONG_FAP:.0e} "
-                                            f"({_n_trust} Gaia in the footprint)")]
+                    _results = [dict(reason=f"no triangle-supported solution, no vote solution with P <= {TRI_STRONG_FAP:.0e} "
+                                            f"and none within {_near}\" of the header ({_n_trust} Gaia in the footprint)")]
                 _good = _strong
         if not _good:
             print(f"Finished {image_name}: {_results[0]['reason']}", file=original_stdout)
