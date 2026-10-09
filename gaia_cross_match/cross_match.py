@@ -1062,7 +1062,8 @@ HEADER_SEED_RADIUS_PX = 2.0
 HEADER_PLAUS_FAP = 1e-10
 TRIANGLES = os.environ.get('BP3M_XMATCH_TRIANGLES', '1') != '0'
 TRI_REQUIRE = os.environ.get('BP3M_XMATCH_TRI_REQUIRE', '1') != '0'   # low-N solutions need triangle support
-TRI_AGREE_PX = 4.0           # a solution 'has triangle support' if it maps the header centre within this of one      # beyond the header-label window a solution must beat this chance probability
+TRI_AGREE_PX = 4.0           # a solution 'has triangle support' if it maps the header centre within this of one
+TRI_STRONG_FAP = 1e-12       # without triangle support, a low-N vote solution needs this chance probability      # beyond the header-label window a solution must beat this chance probability
 HEADER_FIRST = os.environ.get('BP3M_XMATCH_HEADER_FIRST', '1') != '0'
 # Header-neighbourhood scan (2026-10-08): instead of trusting the header point, score every offset within a
 # window set by the header's WCS provenance with a TIGHT association (1 px cells, magnitude-consistent), take the
@@ -1737,13 +1738,23 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                                  r['C'] * (_c0[0] - r['xs_o']) + r['D'] * (_c0[1] - r['ys_o']) + r['yt_o']])
             _tri_pts = [_c0 - _s0 * np.array([a, b]) for a, b, _n, _sp in _tri]
             _sup = [r for r in _good if any(np.hypot(*(_gc(r) - tp)) < TRI_AGREE_PX for tp in _tri_pts)]
-            if len(_sup) < len(_good):
-                print(f"  Triangle check ({_n_trust} Gaia in the footprint): {len(_good) - len(_sup)} of {len(_good)} "
-                      f"significant solution(s) have no geometric (triangle) support -> dropped")
-            if not _sup:
-                _results = [dict(reason=f"no triangle-supported solution ({_n_trust} Gaia in the footprint; "
-                                        f"{len(_good)} vote-only solution(s) unconfirmed)")]
-            _good = _sup
+            if _sup:
+                # a geometrically confirmed solution exists: it wins over vote-only ones
+                if len(_sup) < len(_good):
+                    print(f"  Triangle check ({_n_trust} Gaia in the footprint): {len(_good) - len(_sup)} vote-only "
+                          f"solution(s) dropped in favour of {len(_sup)} triangle-supported one(s)")
+                _good = _sup
+            else:
+                # no triangle support: only very significant vote solutions survive (690-image test: genuine low-N
+                # solutions had P <= 4e-14, the spurious 'suspects' P >= 1.7e-10)
+                _strong = [r for r in _good if r['_fap'] <= TRI_STRONG_FAP]
+                if len(_strong) < len(_good):
+                    print(f"  Triangle check ({_n_trust} Gaia in the footprint): no triangle support; "
+                          f"{len(_good) - len(_strong)} vote-only solution(s) with P > {TRI_STRONG_FAP:.0e} dropped")
+                if not _strong:
+                    _results = [dict(reason=f"no triangle-supported solution and no vote solution with P <= {TRI_STRONG_FAP:.0e} "
+                                            f"({_n_trust} Gaia in the footprint)")]
+                _good = _strong
         if not _good:
             print(f"Finished {image_name}: {_results[0]['reason']}", file=original_stdout)
             return
