@@ -79,6 +79,13 @@ def filter_name(ph) -> str:
     return ph.get('FILTER') or (ph.get('FILTER1') if str(ph.get('FILTER1', '')).startswith('F') else ph.get('FILTER2'))
 
 
+def _filter_any(ph, telescope='HST') -> str:
+    if telescope == 'JWST':
+        from bp3m.data_loader_flc import _get_filter      # NIRISS: FILTER=CLEAR, band in PUPIL
+        return _get_filter(ph)
+    return filter_name(ph)
+
+
 def refpix(cat_hdr1, h1):
     """(crpix (2,), ra_cen, dec_cen): mean over chips of the catalogue's CHIPn_CRPIX{1,2}_GDC / CHIPn_CRVAL1/2,
     exactly as gaia_cross_match.process_single_image; FLC ext-1 CRPIX/CRVAL when the catalogue lacks them."""
@@ -91,23 +98,43 @@ def refpix(cat_hdr1, h1):
     return np.array([float(h1['CRPIX1']), float(h1['CRPIX2'])]), float(h1['CRVAL1']), float(h1['CRVAL2'])
 
 
-def frame_geometry(ph, h1, cat_hdr1) -> dict:
-    """Per-image header-frame constants: pred = crpix + M @ (xi, eta)[deg]."""
+def frame_geometry(ph, h1, cat_hdr1, telescope: str = 'HST', transformation: dict | None = None) -> dict:
+    """Per-image header-frame constants: pred = crpix + M @ (xi, eta)[deg].
+
+    HST: Anderson GDC frame, nominal scale x initial_scale x VAFACTOR, rotation -ORIENTAT, epoch EXPSTART.
+    JWST (2026-10-11): the GDC frame's plate scale and orientation implied by the header WCS (SIP), which the
+    cross-match measures per exposure and writes to transformation.csv ('pixel_scale' x 'initial_scale',
+    'orientat'; the same scale-prior centre the loader uses), epoch EXPMID, observer = JWST ephemeris
+    (SCI JWST_X/Y/Z, km, barycentric ICRS) instead of the Earth centre."""
     from bp3m.instrument_config import get_instrument_config
     crpix, ra_cen, dec_cen = refpix(cat_hdr1, h1)
     icfg = get_instrument_config(str(ph.get('INSTRUME')), str(ph.get('DETECTOR')))
-    vaf = float(h1.get('VAFACTOR', ph.get('VAFACTOR', 1.0)) or 1.0)
-    # HST only (Anderson GDC frame, IDCSCALE x VAFACTOR).  JWST labels, when built, must take the GDC-frame
-    # scale from transformation.csv 'initial_scale' (header-WCS measured, 2026-10-07), not this product.
-    pscale_deg = icfg['pixel_scale'] * icfg['initial_scale'] * vaf / 3600.0   # deg/px in Anderson's GDC frame
-    orientat = float(h1.get('ORIENTAT', 0.0))
+    tele_xyz = None
+    if telescope == 'JWST':
+        tr = transformation or {}
+        vaf = float(h1.get('VA_SCALE', 1.0) or 1.0)
+        pscale_deg = float(tr['pixel_scale']) * float(tr['initial_scale']) / 3600.0
+        orientat = float(tr['orientat'])
+        mjd = float(ph.get('EXPMID') or ph['EXPSTART'])
+        try:
+            tele_xyz = [float(h1[k]) / 149597870.7 for k in ('JWST_X', 'JWST_Y', 'JWST_Z')]
+            if not (0.5 < float(np.linalg.norm(tele_xyz)) < 1.5):
+                tele_xyz = None
+        except Exception:
+            tele_xyz = None
+    else:
+        vaf = float(h1.get('VAFACTOR', ph.get('VAFACTOR', 1.0)) or 1.0)
+        pscale_deg = icfg['pixel_scale'] * icfg['initial_scale'] * vaf / 3600.0   # deg/px in Anderson's GDC frame
+        orientat = float(h1.get('ORIENTAT', 0.0))
+        mjd = float(ph['EXPSTART'])
     th = np.radians(-orientat); R0 = np.array([[np.cos(th), np.sin(th)], [-np.sin(th), np.cos(th)]])
     M = np.linalg.inv(R0) @ (np.array([[-1.0, 0.0], [0.0, 1.0]]) / pscale_deg)   # px/deg; +X = -RA
-    mjd = float(ph['EXPSTART']); t_yr = 2000.0 + (mjd - 51544.5) / 365.25
+    t_yr = 2000.0 + (mjd - 51544.5) / 365.25
     return dict(crpix_x=float(crpix[0]), crpix_y=float(crpix[1]), ra_cen=ra_cen, dec_cen=dec_cen, orientat=orientat,
                 vafactor=vaf, pscale_deg=pscale_deg, pscale_mas=pscale_deg * 3.6e6, M=M.tolist(),
-                mjd=mjd, year=t_yr, dt_gaia_yr=t_yr - GAIA_EPOCH, filter=filter_name(ph),
-                instrument=ph.get('INSTRUME'), detector=ph.get('DETECTOR'), wcsname=str(h1.get('WCSNAME', '')))
+                mjd=mjd, year=t_yr, dt_gaia_yr=t_yr - GAIA_EPOCH, filter=_filter_any(ph, telescope),
+                instrument=ph.get('INSTRUME'), detector=ph.get('DETECTOR'), wcsname=str(h1.get('WCSNAME', '')),
+                telescope=telescope, tele_xyz=tele_xyz)
 
 
 def trusted_ids(indv_dirs) -> set:
@@ -153,8 +180,11 @@ def header_frame_inputs(matched: pd.DataFrame, sa: pd.DataFrame, cat, geom: dict
     if len(m) < 5:
         return None
     mjd, dt = geom['mjd'], geom['dt_gaia_yr']
-    with solar_system_ephemeris.set('builtin'):          # as bp3m.solver: Earth barycentric position
-        tele = get_tele_position(Time(mjd, format='mjd'), curr_id='earth')
+    if geom.get('tele_xyz') is not None:                  # JWST: its own ephemeris (as the loader / solver)
+        tele = np.asarray(geom['tele_xyz'], float)
+    else:
+        with solar_system_ephemeris.set('builtin'):      # as bp3m.solver: Earth barycentric position
+            tele = get_tele_position(Time(mjd, format='mjd'), curr_id='earth')
     ra_p, dec_p = propagate_gaia_positions(s.ra.to_numpy(float), s.dec.to_numpy(float), s.pmra.to_numpy(float),
                                            s.pmdec.to_numpy(float), s.parallax.to_numpy(float), dt, tele)
     f_ra, f_dec = get_parallax_factors(s.ra.to_numpy(float), s.dec.to_numpy(float), tele)

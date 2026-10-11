@@ -44,6 +44,39 @@ HDR1_ALL = ['MDRIZSKY', 'ORIENTAT', 'VAFACTOR', 'CCDCHIP', 'LTV1', 'LTV2', 'BINA
             'CD2_1', 'CD2_2']
 HDR_KEYS = ['EXPSTART', 'EXPTIME', 'PA_V3', 'CCDGAIN', 'FLASHDUR', 'PCTEFRAC', 'SUN_ALT',
             'PROPOSID', 'SUBARRAY', 'POSTARG1', 'POSTARG2', 'VAFACTOR', 'ASN_ID', 'APERTURE']
+# JWST (2026-10-11): stage-2 _cal.fits keywords for the same per-image record / label columns.  Primary header:
+HDR0_JWST = ['TELESCOP', 'INSTRUME', 'DETECTOR', 'MODULE', 'CHANNEL', 'FILTER', 'PUPIL', 'PROGRAM', 'OBSERVTN', 'VISIT',
+             'VISITGRP', 'SEQ_ID', 'ACT_ID', 'EXPOSURE', 'EXP_TYPE', 'EXPSTART', 'EXPMID', 'EXPEND', 'EFFEXPTM',
+             'DURATION', 'READPATT', 'NGROUPS', 'NINTS', 'NFRAMES', 'GROUPGAP', 'SUBARRAY', 'SUBSTRT1', 'SUBSTRT2',
+             'SUBSIZE1', 'SUBSIZE2', 'FASTAXIS', 'SLOWAXIS', 'PATTTYPE', 'PATT_NUM', 'NUMDTHPT', 'PATTSIZE',
+             'SUBPXPTS', 'SUBPXNUM', 'XOFFSET', 'YOFFSET', 'APERNAME', 'PPS_APER', 'TARGPROP', 'TARG_RA', 'TARG_DEC',
+             'GS_ORDER', 'GSSTRTTM', 'GSENDTIM', 'GS_RA', 'GS_DEC', 'GS_URA', 'GS_UDEC', 'GS_MAG', 'GS_UMAG',
+             'GS_V3_PA', 'VISITYPE', 'CAL_VER', 'CRDS_CTX', 'DATE-OBS', 'TIME-OBS']
+# ... and SCI extension (pointing, velocity aberration, WCS reference, ephemeris):
+HDR1_JWST = ['PA_V3', 'PA_APER', 'V2_REF', 'V3_REF', 'VPARITY', 'V3I_YANG', 'RA_REF', 'DEC_REF', 'ROLL_REF',
+             'VA_SCALE', 'VA_RA', 'VA_DEC', 'CRPIX1', 'CRPIX2', 'CRVAL1', 'CRVAL2', 'PC1_1', 'PC1_2', 'PC2_1',
+             'PC2_2', 'CDELT1', 'CDELT2', 'NAXIS1', 'NAXIS2', 'PHOTMJSR', 'PHOTUJA2', 'PIXAR_SR', 'PIXAR_A2',
+             'JWST_X', 'JWST_Y', 'JWST_Z', 'JWST_DX', 'JWST_DY', 'JWST_DZ', 'BKGLEVEL', 'S_REGION']
+# label columns shared with HST (same names, JWST equivalents) + JWST-only columns
+HDR_KEYS_JWST = {'expstart': ('h0', 'EXPSTART'), 'exptime': ('h0', 'EFFEXPTM'), 'pa_v3': ('h1', 'PA_V3'),
+                 'proposid': ('h0', 'PROGRAM'), 'subarray': ('h0', 'SUBARRAY'), 'vafactor': ('h1', 'VA_SCALE'),
+                 'aperture': ('h0', 'APERNAME'), 'module': ('h0', 'MODULE'), 'channel': ('h0', 'CHANNEL'),
+                 'pupil': ('h0', 'PUPIL'), 'observtn': ('h0', 'OBSERVTN'), 'visit': ('h0', 'VISIT'),
+                 'exposure': ('h0', 'EXPOSURE'), 'patt_num': ('h0', 'PATT_NUM'), 'numdthpt': ('h0', 'NUMDTHPT'),
+                 'readpatt': ('h0', 'READPATT'), 'ngroups': ('h0', 'NGROUPS'), 'pa_aper': ('h1', 'PA_APER'),
+                 'gs_mag': ('h0', 'GS_MAG'), 'bkglevel': ('h1', 'BKGLEVEL')}
+
+
+def image_files(data_root, field_name: str, image_name: str):
+    """(telescope, image dir, science FITS, pypass catalogue) of one image, searching every telescope root
+    ({field}/HST/mastDownload/HST, {field}/JWST/mastDownload/JWST).  The FITS / catalogue are the HST
+    _flc names when absent (callers test .exists())."""
+    from bp3m.data_loader_flc import find_image_dir, _image_file, _catalog_file
+    img_root = find_image_dir(Path(data_root) / field_name, image_name)
+    tel = img_root.parent.name if img_root.parent.name in ('HST', 'JWST') else 'HST'
+    flc = _image_file(img_root, image_name) or img_root / f'{image_name}_flc.fits'
+    cat_p = _catalog_file(img_root, image_name) or img_root / f'{image_name}_flc_catalog.fits'
+    return tel, img_root, flc, cat_p
 
 
 def _jitter_columns(img_root: Path) -> dict:
@@ -93,50 +126,58 @@ def export_is_current(output_dir) -> bool:
 
 
 def export_gdc_labels(output_dir, field_name: str, data_root, image_name: str,
-                      telescope: str = 'HST', pos_corr_model=None, pos_corr_table=None) -> int:
+                      telescope: str | None = None, pos_corr_model=None, pos_corr_table=None) -> int:
     """Write the GDC label export of a single-image fit into <output_dir>; returns the Stage-1 row count.
 
     Files: gdc_labels.csv.gz (Stage-1 residual rows of this fit), gdc_hdr.csv.gz (header-frame,
     model-independent rows), gdc_image.json (per-image record; written last).  Reads only files
-    on disk, so it can (re)build the export of an image whose fit is cached and not redone."""
+    on disk, so it can (re)build the export of an image whose fit is cached and not redone.
+    The telescope (HST / JWST) is found from where the image lives; *telescope* is accepted for
+    backward compatibility and ignored."""
     from astropy.io import fits
     from scipy.spatial import cKDTree
     out_dir = Path(output_dir)
     image_name = str(image_name).replace('_hi', '').replace('_lo', '')
-    img_root = Path(data_root) / field_name / telescope / 'mastDownload' / telescope / image_name
-    flc = img_root / f'{image_name}_flc.fits'
-    cat_p = img_root / f'{image_name}_flc_catalog.fits'
+    tel, img_root, flc, cat_p = image_files(data_root, field_name, image_name)
+    if tel == 'JWST':
+        pos_corr_model = None          # learned GDC corrections are HST-only (the loader applies none to JWST)
     if not (out_dir / 'detections.npz').exists() or not flc.exists() or not cat_p.exists():
         return 0
     try:
         n_rows, s1_err = _export_stage1(out_dir, field_name, image_name, img_root, flc, cat_p,
-                                        pos_corr_model, pos_corr_table), None
+                                        pos_corr_model, pos_corr_table, tel), None
     except Exception as exc:
         n_rows, s1_err = 0, f'{type(exc).__name__}: {exc}'
     if n_rows == 0 and (out_dir / LABEL_FILE).exists():
         (out_dir / LABEL_FILE).unlink()               # never leave rows of an earlier export behind
     _export_header_frame_and_record(out_dir, field_name, image_name, img_root, flc, cat_p,
-                                    pos_corr_model, pos_corr_table, n_rows, s1_err)
+                                    pos_corr_model, pos_corr_table, n_rows, s1_err, tel)
     return n_rows
 
 
 def _export_header_frame_and_record(out_dir, field_name, image_name, img_root, flc, cat_p,
-                                    pos_corr_model, pos_corr_table, n_stage1, stage1_error=None):
+                                    pos_corr_model, pos_corr_table, n_stage1, stage1_error=None, telescope='HST'):
     import hashlib
     from astropy.io import fits
     from bp3m.pipeline.header_frame import frame_geometry, header_frame_inputs, trusted_ids
+    jw = telescope == 'JWST'
     with fits.open(flc, memmap=True) as hd:
-        ph = hd[0].header; h1 = hd[1].header.copy()
+        ph = hd[0].header; h1 = (hd['SCI'] if jw else hd[1]).header.copy()
         sci = {}
         for e in range(1, len(hd)):
             if hd[e].header.get('EXTNAME') == 'SCI':
                 sci[e] = {k: _jsonable(hd[e].header.get(k)) for k in ('CCDCHIP', 'MDRIZSKY', 'LTV1', 'LTV2', 'NAXIS1', 'NAXIS2')}
-        h0 = {k.replace('-', '_'): _jsonable(ph.get(k)) for k in HDR0_ALL}
+        h0 = {k.replace('-', '_'): _jsonable(ph.get(k)) for k in (HDR0_JWST if jw else HDR0_ALL)}
         ph = ph.copy()
-    h1d = {k: _jsonable(h1.get(k)) for k in HDR1_ALL}
+    h1d = {k: _jsonable(h1.get(k)) for k in (HDR1_JWST if jw else HDR1_ALL)}
+    try:
+        tr = pd.read_csv(img_root / 'transformation.csv').set_index('parameter')['value']
+        tr = {k: _jsonable(v) for k, v in tr.items()}
+    except Exception:
+        tr = {}
     with fits.open(cat_p, memmap=True) as hc:
         cat_hdr1 = hc[1].header.copy(); cat = hc[1].data
-        geom = frame_geometry(ph, h1, cat_hdr1)
+        geom = frame_geometry(ph, h1, cat_hdr1, telescope=telescope, transformation=tr)
         n_hdr = 0; hdr_err = None
         try:
             mg = img_root / 'matched_gaia.csv'
@@ -160,17 +201,12 @@ def _export_header_frame_and_record(out_dir, field_name, image_name, img_root, f
             return {}
     xs = _js(img_root / 'xmatch_status.json'); rc = _js(out_dir / 'run_config.json')
     try:
-        tr = pd.read_csv(img_root / 'transformation.csv').set_index('parameter')['value']
-        tr = {k: _jsonable(v) for k, v in tr.items()}
-    except Exception:
-        tr = {}
-    try:
         xf = pd.read_csv(out_dir / 'image_transformations.csv').to_dict(orient='records')
         xf = [{k: _jsonable(v) for k, v in r.items()} for r in xf]
     except Exception:
         xf = []
     geom_j = {k: (v if k == 'M' else _jsonable(v)) for k, v in geom.items()}
-    rec = {'field': field_name, 'image': image_name, 'label_version': LABEL_VERSION,
+    rec = {'field': field_name, 'image': image_name, 'telescope': telescope, 'label_version': LABEL_VERSION,
            'n_stage1_rows': int(n_stage1), 'n_hdr_rows': int(n_hdr), 'stage1_error': stage1_error, 'hdr_error': hdr_err,
            'header_frame': geom_j, 'h0': h0, 'h1': h1d, 'sci_ext': {str(k): v for k, v in sci.items()},
            'jitter': {k: _jsonable(v) for k, v in _jitter_columns(img_root).items()},
@@ -188,7 +224,8 @@ def _export_header_frame_and_record(out_dir, field_name, image_name, img_root, f
     tmp.write_text(json.dumps(rec, indent=1)); tmp.replace(out_dir / IMAGE_FILE)
 
 
-def _export_stage1(out_dir, field_name, image_name, img_root, flc, cat_p, pos_corr_model, pos_corr_table) -> int:
+def _export_stage1(out_dir, field_name, image_name, img_root, flc, cat_p, pos_corr_model, pos_corr_table,
+                   telescope='HST') -> int:
     from astropy.io import fits
     from scipy.spatial import cKDTree
     det = np.load(out_dir / 'detections.npz', allow_pickle=True)
@@ -199,9 +236,16 @@ def _export_stage1(out_dir, field_name, image_name, img_root, flc, cat_p, pos_co
                      usecols=lambda c: c in ('Gaia_id', 'pmra', 'pmdec', 'parallax', 'pmra_error', 'pmdec_error',
                                              'parallax_error', 'gmag', 'bp_rp', 'ruwe', 'Gaia_time'))
     xf = pd.read_csv(out_dir / 'image_transformations.csv')
+    jw = telescope == 'JWST'
     ph = fits.getheader(flc, 0)
-    hdr = {k.lower(): ph.get(k) for k in HDR_KEYS}
-    filt = ph.get('FILTER') or (ph.get('FILTER1') if str(ph.get('FILTER1', '')).startswith('F') else ph.get('FILTER2'))
+    if jw:
+        from bp3m.data_loader_flc import _get_filter
+        h1s = fits.getheader(flc, 'SCI')
+        hdr = {k: (ph if src == 'h0' else h1s).get(kw) for k, (src, kw) in HDR_KEYS_JWST.items()}
+        filt = _get_filter(ph)                        # NIRISS: FILTER=CLEAR, band in PUPIL
+    else:
+        hdr = {k.lower(): ph.get(k) for k in HDR_KEYS}
+        filt = ph.get('FILTER') or (ph.get('FILTER1') if str(ph.get('FILTER1', '')).startswith('F') else ph.get('FILTER2'))
     inst, detc = ph.get('INSTRUME'), ph.get('DETECTOR')
     sky_ext = {}
     with fits.open(flc, memmap=True) as hd:
@@ -217,7 +261,7 @@ def _export_stage1(out_dir, field_name, image_name, img_root, flc, cat_p, pos_co
     tree = cKDTree(cat_xy)
     names = cat.dtype.names
     pcm, pc_hdr = None, None
-    if pos_corr_model:
+    if pos_corr_model and not jw:
         pcm = _pos_corr(str(pos_corr_model)); pc_hdr = pcm.read_header(flc)
     rows = []
     for k in keys:
@@ -272,10 +316,13 @@ def _export_stage1(out_dir, field_name, image_name, img_root, flc, cat_p, pos_co
     df = pd.concat(rows, ignore_index=True)
     const = {**hdr, **_jitter_columns(img_root)}
     df = pd.concat([df, pd.DataFrame({k: [v] * len(df) for k, v in const.items()})], axis=1)
-    df['mjd'] = float(ph['EXPSTART']); df['filter'] = filt; df['instrument'] = inst; df['detector'] = detc
+    # JWST: exposure MIDPOINT (the epoch the loader / solver use for JWST frames); HST: EXPSTART as before
+    df['mjd'] = float(ph['EXPMID'] if jw and ph.get('EXPMID') is not None else ph['EXPSTART'])
+    df['filter'] = filt; df['instrument'] = inst; df['detector'] = detc; df['telescope'] = telescope
     df['year'] = 2000.0 + (df['mjd'] - 51544.5) / 365.25
     df['phase_x'] = np.mod(df['x'], 1.0); df['phase_y'] = np.mod(df['y'], 1.0)
-    df['y_chip'] = np.where(df['chip_ext'] == 4, df['y'] - (2051.0 if inst == 'WFC3' else 2048.0), df['y'])
+    df['y_chip'] = (df['y'] if jw else
+                    np.where(df['chip_ext'] == 4, df['y'] - (2051.0 if inst == 'WFC3' else 2048.0), df['y']))
     df['n_sat'] = df['n_sat'].fillna(0).astype(int)
     df['gdc_corr_model'] = str(pos_corr_model) if pos_corr_model else ''
     df['gdc_corr_dir'] = str(getattr(pcm, 'dir', '')) if pcm is not None else ''
@@ -384,10 +431,13 @@ def consolidate_field(field_name: str, data_root, indv_root=None, log=print) -> 
             cur[d.name] = rp.stat().st_mtime
         elif (d / 'detections.npz').exists():
             stale.append(d.name)
-    try:
-        sel = set(json.loads((Path(data_root) / field_name / 'HST' / f'{field_name}_selected_obsids.json').read_text()))
-    except Exception:
-        sel = None
+    sel = None
+    for _tel in ('HST', 'JWST'):                 # union of every telescope's current selection
+        try:
+            sel = (sel or set()) | set(json.loads((Path(data_root) / field_name / _tel
+                                                   / f'{field_name}_selected_obsids.json').read_text()))
+        except Exception:
+            pass
     old_man = {}
     try:
         old_man = json.loads((root / MANIFEST).read_text())

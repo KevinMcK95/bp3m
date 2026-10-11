@@ -1581,18 +1581,21 @@ def main():
             # fully loading EVERY directory on disk to build a name list (M31: 13,716 dirs, ~1 h per rerun) --
             # is kept for --indv_discover_all_disk / --bp3m_all_images (user wants on-disk discovery).
             _defer_load = (_bp3m_images is not None and not args.indv_discover_all_disk)
+            # image dirs are looked up in every telescope root ({field}/HST/..., {field}/JWST/...;
+            # 2026-10-11: JWST frames get indv fits + GDC label exports exactly like HST images)
+            from bp3m.data_loader_flc import find_image_dir as _find_dir_ix, _image_file as _img_file_ix, \
+                _catalog_file as _cat_file_ix
             if _defer_load:
-                _hst_root_ix = output_dir / field / 'HST' / 'mastDownload' / 'HST'
                 # no matched_gaia.csv -> no Gaia stars -> the full loader would have skipped it too
                 _indv_names = [n for n in sorted(set(_bp3m_images))
-                               if (_hst_root_ix / n / 'matched_gaia.csv').exists()]
+                               if (_find_dir_ix(output_dir / field, n) / 'matched_gaia.csv').exists()]
                 _imgs_all, _spi_all = {}, {}
                 if args.restrict_filters or args.restrict_instdet:
                     from astropy.io import fits as _fits_ix
                     from bp3m.data_loader_flc import _get_filter as _gf_ix
                     for _n in _indv_names:
                         try:
-                            _h0 = _fits_ix.getheader(str(_hst_root_ix / _n / f'{_n}_flc.fits'), 0)
+                            _h0 = _fits_ix.getheader(str(_img_file_ix(_find_dir_ix(output_dir / field, _n), _n)), 0)
                             _imgs_all[_n] = {'filter': _gf_ix(_h0), 'instrument': str(_h0.get('INSTRUME', '')).strip(),
                                              'detector': str(_h0.get('DETECTOR', '')).strip()}
                         except Exception:
@@ -1633,15 +1636,14 @@ def main():
                 --use_indv_outputs can verify the joint fit sees the same
                 cross-match outputs (md5, not mtime heuristics)."""
                 import hashlib as _hl
-                _m = (output_dir / field / 'HST' / 'mastDownload' / 'HST'
-                      / _img_name / 'matched_gaia.csv')
+                _m = _find_dir_ix(output_dir / field, _img_name) / 'matched_gaia.csv'
                 _cfg = {'indv_fit_version': INDV_FIT_VERSION}
                 if _m.exists():
                     _cfg['matched_gaia_md5'] = _hl.md5(_m.read_bytes()).hexdigest()
                     _cfg['matched_gaia_mtime'] = _m.stat().st_mtime
                 # distortion table behind the catalogue's x_gdc/y_gdc
                 from bp3m.pipeline.cross_match import catalog_gdc_id as _cgid
-                _cat = _m.parent / f'{_img_name}_flc_catalog.fits'
+                _cat = _cat_file_ix(_m.parent, _img_name) or (_m.parent / f'{_img_name}_flc_catalog.fits')
                 _cfg['gdc_id'] = _cgid(_cat)
                 try:
                     from astropy.io import fits as _fits
