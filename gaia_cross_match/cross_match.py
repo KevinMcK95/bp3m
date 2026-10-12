@@ -1412,12 +1412,13 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 _r2g = _jsat.raw_to_gdc(hst_cat['x'], hst_cat['y'], hst_cat['x_gdc'], hst_cat['y_gdc'])
                 if _r2g is not None:
                     _sat_g = _r2g(_scx, _scy)
-                _drop, _core = _jsat.near_saturation(hst_cat['x'], hst_cat['y'], _scx, _scy, _sreq)
+                _drop, _core, _fitted = _jsat.near_saturation(hst_cat['x'], hst_cat['y'], _scx, _scy, _sreq)
                 _n_sat_drop = int(_drop.sum())
                 _is_core = _core
                 print(f'  JWST saturated clusters: {len(_scx)}; {_n_sat_drop} catalogue sources within '
                       f'max({_jsat.JWST_SAT_EXCL_PX:.0f} px, {_jsat.JWST_SAT_EXCL_REQ:.0f} r_eq) of one dropped '
-                      f'(spike / wing detections), {int(_core.sum())} core detections kept')
+                      f'(spike / wing detections), {int(_core.sum())} core detections kept '
+                      f'({"fitted cores" if _fitted else "masked cores"})')
                 if _n_sat_drop:
                     hst_cat = hst_cat[~_drop]
                     _orig_row_idx = _orig_row_idx[~_drop]

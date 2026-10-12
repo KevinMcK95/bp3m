@@ -31,6 +31,10 @@ JWST_SAT_CORE_PX = 4.0        # ... except the core detection, within max(this, 
                               # masked (pre-a4a4226 catalogues) a partially saturated star is still detected 3-3.5 px off
                               # the cluster centroid (And XIV / XVII matches); the artefact detections sit at >= 4.8 px
                               # and >= 1.03 r_eq (5,738 artefact matches of the validation sample: 1.3% inside this)
+JWST_SAT_CORE_FITTED_PX = 1.5   # core radius when the catalogue FITS the saturated cores (pypass >= a4a4226): the core
+                                # detection sits 0.2-0.5 px from the centroid, and NIRISS adds a second one ~3 px out
+JWST_CORE_FITTED_FRAC = 0.13    # cores counted as fitted when this fraction of clusters has a detection within 1 px
+                                # (validation sample: masked-core catalogues 0.00-0.11, fitted-core 0.15-0.92)
 JWST_ANCHOR_GMAX = 18.0       # Gaia stars used as saturated-core anchors
 JWST_ANCHOR_BIN_PX = 2.0
 JWST_ANCHOR_MIN = 3           # stars in the anchor offset peak
@@ -109,19 +113,23 @@ def saturated_clusters(flc_path):
 
 
 def near_saturation(x_raw, y_raw, cx, cy, r_eq):
-    """(drop, core) masks over the catalogue: drop = within the exclusion radius of a saturated cluster and not
-    its core detection; core = the detection nearest to a cluster centroid, if within the core radius.  Only one:
-    fitted NIRISS cores (pypass a4a4226, M4) come with a second detection ~3 px out, inside the core radius, and the
-    matcher locked onto those (solution 3 px off the anchors, 200+ matches)."""
+    """(drop, core, fitted) over the catalogue.  core = the detection nearest to a cluster centroid, if within the
+    core radius; drop = within the exclusion radius of a cluster and not a core.  fitted = the catalogue fits the
+    saturated cores (JWST_CORE_FITTED_FRAC of the clusters have a detection within 1 px).  The core radius is then
+    JWST_SAT_CORE_FITTED_PX: fitted NIRISS cores (M4) come with a second detection ~3 px out, which the matcher
+    locked onto (165 matches, 2.6-2.9 px off the anchors).  With masked cores (older catalogues) the star's own
+    detection sits 3-3.5 px off, so the radius is max(JWST_SAT_CORE_PX, r_eq)."""
     x_raw, y_raw = np.asarray(x_raw, float), np.asarray(y_raw, float)
     drop = np.zeros(len(x_raw), bool); core = np.zeros(len(x_raw), bool)
     ok = np.isfinite(x_raw) & np.isfinite(y_raw)
     if len(cx) == 0 or not ok.any():
-        return drop, core
+        return drop, core, False
     idx = np.where(ok)[0]
     tree = cKDTree(np.column_stack([x_raw[idx], y_raw[idx]]))
+    d1, _ = tree.query(np.column_stack([cx, cy]))
+    fitted = bool(np.mean(d1 < 1.0) >= JWST_CORE_FITTED_FRAC)
     r_ex = np.maximum(JWST_SAT_EXCL_PX, JWST_SAT_EXCL_REQ * r_eq)
-    r_co = np.maximum(JWST_SAT_CORE_PX, r_eq)
+    r_co = np.full(len(cx), JWST_SAT_CORE_FITTED_PX) if fitted else np.maximum(JWST_SAT_CORE_PX, r_eq)
     for k in range(len(cx)):
         near = tree.query_ball_point([cx[k], cy[k]], float(r_ex[k]))
         if not near:
@@ -132,7 +140,7 @@ def near_saturation(x_raw, y_raw, cx, cy, r_eq):
         if d.min() <= r_co[k]:
             core[idx[near[np.argmin(d)]]] = True      # one core detection per saturated star: the nearest
     drop &= ~core
-    return drop, core
+    return drop, core, fitted
 
 
 def raw_to_gdc(x_raw, y_raw, x_gdc, y_gdc):
