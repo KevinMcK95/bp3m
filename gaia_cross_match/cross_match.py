@@ -17,6 +17,7 @@ from scipy.spatial import KDTree
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from .miracle_match import miracle_match, rd2x, rd2y
 from .catalog_matcher import fit_affine_weighted, fit_4p_weighted, apply_affine, compute_mahalanobis, compute_logprob_cost, find_offset, find_scale_and_offset
+from . import jwst_saturation as _jsat
 from bp3m.instrument_config import get_instrument_config, SIGMA_ROT_DEG, SIGMA_SCALE, SIGMA_SKEW
 from bp3m.astro_utils import (GAIA_SYS_DICT, get_tele_position,
                               get_parallax_factors, propagate_gaia_positions)
@@ -1304,6 +1305,13 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             except Exception:
                 _photplam = np.nan
         _chance_mag_win = CHANCE_MAG_WIN_UV if (np.isfinite(_photplam) and _photplam < 4000.0) else CHANCE_MAG_WIN
+        _abg_win = None
+        if str(params.get('instrument', '')).strip().upper() in ('NIRCAM', 'NIRISS', 'MIRI'):
+            _h0 = fits.getheader(hst['flc'], 0)
+            _jfilt = _jsat.jwst_filter_name(_h0)
+            _abg_win = _jsat.jwst_abg_window(params['instrument'], params['detector'], _jfilt)
+            if str(params['instrument']).strip().upper() == 'MIRI':
+                _chance_mag_win = _jsat.MIRI_CHANCE_MAG_WIN
 
         # --- Propagate Gaia to HST epoch and project to pixel frame ---
         from bp3m.astro_utils import field_typical_astrometry
@@ -1392,6 +1400,38 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             print(f'  Dropping {(~_valid).sum()} NaN/inf rows from HST catalog')
             hst_cat = hst_cat[_valid]
             _orig_row_idx = _orig_row_idx[_valid]
+        # JWST saturated stars (2026-10-12, gaia_cross_match.jwst_saturation): DQ-SATURATED cluster centroids
+        # (anchors, below) and removal of the spike / wing detections around them; the core detection stays
+        _is_jwst_img = str(params.get('instrument', '')).strip().upper() in ('NIRCAM', 'NIRISS', 'MIRI')
+        _sat_g = None            # saturated-cluster centroids in the GDC frame
+        _n_sat_drop = 0
+        _is_core = np.zeros(len(hst_cat), bool)     # saturated-core detections (biased photometry)
+        if _is_jwst_img:
+            _scx, _scy, _sreq = _jsat.saturated_clusters(hst['flc'])
+            if len(_scx):
+                _r2g = _jsat.raw_to_gdc(hst_cat['x'], hst_cat['y'], hst_cat['x_gdc'], hst_cat['y_gdc'])
+                if _r2g is not None:
+                    _sat_g = _r2g(_scx, _scy)
+                _drop, _core, _fitted = _jsat.near_saturation(hst_cat['x'], hst_cat['y'], _scx, _scy, _sreq)
+                _n_sat_drop = int(_drop.sum())
+                _is_core = _core
+                print(f'  JWST saturated clusters: {len(_scx)}; {_n_sat_drop} catalogue sources within '
+                      f'max({_jsat.JWST_SAT_EXCL_PX:.0f} px, {_jsat.JWST_SAT_EXCL_REQ:.0f} r_eq) of one dropped '
+                      f'(spike / wing detections), {int(_core.sum())} core detections kept '
+                      f'({"fitted cores" if _fitted else "masked cores"})')
+                if _n_sat_drop:
+                    hst_cat = hst_cat[~_drop]
+                    _orig_row_idx = _orig_row_idx[~_drop]
+                    _is_core = _is_core[~_drop]
+        if _is_jwst_img:
+            _psig = np.sqrt(np.maximum(hst_cat['cov_xx_gdc'].astype(float), hst_cat['cov_yy_gdc'].astype(float)))
+            _bad_sig = ~(_psig <= _jsat.JWST_MAX_POS_SIG_PX)
+            if _bad_sig.any():
+                print(f'  {int(_bad_sig.sum())} detections with position error > {_jsat.JWST_MAX_POS_SIG_PX:g} px '
+                      f'(unconverged fits) dropped')
+                hst_cat = hst_cat[~_bad_sig]
+                _orig_row_idx = _orig_row_idx[~_bad_sig]
+                _is_core = _is_core[~_bad_sig]
         x_hst      = hst_cat['x_gdc'].astype(float)
         y_hst      = hst_cat['y_gdc'].astype(float)
         # Learned GDC correction (same applier and sign as the BP3M loaders: corrected = x_gdc - bias),
@@ -1448,6 +1488,25 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             'err': g_err_in, 'has_pms': in_has_pms,
             'xguess': xg_guess_in, 'yguess': yg_guess_in,
         }
+        # JWST saturated-core anchors: the header offset measured from the saturated clusters of bright Gaia
+        # stars (independent of the catalogue's spike / wing detections).  Seeds the match below and gates every
+        # candidate solution: one that does not put the anchors on their cores is rejected.
+        _anc = None
+        if _sat_g is not None:
+            _hok = np.isfinite(x_hst) & np.isfinite(y_hst)
+            _fp = (x_hst[_hok].min(), x_hst[_hok].max(), y_hst[_hok].min(), y_hst[_hok].max()) if _hok.any() else (0, 0, 0, 0)
+            _awin = float(params.get('header_scan_arcsec') or 3.0) / float(params['pixel_scale'])
+            _anc = _jsat.anchor_offset(_sat_g[0], _sat_g[1], xg_guess_in, yg_guess_in, g_mag_in, _awin, _fp)
+            if _anc is None:
+                print(f"  Saturated-core anchors: no significant offset peak (+-{_awin:.0f} px, G < {_jsat.JWST_ANCHOR_GMAX:g})")
+            else:
+                print(f"  Saturated-core anchors: header offset dx={_anc['dx']:+.2f} dy={_anc['dy']:+.2f} px from "
+                      f"{_anc['n_peak']} of {_anc['n_pairs']} bright-Gaia / cluster pairs (P={_anc['fap']:.1e}); "
+                      f"{len(_anc['anchors'][0])} anchors")
+        if _anc is not None and guess_affine is None:
+            # centre the guesses (and so every offset search) on the anchored header offset
+            gaia_field['xguess'] = xg_guess_in + _anc['dx']
+            gaia_field['yguess'] = yg_guess_in + _anc['dy']
         if guess_affine is not None:
             _M, _t = np.asarray(guess_affine[0], float), np.asarray(guess_affine[1], float)
             _c = np.array([params['x_cen'], params['y_cen']])
@@ -1543,6 +1602,21 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 print("  Guess-seeded association found < 3 pairs -> narrowed 4P discovery")
         _scan_seed = None
         _extra_seeds = []
+        if best is None and _anc is not None:
+            # direct association at the anchored offset: an extra candidate next to the discovery ones (which now
+            # search around the same offset); the anchor gate then decides between them
+            _s0 = float(params['initial_scale']); _c0 = np.array([params['x_cen'], params['y_cen']])
+            _anc_seed = _guess_direct_seed((_s0 * np.eye(2), _c0 - _s0 * np.array([_anc['dx'], _anc['dy']])), params,
+                                           hst_data_all_disc, gaia_field, max_mag_diff, max(3, int(min_matches)),
+                                           radius_px=HEADER_SEED_RADIUS_PX)
+            if _anc_seed is not None:
+                _anc_seed['_full_idx'] = True
+                _anc_seed['q'], _anc_seed['m'] = 'anchor', float('nan')
+                _extra_seeds.append(_anc_seed)
+                print(f"  Anchor-seeded association: {_anc_seed['n_match']} Gaia-HST pairs within {HEADER_SEED_RADIUS_PX} px "
+                      f"of the anchored prediction (zp={_anc_seed['zp']:.3f}) -> extra candidate")
+            else:
+                print("  Anchor-seeded association found < 3 pairs (discovery searches around the anchored offset)")
         _tri, _n_trust = [], None
         _win_as = params.get('header_scan_arcsec')
         if best is None and guess_affine is None and HEADER_FIRST and _win_as:
@@ -1602,7 +1676,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 break
             print(f"  4P Discovery failed [{_tier_name}] — trying next tier...")
         if best is None and _extra_seeds:
-            best, used_tier = _extra_seeds.pop(0), 'header scan / triangle seed (discovery failed at all tiers)'
+            best, used_tier = _extra_seeds.pop(0), 'header scan / triangle / anchor seed (discovery failed at all tiers)'
         if best is None:
             print(f"Finished {image_name}: 4P Discovery failed at all tiers.", file=original_stdout)
             return
@@ -1694,6 +1768,17 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 return dict(ok=False, reason='Final match filtering removed all stars.')
             if len(h_final) < max(3, int(min_matches)):
                 return dict(ok=False, reason=f'only {len(h_final)} final matches (< {max(3, int(min_matches))}) — rejected.')
+            # JWST absolute photometric gate: the matched stars' AB - G must look like stars, not like the
+            # spike / wing detections of saturated stars (5-8 mag too faint).  Measured on the matches that are not
+            # saturated cores: a fitted partially saturated core reads up to ~2 mag faint (M4 NIRISS F150W: +3.4),
+            # and frames whose every match is a core (all Gaia stars saturated) are left to the anchor gate.
+            _nc = ~_is_core[final_mdf['h'].values]
+            _abg = (float(-np.median(final_mdf['mag_diff'].values[_nc])) if mag_system == 'AB' and _nc.sum() >= 3
+                    else float('nan'))
+            if _abg_win is not None and np.isfinite(_abg) and not (_abg_win[0] <= _abg <= _abg_win[1]):
+                print(f"  AB - G of the matches = {_abg:+.2f} outside [{_abg_win[0]:+.2f}, {_abg_win[1]:+.2f}] for {_jfilt}")
+                return dict(ok=False, reason=f'matched stars AB - G = {_abg:+.2f} mag outside the {_jfilt} window '
+                                             f'[{_abg_win[0]:+.2f}, {_abg_win[1]:+.2f}] (saturated-star artefacts?) — rejected.')
 
             # --- Chance-coincidence test: the same solution shifted by tens of px ---
             _md_core = final_mdf['mag_diff'].values[final_mdf['s'].values < CHANCE_SIGMA_MAX]
@@ -1733,6 +1818,21 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 print(f"  --- candidate {_k + 1}/{len(_cands)}: q<{_cand['q']} m<{_cand['m']:.1f} ({_cand['n_match']} seeds) ---")
             _results.append(_evaluate(_cand))
         _good = [r for r in _results if r['ok']]
+        if _anc is not None and _good:
+            _agree = []
+            for r in _good:
+                _med, _frac = _jsat.anchor_agreement(r['A'], r['B'], r['C'], r['D'], r['xs_o'], r['ys_o'], r['xt_o'],
+                                                     r['yt_o'], x_g_in, y_g_in, _anc['anchors'])
+                r['_anc_med'], r['_anc_frac'] = _med, _frac
+                if _med < _jsat.JWST_ANCHOR_TOL_PX and _frac >= _jsat.JWST_ANCHOR_MIN_FRAC:
+                    _agree.append(r)
+                else:
+                    print(f"  Rejected: solution puts the {len(_anc['anchors'][0])} saturated-core anchors {_med:.1f} px "
+                          f"(median) from their cores ({100 * _frac:.0f}% within {_jsat.JWST_ANCHOR_TOL_PX:g} px)")
+            if not _agree:
+                _results = [dict(reason=f"no solution agrees with the saturated-core anchors (header offset "
+                                        f"{_anc['dx']:+.1f},{_anc['dy']:+.1f} px from {len(_anc['anchors'][0])} anchors)")]
+            _good = _agree
         # header-provenance plausibility (2026-10-08): a solution farther from the header than its WCS label ever
         # shows in solid solutions (the scan window) must be highly significant; marginal far-off solutions in
         # sparse fields (archive census: 933 suspect 'successes', e.g. Gaia-tied headers at 2-6") are rejected.
@@ -1740,7 +1840,8 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             _ps = float(params['pixel_scale'])
             def _off_as(r):
                 return float(np.hypot(r['xt_o'] - r['xs_o'], r['yt_o'] - r['ys_o'])) * _ps
-            _implaus = [r for r in _good if _off_as(r) > float(_win_as) and r['_fap'] > HEADER_PLAUS_FAP]
+            # (an anchor-confirmed solution is exempt: the saturated cores measured where the header really is)
+            _implaus = [r for r in _good if _off_as(r) > float(_win_as) and r['_fap'] > HEADER_PLAUS_FAP and _anc is None]
             if _implaus:
                 for r in _implaus:
                     print(f"  Rejected: {_off_as(r):.2f}\" from a {params['wcsname'] or 'JWST'} header (window {_win_as}\") "
@@ -1749,7 +1850,8 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                 if not _good:
                     _results = [dict(reason=f"solution {_off_as(_implaus[0]):.2f}\" from a {params['wcsname'] or 'JWST'} header "
                                             f"(window {_win_as}\") and only P={_implaus[0]['_fap']:.1e} against chance — implausible")]
-        if TRIANGLES and TRI_REQUIRE and _good and _n_trust is not None and _n_trust < TRI_MAX_TRUST:
+        # (anchor agreement is the stronger geometric confirmation: no triangle requirement then)
+        if TRIANGLES and TRI_REQUIRE and _good and _n_trust is not None and _n_trust < TRI_MAX_TRUST and _anc is None:
             _c0 = np.array([params['x_cen'], params['y_cen']]); _s0 = float(params['initial_scale'])
             def _gc(r):
                 return np.array([r['A'] * (_c0[0] - r['xs_o']) + r['B'] * (_c0[1] - r['ys_o']) + r['xt_o'],
@@ -1868,6 +1970,15 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         # scale prior centre used here (numeric only: read_transformation float()s every value)
         trans_out.add_row(['initial_scale', params['initial_scale']])
         trans_out.add_row(['initial_scale_header', params.get('initial_scale_header', params['initial_scale'])])
+        if _is_jwst_img:
+            # JWST saturated-star guards (numeric; NaN = not applicable)
+            trans_out.add_row(['n_near_sat_dropped', float(_n_sat_drop)])
+            trans_out.add_row(['n_sat_anchors', float(len(_anc['anchors'][0])) if _anc is not None else 0.0])
+            trans_out.add_row(['sat_anchor_dx', _anc['dx'] if _anc is not None else float('nan')])
+            trans_out.add_row(['sat_anchor_dy', _anc['dy'] if _anc is not None else float('nan')])
+            trans_out.add_row(['sat_anchor_resid_px', float(_pick.get('_anc_med', float('nan')))])
+            trans_out.add_row(['ab_minus_g', float(-np.median(final_matches['mag'].values - final_matches['mag_hst'].values))
+                               if mag_system == 'AB' else float('nan')])
         trans_out.write(os.path.join(hst['root'], "transformation.csv"), format='ascii.csv', overwrite=True)
         print(f"Finished {image_name}: Found {len(final_matches)} matches in {time.time()-start_time:.2f}s.", file=original_stdout)
 

@@ -132,6 +132,7 @@ def _header_wcs_gaia_aligned(flc_path) -> bool:
 #   version bump (user 2026-10-06) -- it only changes the outcome of images that FAIL at v4, and those are re-run with
 #   --retry_failed_xmatch (BP3M_XMATCH_RETRY_FAILED=1) instead of a full archive rematch.
 XMATCH_ALGO_VERSION = 4
+JWST_XMATCH_VERSION = 1   # JWST-only logic (gaia_cross_match.jwst_saturation); a params_meta key only for JWST
 
 
 def catalog_gdc_changed(catalog_path) -> bool:
@@ -562,6 +563,13 @@ def run_cross_match(
     if _n_det:
         print(f"  Detached {_n_det} hard-linked cross-match output file(s) (shared with a field copy) before rewriting")
 
+    if telescope.upper() == 'JWST' and pos_corr_model:
+        # the learned GDC correction is an HST model: the BP3M loaders never apply it to JWST positions, so the JWST
+        # cross-match neither applies it nor swaps in the tight solver plate priors it implies (rot 0.03 deg, scale
+        # 2e-5, skew 1e-5); JWST keeps the XMATCH_* widths of the no-model path (2026-10-12)
+        print(f"  JWST: learned GDC correction {pos_corr_model} is HST-only — not applied; plate priors stay at the "
+              f"no-model widths")
+        pos_corr_model = None
     if telescope.upper() == 'JWST' and discovery_max_offset > JWST_DISCOVERY_MAX_OFFSET:
         print(f"  JWST: 4P offset search capped at +-{JWST_DISCOVERY_MAX_OFFSET} px (Gaia-tied FGS headers; was {discovery_max_offset})")
         discovery_max_offset = JWST_DISCOVERY_MAX_OFFSET
@@ -592,6 +600,10 @@ def run_cross_match(
         'init_resid_max':       init_resid_max,
         'pos_corr_model':       (str(pos_corr_model) if pos_corr_model else None),
     }
+    if telescope.upper() == 'JWST':
+        # JWST-only matching version (HST caches unaffected).  1 = (2026-10-12) saturated-core anchors, spike / wing
+        # sources near saturated clusters dropped, AB - G gate, MIRI chance window, non-science frames skipped
+        params_meta['jwst_xmatch_version'] = JWST_XMATCH_VERSION
     # With a learned GDC correction the catalog frame is the corrected one, so the plate
     # priors are the (tight, data-driven) solver priors; without it the raw header frame
     # keeps the loose XMATCH_* widths (uncorrected ACS TDD skew etc.).  CLI values win.
@@ -640,6 +652,7 @@ def run_cross_match(
     work = []
     skipped = []
     skipped_nophot = []
+    skipped_nonsci = []
     flagged_trailed: dict = {}
     for hst in tqdm(folders, desc="  Checking cross-match cache", unit="img",
                     dynamic_ncols=True):
@@ -653,6 +666,23 @@ def run_cross_match(
                 root, dict(params_meta_img, gdc_changed=catalog_gdc_changed(hst['catalog'])))
             if action == 'skip':
                 skipped.append(name)
+                continue
+
+        # JWST non-science exposures (target acquisition, coronagraph / weak-lens / grism pupils): recorded as
+        # skipped with the reason, as the download step's failed-observation manifest does
+        if telescope.upper() == 'JWST':
+            try:
+                from astropy.io import fits as _fits
+                from .download_hst import _nonscience_reason_jwst
+                _ns = _nonscience_reason_jwst(_fits.getheader(hst['flc'], 0))
+            except Exception:
+                _ns = None
+            if _ns:
+                for _f in ('matched_gaia.csv', 'transformation.csv'):
+                    if (root / _f).exists():
+                        (root / _f).unlink()
+                _write_xmatch_status(root, 'skipped', params_meta_img, reason=_ns)
+                skipped_nonsci.append(f"{name} ({_ns})")
                 continue
 
         # Skip images without photometric calibration — their mag column is all
@@ -693,6 +723,8 @@ def run_cross_match(
     if skipped_nophot:
         print(f"  {len(skipped_nophot)} image(s) skipped — no photometric calibration (PHOTFLAM missing): "
               f"{', '.join(skipped_nophot)}")
+    if skipped_nonsci:
+        print(f"  {len(skipped_nonsci)} JWST non-science image(s) skipped: {', '.join(skipped_nonsci)}")
     if flagged_trailed:
         print(f"  {len(flagged_trailed)} image(s) look trailed (image_quality.json) — matched anyway, flagged in "
               f"xmatch_status.json: {', '.join(flagged_trailed)}")
