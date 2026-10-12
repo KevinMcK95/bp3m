@@ -2199,6 +2199,7 @@ def run_pop_fit(
     v1_prior_sigma_rot_deg       = _v1_cli.get('prior_sigma_rot_deg',       None)
     v1_prior_sigma_scale         = _v1_cli.get('prior_sigma_scale',         None)
     v1_prior_sigma_skew          = _v1_cli.get('prior_sigma_skew',          None)
+    v1_prior_sigma_skew_hst_only = bool(_v1_cli.get('prior_sigma_skew_hst_only', False))
     v1_prior_sigma_pointing      = _v1_cli.get('prior_sigma_pointing',      None)
     v1_use_pair_prior            = _v1_hp.get('use_pair_prior',             False)
     v1_fit_chip_offset           = bool(v1_cfg.get('fit_chip_offset', False))   # 8p: mirror the v1 layout
@@ -2497,6 +2498,7 @@ def run_pop_fit(
                         prior_sigma_rot_deg=v1_prior_sigma_rot_deg,
                         prior_sigma_scale=v1_prior_sigma_scale,
                         prior_sigma_skew=v1_prior_sigma_skew,
+                        prior_sigma_skew_hst_only=v1_prior_sigma_skew_hst_only,
                         prior_sigma_pointing=v1_prior_sigma_pointing,
                         prior_sigma_poly_px=poly_prior_px,
                         prior_sigma_pair_rot_deg=v1_prior_sigma_pair_rot_deg,

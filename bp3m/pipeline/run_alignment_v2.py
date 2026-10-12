@@ -672,6 +672,7 @@ def run_alignment_v2(
     prior_sigma_rot_deg: float | None = None,
     prior_sigma_scale: float | None = None,
     prior_sigma_skew: float | None = None,
+    prior_sigma_skew_hst_only: bool = False,
     prior_sigma_pointing: float | None = None,
     prior_sigma_pair_rot_deg: float | None = None,
     prior_sigma_pair_scale: float | None = None,
@@ -875,9 +876,11 @@ def run_alignment_v2(
               "using transformation.csv initialization.")
 
     # ── Initialise solver ─────────────────────────────────────────────────────
+    _skew_hst_only = bool(prior_sigma_skew_hst_only)   # forwarded from v1 (run_iterate_v2)
     if prior_sigma_skew is None and pos_corr_model:      # as run_alignment (2026-09-30)
         from bp3m.instrument_config import SIGMA_SKEW_CORRECTED
         prior_sigma_skew = SIGMA_SKEW_CORRECTED
+        _skew_hst_only = True     # the model corrects HST positions only
         print(f"  skew prior: pos_corr_model applied -> sigma_skew = {prior_sigma_skew:g}")
     SolverClass = BP3MSolverSparse if use_sparse else BP3MSolver
     solver = SolverClass(
@@ -888,6 +891,7 @@ def run_alignment_v2(
         prior_sigma_rot_deg=prior_sigma_rot_deg,
         prior_sigma_scale=prior_sigma_scale,
         prior_sigma_skew=prior_sigma_skew,
+        prior_sigma_skew_hst_only=_skew_hst_only,
         prior_sigma_pointing=prior_sigma_pointing,
         prior_sigma_pair_rot_deg=prior_sigma_pair_rot_deg,
         prior_sigma_pair_scale=prior_sigma_pair_scale,
