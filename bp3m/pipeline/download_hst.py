@@ -1667,12 +1667,28 @@ def _invalidate_psf_cache(flc_path: Path) -> None:
 _VERIFY_RULES = 2
 
 
+def _nonscience_reason_jwst(h0) -> str | None:
+    """JWST exposures that are not direct science imaging (2026-10-12), excluded like HST calibration exposures:
+    EXP_TYPE not *_IMAGE (target acquisition NRC_TACQ / NRC_TACONFIRM / MIR_TACQ, coronagraphy, AMI, grism,
+    time-series NRC_TSIMAGE), or a PUPIL coronagraph mask / weak lens / grism.  The four 47 Tuc F212N frames
+    with ~300 detections were MASKRND coronagraph images (DN/s, uncalibrated) fitted with the clear-pupil PSF;
+    programmes 6005 / 7651 F210M are NRC_TACONFIRM."""
+    exp_type = str(h0.get('EXP_TYPE', '') or '').strip().upper()
+    pupil = str(h0.get('PUPIL', '') or '').strip().upper()
+    if exp_type and not exp_type.endswith('_IMAGE'):
+        return f"non-science exposure (EXP_TYPE='{exp_type}')"
+    if pupil.startswith(('MASK', 'WL', 'GRISM')):
+        return f"non-science exposure (PUPIL='{pupil}', EXP_TYPE='{exp_type}')"
+    return None
+
+
 def _failed_reason_jwst(h0) -> str | None:
     """JWST failed-observation rules on a primary header (Liwen Chen's bp3m fork):
     1. EFFEXPTM == 0        — no effective exposure time collected;
     2. ENG_QUAL != 'OK'     — guide-star / engineering problem during the exposure;
     3. DATAPROB == True     — pipeline flagged a data problem;
-    4. VISITSTA != 'SUCCESSFUL' — the visit did not complete.
+    4. VISITSTA != 'SUCCESSFUL' — the visit did not complete;
+    5. not direct science imaging (_nonscience_reason_jwst).
     """
     effexptm = h0.get('EFFEXPTM', None)
     eng_qual = str(h0.get('ENG_QUAL', '') or '').strip()
@@ -1686,7 +1702,7 @@ def _failed_reason_jwst(h0) -> str | None:
         return "DATAPROB=True"
     if visitsta and visitsta != 'SUCCESSFUL':
         return f"VISITSTA='{visitsta}'"
-    return None
+    return _nonscience_reason_jwst(h0)
 
 
 def _failed_reason_hst(h0) -> str | None:
