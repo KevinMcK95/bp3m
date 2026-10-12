@@ -1109,6 +1109,7 @@ def run_photometry_fits(
     psf_delta=None,
     mag_st_max=28.0,
     noise_from_err=None,
+    jwst_mask_saturated=False,
     **kwargs,
 ):
     """Run PSF-fitting photometry on all science chips of a FITS image.
@@ -1121,6 +1122,10 @@ def run_photometry_fits(
     (library naming, PUPIL filter, PIXAR_SR AB zero point, ERR^2 noise, DQ policy)
     were adapted from Liwen Chen's jwst1pass_py_v2.
 
+    jwst_mask_saturated : bool.  JWST only: mask SATURATED (DQ 2) pixels that are not also
+                 DO_NOT_USE.  False (default) keeps calwebb's early-group slope estimates in
+                 partially saturated cores.  On five dense SW frames (2026-10-12) the recovered
+                 stars matched Gaia as well as unsaturated stars in the same frame.
     noise_from_err : None | bool.  Use the pipeline ERR extension (squared) as the
                  total per-pixel variance.  None = JWST yes, HST only with the
                  PYPASS_NOISE_FROM_ERR=1 environment switch.
@@ -1333,8 +1338,12 @@ def run_photometry_fits(
                       f"{_fmin_from_mag:.1f} e- in {_exptime:.0f}s)")
 
         # offsets from the chip header: CCDCHIP mosaic position + subarray LTV
+        # JWST: load_image returns only the non-finite-pixel mask; the DQ policy below is the
+        # whole DQ mask.  (Until 2026-10-12 load_image also received dq_ext with dq_flags=None,
+        # i.e. EVERY non-zero bit, and the policy was OR-ed onto it, so JUMP_DET (4), TELEGRAPH
+        # and UNRELIABLE_* pixels -- 0.8-6.4% of a dense NIRCam SW frame -- were masked too.)
         data, _g, _rn, mask, x_offset, y_offset = load_image(
-            image_path, sci_ext=sci_ext, dq_ext=dq_ext, dq_flags=dq_flags)
+            image_path, sci_ext=sci_ext, dq_ext=(None if _is_jwst else dq_ext), dq_flags=dq_flags)
 
         # Load raw DQ integer array for per-star DQ stats and to rebuild the
         # boolean mask excluding warm pixels (bit 4), which are mild enough to
@@ -1346,7 +1355,8 @@ def run_photometry_fits(
                     _dq_array = np.array(_dqh[dq_ext].data, dtype=np.int32)
                 if _is_jwst:
                     # JWST: mask listed bits only (NaN pixels carry DO_NOT_USE), see JWST_DQ_MASK_BITS
-                    _dqm = (_dq_array & np.int32(JWST_DQ_MASK_BITS & 0x7fffffff)) != 0
+                    _bits = JWST_DQ_MASK_BITS if jwst_mask_saturated else (JWST_DQ_MASK_BITS & ~JWST_DQ_SATURATED)
+                    _dqm = (_dq_array & np.int32(_bits & 0x7fffffff)) != 0
                     _dqm |= _dq_array < 0        # bit 31 (REFERENCE_PIXEL) reads as the sign bit
                     mask = _dqm | (mask if mask is not None else False)
                 else:
@@ -1529,10 +1539,11 @@ def run_photometry_fits(
         if _chip_recs and _chip_dq is not None:
             compute_dq_stats(_chip_recs, _chip_dq)
             if is_jwst(instrume):
-                # JWST n_sat = masked (DO_NOT_USE | SATURATED) pixels in the fit window, the analogue of
-                # HST's count above sat_threshold (no numeric threshold exists for MJy/sr data)
+                # JWST n_sat = masked (DO_NOT_USE, and SATURATED when it is masked) pixels in the fit
+                # window, the analogue of HST's count above sat_threshold (no numeric threshold exists
+                # for MJy/sr data)
                 _ny, _nx = _chip_dq.shape; _hw = int(half_width)
-                _lost = (_chip_dq & np.int32(1 | JWST_DQ_SATURATED)) != 0
+                _lost = (_chip_dq & np.int32(1 | (JWST_DQ_SATURATED if jwst_mask_saturated else 0))) != 0
                 for _r in _chip_recs:
                     _xi, _yi = int(round(float(_r.x))), int(round(float(_r.y)))
                     _r.n_sat = int(_lost[max(_yi - _hw, 0):_yi + _hw + 1, max(_xi - _hw, 0):_xi + _hw + 1].sum())
