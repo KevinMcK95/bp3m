@@ -27,7 +27,10 @@ JWST_DQ_SATURATED = 2
 JWST_SAT_MIN_PIX = 4          # a saturated cluster has >= this many connected SATURATED pixels
 JWST_SAT_EXCL_PX = 20.0       # sources within max(this, JWST_SAT_EXCL_REQ x r_eq) of a cluster centroid are dropped ...
 JWST_SAT_EXCL_REQ = 3.0
-JWST_SAT_CORE_PX = 2.0        # ... except the core detection, within max(this, r_eq / 2) of the centroid
+JWST_SAT_CORE_PX = 4.0        # ... except the core detection, within max(this, r_eq) of the centroid.  With the core
+                              # masked (pre-a4a4226 catalogues) a partially saturated star is still detected 3-3.5 px off
+                              # the cluster centroid (And XIV / XVII matches); the artefact detections sit at >= 4.8 px
+                              # and >= 1.03 r_eq (5,738 artefact matches of the validation sample: 1.3% inside this)
 JWST_ANCHOR_GMAX = 18.0       # Gaia stars used as saturated-core anchors
 JWST_ANCHOR_BIN_PX = 2.0
 JWST_ANCHOR_MIN = 3           # stars in the anchor offset peak
@@ -115,7 +118,7 @@ def near_saturation(x_raw, y_raw, cx, cy, r_eq):
     idx = np.where(ok)[0]
     tree = cKDTree(np.column_stack([x_raw[idx], y_raw[idx]]))
     r_ex = np.maximum(JWST_SAT_EXCL_PX, JWST_SAT_EXCL_REQ * r_eq)
-    r_co = np.maximum(JWST_SAT_CORE_PX, 0.5 * r_eq)
+    r_co = np.maximum(JWST_SAT_CORE_PX, r_eq)
     for k in range(len(cx)):
         near = tree.query_ball_point([cx[k], cy[k]], float(r_ex[k]))
         if not near:
