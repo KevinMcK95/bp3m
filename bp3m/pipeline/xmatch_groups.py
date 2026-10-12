@@ -507,6 +507,8 @@ def run_group_pass(folders: list, gaia_df: pd.DataFrame, match_kwargs: dict, par
         f"{len(groups) - len(todo)} unchanged since their last pass (skipped), {len(todo)} to check")
     if not todo:
         return 0
+    if callable(gaia_df):    # lazily loaded field Gaia table (run_cross_match): only now is it needed
+        gaia_df = gaia_df()
     for fs in todo:          # stale scratch dirs from an interrupted pass
         for f in fs:
             for d in Path(f['root']).glob('.xmatch_group_tmp*'):
@@ -670,6 +672,41 @@ def run_group_pass(folders: list, gaia_df: pd.DataFrame, match_kwargs: dict, par
 # JWST: sibling-predicted transformations for frames without a Gaia solution (2026-10-07)
 # ---------------------------------------------------------------------------
 
+PREALIGN_CACHE_VERSION = 1   # bump on any change to write_jwst_sibling_prealign / classify / consensus logic
+
+
+def _prealign_member_sig(f: dict) -> list:
+    """Everything a Member (and the prealign file it may own) is built from: status, match, transformation,
+    catalogue and image (size + mtime), and the current transformation_prealign.csv."""
+    r = Path(f['root'])
+
+    def _st(p):
+        try:
+            st = Path(p).stat()
+            return [st.st_size, st.st_mtime_ns]
+        except OSError:
+            return None
+    return [r.name, file_md5(r / 'xmatch_status.json'), file_md5(r / 'matched_gaia.csv'),
+            file_md5(r / 'transformation.csv'), _st(f['catalog']), _st(f['flc']),
+            file_md5(r / 'transformation_prealign.csv')]
+
+
+def _prealign_group_sig(fs: list) -> str:
+    blob = json.dumps({'v': PREALIGN_CACHE_VERSION, 'gp': GROUP_PASS_VERSION, 'min_sib': MIN_SIB_MATCHES,
+                       'spread': PREALIGN_MAX_SPREAD_PX, 'low_n': [LOW_N_MAX, LOW_N_MAX_OFFSET_MAS],
+                       'members': sorted(_prealign_member_sig(f) for f in fs)}, sort_keys=True, default=str)
+    return hashlib.md5(blob.encode()).hexdigest()[:16]
+
+
+def _jwst_tel_dir(folders: list) -> "Path | None":
+    """{field}/JWST for folders laid out as {field}/JWST/mastDownload/JWST/<image>, else None."""
+    try:
+        r = Path(folders[0]['root'])
+        return r.parents[2] if r.parents[1].name == 'mastDownload' else None
+    except (IndexError, KeyError):
+        return None
+
+
 def write_jwst_sibling_prealign(folders: list, log=print) -> int:
     """For every JWST frame of a visit group WITHOUT a usable Gaia solution (cross-match failed, or demoted as
     spurious) write <image>/transformation_prealign.csv: the transformation.csv-schema affine predicted from the
@@ -679,38 +716,71 @@ def write_jwst_sibling_prealign(folders: list, log=print) -> int:
     sparse M31-satellite fields (And XIV: 125/154 frames unmatched) the G < 19 Gaia stars are saturated in the
     300 s NIRCam frames, so this is the only way the SW detectors enter the solve.  Returns the number written;
     stale files of frames that have their own good solution are removed."""
-    groups = light_groups(folders, None)
-    n_written = n_removed = n_nocons = 0
+    # Groups whose members' inputs and prealign files are unchanged since the last call are skipped
+    # (2026-10-12: building Member() for all 2833 47Tuc_JWST_dev frames took 23 min although every group was
+    # unchanged).  The header-only grouping shares the group pass's visit_groups_cache.json.
+    _tel = _jwst_tel_dir(folders) if folders else None
+    groups = light_groups(folders, (_tel / 'visit_groups_cache.json') if _tel is not None else None)
+    _cpath = (_tel / 'jwst_prealign_cache.json') if _tel is not None else None
+    try:
+        _cache = json.loads(_cpath.read_text()) if _cpath is not None and _cpath.exists() else {}
+    except Exception:
+        _cache = {}
+    _new_cache = {}
+    n_written = n_removed = n_nocons = n_skipped = 0
     for fs in groups:
-        ms = [m for m in (Member(f) for f in fs) if not m.empty and getattr(m, 'telescope', 'HST') == 'JWST']
-        if not ms:
+        _gkey = ','.join(sorted(Path(f['root']).name for f in fs))
+        _sig = _prealign_group_sig(fs)
+        _c = _cache.get(_gkey)
+        if _c is not None and _c.get('sig') == _sig:
+            n_written += int(_c.get('n_written', 0)); n_nocons += int(_c.get('n_nocons', 0))
+            n_skipped += 1; _new_cache[_gkey] = _c
             continue
-        info = classify(ms, {})
-        trusted = [m for m in ms if info[m.name]['cls'] == 'trusted']
-        for m in ms:
-            pre = m.root / 'transformation_prealign.csv'
-            if m.ok and info[m.name]['cls'] != 'suspect':
-                if pre.exists():
-                    pre.unlink(); n_removed += 1
-                continue
-            cons = consensus(m, [s for s in trusted if s is not m])
-            if cons is None or cons[1] > PREALIGN_MAX_SPREAD_PX:
-                n_nocons += 1
-                if pre.exists():
-                    pre.unlink(); n_removed += 1
-                continue
-            (M, t), spread, n_sib = cons
-            A_, B_, C_, D_ = M[0, 0], M[0, 1], M[1, 0], M[1, 1]
-            fr = m.params
-            vals = dict(A=A_, B=B_, C=C_, D=D_, xs_o=m.c[0], ys_o=m.c[1], xt_o=t[0], yt_o=t[1],
-                        ratio=float(np.sqrt(abs(A_ * D_ - B_ * C_))), rot_deg=float(np.degrees(np.arctan2(B_ - C_, A_ + D_))),
-                        on_skew=0.5 * (A_ - D_), off_skew=0.5 * (B_ + C_), zp=np.nan,
-                        ra_cen=fr['ra_cen'], dec_cen=fr['dec_cen'], x_cen=fr['x_cen'], y_cen=fr['y_cen'],
-                        pixel_scale=fr['pixel_scale'], orientat=fr['orientat'], prealign_anchor=np.nan,
-                        initial_scale=fr.get('initial_scale', np.nan), initial_scale_header=fr.get('initial_scale_header', np.nan),
-                        n_match=0, rms_px=float(spread), n_siblings=int(n_sib), prealign_source='jwst_visit_siblings')
-            pd.DataFrame({'parameter': list(vals), 'value': list(vals.values())}).to_csv(pre, index=False)
-            n_written += 1
+        _counts = _process_prealign_group(fs)
+        n_written += _counts[0]; n_removed += _counts[1]; n_nocons += _counts[2]
+        _new_cache[_gkey] = {'sig': _prealign_group_sig(fs), 'n_written': _counts[0], 'n_nocons': _counts[2]}
+    if _cpath is not None:
+        try:
+            _tmp = _cpath.with_name(_cpath.name + '.tmp')
+            _tmp.write_text(json.dumps(_new_cache)); _tmp.replace(_cpath)
+        except Exception:
+            pass
     log(f"  [{_ts()}] JWST sibling pre-alignment: {n_written} unmatched frame(s) given a sibling-predicted "
-        f"transformation_prealign.csv ({n_nocons} without a consistent sibling consensus, {n_removed} stale file(s) removed)")
+        f"transformation_prealign.csv ({n_nocons} without a consistent sibling consensus, {n_removed} stale file(s) removed; "
+        f"{n_skipped}/{len(groups)} group(s) unchanged, skipped)")
     return n_written
+
+
+def _process_prealign_group(fs: list) -> tuple:
+    """One visit group of write_jwst_sibling_prealign -> (n_written, n_removed, n_nocons)."""
+    n_written = n_removed = n_nocons = 0
+    ms = [m for m in (Member(f) for f in fs) if not m.empty and getattr(m, 'telescope', 'HST') == 'JWST']
+    if not ms:
+        return 0, 0, 0
+    info = classify(ms, {})
+    trusted = [m for m in ms if info[m.name]['cls'] == 'trusted']
+    for m in ms:
+        pre = m.root / 'transformation_prealign.csv'
+        if m.ok and info[m.name]['cls'] != 'suspect':
+            if pre.exists():
+                pre.unlink(); n_removed += 1
+            continue
+        cons = consensus(m, [s for s in trusted if s is not m])
+        if cons is None or cons[1] > PREALIGN_MAX_SPREAD_PX:
+            n_nocons += 1
+            if pre.exists():
+                pre.unlink(); n_removed += 1
+            continue
+        (M, t), spread, n_sib = cons
+        A_, B_, C_, D_ = M[0, 0], M[0, 1], M[1, 0], M[1, 1]
+        fr = m.params
+        vals = dict(A=A_, B=B_, C=C_, D=D_, xs_o=m.c[0], ys_o=m.c[1], xt_o=t[0], yt_o=t[1],
+                    ratio=float(np.sqrt(abs(A_ * D_ - B_ * C_))), rot_deg=float(np.degrees(np.arctan2(B_ - C_, A_ + D_))),
+                    on_skew=0.5 * (A_ - D_), off_skew=0.5 * (B_ + C_), zp=np.nan,
+                    ra_cen=fr['ra_cen'], dec_cen=fr['dec_cen'], x_cen=fr['x_cen'], y_cen=fr['y_cen'],
+                    pixel_scale=fr['pixel_scale'], orientat=fr['orientat'], prealign_anchor=np.nan,
+                    initial_scale=fr.get('initial_scale', np.nan), initial_scale_header=fr.get('initial_scale_header', np.nan),
+                    n_match=0, rms_px=float(spread), n_siblings=int(n_sib), prealign_source='jwst_visit_siblings')
+        pd.DataFrame({'parameter': list(vals), 'value': list(vals.values())}).to_csv(pre, index=False)
+        n_written += 1
+    return n_written, n_removed, n_nocons

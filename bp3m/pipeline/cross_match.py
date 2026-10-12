@@ -531,10 +531,16 @@ def run_cross_match(
     print(f"Step 4: Cross-matching {telescope.upper()} ↔ Gaia")
     print("─"*50)
 
-    gaia_df = load_gaia_data(field_name, str(Path(output_dir)))
-    if gaia_df is None:
-        print("  ERROR: could not load Gaia catalogue.")
-        return []
+    # The field Gaia table is loaded lazily (2026-10-12): a fully cached rerun only needs it if Step 4c
+    # finds a changed visit group (47Tuc_JWST_dev: ~1 min of CSV parsing for nothing otherwise).
+    _gaia_box: dict = {}
+
+    def _gaia():
+        if 'df' not in _gaia_box:
+            _gaia_box['df'] = load_gaia_data(field_name, str(Path(output_dir)))
+        if _gaia_box['df'] is None:
+            raise RuntimeError("could not load Gaia catalogue")
+        return _gaia_box['df']
 
     folders = _find_image_folders(output_dir, field_name,
                                    telescope=telescope, im_type=im_type)
@@ -614,7 +620,7 @@ def run_cross_match(
         print("\n  Step 4c: visit-group completion (sibling-seeded rematch of failed / inconsistent images)")
         try:
             _n_changed = run_group_pass(
-                folders, gaia_df, _kw,
+                folders, _gaia, _kw,
                 lambda m: dict(params_meta, gdc_id=catalog_gdc_id(m.catalog)), dict(params_meta),
                 n_processes=n_processes, force=force_group_pass,
                 cache_path=Path(output_dir) / field_name / telescope.upper() / 'visit_groups_cache.json')
@@ -665,7 +671,7 @@ def run_cross_match(
         if _q.get('trailed'):
             flagged_trailed[name] = {k: _q.get(k) for k in ('trailed', 'axis_ratio', 'pa_coherence', 'pa_deg', 'n_sources')}
 
-        work.append((hst, gaia_df, {
+        work.append((hst, None, {     # Gaia table filled in below (lazy load)
             'hst_pix_floor':        hst_pix_floor,
             'min_matches':          min_matches,
             'zero_pm':              zero_pm,
@@ -714,6 +720,12 @@ def run_cross_match(
                     print(f"  WARNING: QSO vetting failed — {_qexc}")
         return [p for p in existing if p.exists()]
 
+    try:
+        gaia_df = _gaia()
+    except RuntimeError:
+        print("  ERROR: could not load Gaia catalogue.")
+        return []
+    work = [(w[0], gaia_df, w[2]) for w in work]
     print(f"  Gaia stars:  {len(gaia_df)}")
     print(f"  Images to process: {len(work)}")
     _cmd = (

@@ -144,6 +144,96 @@ def resolve_gaia_csvs(field_path):
             False)
 
 
+class GaiaIdFloatMap:
+    """float(source_id) -> int64 source_id, vectorised (np.searchsorted on sorted float keys).
+
+    Same answers as the dict ``{float(g): np.int64(g) for g in ids}`` built in catalogue order: on a
+    float64 collision (two 19-digit ids rounding to the same double) the LAST id in catalogue order wins,
+    exactly as dict assignment does.  Replaces that 3M-entry dict for dense fields (2026-10-12 profile:
+    2.9 s per 47Tuc_JWST_dev worker to build, and a pickled copy per loader process)."""
+
+    def __init__(self, ids):
+        ids = np.asarray(ids, dtype=np.int64)
+        f = ids.astype(np.float64)
+        order = np.argsort(f, kind="stable")          # stable: equal keys stay in catalogue order
+        fs, gs = f[order], ids[order]
+        last = np.ones(len(fs), dtype=bool)
+        if len(fs) > 1:
+            last[:-1] = fs[1:] != fs[:-1]
+        self.keys, self.vals = fs[last], gs[last]
+
+    def lookup(self, floats, missing=-1) -> np.ndarray:
+        floats = np.asarray(floats, dtype=np.float64)
+        out = np.full(floats.shape, np.int64(missing), dtype=np.int64)
+        if len(self.keys) == 0 or floats.size == 0:
+            return out
+        i = np.clip(np.searchsorted(self.keys, floats), 0, len(self.keys) - 1)
+        hit = self.keys[i] == floats                   # NaN never hits (as a dict lookup of a NaN misses)
+        out[hit] = self.vals[i[hit]]
+        return out
+
+    def get(self, f, default=None):
+        """dict.get-compatible single lookup."""
+        if len(self.keys) == 0:
+            return default
+        f = float(f)
+        i = min(int(np.searchsorted(self.keys, f)), len(self.keys) - 1)
+        return np.int64(self.vals[i]) if self.keys[i] == f else default
+
+
+def _in_sorted(sorted_ids: np.ndarray, values) -> np.ndarray:
+    """Boolean membership of ``values`` in the ascending int64 array ``sorted_ids`` (O(n log N); replaces
+    ``Series.isin(set)``, which re-hashes the whole N-element set on every call: 1.5 s per image against
+    47Tuc_JWST_dev's 3M Gaia ids)."""
+    values = np.asarray(values, dtype=np.int64)
+    if len(sorted_ids) == 0 or values.size == 0:
+        return np.zeros(values.shape, dtype=bool)
+    i = np.clip(np.searchsorted(sorted_ids, values), 0, len(sorted_ids) - 1)
+    return sorted_ids[i] == values
+
+
+# Slim Gaia catalogue cache (2026-10-12): every --fit_indv_images_only worker used to re-read the whole field
+# Gaia CSV for its one frame (47Tuc_JWST_dev: 3.0M rows / 1.7 GB, 22 s of a 43 s frame).  The processed
+# gaia_catalog (column subset, dropna, sort, dedup, rename) is written once as parquet next to the CSVs and
+# reused while every input CSV keeps its size and mtime; parquet keeps the int64 ids and float64 columns
+# exactly.  Bump _GAIA_SLIM_VERSION whenever the processing below changes.
+_GAIA_SLIM_VERSION = 1
+
+
+def _gaia_slim_cache_path(paths, mode: str) -> "Path | None":
+    import hashlib
+    try:
+        items = []
+        for p in paths:
+            st = Path(p).stat()
+            items.append((str(Path(p).resolve()), st.st_size, st.st_mtime_ns))
+    except OSError:
+        return None
+    blob = json.dumps({"v": _GAIA_SLIM_VERSION, "mode": mode, "files": items})
+    return Path(paths[0]).parent / ".bp3m_gaia_slim" / f"{hashlib.md5(blob.encode()).hexdigest()[:20]}.parquet"
+
+
+def _read_gaia_slim(path: "Path | None"):
+    if path is None or not path.exists():
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return None
+
+
+def _write_gaia_slim(path: "Path | None", df: pd.DataFrame) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, path)                          # atomic: concurrent readers see the old or the new file
+    except Exception as exc:
+        print(f"  (Gaia slim cache not written: {exc})")
+
+
 # Science-image suffixes per telescope product: HST FLC/FLT, JWST stage-2 CAL.
 _IMAGE_SUFFIXES = ("_flc", "_flt", "_cal")
 _JWST_INSTRUMENTS = {"NIRCAM", "NIRISS", "MIRI"}
@@ -511,9 +601,12 @@ def _build_stars_df(img_dir: Path, img_name: str,
     if sid_col.dtype == np.float64 and gaia_float_to_int64 is not None:
         raw_floats = sid_col.to_numpy(float)
         _sentinel  = np.int64(-1)
-        gaia_ids   = np.array(
-            [gaia_float_to_int64.get(f, _sentinel) for f in raw_floats],
-            dtype=np.int64)
+        if isinstance(gaia_float_to_int64, GaiaIdFloatMap):
+            gaia_ids = gaia_float_to_int64.lookup(raw_floats, missing=_sentinel)
+        else:
+            gaia_ids = np.array(
+                [gaia_float_to_int64.get(f, _sentinel) for f in raw_floats],
+                dtype=np.int64)
         # Drop rows whose float ID couldn't be mapped (shouldn't happen for
         # stars that originated from this Gaia catalog, but guard just in case)
         valid = gaia_ids != _sentinel
@@ -929,66 +1022,85 @@ def load_image_data_flc(data_root, field_name: str,
         return pd.read_csv(path, usecols=lambda c: c in _gaia_usecols) \
                  .rename(columns={"SOURCE_ID": "source_id"})
 
+    # Which CSVs, and how they are combined (each mode keeps its original de-duplication order)
     if gaia_csv is not None:
         if isinstance(gaia_csv, (list, tuple)):
-            gaia_paths = [Path(p) for p in gaia_csv]
-            missing = [p for p in gaia_paths if not p.exists()]
+            _gaia_mode, _gaia_paths = "list", [Path(p) for p in gaia_csv]
+            missing = [p for p in _gaia_paths if not p.exists()]
             if missing:
                 raise FileNotFoundError(f"Gaia CSV(s) not found: {missing}")
-            gaia_frames = [_read_gaia_csv(p) for p in gaia_paths]
-            gaia_raw = (pd.concat(gaia_frames, ignore_index=True)
-                        .drop_duplicates("source_id"))
-            print(f"Loading {len(gaia_paths)} Gaia catalogs "
-                  f"({len(gaia_raw)} unique stars)")
         else:
             gaia_csv = Path(gaia_csv)
             if not gaia_csv.exists():
                 raise FileNotFoundError(f"Gaia CSV not found: {gaia_csv}")
-            print(f"Loading Gaia catalog: {gaia_csv.name}", flush=True)
+            _gaia_mode, _gaia_paths = "single", [gaia_csv]
+    else:
+        _gaia_paths, _from_sidecar = resolve_gaia_csvs(field_path)
+        if not _gaia_paths:
+            raise FileNotFoundError(f"No Gaia catalog files found in {gaia_dir}")
+        _gaia_mode = "resolved"
+
+    def _build_gaia_catalog():
+        if _gaia_mode == "list":
+            gaia_frames = [_read_gaia_csv(p) for p in _gaia_paths]
+            gaia_raw = (pd.concat(gaia_frames, ignore_index=True)
+                        .drop_duplicates("source_id"))
+            print(f"Loading {len(_gaia_paths)} Gaia catalogs "
+                  f"({len(gaia_raw)} unique stars)")
+        elif _gaia_mode == "single":
+            print(f"Loading Gaia catalog: {_gaia_paths[0].name}", flush=True)
             import time as _time
             _t0 = _time.time()
-            gaia_raw = _read_gaia_csv(gaia_csv)
+            gaia_raw = _read_gaia_csv(_gaia_paths[0])
             print(f"  {len(gaia_raw)} rows in {_time.time()-_t0:.1f}s", flush=True)
-    else:
-        gaia_files, _from_sidecar = resolve_gaia_csvs(field_path)
-        if not gaia_files:
-            raise FileNotFoundError(f"No Gaia catalog files found in {gaia_dir}")
-        if _from_sidecar:
-            print(f"Loading {len(gaia_files)} Gaia CSV(s) from the "
-                  f"{field_name}_gaia_files.json sidecar.")
-        elif len(gaia_files) > 1:
-            print(f"Loading {len(gaia_files)} Gaia CSV files (concatenated).")
-        gaia_frames = [_read_gaia_csv(f) for f in gaia_files]
-        gaia_raw = pd.concat(gaia_frames, ignore_index=True).drop_duplicates("source_id")
+        else:
+            if _from_sidecar:
+                print(f"Loading {len(_gaia_paths)} Gaia CSV(s) from the "
+                      f"{field_name}_gaia_files.json sidecar.")
+            elif len(_gaia_paths) > 1:
+                print(f"Loading {len(_gaia_paths)} Gaia CSV files (concatenated).")
+            gaia_frames = [_read_gaia_csv(f) for f in _gaia_paths]
+            gaia_raw = pd.concat(gaia_frames, ignore_index=True).drop_duplicates("source_id")
 
-    gaia_cols = [
-        "source_id", "ra", "dec", "ra_error", "dec_error", "ra_dec_corr",
-        "ra_parallax_corr", "ra_pmra_corr", "ra_pmdec_corr",
-        "dec_parallax_corr", "dec_pmra_corr", "dec_pmdec_corr",
-        "parallax", "parallax_error", "parallax_pmra_corr", "parallax_pmdec_corr",
-        "pmra", "pmra_error", "pmra_pmdec_corr", "pmdec", "pmdec_error",
-        "ref_epoch", "ruwe", "pseudocolour", "gmag", "gmag_error",
-        "bpmag", "bpmag_error", "rpmag", "rpmag_error", "bp_rp", "bp_rp_error",
-    ]
-    gaia_catalog = (
-        gaia_raw[[c for c in gaia_cols if c in gaia_raw.columns]]
-        .dropna(subset=["ra", "dec"])
-        .sort_values("source_id")
-        .drop_duplicates("source_id", keep="first")
-        .reset_index(drop=True)
-    )
-    gaia_catalog.rename(
-        columns={"source_id": "Gaia_id", "ref_epoch": "Gaia_time"}, inplace=True
-    )
+        gaia_cols = [
+            "source_id", "ra", "dec", "ra_error", "dec_error", "ra_dec_corr",
+            "ra_parallax_corr", "ra_pmra_corr", "ra_pmdec_corr",
+            "dec_parallax_corr", "dec_pmra_corr", "dec_pmdec_corr",
+            "parallax", "parallax_error", "parallax_pmra_corr", "parallax_pmdec_corr",
+            "pmra", "pmra_error", "pmra_pmdec_corr", "pmdec", "pmdec_error",
+            "ref_epoch", "ruwe", "pseudocolour", "gmag", "gmag_error",
+            "bpmag", "bpmag_error", "rpmag", "rpmag_error", "bp_rp", "bp_rp_error",
+        ]
+        gaia_catalog = (
+            gaia_raw[[c for c in gaia_cols if c in gaia_raw.columns]]
+            .dropna(subset=["ra", "dec"])
+            .sort_values("source_id")
+            .drop_duplicates("source_id", keep="first")
+            .reset_index(drop=True)
+        )
+        gaia_catalog.rename(
+            columns={"source_id": "Gaia_id", "ref_epoch": "Gaia_time"}, inplace=True
+        )
+        return gaia_catalog
+
+    import time as _time
+    _slim_path = _gaia_slim_cache_path(_gaia_paths, _gaia_mode)
+    _t0 = _time.time()
+    gaia_catalog = _read_gaia_slim(_slim_path)
+    if gaia_catalog is not None:
+        print(f"Gaia catalog: {len(gaia_catalog)} stars from the slim cache "
+              f"({_slim_path.parent.name}/{_slim_path.name}, {_time.time()-_t0:.1f}s)", flush=True)
+    else:
+        gaia_catalog = _build_gaia_catalog()
+        _write_gaia_slim(_slim_path, gaia_catalog)
 
     # Build a float64-keyed lookup for recovering exact int64 Gaia IDs from
     # matched_gaia.csv files that stored gaia_source_id as float (scientific
     # notation).  float(int64_id) is the same rounding that pandas applies when
     # writing an int64 column as float, so the dict keys match what the CSV
     # reader returns even when precision is lost.
-    gaia_float_to_int64: dict[float, np.int64] = {
-        float(gid): np.int64(gid) for gid in gaia_catalog["Gaia_id"].values
-    }
+    # (GaiaIdFloatMap: same answers as that dict, vectorised.)
+    gaia_float_to_int64 = GaiaIdFloatMap(gaia_catalog["Gaia_id"].to_numpy(np.int64))
 
     # ── Per-image data ────────────────────────────────────────────────────────
     img_dirs = sorted((p for r in image_roots for p in r.iterdir() if p.is_dir()),
@@ -998,7 +1110,10 @@ def load_image_data_flc(data_root, field_name: str,
     stars_per_image: dict = {}
     summary_rows: list    = []
 
-    gaia_id_set = set(gaia_catalog["Gaia_id"].values)
+    # ascending int64 (gaia_catalog is sorted by source_id): membership by binary search
+    gaia_ids_sorted = gaia_catalog["Gaia_id"].to_numpy(np.int64)
+    if len(gaia_ids_sorted) > 1 and not np.all(gaia_ids_sorted[1:] >= gaia_ids_sorted[:-1]):
+        gaia_ids_sorted = np.sort(gaia_ids_sorted)
 
     _pos_corr = None
     _n_corr_imgs: list = []
@@ -1051,7 +1166,7 @@ def load_image_data_flc(data_root, field_name: str,
             continue
 
         # Keep only stars that are in the Gaia catalog
-        in_gaia = stars_df["Gaia_id"].isin(gaia_id_set)
+        in_gaia = _in_sorted(gaia_ids_sorted, stars_df["Gaia_id"].to_numpy())
         stars_df = stars_df[in_gaia].reset_index(drop=True)
         if len(stars_df) == 0 and not _prealign_only:
             skipped.append(img_name)
