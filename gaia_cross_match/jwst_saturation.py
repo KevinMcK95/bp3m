@@ -110,7 +110,9 @@ def saturated_clusters(flc_path):
 
 def near_saturation(x_raw, y_raw, cx, cy, r_eq):
     """(drop, core) masks over the catalogue: drop = within the exclusion radius of a saturated cluster and not
-    its core detection; core = within the core radius of a cluster centroid."""
+    its core detection; core = the detection nearest to a cluster centroid, if within the core radius.  Only one:
+    fitted NIRISS cores (pypass a4a4226, M4) come with a second detection ~3 px out, inside the core radius, and the
+    matcher locked onto those (solution 3 px off the anchors, 200+ matches)."""
     x_raw, y_raw = np.asarray(x_raw, float), np.asarray(y_raw, float)
     drop = np.zeros(len(x_raw), bool); core = np.zeros(len(x_raw), bool)
     ok = np.isfinite(x_raw) & np.isfinite(y_raw)
@@ -127,7 +129,8 @@ def near_saturation(x_raw, y_raw, cx, cy, r_eq):
         near = np.asarray(near, int)
         d = np.hypot(x_raw[idx[near]] - cx[k], y_raw[idx[near]] - cy[k])
         drop[idx[near]] = True
-        core[idx[near[d <= r_co[k]]]] = True
+        if d.min() <= r_co[k]:
+            core[idx[near[np.argmin(d)]]] = True      # one core detection per saturated star: the nearest
     drop &= ~core
     return drop, core
 

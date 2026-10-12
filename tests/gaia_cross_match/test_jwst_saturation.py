@@ -45,13 +45,16 @@ def test_saturated_clusters_and_near_saturation(tmp_path):
     assert len(cx) == 2
     o = np.argsort(cx)
     assert cx[o][0] == pytest.approx(40.0, abs=0.5) and cy[o][0] == pytest.approx(61.0, abs=0.5)
-    # core (kept), core-masked star 3.5 px off (kept), spike at 10 px (dropped), field star 60 px away (kept);
-    # big star: 3 r_eq exclusion
+    # core (kept), a second detection 3.5 px off the same core (dropped: one core per star), spike at 10 px
+    # (dropped), field star 60 px away (kept); big star: 3 r_eq exclusion
     x = np.array([40.1, 43.5, 50.0, 100.0, 120.0 + 19.0, 120.0 + 25.0])
     y = np.array([60.9, 61.0, 61.0, 61.0, 140.0, 140.0])
     drop, core = js.near_saturation(x, y, cx, cy, req)
-    assert list(core) == [True, True, False, False, False, False]
-    assert list(drop) == [False, False, True, False, True, False]
+    assert list(core) == [True, False, False, False, False, False]
+    assert list(drop) == [False, True, True, False, True, False]
+    # core masked (pre-a4a4226): the star's own detection 3.5 px off is the nearest, so it is the core
+    drop, core = js.near_saturation(x[1:], y[1:], cx, cy, req)
+    assert core[0] and not drop[0]
 
 
 def test_raw_to_gdc_recovers_polynomial():
