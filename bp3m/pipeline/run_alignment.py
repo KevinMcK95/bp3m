@@ -513,9 +513,11 @@ def run_alignment(  # noqa: C901
     # Skew prior: with a learned GDC correction the ACS time-dependent skew is
     # removed and the Phase D width applies; without one the raw TDD (~1e-4) must
     # stay free (instrument_config, 2026-09-30).  CLI --prior_sigma_skew overrides.
+    _skew_hst_only = False
     if prior_sigma_skew is None and pos_corr_model:
         from bp3m.instrument_config import SIGMA_SKEW_CORRECTED
         prior_sigma_skew = SIGMA_SKEW_CORRECTED
+        _skew_hst_only = True     # the model corrects HST positions only
         print(f"  skew prior: pos_corr_model applied -> sigma_skew = {prior_sigma_skew:g}")
     if use_sparse and fit_epoch_distortion:
         raise ValueError("--fit_epoch_distortion is not supported with --sparse yet")
@@ -527,6 +529,7 @@ def run_alignment(  # noqa: C901
                           prior_sigma_rot_deg=prior_sigma_rot_deg,
                           prior_sigma_scale=prior_sigma_scale,
                           prior_sigma_skew=prior_sigma_skew,
+                          prior_sigma_skew_hst_only=_skew_hst_only,
                           prior_sigma_pointing=prior_sigma_pointing,
                           prior_sigma_pair_rot_deg=prior_sigma_pair_rot_deg,
                           prior_sigma_pair_scale=prior_sigma_pair_scale,
@@ -1460,6 +1463,7 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
             'prior_sigma_rot_deg':       getattr(solver, '_sigma_rot_deg_cli', None),
             'prior_sigma_scale':         getattr(solver, '_sigma_scale_cli', None),
             'prior_sigma_skew':          getattr(solver, '_sigma_skew_cli', None),
+            'prior_sigma_skew_hst_only': getattr(solver, '_sigma_skew_hst_only', False) or None,
             'prior_sigma_pointing':      getattr(solver, '_sigma_pointing_cli', None),
             'prior_sigma_pair_rot_deg':  getattr(solver, '_sigma_pair_rot_deg_cli', None),
             'prior_sigma_pair_scale':    getattr(solver, '_sigma_pair_scale_cli', None),

@@ -283,7 +283,7 @@ class BP3MSolver:
                  star_id_to_idx, image_names, star_in_image,
                  poly_order=1, exclude_2p_from_alignment=False,
                  prior_sigma_rot_deg=None, prior_sigma_scale=None,
-                 prior_sigma_skew=None, prior_sigma_pointing=None,
+                 prior_sigma_skew=None, prior_sigma_pointing=None, prior_sigma_skew_hst_only=False,
                  prior_sigma_pair_rot_deg=None, prior_sigma_pair_scale=None,
                  prior_sigma_pair_skew=None, prior_sigma_pair_pointing=None,
                  use_pair_prior=False, prior_sigma_poly_px=None,
@@ -323,6 +323,9 @@ class BP3MSolver:
         self._sigma_rot_deg_cli       = prior_sigma_rot_deg
         self._sigma_scale_cli         = prior_sigma_scale
         self._sigma_skew_cli          = prior_sigma_skew
+        # True when prior_sigma_skew came from a learned HST correction model (run_alignment): non-HST
+        # images keep their per-instrument skew width (the model never corrects their positions).
+        self._sigma_skew_hst_only     = bool(prior_sigma_skew_hst_only)
         self._sigma_pointing_cli      = prior_sigma_pointing
         self._sigma_poly_px_cli       = prior_sigma_poly_px
         self._sigma_pair_rot_deg_cli  = prior_sigma_pair_rot_deg
@@ -1020,7 +1023,8 @@ class BP3MSolver:
                 meta, poly_order=self.poly_order,
                 sigma_rot_deg  = self._sigma_rot_deg_cli,
                 sigma_scale    = self._sigma_scale_cli,
-                sigma_skew     = self._sigma_skew_cli,
+                sigma_skew     = (None if self._sigma_skew_hst_only and meta.get("telescope", "HST") != "HST"
+                                  else self._sigma_skew_cli),
                 # per-image override (v2 visit prealign: pointing known from the visit siblings)
                 sigma_pointing = meta.get("sigma_pointing_override", self._sigma_pointing_cli),
                 sigma_poly_px  = getattr(self, '_sigma_poly_px_cli', None),
