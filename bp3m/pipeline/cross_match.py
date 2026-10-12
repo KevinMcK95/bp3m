@@ -557,6 +557,13 @@ def run_cross_match(
     if _n_det:
         print(f"  Detached {_n_det} hard-linked cross-match output file(s) (shared with a field copy) before rewriting")
 
+    if telescope.upper() == 'JWST' and pos_corr_model:
+        # the learned GDC correction is an HST model: the BP3M loaders never apply it to JWST positions, so the JWST
+        # cross-match neither applies it nor swaps in the tight solver plate priors it implies (rot 0.03 deg, scale
+        # 2e-5, skew 1e-5); JWST keeps the XMATCH_* widths of the no-model path (2026-10-12)
+        print(f"  JWST: learned GDC correction {pos_corr_model} is HST-only — not applied; plate priors stay at the "
+              f"no-model widths")
+        pos_corr_model = None
     if telescope.upper() == 'JWST' and discovery_max_offset > JWST_DISCOVERY_MAX_OFFSET:
         print(f"  JWST: 4P offset search capped at +-{JWST_DISCOVERY_MAX_OFFSET} px (Gaia-tied FGS headers; was {discovery_max_offset})")
         discovery_max_offset = JWST_DISCOVERY_MAX_OFFSET
