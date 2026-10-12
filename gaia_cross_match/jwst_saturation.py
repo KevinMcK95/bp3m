@@ -41,7 +41,8 @@ JWST_ANCHOR_MIN_FRAC = 0.5    # ... and puts at least this fraction of the ancho
 # AB - G (pypass mag_ab_gdc minus Gaia G) of the matched stars: median over the frames whose solution the
 # saturated-core test confirmed (xmatch_failures/frame_classes.csv 'ok', 2,797 frames; 1-99% within -0.3..+2.5).
 # The artefact locks sit at +3.0..+8.4.  Window: centre - JWST_ABG_LO .. centre + JWST_ABG_HI.  The blue side is
-# wide because no failure lives there, while the 1% tails reach -1.9 (F200W).
+# open (no failure lives there; reddened M4 giants reach -2.9 in F200W / -2.3 in F277W).  Saturated-core matches are
+# excluded from the measurement (their fitted flux is biased).
 JWST_ABG_CENTRE = {
     ('NIRCAM', 'F070W'): 0.53, ('NIRCAM', 'F090W'): 0.66, ('NIRCAM', 'F115W'): 0.86, ('NIRCAM', 'F140M'): 1.09,
     ('NIRCAM', 'F150W'): 1.28, ('NIRCAM', 'F182M'): 1.55, ('NIRCAM', 'F200W'): 1.62, ('NIRCAM', 'F210M'): 1.63,
@@ -49,7 +50,7 @@ JWST_ABG_CENTRE = {
     ('NIRISS', 'F090W'): -0.11, ('NIRISS', 'F150W'): -0.09, ('NIRISS', 'F200W'): -0.16,
 }
 JWST_ABG_DEFAULT = {'NIRCAM_SW': 1.0, 'NIRCAM_LW': 2.0, 'NIRISS': 0.0}   # filters without a measured centre
-JWST_ABG_LO = 4.0
+JWST_ABG_LO = 6.0
 JWST_ABG_HI = 2.0
 MIRI_CHANCE_MAG_WIN = 3.0     # chance-test magnitude half-window for MIRI (optical/NIR: 1.5)
 # Position-error cap: MIRI pypass catalogues carry unconverged fits with sigma_x of 10^3-10^4 px (Sextans A F770W:

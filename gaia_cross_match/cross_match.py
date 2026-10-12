@@ -1405,6 +1405,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         _is_jwst_img = str(params.get('instrument', '')).strip().upper() in ('NIRCAM', 'NIRISS', 'MIRI')
         _sat_g = None            # saturated-cluster centroids in the GDC frame
         _n_sat_drop = 0
+        _is_core = np.zeros(len(hst_cat), bool)     # saturated-core detections (biased photometry)
         if _is_jwst_img:
             _scx, _scy, _sreq = _jsat.saturated_clusters(hst['flc'])
             if len(_scx):
@@ -1413,12 +1414,14 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                     _sat_g = _r2g(_scx, _scy)
                 _drop, _core = _jsat.near_saturation(hst_cat['x'], hst_cat['y'], _scx, _scy, _sreq)
                 _n_sat_drop = int(_drop.sum())
+                _is_core = _core
                 print(f'  JWST saturated clusters: {len(_scx)}; {_n_sat_drop} catalogue sources within '
                       f'max({_jsat.JWST_SAT_EXCL_PX:.0f} px, {_jsat.JWST_SAT_EXCL_REQ:.0f} r_eq) of one dropped '
                       f'(spike / wing detections), {int(_core.sum())} core detections kept')
                 if _n_sat_drop:
                     hst_cat = hst_cat[~_drop]
                     _orig_row_idx = _orig_row_idx[~_drop]
+                    _is_core = _is_core[~_drop]
         if _is_jwst_img:
             _psig = np.sqrt(np.maximum(hst_cat['cov_xx_gdc'].astype(float), hst_cat['cov_yy_gdc'].astype(float)))
             _bad_sig = ~(_psig <= _jsat.JWST_MAX_POS_SIG_PX)
@@ -1427,6 +1430,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                       f'(unconverged fits) dropped')
                 hst_cat = hst_cat[~_bad_sig]
                 _orig_row_idx = _orig_row_idx[~_bad_sig]
+                _is_core = _is_core[~_bad_sig]
         x_hst      = hst_cat['x_gdc'].astype(float)
         y_hst      = hst_cat['y_gdc'].astype(float)
         # Learned GDC correction (same applier and sign as the BP3M loaders: corrected = x_gdc - bias),
@@ -1764,8 +1768,12 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             if len(h_final) < max(3, int(min_matches)):
                 return dict(ok=False, reason=f'only {len(h_final)} final matches (< {max(3, int(min_matches))}) — rejected.')
             # JWST absolute photometric gate: the matched stars' AB - G must look like stars, not like the
-            # spike / wing detections of saturated stars (5-8 mag too faint)
-            _abg = float(-np.median(final_mdf['mag_diff'].values)) if mag_system == 'AB' else float('nan')
+            # spike / wing detections of saturated stars (5-8 mag too faint).  Measured on the matches that are not
+            # saturated cores: a fitted partially saturated core reads up to ~2 mag faint (M4 NIRISS F150W: +3.4),
+            # and frames whose every match is a core (all Gaia stars saturated) are left to the anchor gate.
+            _nc = ~_is_core[final_mdf['h'].values]
+            _abg = (float(-np.median(final_mdf['mag_diff'].values[_nc])) if mag_system == 'AB' and _nc.sum() >= 3
+                    else float('nan'))
             if _abg_win is not None and np.isfinite(_abg) and not (_abg_win[0] <= _abg <= _abg_win[1]):
                 print(f"  AB - G of the matches = {_abg:+.2f} outside [{_abg_win[0]:+.2f}, {_abg_win[1]:+.2f}] for {_jfilt}")
                 return dict(ok=False, reason=f'matched stars AB - G = {_abg:+.2f} mag outside the {_jfilt} window '
