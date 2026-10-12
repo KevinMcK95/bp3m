@@ -628,6 +628,10 @@ def _parse_args():
                      help='Skip BP3M alignment (stop after cross-match)')
     ctl.add_argument('--no_plots', action='store_true',
                      help='Suppress all diagnostic plot generation')
+    ctl.add_argument('--indv_jwst_plot_every', type=int, default=20,
+                     help='With --fit_indv_images_only: diagnostic plots for every Nth JWST frame only '
+                          '(1 = every frame, 0 = none; default 20).  Plots were ~10 s of a ~20-40 s JWST '
+                          'indv fit (2026-10-12 profile).  HST images are always plotted unless --no_plots.')
     ctl.add_argument('--plot_residuals', action='store_true',
                      help='Generate per-image HST XY residual maps (slow for large fields; off by default)')
     ctl.add_argument('--plot_influence', action='store_true',
@@ -1605,7 +1609,7 @@ def main():
             else:
                 _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
                     output_dir, field, pos_err_floor=_pos_err_floor_by_tel,
-                    gaia_csv=gaia_csv_path)
+                    gaia_csv=gaia_csv_path, n_processes=args.n_processes)
                 _, _indv_names, _ = build_index_maps(_spi_all, _gaia_all)
 
             if _bp3m_images is not None:
@@ -1770,7 +1774,8 @@ def main():
                 # full data load ONLY for images that will be fitted; same cuts as the old discovery
                 _imgs_all, _spi_all, _gaia_all = load_image_data_flc(
                     output_dir, field, pos_err_floor=_pos_err_floor_by_tel,
-                    gaia_csv=gaia_csv_path, restrict_images=set(_indv_names))
+                    gaia_csv=gaia_csv_path, restrict_images=set(_indv_names),
+                    n_processes=args.n_processes)
                 _, _loaded, _ = build_index_maps(_spi_all, _gaia_all)
                 _loaded = set(_loaded)
                 _n_before = len(_indv_names)
@@ -1792,6 +1797,20 @@ def main():
             print("─"*50, flush=True)
 
             _n_ok, _n_fail, _n_done = 0, 0, 0
+
+            # JWST indv campaigns plot a sample of frames (--indv_jwst_plot_every); HST unchanged
+            _kw_noplot = dict(_run_kw, no_plots=True)
+            _jw_names = [n for n in _indv_names
+                         if str(_imgs_all.get(n, {}).get('telescope', '')).upper() == 'JWST'
+                         or n.lower().startswith('jw')]
+            _every = args.indv_jwst_plot_every
+            _jw_noplot = {n for _k, n in enumerate(_jw_names) if _every <= 0 or _k % _every != 0}
+            if _jw_noplot and not args.no_plots:
+                print(f"  Diagnostic plots for {len(_jw_names) - len(_jw_noplot)}/{len(_jw_names)} JWST frame(s) "
+                      f"(--indv_jwst_plot_every {_every})")
+
+            def _kw_for(_img):
+                return _kw_noplot if _img in _jw_noplot else _run_kw
 
             def _indv_report(_res):
                 _img_r, _err, _n_fit, _n_astrom, _n_det, _dt_s = _res
@@ -1825,7 +1844,7 @@ def main():
                             max_workers=min(_n_proc, len(_batch)),
                             mp_context=_mp.get_context("forkserver"),
                             initializer=_indv_pool_init) as _ex:
-                        _futs = {_ex.submit(_run_indv_one, _img, _run_kw,
+                        _futs = {_ex.submit(_run_indv_one, _img, _kw_for(_img),
                                             _indv_root,
                                             _cfg_map[_img]): _img
                                  for _img in _batch}
@@ -1843,7 +1862,7 @@ def main():
                                 _n_fail += 1
             else:
                 for _img in _indv_names:
-                    _res = _run_indv_one(_img, _run_kw, _indv_root,
+                    _res = _run_indv_one(_img, _kw_for(_img), _indv_root,
                                          _cfg_map[_img])
                     _n_done += 1
                     if _indv_report(_res):

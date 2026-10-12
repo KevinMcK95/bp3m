@@ -1046,25 +1046,59 @@ def download_hst_images(
 
         print("  Download complete.")
 
-        # Validate newly downloaded files for failed observations (EXPTIME=0).
+        # Validate newly downloaded files for failed observations (EXPTIME=0), and seed the
+        # verification cache with the files that also pass the full FITS verify, so the next run
+        # does not re-open every fresh download (2026-10-12: Omega_Cen_JWST_dev's cache was empty
+        # after its download, i.e. all 310 files re-verified on the rerun).
         if 'dataURI' in to_dl.columns:
+            from astropy.io import fits as _fits_v
+            from concurrent.futures import ThreadPoolExecutor as _TPE
             mast_root_nd = hst_dir / "mastDownload" / tel_upper
-            for _, row in tqdm(to_dl.iterrows(), total=len(to_dl),
-                               desc="  Validating downloaded files", unit="file",
-                               dynamic_ncols=True):
+            _vc_path = hst_dir / ".verify_cache.json"
+
+            def _validate_new(row):
                 obs_id = row.get('obs_id', '')
-                if obs_id in failed_obsids:
-                    continue
                 fname = Path(row['dataURI']).name
                 dest = mast_root_nd / obs_id / fname
                 if not dest.exists():
-                    continue
+                    return obs_id, fname, dest, None, None
                 fail_reason = _check_exptime(dest, tel_upper)
+                entry = None
+                try:
+                    st = dest.stat()
+                    with _fits_v.open(dest, memmap=True) as hdul:
+                        hdul.verify('exception')
+                    entry = [st.st_size, st.st_mtime_ns, fail_reason, _VERIFY_RULES]
+                except Exception:
+                    entry = None          # judged again (and re-fetched if broken) on the next run
+                return obs_id, fname, dest, fail_reason, entry
+
+            _rows = [row for _, row in to_dl.iterrows()]
+            _new_entries = {}
+            with _TPE(max_workers=max(1, min(n_processes, len(_rows)))) as _vpool:
+                _vres = list(tqdm(_vpool.map(_validate_new, _rows), total=len(_rows),
+                                  desc="  Validating downloaded files", unit="file",
+                                  dynamic_ncols=True))
+            for obs_id, fname, dest, fail_reason, entry in _vres:
+                if entry is not None:
+                    _new_entries[f"{obs_id}/{fname}"] = entry
+                if obs_id in failed_obsids:
+                    continue
                 if fail_reason:
                     print(f"  WARNING: {fname} is a failed observation ({fail_reason}) — "
                           f"skipping all downstream steps.")
                     _invalidate_psf_cache(dest)
                     failed_obsids[obs_id] = fail_reason
+            if _new_entries:
+                try:
+                    _vc = json.loads(_vc_path.read_text()) if _vc_path.exists() else {}
+                except Exception:
+                    _vc = {}
+                _vc.update(_new_entries)
+                try:
+                    _vc_path.write_text(json.dumps(_vc))
+                except Exception:
+                    pass
 
         if failed_obsids:
             print(f"  NOTE: {len(failed_obsids)} failed observation(s) excluded from processing: "
