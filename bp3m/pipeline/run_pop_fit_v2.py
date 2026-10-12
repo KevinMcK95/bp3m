@@ -65,15 +65,26 @@ def _load_catalog(field_dir: Path, gaia_source: str = 'v2') -> pd.DataFrame:
         mc.get('corr_pmra_pmdec_xmatch'), errors='coerce').fillna(0.0)
     mc['pm_origin'] = 'xmatch'
 
-    # Gaia RUWE for the membership quality mask (master_combined_v2 carries none); the v2
-    # solve's stellar_astrometry has it for every Gaia star.  NaN = no Gaia 5p/6p solution.
+    # Gaia RUWE and excess-noise significance for the membership trust rule (the solver's:
+    # RUWE <= 1.4 and excess sig <= 2; NaN = no value = trusted).  master_combined_v2
+    # carries neither, so read the field's Gaia tables.
     mc['ruwe'] = np.nan
-    _sa_path = field_dir / 'BP3M_v2_results' / 'stellar_astrometry.csv'
-    if _sa_path.exists():
-        _ru = pd.read_csv(_sa_path, usecols=['Gaia_id', 'ruwe'], dtype={'Gaia_id': np.int64})
-        _ru = _ru[_ru['Gaia_id'] > 0].drop_duplicates('Gaia_id').set_index('Gaia_id')['ruwe']
-        _hit = mc['gaia_source_id'].isin(_ru.index) & (mc['gaia_source_id'] != 0)
-        mc.loc[_hit, 'ruwe'] = _ru.loc[mc.loc[_hit, 'gaia_source_id']].to_numpy(float)
+    mc['astrometric_excess_noise_sig'] = np.nan
+    from bp3m.data_loader_flc import resolve_gaia_csvs
+    _gfiles, _ = resolve_gaia_csvs(field_dir)
+    _want = {'source_id', 'SOURCE_ID', 'ruwe', 'astrometric_excess_noise_sig'}
+    if _gfiles:
+        _g = (pd.concat([pd.read_csv(f, usecols=lambda c: c in _want,
+                                     dtype={'source_id': np.int64, 'SOURCE_ID': np.int64})
+                         .rename(columns={'SOURCE_ID': 'source_id'}) for f in _gfiles],
+                        ignore_index=True)
+              .drop_duplicates('source_id').set_index('source_id'))
+        _hit = mc['gaia_source_id'].isin(_g.index) & (mc['gaia_source_id'] != 0)
+        for _c in ('ruwe', 'astrometric_excess_noise_sig'):
+            if _c in _g.columns:
+                mc.loc[_hit, _c] = _g.loc[mc.loc[_hit, 'gaia_source_id'], _c].to_numpy(float)
+    else:
+        print("  WARNING: no Gaia tables found — membership trust rule not applied")
 
     if gaia_source == 'v2':
         sa_path = field_dir / 'BP3M_v2_results' / 'stellar_astrometry.csv'
@@ -293,7 +304,7 @@ def _catalog_main(argv=None):
     p.add_argument('--freeze_member_seed', action='store_true',
                    help='seed can only lose members, never gain')
     p.add_argument('--keep_untrusted_members', action='store_true',
-                   help='TEST: let stars failing the solver trust rule (Gaia RUWE > 1.4) be '
+                   help='TEST: let stars failing the solver trust rule (RUWE > 1.4, excess sig > 2) be '
                         'members; by default they are ineligible whatever the seed says')
     p.add_argument('--no_plots', action='store_true')
     args = p.parse_args(argv)
@@ -332,12 +343,13 @@ def _catalog_main(argv=None):
                 & (sig_rms < args.max_sigma_free_pm)
                 & (n_det_fit >= args.min_detections)).to_numpy()
     # Membership (seeded or not) never bypasses the bad-data mask: a star the solver will not
-    # trust for alignment (Gaia RUWE > 1.4; NaN = 2p/HST-only stays trusted) is not eligible.
+    # trust for alignment (Gaia RUWE > 1.4 or excess sig > 2; NaN = no value) is not eligible.
     # A seed lists LIKELY members; it does not make their astrometry good (user 2026-10-12).
     if not args.keep_untrusted_members:
-        _untrusted = (df['ruwe'].to_numpy(float) > 1.4)
+        _untrusted = ((df['ruwe'].to_numpy(float) > 1.4)
+                      | (df['astrometric_excess_noise_sig'].to_numpy(float) > 2.0))
         print(f"  member quality mask: {int((_untrusted & eligible).sum())} otherwise-eligible "
-              f"sources with RUWE > 1.4 made ineligible")
+              f"sources with RUWE > 1.4 or excess-noise sig > 2 made ineligible")
         eligible &= ~_untrusted
     print(f"  Sources: {len(df)} total, {eligible.sum()} eligible "
           f"(sigma_rms < {args.max_sigma_free_pm}, "

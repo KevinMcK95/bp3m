@@ -1535,7 +1535,7 @@ def run_pop_fit_rotation(
         _untrusted_sidx = np.where(~np.asarray(solver.gaia_trustworthy, bool))[0]
         _n_bar = len(np.intersect1d(np.asarray(member_sidx, int), _untrusted_sidx))
         member_sidx = np.setdiff1d(np.asarray(member_sidx, int), _untrusted_sidx)
-        print(f"  member quality mask: {len(_untrusted_sidx)} untrusted stars (RUWE > 1.4) "
+        print(f"  member quality mask: {len(_untrusted_sidx)} untrusted stars (RUWE > 1.4 or excess sig > 2) "
               f"barred from membership; {_n_bar} initial member(s) removed, "
               f"{len(member_sidx)} remain")
 
@@ -2282,7 +2282,7 @@ def main():
                         help='seed membership is remove-only: disables the free-PM quality cut so '
                              'seed stars are not dropped for a poorly constrained free PM')
     parser.add_argument('--keep_untrusted_members', action='store_true',
-                        help='TEST: let stars failing the solver trust rule (Gaia RUWE > 1.4) be '
+                        help='TEST: let stars failing the solver trust rule (RUWE > 1.4, excess sig > 2) be '
                              'members; by default they are barred whatever the seed says')
     parser.add_argument('--bp3m_results_name', type=str, default=None,
                         help="source results directory (default BP3M_results); a suffixed one "

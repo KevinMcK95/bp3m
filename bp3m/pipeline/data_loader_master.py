@@ -85,6 +85,7 @@ _GAIA_COLS = [
     "pmra", "pmra_error", "pmra_pmdec_corr", "pmdec", "pmdec_error",
     "ref_epoch", "ruwe", "pseudocolour", "gmag", "gmag_error",
     "bpmag", "bpmag_error", "rpmag", "rpmag_error", "bp_rp", "bp_rp_error",
+    "astrometric_excess_noise_sig",
 ]
 
 # Correlation and error columns that solver expects; filled with NaN if absent
@@ -975,6 +976,10 @@ def load_master_v2(
         # re-enable them via test-3 re-admission if their residuals improve.
         use_for_align_full = is_gaia & ok_pos & ok_sat          # without outlier filter
         use_for_align      = use_for_align_full & ~is_outlier   # initial fit flag
+        # Detection-level bad-data mask, independent of Gaia status: finite position, not
+        # saturated, not a Phase-6 outlier, valid PSF fit (q_hst > 0).  HST-only detections
+        # that the v2 enable step or a member seed admits must pass it (user 2026-10-12).
+        det_quality_ok     = ok_pos & ok_sat & ~is_outlier & (qfit_arr > 0)
 
         df = pd.DataFrame({
             "Gaia_id":                 gaia_ids,
@@ -990,6 +995,7 @@ def load_master_v2(
             "use_for_alignment":       use_for_align,
             "use_for_align_init_flag": use_for_align_full,
             "use_for_fit":             use_for_align,
+            "det_quality_ok":          det_quality_ok,
             "det_chi2":                det_chi2_arr,
             "chip_ext":                _chip,
             **_jcols,

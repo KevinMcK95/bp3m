@@ -1910,6 +1910,8 @@ def _admit_seed_detections(solver, image_names: list, seed_sidx: np.ndarray,
         sel = is_seed[sidx] & hst_only_glob[sidx]
         if 'use_for_fit_max' in d:
             sel &= np.asarray(d['use_for_fit_max'], dtype=bool)
+        if 'det_quality_ok' in d:
+            sel &= np.asarray(d['det_quality_ok'], dtype=bool)
         if not sel.any():
             continue
         use_fit = np.asarray(d['use_for_fit'], dtype=bool)
@@ -2712,7 +2714,7 @@ def run_pop_fit(
     if not keep_untrusted_members:
         _untrusted_sidx = np.where(~np.asarray(solver.gaia_trustworthy, bool))[0]
         _n_bar = len(np.intersect1d(np.asarray(member_sidx, int), _untrusted_sidx))
-        print(f"  member quality mask: {len(_untrusted_sidx)} untrusted stars (RUWE > 1.4) "
+        print(f"  member quality mask: {len(_untrusted_sidx)} untrusted stars (RUWE > 1.4 or excess sig > 2) "
               f"barred from membership ({_n_bar} of the initial members)")
 
     # A vetted QSO anchor is never a member: its secular-aberration prior REPLACES the
@@ -4015,7 +4017,7 @@ def main(argv=None):
                         help='TEST: bar stars without Gaia PM solutions (2p, '
                              'HST-only) from membership')
     parser.add_argument('--keep_untrusted_members', action='store_true',
-                        help='TEST: let stars failing the solver trust rule (Gaia RUWE > 1.4) be '
+                        help='TEST: let stars failing the solver trust rule (RUWE > 1.4, excess sig > 2) be '
                              'members; by default they are barred whatever the seed says')
     parser.add_argument('--members_hst_only', action='store_true',
                         help='TEST: bar Gaia-matched stars from membership; '

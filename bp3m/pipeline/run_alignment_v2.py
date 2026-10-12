@@ -204,8 +204,12 @@ class V2AlignmentCallback:
 
                 soft = self._soft_flags.get(img, np.zeros(n, dtype=int))
 
-                # Permanently remove detections that were soft-flagged >= 1 time
-                permanently_bad = hst_mask & (soft > 0)
+                # Permanently remove detections that were soft-flagged >= 1 time, or that
+                # fail the bad-data mask every other admission path applies (saturation,
+                # Phase-6 outlier, q_hst <= 0, initial residual > 100 px; user 2026-10-12)
+                det_ok = (np.asarray(d.get("det_quality_ok", np.ones(n, bool)), bool)
+                          & np.asarray(d.get("use_for_fit_max", np.ones(n, bool)), bool))
+                permanently_bad = hst_mask & ((soft > 0) | ~det_ok)
                 if permanently_bad.any():
                     # Mark them as excluded by setting use_for_fit to False
                     # (they start False anyway; this ensures _update_use_for_fit

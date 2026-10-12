@@ -760,7 +760,7 @@ def load_image_data_flc(data_root, field_name: str,
         "parallax_pmdec_corr", "pmra", "pmra_error", "pmra_pmdec_corr",
         "pmdec", "pmdec_error", "ref_epoch", "ruwe", "pseudocolour",
         "gmag", "gmag_error", "bpmag", "bpmag_error", "rpmag", "rpmag_error",
-        "bp_rp", "bp_rp_error",
+        "bp_rp", "bp_rp_error", "astrometric_excess_noise_sig",
     }
 
     def _read_gaia_csv(path):
@@ -807,6 +807,7 @@ def load_image_data_flc(data_root, field_name: str,
         "pmra", "pmra_error", "pmra_pmdec_corr", "pmdec", "pmdec_error",
         "ref_epoch", "ruwe", "pseudocolour", "gmag", "gmag_error",
         "bpmag", "bpmag_error", "rpmag", "rpmag_error", "bp_rp", "bp_rp_error",
+        "astrometric_excess_noise_sig",
     ]
     gaia_catalog = (
         gaia_raw[[c for c in gaia_cols if c in gaia_raw.columns]]

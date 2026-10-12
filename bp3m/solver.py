@@ -477,6 +477,15 @@ class BP3MSolver:
         # NaN RUWE = 2-param stars (no 5D Gaia solution); treat as trustworthy
         # since NaN means "not applicable", not "poor astrometry".
         self.gaia_trustworthy = np.isnan(ruwe) | (ruwe <= 1.4)
+        # Significant astrometric excess noise is the same kind of evidence (unmodelled
+        # source motion/structure: blends, binaries) and is barred with RUWE (user
+        # 2026-10-12: it also biased the NGC_55/NGC_300 rotation pop fits).  NaN = no value.
+        if "astrometric_excess_noise_sig" in g.columns:
+            _aens = g["astrometric_excess_noise_sig"].to_numpy(float)
+            self.gaia_trustworthy &= ~(_aens > 2.0)
+        else:
+            print("  WARNING: gaia catalogue has no astrometric_excess_noise_sig — "
+                  "trust rule is RUWE-only")
         self.gaia_g  = g["gmag"].to_numpy(float)
         self.gaia_n_hst_used = np.zeros(len(self.gaia_g)).astype(int)
         self.gaia_ra  = g["ra"].to_numpy(float)
@@ -1056,6 +1065,12 @@ class BP3MSolver:
                 # own v_hat via h_all (astrometry-only path in _solve_one_pass).
                 "use_for_astrom" : good_for_fitting | df['use_for_fit'].to_numpy(bool),
                 "use_for_fit_max": ok_init.copy(),    # hard ceiling: only blocks 100px+ outliers
+                # detection-level bad-data mask (loader column; q_hst > 0 when absent).  Any
+                # path that admits detections outside use_for_fit (HST-only enable, member
+                # seed) must AND it with use_for_fit_max.
+                "det_quality_ok": (df["det_quality_ok"].to_numpy(bool)
+                                   if "det_quality_ok" in df.columns
+                                   else df["q_hst"].to_numpy(float) > 0),
                 # Frozen snapshot of initially-trusted stars (use_for_alignment=True,
                 # q_hst>0, gaia_trustworthy, initial residual ≤ 100px).  Used as the
                 # reference population for the test-3 adaptive threshold so that
