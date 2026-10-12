@@ -1107,6 +1107,7 @@ def run_pop_fit_rotation(
     member_seed_csv: "Path | str | None" = None,
     use_member_seed: bool = False,
     freeze_member_seed: bool = False,
+    keep_untrusted_members: bool = False,
     d_kpc: "float | None" = None,
     rotation_sign: float = 1.0,
 ) -> Path:
@@ -1524,6 +1525,20 @@ def run_pop_fit_rotation(
                   + ', '.join(str(int(g)) for g in _gids))
             member_sidx = np.setdiff1d(np.asarray(member_sidx, int), _qso_bar_sidx)
 
+    # Membership (seeded, frozen or sigma-clipped) never bypasses the bad-data mask: a star
+    # the solver will not trust for alignment (Gaia RUWE > 1.4; NaN RUWE = 2p stays trusted)
+    # is not a member either.  A seed lists LIKELY members; it does not make their astrometry
+    # good (user 2026-10-12: 22 NGC_55 seed members with RUWE > 1.4 moved mu_pop,dec by
+    # ~-30 uas/yr and made it depend on the position floor).
+    _untrusted_sidx = None
+    if not keep_untrusted_members:
+        _untrusted_sidx = np.where(~np.asarray(solver.gaia_trustworthy, bool))[0]
+        _n_bar = len(np.intersect1d(np.asarray(member_sidx, int), _untrusted_sidx))
+        member_sidx = np.setdiff1d(np.asarray(member_sidx, int), _untrusted_sidx)
+        print(f"  member quality mask: {len(_untrusted_sidx)} untrusted stars (RUWE > 1.4) "
+              f"barred from membership; {_n_bar} initial member(s) removed, "
+              f"{len(member_sidx)} remain")
+
     # ── μ_pop prior ────────────────────────────────────────────────────────────
     _extra = sigma_pm ** 2 + pm_sys_floor ** 2
     _mem_pm_ra   = _pmra_v1_only[member_sidx]
@@ -1618,6 +1633,8 @@ def run_pop_fit_rotation(
             _sidx = np.intersect1d(_sidx, _seed_frozen_sidx)
         if _qso_bar_sidx is not None:
             _sidx = np.setdiff1d(_sidx, _qso_bar_sidx)
+        if _untrusted_sidx is not None:
+            _sidx = np.setdiff1d(_sidx, _untrusted_sidx)
         return _sidx
 
     # ── Phase 1: μ-only solve ─────────────────────────────────────────────────
@@ -2264,6 +2281,9 @@ def main():
     parser.add_argument('--freeze_member_seed', action='store_true',
                         help='seed membership is remove-only: disables the free-PM quality cut so '
                              'seed stars are not dropped for a poorly constrained free PM')
+    parser.add_argument('--keep_untrusted_members', action='store_true',
+                        help='TEST: let stars failing the solver trust rule (Gaia RUWE > 1.4) be '
+                             'members; by default they are barred whatever the seed says')
     parser.add_argument('--bp3m_results_name', type=str, default=None,
                         help="source results directory (default BP3M_results); a suffixed one "
                              "writes a matching BP3M_pop_fit_rotation_results_<suffix>")
@@ -2308,6 +2328,7 @@ def main():
         member_seed_csv=args.member_seed_csv,
         use_member_seed=args.use_member_seed,
         freeze_member_seed=args.freeze_member_seed,
+        keep_untrusted_members=args.keep_untrusted_members,
         d_kpc=args.d_kpc,
         rotation_sign=args.rotation_sign,
     )

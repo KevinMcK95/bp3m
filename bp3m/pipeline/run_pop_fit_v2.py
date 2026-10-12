@@ -65,6 +65,16 @@ def _load_catalog(field_dir: Path, gaia_source: str = 'v2') -> pd.DataFrame:
         mc.get('corr_pmra_pmdec_xmatch'), errors='coerce').fillna(0.0)
     mc['pm_origin'] = 'xmatch'
 
+    # Gaia RUWE for the membership quality mask (master_combined_v2 carries none); the v2
+    # solve's stellar_astrometry has it for every Gaia star.  NaN = no Gaia 5p/6p solution.
+    mc['ruwe'] = np.nan
+    _sa_path = field_dir / 'BP3M_v2_results' / 'stellar_astrometry.csv'
+    if _sa_path.exists():
+        _ru = pd.read_csv(_sa_path, usecols=['Gaia_id', 'ruwe'], dtype={'Gaia_id': np.int64})
+        _ru = _ru[_ru['Gaia_id'] > 0].drop_duplicates('Gaia_id').set_index('Gaia_id')['ruwe']
+        _hit = mc['gaia_source_id'].isin(_ru.index) & (mc['gaia_source_id'] != 0)
+        mc.loc[_hit, 'ruwe'] = _ru.loc[mc.loc[_hit, 'gaia_source_id']].to_numpy(float)
+
     if gaia_source == 'v2':
         sa_path = field_dir / 'BP3M_v2_results' / 'stellar_astrometry.csv'
         if sa_path.exists():
@@ -282,6 +292,9 @@ def _catalog_main(argv=None):
                         'gaia_source_id columns)')
     p.add_argument('--freeze_member_seed', action='store_true',
                    help='seed can only lose members, never gain')
+    p.add_argument('--keep_untrusted_members', action='store_true',
+                   help='TEST: let stars failing the solver trust rule (Gaia RUWE > 1.4) be '
+                        'members; by default they are ineligible whatever the seed says')
     p.add_argument('--no_plots', action='store_true')
     args = p.parse_args(argv)
 
@@ -318,6 +331,14 @@ def _catalog_main(argv=None):
                 & np.isfinite(sig_rms) & (sig_rms > 0)
                 & (sig_rms < args.max_sigma_free_pm)
                 & (n_det_fit >= args.min_detections)).to_numpy()
+    # Membership (seeded or not) never bypasses the bad-data mask: a star the solver will not
+    # trust for alignment (Gaia RUWE > 1.4; NaN = 2p/HST-only stays trusted) is not eligible.
+    # A seed lists LIKELY members; it does not make their astrometry good (user 2026-10-12).
+    if not args.keep_untrusted_members:
+        _untrusted = (df['ruwe'].to_numpy(float) > 1.4)
+        print(f"  member quality mask: {int((_untrusted & eligible).sum())} otherwise-eligible "
+              f"sources with RUWE > 1.4 made ineligible")
+        eligible &= ~_untrusted
     print(f"  Sources: {len(df)} total, {eligible.sum()} eligible "
           f"(sigma_rms < {args.max_sigma_free_pm}, "
           f"n_detect_fit >= {args.min_detections}); "
@@ -431,6 +452,7 @@ def _catalog_main(argv=None):
         'pm_sys_floor': float(args.pm_sys_floor),
         'member_sigma_clip': float(args.member_sigma_clip),
         'max_sigma_free_pm': float(args.max_sigma_free_pm),
+        'keep_untrusted_members': bool(args.keep_untrusted_members),
         'min_detections': int(args.min_detections),
         'gaia_source': args.gaia_source,
         'input': 'hst_xmatch/master_combined_v2.csv',

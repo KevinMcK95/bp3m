@@ -2100,6 +2100,7 @@ def run_pop_fit(
     det_chi2_threshold_v2: float | None = None,
     members_hst_only: bool = False,
     members_5p_only: bool = False,
+    keep_untrusted_members: bool = False,
     hst_members_fit: bool = False,
     hst_all_fit: bool = False,
     pos_corr_table: "str | None" = None,
@@ -2702,6 +2703,18 @@ def run_pop_fit(
         print(f"  members_5p_only: {len(_no5p_sidx)} stars without Gaia PMs "
               f"barred from membership")
 
+    # Membership (seeded, frozen or sigma-clipped) never bypasses the bad-data mask: a star
+    # the solver will not trust for alignment (Gaia RUWE > 1.4; NaN RUWE = 2p/HST-only stays
+    # trusted) is not a member either.  A seed lists LIKELY members; it does not make their
+    # astrometry good (user 2026-10-12: 22 NGC_55 seed members with RUWE > 1.4 moved the
+    # rotation mu_pop,dec by ~-30 uas/yr and made it floor-dependent).
+    _untrusted_sidx = None
+    if not keep_untrusted_members:
+        _untrusted_sidx = np.where(~np.asarray(solver.gaia_trustworthy, bool))[0]
+        _n_bar = len(np.intersect1d(np.asarray(member_sidx, int), _untrusted_sidx))
+        print(f"  member quality mask: {len(_untrusted_sidx)} untrusted stars (RUWE > 1.4) "
+              f"barred from membership ({_n_bar} of the initial members)")
+
     # A vetted QSO anchor is never a member: its secular-aberration prior REPLACES the
     # member prior (QSO anchor design).  Both at once tie mu_pop directly to the
     # aberration value -- NGC_300 2026-09-28: 5 seed "members" were anchors, pinning
@@ -2724,6 +2737,8 @@ def run_pop_fit(
             _sidx = np.setdiff1d(_sidx, _gaia_pos_sidx)
         if _no5p_sidx is not None:
             _sidx = np.setdiff1d(_sidx, _no5p_sidx)
+        if _untrusted_sidx is not None:
+            _sidx = np.setdiff1d(_sidx, _untrusted_sidx)
         if _qso_bar_sidx is not None:
             _sidx = np.setdiff1d(_sidx, _qso_bar_sidx)
         return _sidx
@@ -2736,8 +2751,8 @@ def run_pop_fit(
         print(f"  Freeze: max_sigma_free_pm {max_sigma_free_pm} -> inf (poorly-constrained seed members stay members)")
         max_sigma_free_pm = np.inf
     member_sidx = _freeze_members(member_sidx)
-    if members_hst_only or members_5p_only:
-        print(f"  Initial members after Gaia bar: {len(member_sidx)}")
+    if members_hst_only or members_5p_only or _untrusted_sidx is not None:
+        print(f"  Initial members after bars: {len(member_sidx)}")
 
     # ── μ_pop prior: weighted mean of initial members ─────────────────────────
     _extra = sigma_pm ** 2 + pm_sys_floor ** 2
@@ -3999,6 +4014,9 @@ def main(argv=None):
     parser.add_argument('--members_5p_only', action='store_true',
                         help='TEST: bar stars without Gaia PM solutions (2p, '
                              'HST-only) from membership')
+    parser.add_argument('--keep_untrusted_members', action='store_true',
+                        help='TEST: let stars failing the solver trust rule (Gaia RUWE > 1.4) be '
+                             'members; by default they are barred whatever the seed says')
     parser.add_argument('--members_hst_only', action='store_true',
                         help='TEST: bar Gaia-matched stars from membership; '
                              'only HST-only stars inform mu_pop')
@@ -4177,6 +4195,7 @@ def main(argv=None):
         det_chi2_threshold_v2=args.det_chi2_threshold_v2,
         members_hst_only=args.members_hst_only,
         members_5p_only=args.members_5p_only,
+        keep_untrusted_members=args.keep_untrusted_members,
         hst_members_fit=args.hst_members_fit or args.hst_all_fit,
         hst_all_fit=args.hst_all_fit,
         pos_corr_table=args.pos_corr_table,
