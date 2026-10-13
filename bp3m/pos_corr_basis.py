@@ -363,4 +363,7 @@ def make_pos_corr(spec: str):
         from bp3m.pos_corr_model import PosCorrModel
         return PosCorrModel(sp)
     m = _load(base_spec)
+    if ref and ref.startswith('prior:'):                 # option C: learned per-image affine prior centres
+        from bp3m.pos_corr_prior import PriorCentreRef
+        return GaugeFixedPosCorr(m, gauge, spec=str(spec), ref=PriorCentreRef(ref[len('prior:'):])) if gauge else m
     return GaugeFixedPosCorr(m, gauge, spec=str(spec), ref=_load(ref) if ref else None) if gauge else m

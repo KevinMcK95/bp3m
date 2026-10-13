@@ -29,6 +29,8 @@ Spec syntax (everything that goes through make_pos_corr, incl. run_config.json, 
     DIR:TAG#gauge=affine6                       6p gauge (default per-image model)
     DIR:TAG#gauge=affine8                       8p gauge (with --fit_chip_offset)
     DIR:TAG#gauge=affine6,gauge_ref=DIR2:TAG2   affine part taken from the reference model
+    DIR:TAG#gauge=affine6,gauge_ref=prior:PATH  affine part from learned per-image prior centres (option C,
+                                                bp3m.pos_corr_prior; PATH = prior_model.json)
 The '#gauge=none' or no suffix = the model as trained.
 """
 from __future__ import annotations
@@ -108,7 +110,10 @@ class GaugeFixedPosCorr:
         if mode not in GAUGE_MODES:
             raise ValueError(mode)
         self.base, self.mode, self.spec = base, mode, spec
-        self.ref = GaugeFixedPosCorr(ref, mode) if ref is not None else None
+        if ref is not None and getattr(ref, 'is_prior', False):   # option C: learned prior centres (pos_corr_prior)
+            self.ref = ref
+        else:
+            self.ref = GaugeFixedPosCorr(ref, mode) if ref is not None else None
         self._cache = {}          # flc path -> dict(coef_x, coef_y, maps, info) or None
         self.last_info = None
 
@@ -225,7 +230,13 @@ class GaugeFixedPosCorr:
         if p is None:
             return b
         cx, cy = p['cx'], p['cy']
-        if self.ref is not None:
+        if self.ref is not None and getattr(self.ref, 'is_prior', False):
+            pc = self.ref.coef(hdr, self.base, mode=p['mode'])
+            if pc is None:                      # detector / time not covered by the prior model: model as trained
+                return b
+            rx, ry = pc[0][:len(cx)], pc[1][:len(cy)]
+            cx, cy = cx - rx, cy - ry
+        elif self.ref is not None:
             pr = self.ref._projection(hdr)
             if pr is None:                      # reference does not cover this image: model as trained
                 return b

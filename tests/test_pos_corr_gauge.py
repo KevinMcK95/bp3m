@@ -113,12 +113,46 @@ def test_reference_affine():
         assert np.max(np.abs(bx - (nx + ax))) < 1e-6 and np.max(np.abs(by - (ny + ay))) < 1e-6
 
 
+def test_prior_reference():
+    """gauge_ref=prior: (option C) -> non-linear shape of f + the learned prior-centre affine part for the image."""
+    import json
+    from bp3m.pos_corr_prior import PriorCentreRef, linear_to_coef
+    with tempfile.TemporaryDirectory() as tmp:
+        flc, cat = _catalog(tmp)
+        truth = dict(scale=3e-5, rot=-2e-5, on=1.5e-5, off=-4e-6)
+        spec = dict(spans=[2002.0, 2009.4, 2024.45, 2027.0], knots=[[], [], []], filters=[], use_filter=False, use_orbit=False)
+        # design columns: per segment [level, slope]; level of segment 2 (2009.4-2024.45) = value, slopes 0
+        beta = lambda v: [0, 0, v, 0, 0, 0]
+        m = dict(version='test', orbit_features=[], targets=['scale', 'rot', 'on', 'off'],
+                 detectors={'ACS/WFC': dict(spec=spec, targets={k: dict(beta=beta(v), tau=1e-5) for k, v in truth.items()})})
+        path = os.path.join(tmp, 'prior.json'); json.dump(m, open(path, 'w'))
+        nl = lambda xg, yg: (0.02 * np.sin(xg / 500.0) * np.cos(yg / 700.0), 0.015 * ((xg - 2048) / 2048) ** 3)
+        kA = [0.3, 0.05, -0.02, 0.0, -0.1, 0.01, 0.04, 0.0]
+        f = _Fake(lambda xg, yg, hi: tuple(a + b for a, b in zip(nl(xg, yg), _affine(xg, yg, hi, kA))))
+        g = GaugeFixedPosCorr(f, 'affine6', ref=PriorCentreRef(path))
+        h = dict(g.read_header(flc)); h['EXPSTART'] = 51544.5 + 16.0 * 365.25      # 2016.0
+        bx, by = g.bias(cat, h)
+        gn = GaugeFixedPosCorr(_Fake(lambda xg, yg, hi: nl(xg, yg)), 'affine6'); nx, ny = gn.bias(cat, gn.read_header(flc))
+        cx, cy = linear_to_coef(**truth); xg, yg = np.asarray(cat['x_gdc']), np.asarray(cat['y_gdc'])
+        A = np.stack([np.ones_like(xg), (xg - 2048) / 2048, (yg - 2048) / 2048], 1)
+        assert np.max(np.abs(bx - (nx + A @ cx))) < 1e-6 and np.max(np.abs(by - (ny + A @ cy))) < 1e-6
+        # coefficients -> (scale, rot, on, off) with GaugeFixedPosCorr.info's convention recovers the truth
+        jxx, jxy, jyx, jyy = cx[1] / 2048, cx[2] / 2048, cy[1] / 2048, cy[2] / 2048
+        rec = dict(scale=0.5 * (jxx + jyy), rot=0.5 * (jyx - jxy), on=0.5 * (jxx - jyy), off=0.5 * (jxy + jyx))
+        assert all(abs(rec[k] - truth[k]) < 1e-15 for k in truth), rec
+        # an uncovered detector falls back to the model as trained
+        h2 = dict(h); h2['INSTRUME'] = 'WFC3'; h2['DETECTOR'] = 'UVIS'; h2['_flc_path'] = flc + '.x'
+        fx, fy = g.bias(cat, h2); ox, oy = f.bias(cat, h2)
+        assert np.max(np.abs(fx - ox)) < 1e-12
+
+
 def test_spec_parsing():
     assert split_spec('/m/basis:C_r3') == ('/m/basis:C_r3', None)
     assert split_spec('/m/basis:C_r3#gauge=affine6') == ('/m/basis:C_r3', 'affine6')
     assert split_spec('/m/basis:C_r3:noorbit#gauge=affine8') == ('/m/basis:C_r3:noorbit', 'affine8')
     assert split_spec('/m/basis:C_r3#gauge=none') == ('/m/basis:C_r3', None)
     assert split_spec('/m/b:C_r3#gauge=affine6,gauge_ref=/v4/g:C_r2', with_ref=True) == ('/m/b:C_r3', 'affine6', '/v4/g:C_r2')
+    assert split_spec('/m/b:C_r3#gauge=affine6,gauge_ref=prior:/o/prior_model.json', with_ref=True) == ('/m/b:C_r3', 'affine6', 'prior:/o/prior_model.json')
 
 
 if __name__ == '__main__':
