@@ -451,6 +451,11 @@ def _parse_args():
                     help='Learned GDC-residual correction: basis bundle DIR[:TAG[:noorbit]] (bp3m/pos_corr_basis.py) or MLP '
                          'model dir/json paths; applied per detection at catalog load in the cross-match, v1, v2 and pop-fit. '
                          'Default: the pos_corr_model key of $BP3M_HOME/config.toml; "none" disables. Composes with --pos_corr_table.')
+    bp.add_argument('--pos_corr_gauge', type=str, default=None, choices=['none', 'affine6', 'affine8'],
+                    help='Gauge fix for --pos_corr_model (bp3m/pos_corr_gauge.py): remove each image\'s least-squares affine '
+                         '(6p; affine8 adds the upper-chip offset of --fit_chip_offset) projection of the learned correction, so it '
+                         'supplies only non-linear shape and the tight per-image priors stay valid. Appended to the model spec as '
+                         '"#gauge=MODE" (recorded in run_config.json; v2 and pop-fit inherit it). Default: none (model as trained).')
     bp.add_argument('--gaia_uwu_mag', action='store_true',
                     help='use the magnitude-dependent Gaia unit-weight uncertainties (Fabricius '
                          '2021 Fig.19/20) instead of the scalar 1.05/1.22; parallax and '
@@ -827,6 +832,9 @@ def main():
             print(f'  pos_corr_model (config.toml default): {args.pos_corr_model}')
     if args.pos_corr_model is not None and str(args.pos_corr_model).strip().lower() == 'none':
         args.pos_corr_model = None
+    if args.pos_corr_model and getattr(args, 'pos_corr_gauge', None) not in (None, 'none') and '#gauge=' not in str(args.pos_corr_model):
+        args.pos_corr_model = f'{args.pos_corr_model}#gauge={args.pos_corr_gauge}'
+        print(f'  pos_corr_model with gauge fix: {args.pos_corr_model}')
     if getattr(args, 'gaia_uwu_mag', False):
         from bp3m.astro_utils import set_gaia_uwu_mag
         set_gaia_uwu_mag(True)
