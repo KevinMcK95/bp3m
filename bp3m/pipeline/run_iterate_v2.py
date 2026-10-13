@@ -86,6 +86,11 @@ def main():
                         help='Outer iteration at which HST-only sources are enabled')
     parser.add_argument('--hst_max_pm_unc', type=float, default=5.0,
                         help='Global PM uncertainty cut for HST-only eligibility (mas/yr)')
+    parser.add_argument('--max_pm_masyr', type=float, default=100.,
+                        help='Largest proper motion (mas/yr) allowed when matching HST sources between '
+                             'epochs (within-filter match radius grows by max_pm_masyr * dt). The default '
+                             '100 lets chance pairings dominate sparse multi-year fields (Hydra II 2016-2020: '
+                             '66%% spurious); ~10 suits distant targets')
     parser.add_argument('--hst_max_per_image', type=int, default=1000,
                         help='Per-image cap on HST-only source count')
     parser.add_argument('--hst_pm_sigma_diffuse', type=float, default=100.0,
@@ -239,6 +244,7 @@ def main():
         mag_floor                = args.mag_floor,
         min_detections           = args.min_detections,
         cross_filter_radius_mas  = args.cross_filter_radius_mas,
+        max_pm_masyr             = args.max_pm_masyr,
         save_detections          = not args.no_save_detections,
         phase4_outlier_sigma     = args.phase4_outlier_sigma,
         anchor_bp3m_dir              = bp3m_v1_dir if bp3m_v1_dir.exists() else None,
