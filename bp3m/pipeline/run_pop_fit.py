@@ -2082,6 +2082,7 @@ def run_pop_fit(
     freeze_member_seed: bool = False,
     seed_preclip: float | None = None,
     seed_preclip_max_sigma: float = 1.0,
+    photometric_veto: "Path | str | None" = None,
     freeze_mu_pop_init: bool = False,
     poly_order: int | None = None,
     no_plots: bool = False,
@@ -2755,10 +2756,31 @@ def run_pop_fit(
                   f"removed from membership (QSO prior wins): "
                   + ', '.join(str(int(g)) for g in _gids))
 
+    # Photometric veto (notebook 07/08 *_photometric.csv): stars the photometric panels (CMDs / colour-colour)
+    # rejected can never be members, whatever their astrometry; the astrometric selection only seeds membership.
+    _phot_veto_sidx = None
+    if photometric_veto is not None:
+        _pv = pd.read_csv(Path(photometric_veto), dtype={'gaia_source_id': np.int64})
+        _rej = _pv[_pv['phot_status'].astype(str) == 'reject']
+        if 'source_index' in _rej.columns:
+            _sg = (_rej['gaia_source_id'].to_numpy(np.int64) if 'gaia_source_id' in _rej.columns
+                   else np.zeros(len(_rej), np.int64))
+            _ss = pd.to_numeric(_rej['source_index'], errors='coerce').fillna(-1).astype(np.int64).to_numpy()
+            _rids = [int(g) if g != 0 else int(-(si + 1)) for g, si in zip(_sg, _ss)]
+        else:
+            _rids = [int(g) for g in _rej['gaia_source_id'].values]
+        _phot_veto_sidx = np.array(sorted(star_id_to_idx[g] for g in _rids if g in star_id_to_idx), dtype=int)
+        _n_pass = int((_pv['phot_status'].astype(str) == 'pass').sum())
+        print(f"  photometric veto {Path(photometric_veto).name}: {len(_rej)} rejected / {_n_pass} passed in the "
+              f"photometric panels; {len(_phot_veto_sidx)} rejected stars in this solve barred from membership "
+              f"({len(np.intersect1d(np.asarray(member_sidx, int), _phot_veto_sidx))} of the initial members)")
+
     def _freeze_members(_sidx):
         _sidx = np.asarray(_sidx, int)
         if _seed_frozen_sidx is not None:
             _sidx = np.intersect1d(_sidx, _seed_frozen_sidx)
+        if _phot_veto_sidx is not None:
+            _sidx = np.setdiff1d(_sidx, _phot_veto_sidx)
         if _gaia_pos_sidx is not None:
             _sidx = np.setdiff1d(_sidx, _gaia_pos_sidx)
         if _no5p_sidx is not None:
@@ -2777,7 +2799,7 @@ def run_pop_fit(
         print(f"  Freeze: max_sigma_free_pm {max_sigma_free_pm} -> inf (poorly-constrained seed members stay members)")
         max_sigma_free_pm = np.inf
     member_sidx = _freeze_members(member_sidx)
-    if members_hst_only or members_5p_only or _untrusted_sidx is not None:
+    if members_hst_only or members_5p_only or _untrusted_sidx is not None or _phot_veto_sidx is not None:
         print(f"  Initial members after bars: {len(member_sidx)}")
 
     # ── μ_pop prior: weighted mean of initial members ─────────────────────────
@@ -3975,6 +3997,9 @@ def main(argv=None):
                              'with RMS PM sigma < --seed_preclip_max_sigma can be dropped. Default: off.')
     parser.add_argument('--seed_preclip_max_sigma', type=float, default=1.0,
                         help='Only seed stars with an RMS initial PM sigma below this (mas/yr) are pre-clipped.')
+    parser.add_argument('--photometric_veto', type=str, default=None,
+                        help='CSV from notebook 07/08 (<seed>_photometric.csv: source_index / gaia_source_id, '
+                             'phot_status pass|reject): stars rejected by the photometric panels can never be members.')
     parser.add_argument('--member_seed_csv', type=str, default=None,
                         help='CSV with gaia_source_id (+ optional trusted bool) from the '
                              'interactive selection notebook (07_member_selection). '
@@ -4206,6 +4231,7 @@ def main(argv=None):
         freeze_member_seed=args.freeze_member_seed,
         seed_preclip=args.seed_preclip,
         seed_preclip_max_sigma=args.seed_preclip_max_sigma,
+        photometric_veto=args.photometric_veto,
         freeze_mu_pop_init=args.freeze_mu_pop_init,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
