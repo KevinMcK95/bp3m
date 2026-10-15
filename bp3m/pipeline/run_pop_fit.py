@@ -2080,6 +2080,8 @@ def run_pop_fit(
     member_seed_csv: "Path | str | None" = None,
     use_member_seed: bool = False,
     freeze_member_seed: bool = False,
+    seed_preclip: float | None = None,
+    seed_preclip_max_sigma: float = 1.0,
     freeze_mu_pop_init: bool = False,
     poly_order: int | None = None,
     no_plots: bool = False,
@@ -2651,6 +2653,28 @@ def run_pop_fit(
             raise ValueError(
                 f"member_seed_csv matched only {len(member_sidx)} stars — "
                 f"check that the IDs come from this field's catalogues.")
+        # --seed_preclip: a loose seed can hold confident non-members (Gaia stars with well-measured PMs far from
+        # the population) that would drag the first mu_pop solve before any clipping happens.  Drop seed stars
+        # whose initial (v1 / Gaia) PM is > seed_preclip sigma from the initial mu_pop (LVD / --mu_pop_init, else
+        # the bootstrap), using C_pm + sigma_pm^2 I; only stars with a well-measured PM (RMS sigma <
+        # seed_preclip_max_sigma) can be dropped, so noisy HST-only stars are left to the iterations.
+        if seed_preclip is not None and len(member_sidx):
+            _ref = _mu_init_arr if _mu_init_arr is not None else _mu_boot
+            _s = np.asarray(member_sidx, int)
+            _pa, _pd = _pmra_v1_only[_s], _pmdec_v1_only[_s]
+            _sa, _sd = _sig_pmra_init[_s], _sig_pmdec_init[_s]
+            _rho = np.where(np.isfinite(_corr_pm_init[_s]), _corr_pm_init[_s], 0.0)
+            _ok = np.isfinite(_pa) & np.isfinite(_pd) & np.isfinite(_sa) & np.isfinite(_sd)
+            _well = _ok & (np.sqrt(0.5 * (_sa ** 2 + _sd ** 2)) < seed_preclip_max_sigma)
+            _vxx = _sa ** 2 + sigma_pm ** 2; _vyy = _sd ** 2 + sigma_pm ** 2; _vxy = _rho * _sa * _sd
+            _det = np.maximum(_vxx * _vyy - _vxy ** 2, 1e-30)
+            _dx, _dy = _pa - _ref[0], _pd - _ref[1]
+            _chi2 = np.where(_ok, (_vyy * _dx ** 2 - 2 * _vxy * _dx * _dy + _vxx * _dy ** 2) / _det, 0.0)
+            _drop = _well & (_chi2 > seed_preclip ** 2)
+            member_sidx = _s[~_drop]
+            print(f"  seed_preclip {seed_preclip:g} sigma about ({_ref[0]:+.4f}, {_ref[1]:+.4f}) mas/yr: dropped "
+                  f"{int(_drop.sum())} of {int(_well.sum())} well-measured seed stars (RMS sigma < "
+                  f"{seed_preclip_max_sigma:g} mas/yr); {len(member_sidx)} initial members remain")
     else:
         print("\n  Selecting initial members from v1 bp3m PMs...")
         member_sidx = _select_initial_members(
@@ -3945,6 +3969,12 @@ def main(argv=None):
                         help='Like --use_member_seed, but membership refinement can only '
                              'REMOVE stars from the seed set — stars outside the seed can '
                              'never become members.')
+    parser.add_argument('--seed_preclip', type=float, default=None,
+                        help='Before the first solve, drop seed stars whose initial PM is more than this many '
+                             'sigma (C_pm + sigma_pm^2) from the initial mu_pop (LVD / --mu_pop_init); only stars '
+                             'with RMS PM sigma < --seed_preclip_max_sigma can be dropped. Default: off.')
+    parser.add_argument('--seed_preclip_max_sigma', type=float, default=1.0,
+                        help='Only seed stars with an RMS initial PM sigma below this (mas/yr) are pre-clipped.')
     parser.add_argument('--member_seed_csv', type=str, default=None,
                         help='CSV with gaia_source_id (+ optional trusted bool) from the '
                              'interactive selection notebook (07_member_selection). '
@@ -4174,6 +4204,8 @@ def main(argv=None):
         member_seed_csv=args.member_seed_csv,
         use_member_seed=args.use_member_seed,
         freeze_member_seed=args.freeze_member_seed,
+        seed_preclip=args.seed_preclip,
+        seed_preclip_max_sigma=args.seed_preclip_max_sigma,
         freeze_mu_pop_init=args.freeze_mu_pop_init,
         poly_order=args.poly_order,
         no_plots=args.no_plots,
