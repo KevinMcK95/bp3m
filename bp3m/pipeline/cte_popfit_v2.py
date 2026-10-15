@@ -55,7 +55,7 @@ def _basis(yt, xt, mp, tau, time_order):
     return np.stack([s * m * t for t in tm for s in sp for m in mg], axis=1)    # (n, nf)
 
 
-def _setup(solver, image_names, stars_per_image, star_id_to_idx, anchor_sidx, time_order):
+def _setup(solver, image_names, stars_per_image, star_id_to_idx, anchor_sidx, time_order, group_by='chip'):
     """Per-image static CTE geometry; stores originals of X_c/Y_c once."""
     anchors = set(int(s) for s in (anchor_sidx if anchor_sidx is not None else []))
     per, groups, mags = {}, {}, []
@@ -106,6 +106,13 @@ def _setup(solver, image_names, stars_per_image, star_id_to_idx, anchor_sidx, ti
             Jg[fin] = jj[fin].reshape(-1, 2, 2); n_jac = int(fin.sum())
         yt = np.abs(yr - np.where(hi, _Y_READOUT_TOP, _Y_READOUT_BOT)) / 2048.0
         g = np.array([f'{cname}{"1" if h else "2"}' for h in hi], dtype=object)    # WFC1/UVIS1 = top chip
+        # group_by (2026-10-15): 'epoch' / 'visit' give each epoch (calendar half-year) / visit (rootname[:6]) its own gamma
+        # block per chip, shared by all its sibling images -- CTE residuals change between programmes (Sextans A brightness
+        # split: -7..-32 mpx in 2022, -55..-120 mpx in 2025 ACS) while the default 'chip' block is one per field.
+        if group_by == 'epoch':
+            g = np.array([f'{x}_{np.floor(_year(meta["hst_time_mjd"]) * 2) / 2:.1f}' for x in g], dtype=object)
+        elif group_by == 'visit':
+            g = np.array([f'{x}_{str(img)[:6]}' for x in g], dtype=object)
         for gg in set(g[ok]):
             groups.setdefault(gg, 0)
         anc = np.array([int(s) in anchors for s in d['sidx']])
@@ -308,11 +315,11 @@ def _conditioned(solve_fn, member_sidx, mu, r, z_weights):
 
 
 def run_cte_v2(solver, image_names, stars_per_image, star_id_to_idx, solve_fn, member_sidx, mu_pop, r, a_arr,
-               C_vT=None, anchor_sidx=None, sigma_pm=None, sigma_plx_tot=None, sigma_gamma=0.03, C_pop_prior_inv=None, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4):
+               C_vT=None, anchor_sidx=None, sigma_pm=None, sigma_plx_tot=None, sigma_gamma=0.03, C_pop_prior_inv=None, fix_r=False, z_weights=None, n_iter=5, time_order=1, output_dir=None, tol_mu=1e-4, group_by='chip'):
     """Returns (r, mu_pop, C_shared, C_vT, a_arr, info).  solve_fn(member_sidx, mu, r, fix_r_arg, z_weights_arg)
     is the caller's pop-fit solve (run_pop_fit._solve) so every prior/anchor/weight is the production one."""
     t_start = time.time()
-    per, groups, nf, m_med, m_sd = _setup(solver, image_names, stars_per_image, star_id_to_idx, anchor_sidx, time_order)
+    per, groups, nf, m_med, m_sd = _setup(solver, image_names, stars_per_image, star_id_to_idx, anchor_sidx, time_order, group_by)
     ngrp = len(groups)
     print("\n" + "-" * 60)
     print(f"  CTE phase v2: groups {groups}, {nf} basis terms x 2 directions per group, time_order={time_order}, "

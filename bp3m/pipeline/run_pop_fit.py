@@ -2091,6 +2091,8 @@ def run_pop_fit(
     fit_cte_v2: bool = False,
     cte_v2_n_iter: int = 5,
     cte_v2_time_order: int = 1,
+    cte_v2_group: str = 'chip',
+    cte_v2_sigma_gamma: float = 0.03,
     cte_mag_poly_order: int = 3,
     cte_spatial_order: int = 2,
     cte_time_poly_order: int = 0,
@@ -3284,7 +3286,7 @@ def run_pop_fit(
             lambda m, mu, r, fx, z: _solve(m, mu, r, fix_r_arg=fx, z_weights_arg=z),
             member_sidx, mu_pop_current, r_current, _a_cte, C_vT=_CvT_cte,
             anchor_sidx=_qso_sidx, sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, C_pop_prior_inv=C_pop_prior_inv, fix_r=_frozen, z_weights=z_weights_final,
-            n_iter=cte_v2_n_iter, time_order=cte_v2_time_order, output_dir=output_pfr)
+            n_iter=cte_v2_n_iter, time_order=cte_v2_time_order, output_dir=output_pfr, group_by=cte_v2_group, sigma_gamma=cte_v2_sigma_gamma)
         if not _cte_info.get('skipped'):
             if not _frozen and _C_cte is not None:
                 C_shared_joint = _C_cte
@@ -4024,6 +4026,11 @@ def main(argv=None):
                              'z-weights, frozen/free r kept), applied before the final posterior pass. Replaces --fit_cte.')
     parser.add_argument('--cte_v2_n_iter', type=int, default=5, help='CTE v2 outer iterations (default 5)')
     parser.add_argument('--cte_v2_time_order', type=int, default=1, help='CTE v2 time order: 0 constant, 1 + linear (default)')
+    parser.add_argument('--cte_v2_group', choices=['chip', 'epoch', 'visit'], default='chip',
+                        help="CTE v2 gamma blocks: one per camera chip (default), per chip x epoch (half-year), or per chip x visit; "
+                             "epoch/visit blocks are shared by all sibling images (use --cte_v2_time_order 0 with them)")
+    parser.add_argument('--cte_v2_sigma_gamma', type=float, default=0.03,
+                        help='CTE v2 Gaussian prior sigma per coefficient [px] (default 0.03; ACS 2025 residuals reach ~0.1 px)')
     parser.add_argument('--cte_mag_poly_order', type=int, default=3,
                         help='CTE magnitude polynomial order (default 3)')
     parser.add_argument('--cte_spatial_order', type=int, default=2,
@@ -4245,6 +4252,8 @@ def main(argv=None):
         fit_cte_v2=args.fit_cte_v2,
         cte_v2_n_iter=args.cte_v2_n_iter,
         cte_v2_time_order=args.cte_v2_time_order,
+        cte_v2_group=args.cte_v2_group,
+        cte_v2_sigma_gamma=args.cte_v2_sigma_gamma,
         cte_mag_poly_order=args.cte_mag_poly_order,
         cte_spatial_order=args.cte_spatial_order,
         cte_time_poly_order=args.cte_time_poly_order,
