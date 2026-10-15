@@ -2756,23 +2756,27 @@ def run_pop_fit(
                   f"removed from membership (QSO prior wins): "
                   + ', '.join(str(int(g)) for g in _gids))
 
-    # Photometric veto (notebook 07/08 *_photometric.csv): stars the photometric panels (CMDs / colour-colour)
-    # rejected can never be members, whatever their astrometry; the astrometric selection only seeds membership.
+    # Photometric veto (notebook 07/08 *_photometric.csv): only stars that PASSED the photometric panels (CMDs /
+    # colour-colour) can be members, whatever their astrometry; the astrometric selection only seeds membership.
+    # Stars without a verdict (not shown in the notebook, e.g. above its SIG_PM_MAX gate) are treated as rejected
+    # (user 10-15).
     _phot_veto_sidx = None
     if photometric_veto is not None:
         _pv = pd.read_csv(Path(photometric_veto), dtype={'gaia_source_id': np.int64})
-        _rej = _pv[_pv['phot_status'].astype(str) == 'reject']
-        if 'source_index' in _rej.columns:
-            _sg = (_rej['gaia_source_id'].to_numpy(np.int64) if 'gaia_source_id' in _rej.columns
-                   else np.zeros(len(_rej), np.int64))
-            _ss = pd.to_numeric(_rej['source_index'], errors='coerce').fillna(-1).astype(np.int64).to_numpy()
-            _rids = [int(g) if g != 0 else int(-(si + 1)) for g, si in zip(_sg, _ss)]
+        _pas = _pv[_pv['phot_status'].astype(str) == 'pass']
+        if 'source_index' in _pas.columns:
+            _sg = (_pas['gaia_source_id'].to_numpy(np.int64) if 'gaia_source_id' in _pas.columns
+                   else np.zeros(len(_pas), np.int64))
+            _ss = pd.to_numeric(_pas['source_index'], errors='coerce').fillna(-1).astype(np.int64).to_numpy()
+            _pids = [int(g) if g != 0 else int(-(si + 1)) for g, si in zip(_sg, _ss)]
         else:
-            _rids = [int(g) for g in _rej['gaia_source_id'].values]
-        _phot_veto_sidx = np.array(sorted(star_id_to_idx[g] for g in _rids if g in star_id_to_idx), dtype=int)
-        _n_pass = int((_pv['phot_status'].astype(str) == 'pass').sum())
-        print(f"  photometric veto {Path(photometric_veto).name}: {len(_rej)} rejected / {_n_pass} passed in the "
-              f"photometric panels; {len(_phot_veto_sidx)} rejected stars in this solve barred from membership "
+            _pids = [int(g) for g in _pas['gaia_source_id'].values]
+        _pass_sidx = np.array(sorted(star_id_to_idx[g] for g in _pids if g in star_id_to_idx), dtype=int)
+        _phot_veto_sidx = np.setdiff1d(np.arange(solver.n_stars), _pass_sidx)
+        _n_rej = int((_pv['phot_status'].astype(str) == 'reject').sum())
+        print(f"  photometric veto {Path(photometric_veto).name}: {len(_pas)} passed / {_n_rej} rejected in the "
+              f"photometric panels; {len(_pass_sidx)} passing stars in this solve may be members, the other "
+              f"{len(_phot_veto_sidx)} (rejected or without a verdict) are barred "
               f"({len(np.intersect1d(np.asarray(member_sidx, int), _phot_veto_sidx))} of the initial members)")
 
     def _freeze_members(_sidx):
@@ -3999,7 +4003,8 @@ def main(argv=None):
                         help='Only seed stars with an RMS initial PM sigma below this (mas/yr) are pre-clipped.')
     parser.add_argument('--photometric_veto', type=str, default=None,
                         help='CSV from notebook 07/08 (<seed>_photometric.csv: source_index / gaia_source_id, '
-                             'phot_status pass|reject): stars rejected by the photometric panels can never be members.')
+                             'phot_status pass|reject): only stars that PASSED the photometric panels can be members '
+                             '(rejected stars and stars without a verdict are barred).')
     parser.add_argument('--member_seed_csv', type=str, default=None,
                         help='CSV with gaia_source_id (+ optional trusted bool) from the '
                              'interactive selection notebook (07_member_selection). '
