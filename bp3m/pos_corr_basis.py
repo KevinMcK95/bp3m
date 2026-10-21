@@ -254,7 +254,15 @@ class PosCorrBasis:
     def __init__(self, spec: str):
         """spec = 'DIR' (all basis_*.json in DIR), 'DIR:TAG', or 'DIR:TAG:noorbit' (orbit-conditioned terms left out;
         for tests of the rest of the correction while the orbit block is being validated)."""
+        spec, _, mlp_dir = str(spec).partition('+mlp:')            # 10-21 (GDC v8): 'DIR:TAG+mlp:RUN_DIR' adds the MLP residual g of ml/v8 (mlp_<DET>.{json,npz})
         parts = str(spec).split(':'); d = parts[0]; tag = parts[1] if len(parts) > 1 else ''; self.use_orbit = not (len(parts) > 2 and parts[2] == 'noorbit')
+        self.mlp = {}
+        if mlp_dir:
+            for jf in sorted(glob.glob(os.path.join(mlp_dir, 'mlp_*.json'))):
+                if '_epoch' in os.path.basename(jf): continue
+                jm = json.load(open(jf)); zm = np.load(jf[:-5] + '.npz'); nl = len([k for k in zm.files if k.startswith('W')])
+                self.mlp[jm['det']] = (jm, [(zm[f'W{i}'], zm[f'b{i}']) for i in range(nl)])
+            if not self.mlp: raise FileNotFoundError(f'pos_corr_basis: no mlp_*.json in {mlp_dir}')
         files = sorted(glob.glob(os.path.join(d, f'basis_*_{tag or "*"}.json')))
         if not files: raise FileNotFoundError(f'pos_corr_basis: no basis_*.json in {spec}')
         self.models = {}
@@ -267,7 +275,7 @@ class PosCorrBasis:
 
     @property
     def summary(self):
-        return f'{len(self.models)} basis models from {self.dir}' + ('' if self.use_orbit else ' (orbit terms OFF)') + ': ' + ', '.join(f'{k[0]}/{k[1]}' for k in sorted(self.models))
+        return f'{len(self.models)} basis models from {self.dir}' + ('' if self.use_orbit else ' (orbit terms OFF)') + (f' + MLP residual for {sorted(self.mlp)}' if self.mlp else '') + ': ' + ', '.join(f'{k[0]}/{k[1]}' for k in sorted(self.models))
 
     @staticmethod
     def read_header(flc_path) -> dict:
@@ -322,11 +330,33 @@ class PosCorrBasis:
             feats = spec.get('orbit_feature_list') or ORBIT_FEATURES; zrow = np.array([zrow[ORBIT_FEATURES.index(f)] for f in feats])
             z = np.tile(zrow, (n, 1))
         A = model.design(x, y_chip, chip, t, dm, lsky=lsky, phx=phx, phy=phy, z=z)
-        return A @ bx, A @ by
+        fx, fy = A @ bx, A @ by
+        mm = self.mlp.get(key)
+        if mm is not None and filt in mm[0]['filters']:
+            g = _mlp_residual(mm, filt, x, y_chip, chip, year, dm, lsky if lsky is not None else np.ones(n), z if z is not None else np.zeros((n, len(ORBIT_FEATURES))))
+            fx = fx + g[:, 0]; fy = fy + g[:, 1]
+        return fx, fy
 
     def area_mag(self, tbl, hdr, orbit=None, h=4.0):
         """magnitude term of this correction's pixel-area change (add to calibrated mags); see area_mag()."""
         return area_mag(lambda t: self.bias(t, hdr, orbit=orbit), tbl, h=h)
+
+
+def _mlp_residual(mm, filt, x, y_chip, chip, year, dm, lsky, oz):
+    """GDC v8 residual g (px, raw frame) of the ml/v8 MLP on top of a basis: features exactly as ml/v8/mlp_data.features
+    (x/4096, y_chip/2048, c4, (yr-2016)/10, dm/8, lsky, sin/cos 2pi phase x/y, 9 scaled orbit features) + filter one-hot;
+    g = MLP(z) - MLP(z_anchor) with the anchor at x 2048, y_chip 1024, chip 1, dm 0, phase 0 (t, sky, orbit kept)."""
+    jm, params = mm; n = len(x); phx = np.mod(x, 1.0); phy = np.mod(y_chip, 1.0)
+    Z = np.column_stack([x / 4096.0, y_chip / 2048.0, (chip == 4).astype(float), np.full(n, (year - 2016.0) / 10.0), dm / 8.0, lsky,
+                         np.sin(2 * np.pi * phx), np.cos(2 * np.pi * phx), np.sin(2 * np.pi * phy), np.cos(2 * np.pi * phy), oz]).astype(float)
+    oh = np.zeros((n, len(jm['filters']))); oh[:, jm['filters'].index(filt)] = 1.0; Z = np.c_[Z, oh]
+    Za = Z.copy()
+    for c, v in jm['anchor'].items(): Za[:, int(c)] = v
+    def fwd(h):
+        for W, b in params[:-1]:
+            h = h @ W + b; h = 0.5 * h * (1 + np.tanh(np.sqrt(2 / np.pi) * (h + 0.044715 * h ** 3)))     # jax.nn.gelu (approximate)
+        W, b = params[-1]; return h @ W + b
+    return fwd(Z) - fwd(Za)
 
 
 def area_mag(bias_fn, tbl, h=4.0):
