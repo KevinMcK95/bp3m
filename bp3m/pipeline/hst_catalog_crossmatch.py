@@ -3842,7 +3842,23 @@ def _measure_astrometry_proper(
 
     # Collect results keyed by row_i so that sorting for load balance
     # does not scramble the output order (results must align with combined_df.index).
-    row_results: dict[int, dict] = {}
+    # Column store (10-21): results go straight into per-key arrays at the row's position in combined_df.index.  A list of
+    # 1.95M ~100-key dicts (NGC 300) costs ~15 GB and pd.DataFrame(list_of_dicts) doubles it; arrays cost ~1.5 GB.
+    _N_out = len(combined_df); _pos_of = {ri: p for p, ri in enumerate(combined_df.index)}
+    _cols: dict = {}; _K_list: list = [None] * _N_out
+    def _store(ri, res):
+        p = _pos_of[ri]; _K_list[p] = res.pop('_K_pm_ref', None)
+        for k, v in res.items():
+            c = _cols.get(k)
+            if c is None:
+                if isinstance(v, str): c = np.full(_N_out, '', dtype=object)
+                elif isinstance(v, (bool, np.bool_)): c = np.zeros(_N_out, dtype=bool)
+                elif isinstance(v, (int, np.integer)): c = np.zeros(_N_out, dtype=np.int64)
+                else: c = np.full(_N_out, np.nan, dtype=np.float64)
+                _cols[k] = c
+            if c.dtype.kind in 'ib' and isinstance(v, (float, np.floating)):      # an int column meets a float value: promote
+                c = c.astype(np.float64); _cols[k] = c
+            c[p] = v
 
     if n_workers > 1 and n_total >= 200:
         # Sort by detection count descending (heaviest first), then round-robin
@@ -3860,14 +3876,12 @@ def _measure_astrometry_proper(
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             for chunk_results in executor.map(_process_chunk, chunks):
                 for ri, res in chunk_results:
-                    row_results[ri] = res
+                    _store(ri, res)
     else:
         for row_i in all_indices:
-            row_results[row_i] = _fit_one_source(row_i)
+            _store(row_i, _fit_one_source(row_i))
             _report_progress(1)
 
-    # Reconstruct in combined_df.index order
-    out_rows = [row_results[ri] for ri in combined_df.index]
 
     elapsed_total = time.perf_counter() - _t_dispatch
     rate_total    = n_total / elapsed_total if elapsed_total > 0 else 0.0
@@ -3876,9 +3890,8 @@ def _measure_astrometry_proper(
     print(f"  [phase4] total phase time: "
           f"{time.perf_counter() - _t0_phase:.1f}s")
 
-    # Extract the sparse K_pm pieces before DataFrame construction (list aligned with combined_df.index; None = no fit).
-    K_pm_out = [_row.pop('_K_pm_ref', None) for _row in out_rows]
-    return pd.DataFrame(out_rows, index=combined_df.index), K_pm_out
+    # Sparse K_pm pieces (list aligned with combined_df.index; None = no fit) and the column store as the DataFrame.
+    return pd.DataFrame(_cols, index=combined_df.index), _K_list
 
 
 # ── Phase 5: PM-guided second-pass cross-match ────────────────────────────────
@@ -5061,9 +5074,10 @@ def run_hst_crossmatch(
             combined_v2_df.to_csv(_out_v2, index=False)
             print(f"  Saved → {_out_v2.name}")
         except Exception as _exc_v2:
-            print(f"  Warning: Phase 5 failed: {_exc_v2}")
+            # 10-21: NO fallback (user rule): a failed phase 4/5 must stop the run, not silently continue with the first-pass
+            # catalogue (NGC 300 job 77 ran on after a MemoryError here and would have written a catalogue without PMs).
             import traceback; traceback.print_exc()
-            combined_v2_df = combined_df
+            raise RuntimeError(f"HST cross-match phase 4/5 failed: {_exc_v2!r}") from _exc_v2
 
     # ── Diagnostic figures ────────────────────────────────────────────────────
     field_name = Path(field_dir).name
