@@ -2062,6 +2062,8 @@ def run_pop_fit(
     sigma_pm: float = 0.0075,
     plx_pop: float = 0.003873,
     sigma_plx_tot: float = 0.0001425,
+    fit_plx_offset: bool = False,
+    plx_offset_prior_sigma: float = 0.1,
     mu_pop_prior_sigma: float = 0.5,
     n_iter_mu: int = 20,
     n_iter_joint: int = 20,
@@ -2905,13 +2907,34 @@ def run_pop_fit(
         _use_any = _d['use_for_fit'] | _d.get('use_for_astrom', _d['use_for_fit'])
         np.add.at(solver.gaia_n_hst_used, _d['sidx'][_use_any], 1)
 
+    # ── Shared parallax zero-point offset (user 2026-10-20) ─────────────────────
+    # Pinning every member's parallax to the literature value ignores a local Gaia parallax zero-point; through each
+    # star's PM-parallax covariance the pull toward plx_pop can drag mu_pop along.  With --fit_plx_offset the member
+    # prior is N(plx_pop + delta, sigma_plx_tot^2) with ONE shared delta per field, re-estimated after every solve from the
+    # members' FREE posteriors (population prior removed): delta = sum w (plx_free - plx_pop) / (sum w + sigma_delta^-2),
+    # w = 1 / (C_free[4,4] + sigma_plx_tot^2), prior delta ~ N(0, plx_offset_prior_sigma^2).  Alternating with the joint
+    # (r, mu_pop) solve this is block coordinate ascent on the marginal likelihood.
+    _plx = {'eff': float(plx_pop), 'off': 0.0, 'sig': float('nan'), 'n': 0, 'hist': [], 'on': bool(fit_plx_offset), 'prior_sigma': float(plx_offset_prior_sigma)}
+
+    def _update_plx_offset(a_free, C_free, member_sidx_arg):
+        if not fit_plx_offset or len(member_sidx_arg) == 0:
+            return
+        cf = C_free[member_sidx_arg, 4, 4]; ok = np.isfinite(cf) & (cf > 0)
+        if ok.sum() < 5:
+            return
+        w = 1.0 / (cf[ok] + sigma_plx_tot ** 2); d = a_free[member_sidx_arg, 4][ok] - plx_pop
+        wp = float(plx_offset_prior_sigma) ** -2
+        off = float(np.sum(w * d) / (np.sum(w) + wp)); sig = float(1.0 / np.sqrt(np.sum(w) + wp))
+        _plx.update(eff=plx_pop + off, off=off, sig=sig, n=int(ok.sum())); _plx['hist'].append(off)
+        print(f"    parallax offset: delta={off * 1e3:+.4f} ± {sig * 1e3:.4f} uas (n={int(ok.sum())} members; plx_pop_eff={_plx['eff']:.6f} mas)")
+
     # ── Convenience wrapper: inject QSO anchor args into every _joint_solve call
     def _solve(member_sidx_arg, mu_pop_arg, r_arg,
                fix_r_arg=False, z_weights_arg=None):
         return _joint_solve_pop(
             solver, image_names,
             member_sidx_arg, mu_pop_arg,
-            sigma_pm, plx_pop, sigma_plx_tot,
+            sigma_pm, _plx['eff'], sigma_plx_tot,
             C_pop_prior_inv, mu_pop_prior,
             r_arg, fix_r=fix_r_arg, z_weights=z_weights_arg,
             qso_sidx=_qso_sidx,
@@ -2931,8 +2954,9 @@ def run_pop_fit(
         _mu_pop_used = mu_pop_current.copy()   # mu_pop baked into a_arr
         mu_pop_current = mu_pop_new
         _a_free, _C_free = _compute_free_stellar_posterior(
-            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, _plx['eff'],
             solver._C_VG_inv_per_star)
+        _update_plx_offset(_a_free, _C_free, member_sidx)
         member_sidx = _freeze_members(_select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
@@ -2985,8 +3009,9 @@ def run_pop_fit(
         r_current      = r_new
         mu_pop_current = mu_pop_new
         _a_free, _C_free = _compute_free_stellar_posterior(
-            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+            a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, _plx['eff'],
             solver._C_VG_inv_per_star)
+        _update_plx_offset(_a_free, _C_free, member_sidx)
         member_sidx = _freeze_members(_select_members_from_a(
             _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
             sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
@@ -3028,8 +3053,9 @@ def run_pop_fit(
             r_current      = r_new
             mu_pop_current = mu_pop_new
             _a_free, _C_free = _compute_free_stellar_posterior(
-                a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+                a_arr, C_vT, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, _plx['eff'],
                 solver._C_VG_inv_per_star)
+            _update_plx_offset(_a_free, _C_free, member_sidx)
             member_sidx = _freeze_members(_select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
@@ -3132,13 +3158,14 @@ def run_pop_fit(
             a_arr          = a_arr_p4
 
             _a_free, _C_free = _compute_free_stellar_posterior(
-                a_arr, C_vT_p4, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+                a_arr, C_vT_p4, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, _plx['eff'],
                 solver._C_VG_inv_per_star)
+            _update_plx_offset(_a_free, _C_free, member_sidx)
 
             ok_star, n_use_changed, uff_info = _hard_update_phase4(
                 solver, image_names, r_current, a_arr, C_vT_p4,
                 member_sidx, mu_pop_current,
-                sigma_pm, plx_pop, sigma_plx_tot,
+                sigma_pm, _plx['eff'], sigma_plx_tot,
                 ok_star_prev=ok_star_prev,
                 a_free=_a_free, C_free=_C_free,
                 mu_pop_solve=_mu_pop_used,
@@ -3235,8 +3262,9 @@ def run_pop_fit(
             a_arr           = a_arr_sw
 
             _a_free, _C_free = _compute_free_stellar_posterior(
-                a_arr, C_vT_sw, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+                a_arr, C_vT_sw, member_sidx, sigma_pm, sigma_plx_tot, _mu_pop_used, _plx['eff'],
                 solver._C_VG_inv_per_star)
+            _update_plx_offset(_a_free, _C_free, member_sidx)
             member_sidx = _freeze_members(_select_members_from_a(
                 _a_free, mu_pop_current, _n_hst_det, _C_free, sigma_pm,
                 sigma_clip=member_sigma_clip, pm_sys_floor=pm_sys_floor,
@@ -3619,6 +3647,12 @@ def run_pop_fit(
         'sigma_pm_masyr':        float(sigma_pm),
         'plx_pop_mas':           float(plx_pop),
         'sigma_plx_tot_mas':     float(sigma_plx_tot),
+        'fit_plx_offset':        bool(fit_plx_offset),
+        'plx_offset_mas':        float(_plx['off']),
+        'sigma_plx_offset_mas':  float(_plx['sig']),
+        'plx_offset_n_members':  int(_plx['n']),
+        'plx_pop_eff_mas':       float(_plx['eff']),
+        'plx_offset_prior_sigma_mas': float(plx_offset_prior_sigma),
         'mu_pop_prior_ra':       float(mu_pop_prior[0]),
         'mu_pop_prior_dec':      float(mu_pop_prior[1]),
         'mu_pop_prior_sigma':    float(mu_pop_prior_sigma),
@@ -3799,7 +3833,8 @@ def run_pop_fit(
             mu_pop_hat=mu_pop_current,
             member_sidx=member_sidx,
             sigma_pm=sigma_pm,
-            plx_pop=plx_pop,
+            plx_pop=_plx['eff'],                       # shared parallax offset (10-20): the CTE phase starts from the fitted centre
+            plx_state=(_plx if fit_plx_offset else None),   # ... and keeps re-estimating it in its joint loop
             sigma_plx_tot=sigma_plx_tot,
             mu_pop_prior=mu_pop_prior,
             C_pop_prior_inv=C_pop_prior_inv,
@@ -3928,6 +3963,11 @@ def main(argv=None):
                         help='Total parallax uncertainty (mas) for pop prior. Derived from '
                              '--lvd_key distance uncertainty if not given; otherwise '
                              'defaults to 0.0001425 (Leo I).')
+    parser.add_argument('--fit_plx_offset', action='store_true',
+                        help='Fit ONE shared parallax zero-point offset for the field (member prior N(plx_pop + delta, sigma_plx_tot^2); '
+                             'delta re-estimated from the members\' free posteriors after every solve; user 2026-10-20).')
+    parser.add_argument('--plx_offset_prior_sigma', type=float, default=0.1,
+                        help='Gaussian prior width (mas) on the shared parallax offset (default 0.1 mas, effectively free).')
     parser.add_argument('--mu_pop_prior_sigma', type=float, default=None,
                         help='Gaussian prior width on μ_pop (mas/yr). If --lvd_key provides '
                              'a literature PM uncertainty, set to 3× that value; otherwise '
@@ -4222,6 +4262,8 @@ def main(argv=None):
         field_name=args.name.replace(' ', '_'),
         sigma_pm=_sigma_pm,
         plx_pop=_plx_pop,
+        fit_plx_offset=bool(getattr(args, 'fit_plx_offset', False)),
+        plx_offset_prior_sigma=float(getattr(args, 'plx_offset_prior_sigma', 0.1)),
         sigma_plx_tot=_sigma_plx_tot,
         mu_pop_prior_sigma=_mu_pop_prior_sigma,
         n_iter_mu=args.n_iter_mu,

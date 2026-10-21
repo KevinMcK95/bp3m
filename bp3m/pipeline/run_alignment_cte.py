@@ -898,6 +898,48 @@ def _apply_cte_to_residual_arrays(
 
 # ── Joint Schur-complement solve for (r, γ_CTE, μ_pop) ───────────────────────
 
+def _plx_offset_em(state, a, C_vT, member_sidx, plx_pop, sigma_plx_tot, sigma_pm, mu_pop_used):
+    """Shared field-wide parallax offset (10-20, user): the member prior is N(plx_pop + delta, sigma_plx_tot^2) with ONE
+    delta per field, re-estimated after every joint solve exactly as run_pop_fit._update_plx_offset does: from the members'
+    FREE conditional posteriors (population prior on pm and parallax stripped from the a / C_vT of _joint_solve_cte, which
+    were computed under the centre state['eff'] and mean mu_pop_used),
+        delta = sum w (plx_free - plx_pop) / (sum w + sigma_delta^-2),   w = 1 / (C_free[4,4] + sigma_plx_tot^2),
+    prior delta ~ N(0, state['prior_sigma']^2).  Updates state in place; returns the centre to use next (plx_pop + delta).
+    state = None or {'on': False} -> no-op (returns plx_pop)."""
+    if not state or not state.get('on'):
+        return float(plx_pop)
+    m = np.asarray(member_sidx, dtype=int)
+    if len(m) == 0:
+        return state['eff']
+    Cm = C_vT[m]; am = a[m]; ok = np.isfinite(Cm[:, 4, 4]) & (Cm[:, 4, 4] > 0)
+    if ok.sum() < 5:
+        return state['eff']
+    Cm = Cm[ok]; am = am[ok]
+    try:
+        H = np.linalg.inv(Cm)
+    except np.linalg.LinAlgError:
+        return state['eff']
+    h = np.einsum('nij,nj->ni', H, am)
+    spm = float(sigma_pm) ** -2; spl = float(sigma_plx_tot) ** -2
+    H[:, 2, 2] -= spm; H[:, 3, 3] -= spm; H[:, 4, 4] -= spl
+    h[:, 2] -= spm * mu_pop_used[0]; h[:, 3] -= spm * mu_pop_used[1]; h[:, 4] -= spl * state['eff']
+    good = H[:, 4, 4] > 1e-6 * spl                      # stars whose data constrain the parallax at all (2p Gaia members do not)
+    if good.sum() < 5:
+        return state['eff']
+    try:
+        Cf = np.linalg.inv(H[good])
+    except np.linalg.LinAlgError:
+        return state['eff']
+    af = np.einsum('nij,nj->ni', Cf, h[good]); cf = Cf[:, 4, 4]; g2 = np.isfinite(cf) & (cf > 0)
+    if g2.sum() < 5:
+        return state['eff']
+    w = 1.0 / (cf[g2] + float(sigma_plx_tot) ** 2); d = af[g2, 4] - float(plx_pop); wp = float(state['prior_sigma']) ** -2
+    off = float(np.sum(w * d) / (np.sum(w) + wp)); sig = float(1.0 / np.sqrt(np.sum(w) + wp))
+    state.update(eff=float(plx_pop) + off, off=off, sig=sig, n=int(g2.sum())); state.setdefault('hist', []).append(off)
+    print(f"    parallax offset (CTE phase): delta={off * 1e3:+.4f} +- {sig * 1e3:.4f} uas (n={int(g2.sum())} members; plx_pop_eff={state['eff']:.6f} mas)")
+    return state['eff']
+
+
 def _joint_solve_cte(
     solver,
     image_names: list[str],
@@ -3814,9 +3856,14 @@ def _run_joint_cte_loop(
     member_sidx_init: np.ndarray | None = None,
     mu_pop_init: np.ndarray | None = None,
     fit_cte_x: bool = True,
+    fit_plx_offset: bool = False,
+    plx_offset_prior_sigma: float = 0.1,
+    plx_state: dict | None = None,
 ) -> tuple:
     """
     Outer Gauss-Newton loop for the joint (r, γ_CTE, μ_pop) solve.
+    fit_plx_offset / plx_state (10-20): shared parallax offset of the member prior, re-estimated after every joint solve
+    (_plx_offset_em); pass a dict as plx_state to read the final delta back (keys eff, off, sig, n, hist).
 
     Replaces the alternating solver.fit() + update_cte_params() loop with a
     single coherent joint optimisation.  Each iteration calls _joint_solve_cte
@@ -3925,9 +3972,11 @@ def _run_joint_cte_loop(
               f"n_gaia={len(mu_member_sidx)}  n_hst_prior={len(hst_prior_sidx)}  "
               f"μ=({mu_pop_current[0]:+.4f},{mu_pop_current[1]:+.4f}) ──")
         _t_iter = _jtime.time()
+        if plx_state is None:
+            plx_state = {'on': bool(fit_plx_offset), 'eff': float(plx_pop), 'off': 0.0, 'sig': float('nan'), 'n': 0, 'hist': [], 'prior_sigma': float(plx_offset_prior_sigma)}
         result = _joint_solve_cte(
             solver, image_names, cte_params, t_launch_yr, filtered_spi,
-            mu_member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
+            mu_member_sidx, sigma_pm, plx_state['eff'], sigma_plx_tot,
             mu_pop_current, mu_pop_prior, C_pop_prior_inv, r_current,
             regularize_gamma=regularize_gamma,
             gamma_prior=gamma_prior,
@@ -3935,6 +3984,7 @@ def _run_joint_cte_loop(
             fit_cte_x=fit_cte_x,
         )
         r_hat, C_r, gamma_hat, mu_pop_hat, C_shared, a_arr, K_img, C_vT = result
+        _plx_offset_em(plx_state, a_arr, C_vT, mu_member_sidx, plx_pop, sigma_plx_tot, sigma_pm, mu_pop_current)
 
         # Update state
         cte_params     = _gamma_to_cte_params(gamma_hat, cte_params)
@@ -4911,6 +4961,8 @@ def run_alignment_joint_cte(
     sigma_pm: float = 0.01,
     plx_pop: float = 0.004,
     sigma_plx_tot: float = 1e-4,
+    fit_plx_offset: bool = False,
+    plx_offset_prior_sigma: float = 0.1,
     mu_pop_prior_sigma: float = 0.5,
     # Iteration / convergence
     n_iter_joint: int = 20,
@@ -5416,6 +5468,7 @@ def run_alignment_joint_cte(
     print(f"\n  Starting joint (r, γ, μ_pop) loop ({n_iter_joint} iterations)...")
     t0 = _time.time()
 
+    _plx_state = {'on': bool(fit_plx_offset), 'eff': float(plx_pop), 'off': 0.0, 'sig': float('nan'), 'n': 0, 'hist': [], 'prior_sigma': float(plx_offset_prior_sigma)}
     (r_hat, C_r, gamma_hat, mu_pop_hat, C_shared,
      a_arr, K_img, C_vT, cte_params,
      _gamma_hist, _mu_pop_hist, _C_mu_hist) = _run_joint_cte_loop(
@@ -5430,6 +5483,9 @@ def run_alignment_joint_cte(
         gaia_catalog=gaia_catalog,
         member_sidx_init=member_sidx_init,
         mu_pop_init=mu_pop_warm,
+        fit_plx_offset=fit_plx_offset,
+        plx_offset_prior_sigma=plx_offset_prior_sigma,
+        plx_state=_plx_state,
         fit_cte_x=fit_cte_x,
     )
     print(f"  Joint loop done ({_time.time() - t0:.1f}s)")
@@ -5510,6 +5566,11 @@ def run_alignment_joint_cte(
             "solver":          "joint_cte",
             "sigma_pm":        sigma_pm,
             "plx_pop":         plx_pop,
+            "fit_plx_offset":  bool(fit_plx_offset),
+            "plx_offset_mas":  float(_plx_state['off']),
+            "sigma_plx_offset_mas": float(_plx_state['sig']),
+            "plx_offset_n_members": int(_plx_state['n']),
+            "plx_pop_eff_mas": float(_plx_state['eff']),
             "sigma_plx_tot":   sigma_plx_tot,
             "mu_pop_prior":        mu_pop_prior.tolist(),
             "mu_pop_prior_sigma":  mu_pop_prior_sigma,
@@ -5673,6 +5734,7 @@ def run_cte_phase_after_popfit(
     regularize_gamma: float = 1e-8,
     fit_cte_x: bool = True,
     output_dir: 'Path | None' = None,
+    plx_state: dict | None = None,
 ) -> tuple:
     """
     CTE phase appended after bp3m-pop-fit convergence.
@@ -5697,6 +5759,7 @@ def run_cte_phase_after_popfit(
     a_arr      : (n_stars, 5) stellar astrometry from final iteration
     """
     import time as _wtime
+    _plx_eff = float(plx_state['eff']) if plx_state else float(plx_pop)   # shared parallax offset (10-20): centre from the pop fit, updated in the joint loop
     from astropy.time import Time as _ATime
 
     t_launch_yr = _ACS_LAUNCH_YR
@@ -5744,7 +5807,7 @@ def run_cte_phase_after_popfit(
         _, mu_pop_current, _C_s, _, _, _, _ = _pop_solve(
             solver, image_names,
             member_sidx, mu_pop_current,
-            sigma_pm, plx_pop, sigma_plx_tot,
+            sigma_pm, _plx_eff, sigma_plx_tot,
             C_pop_prior_inv, mu_pop_prior, r_current,
             fix_r=True,
         )
@@ -5759,7 +5822,7 @@ def run_cte_phase_after_popfit(
         r_current, mu_pop_current, _C_s, _, _, _, _ = _pop_solve(
             solver, image_names,
             member_sidx, mu_pop_current,
-            sigma_pm, plx_pop, sigma_plx_tot,
+            sigma_pm, _plx_eff, sigma_plx_tot,
             C_pop_prior_inv, mu_pop_prior, r_current,
             fix_r=False,
         )
@@ -5781,7 +5844,7 @@ def run_cte_phase_after_popfit(
     _t0 = _wtime.time()
     _ws_result = _joint_solve_cte(
         solver, image_names, cte_template, t_launch_yr, stars_per_image,
-        member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
+        member_sidx, sigma_pm, _plx_eff, sigma_plx_tot,
         mu_pop_hat, mu_pop_prior, C_pop_prior_inv, r_hat,
         regularize_gamma=regularize_gamma,
         hst_prior_sidx=None,
@@ -5826,7 +5889,7 @@ def run_cte_phase_after_popfit(
         _, mu_pop_hat, _C_s, _, _, _, _ = _pop_solve(
             solver, image_names,
             member_sidx, mu_pop_hat,
-            sigma_pm, plx_pop, sigma_plx_tot,
+            sigma_pm, _plx_eff, sigma_plx_tot,
             C_pop_prior_inv, mu_pop_prior, r_hat,
             fix_r=True,
         )
@@ -5850,14 +5913,15 @@ def run_cte_phase_after_popfit(
         _t0 = _wtime.time()
         result = _joint_solve_cte(
             solver, image_names, cte_params, t_launch_yr, stars_per_image,
-            member_sidx, sigma_pm, plx_pop, sigma_plx_tot,
+            member_sidx, sigma_pm, _plx_eff, sigma_plx_tot,
             mu_pop_current, mu_pop_prior, C_pop_prior_inv, r_current,
             regularize_gamma=regularize_gamma,
             gamma_prior=gamma_prior,
             hst_prior_sidx=None,
             fit_cte_x=fit_cte_x,
         )
-        r_hat, _, gamma_hat, mu_pop_hat, C_shared, a_arr, _, _ = result
+        r_hat, _, gamma_hat, mu_pop_hat, C_shared, a_arr, _, _C_vT_it = result
+        _plx_eff = _plx_offset_em(plx_state, a_arr, _C_vT_it, member_sidx, plx_pop, sigma_plx_tot, sigma_pm, mu_pop_current)
 
         cte_params     = _gamma_to_cte_params(gamma_hat, cte_template)
         r_current      = r_hat

@@ -1095,6 +1095,8 @@ def run_pop_fit_rotation(
     mu_pop_init: tuple[float, float] | None = None,
     plx_pop: float | None = None,
     sigma_plx_tot: float | None = None,
+    fit_plx_offset: bool = False,
+    plx_offset_prior_sigma: float = 0.1,
     lvd_key: str | None = None,
     lvd_dir: "Path | str | None" = None,
     no_plots: bool = False,
@@ -1586,6 +1588,22 @@ def run_pop_fit_rotation(
           f"rms(Δμ_ra*)={np.std(rot_ra):.4f}  "
           f"rms(Δμ_dec)={np.std(rot_dec):.4f} mas/yr")
 
+    # ── Shared parallax zero-point offset (user 2026-10-20; same as run_pop_fit): member prior N(plx_pop + delta, sigma_plx_tot^2),
+    # one delta per field, re-estimated after every solve from the members' free posteriors.
+    _plx = {'eff': float(plx_pop), 'off': 0.0, 'sig': float('nan'), 'n': 0, 'hist': []}
+
+    def _update_plx_offset(a_free, C_free, member_sidx_arg):
+        if not fit_plx_offset or len(member_sidx_arg) == 0:
+            return
+        cf = C_free[member_sidx_arg, 4, 4]; ok = np.isfinite(cf) & (cf > 0)
+        if ok.sum() < 5:
+            return
+        w = 1.0 / (cf[ok] + sigma_plx_tot ** 2); d = a_free[member_sidx_arg, 4][ok] - plx_pop
+        wp = float(plx_offset_prior_sigma) ** -2
+        off = float(np.sum(w * d) / (np.sum(w) + wp)); sig = float(1.0 / np.sqrt(np.sum(w) + wp))
+        _plx.update(eff=plx_pop + off, off=off, sig=sig, n=int(ok.sum())); _plx['hist'].append(off)
+        print(f"    parallax offset: delta={off * 1e3:+.4f} ± {sig * 1e3:.4f} uas (n={int(ok.sum())} members; plx_pop_eff={_plx['eff']:.6f} mas)")
+
     # ── Convenience wrapper ────────────────────────────────────────────────────
     def _solve(member_sidx_arg, mu_pop_arg, r_arg,
                fix_r_arg=False, z_weights_arg=None,
@@ -1594,7 +1612,7 @@ def run_pop_fit_rotation(
         return _joint_solve_pop_rot(
             solver, image_names,
             member_sidx_arg, mu_pop_arg,
-            sigma_pm, plx_pop, sigma_plx_tot,
+            sigma_pm, _plx['eff'], sigma_plx_tot,
             C_pop_prior_inv, mu_pop_prior,
             r_arg, fix_r=fix_r_arg, z_weights=z_weights_arg,
             qso_sidx=_qso_sidx,
@@ -1610,7 +1628,7 @@ def run_pop_fit_rotation(
     def _free_posterior(a_arg, C_vT_arg, msidx_arg, mu_pop_arg):
         return _compute_free_stellar_posterior_rot(
             a_arg, C_vT_arg, msidx_arg,
-            sigma_pm, sigma_plx_tot, mu_pop_arg, plx_pop,
+            sigma_pm, sigma_plx_tot, mu_pop_arg, _plx['eff'],
             solver._C_VG_inv_per_star, rot_ra, rot_dec)
 
     # Freeze semantics, matching run_pop_fit: the phases may REMOVE stars from the
@@ -1648,6 +1666,7 @@ def run_pop_fit_rotation(
         _mu_pop_used = mu_pop_current.copy()
         mu_pop_current = mu_pop_new
         _a_free, _C_free = _free_posterior(a_arr, C_vT, member_sidx, _mu_pop_used)
+        _update_plx_offset(_a_free, _C_free, member_sidx)
         member_sidx = _select_members(_a_free, mu_pop_current, _C_free)
         print(f"    iter {mu_iter + 1}/{n_iter_mu}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr  "
@@ -1673,6 +1692,7 @@ def run_pop_fit_rotation(
         r_current      = r_new
         mu_pop_current = mu_pop_new
         _a_free, _C_free = _free_posterior(a_arr, C_vT, member_sidx, _mu_pop_used)
+        _update_plx_offset(_a_free, _C_free, member_sidx)
         member_sidx = _select_members(_a_free, mu_pop_current, _C_free)
         print(f"    iter {jt_iter + 1}/{n_iter_joint}: "
               f"μ_pop=({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f})  "
@@ -1702,6 +1722,7 @@ def run_pop_fit_rotation(
             r_current      = r_new
             mu_pop_current = mu_pop_new
             _a_free, _C_free = _free_posterior(a_arr, C_vT, member_sidx, _mu_pop_used)
+            _update_plx_offset(_a_free, _C_free, member_sidx)
             member_sidx = _select_members(_a_free, mu_pop_current, _C_free)
 
             delta_alpha_max = (max(abs(ai[5] - ai[3]) for ai in alpha_info)
@@ -1760,8 +1781,9 @@ def run_pop_fit_rotation(
         # last step size when n_iter_ft was exhausted.
         _a_free, _C_free = _compute_free_stellar_posterior_rot(
             a_arr, C_vT, _member_sidx_ft,
-            sigma_pm, sigma_plx_tot, _mu_pop_used, plx_pop,
+            sigma_pm, sigma_plx_tot, _mu_pop_used, _plx['eff'],
             solver._C_VG_inv_per_star, _rot_ra_used, _rot_dec_used)
+        _update_plx_offset(_a_free, _C_free, _member_sidx_ft)
         member_sidx = _select_members(_a_free, mu_pop_current, _C_free)
         print(f"  Phase 4 final member re-selection: {len(member_sidx)}")
 
@@ -2070,6 +2092,11 @@ def run_pop_fit_rotation(
         'sigma_pm_masyr':        float(sigma_pm),
         'plx_pop_mas':           float(plx_pop),
         'sigma_plx_tot_mas':     float(sigma_plx_tot),
+        'fit_plx_offset':        bool(fit_plx_offset),
+        'plx_offset_mas':        float(_plx['off']),
+        'sigma_plx_offset_mas':  float(_plx['sig']),
+        'plx_offset_n_members':  int(_plx['n']),
+        'plx_pop_eff_mas':       float(_plx['eff']),
         'mu_pop_prior_ra':       float(mu_pop_prior[0]),
         'mu_pop_prior_dec':      float(mu_pop_prior[1]),
         'mu_pop_prior_sigma':    float(mu_pop_prior_sigma),
@@ -2239,6 +2266,8 @@ def main():
                         help='Residual PM dispersion (mas/yr) after rotation removed. '
                              'Defaults to galaxy-specific value.')
     parser.add_argument('--mu_pop_prior_sigma', type=float, default=0.5)
+    parser.add_argument('--fit_plx_offset', action='store_true', help='Fit ONE shared parallax zero-point offset for the field (user 2026-10-20).')
+    parser.add_argument('--plx_offset_prior_sigma', type=float, default=0.1, help='Gaussian prior width (mas) on the shared parallax offset.')
     parser.add_argument('--n_iter_mu',    type=int, default=20)
     parser.add_argument('--n_iter_joint', type=int, default=20)
     parser.add_argument('--n_iter_alpha', type=int, default=20)
@@ -2315,6 +2344,8 @@ def main():
         f_init=args.f_init,
         n_iter_ft=args.n_iter_ft,
         plx_pop=args.plx_pop,
+        fit_plx_offset=bool(getattr(args, 'fit_plx_offset', False)),
+        plx_offset_prior_sigma=float(getattr(args, 'plx_offset_prior_sigma', 0.1)),
         sigma_plx_tot=args.sigma_plx_tot,
         lvd_key=args.lvd_key,
         lvd_dir=args.lvd_dir,
