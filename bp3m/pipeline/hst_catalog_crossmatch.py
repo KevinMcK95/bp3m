@@ -3038,13 +3038,13 @@ def _parse_hst_indices_columns(combined_df: pd.DataFrame) -> dict[int, list[tupl
         row_index → [(sub_name, catalog_index), ...]
     """
     hst_idx_cols = [c for c in combined_df.columns if c.startswith('hst_indices_')]
-    result: dict[int, list[tuple[str, int]]] = {}
-    for row_i, row in combined_df.iterrows():
-        pairs: list[tuple[str, int]] = []
-        for col in hst_idx_cols:
-            val = row.get(col, '')
+    result: dict[int, list[tuple[str, int]]] = {row_i: [] for row_i in combined_df.index}
+    # Column-wise (10-20): iterrows() materialises the whole frame as one object array (610k x 53 for NGC 300) and is slow.
+    for col in hst_idx_cols:
+        for row_i, val in zip(combined_df.index, combined_df[col].to_numpy(dtype=object)):
             if not val or (isinstance(val, float) and np.isnan(val)):
                 continue
+            pairs = result[row_i]
             for token in str(val).split(','):
                 token = token.strip()
                 if ':' not in token:
@@ -3054,8 +3054,19 @@ def _parse_hst_indices_columns(combined_df: pd.DataFrame) -> dict[int, list[tupl
                     pairs.append((sname.strip(), int(cidx_str.strip())))
                 except ValueError:
                     continue
-        result[row_i] = pairs
     return result
+
+
+def load_K_pm_xmatch(path):
+    """Load the sparse K_pm store written next to master_combined_v2.csv (K_pm_xmatch.npz) and return
+    (n_rows, n_r_total, row_fn) where row_fn(i) -> dense (2, n_r_total) float64 PM sensitivity of row i."""
+    z = np.load(path); ptr, cs, blk = z['row_ptr'], z['col_start'], z['blocks']; n_tot = int(z['n_r_total']); n_r = int(z['n_r'])
+    def row_fn(i: int) -> np.ndarray:
+        out = np.zeros((2, n_tot))
+        for k in range(int(ptr[i]), int(ptr[i + 1])):
+            c = int(cs[k]); out[:, c:c + n_r] += blk[k]
+        return out
+    return len(ptr) - 1, n_tot, row_fn
 
 
 def _build_gaia_cov5(row: pd.Series) -> tuple:
@@ -3208,8 +3219,8 @@ def _measure_astrometry_proper(
 
     Returns
     -------
-    (astrom_df, K_pm) : astrom_df is indexed like combined_df; K_pm is the
-    (N, 2, n_r_total) float32 PM-sensitivity array aligned with astrom_df rows.
+    (astrom_df, K_pm) : astrom_df is indexed like combined_df; K_pm is a list aligned with astrom_df rows of sparse
+    PM-sensitivity pieces (col_start (n_det,) int32, blocks (n_det, 2, n_r) float32) or None (see load_K_pm_xmatch).
     """
     _t0_phase = time.perf_counter()
     print(f"  [phase4] setup: {len(combined_df)} sources, "
@@ -3657,15 +3668,18 @@ def _measure_astrometry_proper(
                 CinvH_n = np.einsum('nij,njk->nik', C_hst_inv_n, H_n)   # (N, 2, 5)
                 AtCiA_cond = np.einsum('ndi,ndk->ik', H_n, CinvH_n) + C_prior_inv  # (5,5)
                 C_vT = np.linalg.inv(AtCiA_cond)                         # (5, 5) mas²
-                _n_r_tot = len(r_hat_arr)
-                HtCinvX = np.zeros((5, _n_r_tot))
+                # Sparse (10-20): K_pm is non-zero only in the n_r columns of the images this source is detected in, so it
+                # is kept as (col_start (N,), blocks (N, 2, n_r)); the dense (2, n_r_total) form needed 74 GB for NGC 300
+                # (1.95M sources x 2376 columns).  Dense rows are rebuilt on demand by load_K_pm_xmatch().
+                _C24 = C_vT[2:4, :]
+                _cs_list = np.asarray([int(cs_arr[_a]) for _a in range(N)], dtype=np.int32)
+                _blk = np.empty((N, 2, n_r), dtype=np.float32)
                 for _a in range(N):
-                    _cs = int(cs_arr[_a])
-                    HtCinvX[:, _cs:_cs + n_r] += CinvH_n[_a].T @ X_arr[_a]
-                K_pm = C_vT[2:4, :] @ HtCinvX                            # (2, n_r_total)
+                    _blk[_a] = _C24 @ (CinvH_n[_a].T @ X_arr[_a])
+                K_pm = (_cs_list, _blk)
             except Exception:
                 C_vT = np.full((5, 5), np.nan)
-                K_pm = np.zeros((2, len(r_hat_arr)))
+                K_pm = (np.zeros(0, dtype=np.int32), np.zeros((0, 2, n_r), dtype=np.float32))
 
             return {
                 'u': u, 'C_u': C_u, 'N': N,
@@ -3862,14 +3876,8 @@ def _measure_astrometry_proper(
     print(f"  [phase4] total phase time: "
           f"{time.perf_counter() - _t0_phase:.1f}s")
 
-    # Extract K_pm arrays before DataFrame construction — they can't be stored
-    # as regular DataFrame columns because they are (2, n_r_total) per star.
-    _n_r_tot = len(r_hat_arr)
-    K_pm_out = np.zeros((len(out_rows), 2, _n_r_tot), dtype=np.float32)
-    for _i, _row in enumerate(out_rows):
-        _kpm = _row.pop('_K_pm_ref', None)
-        if _kpm is not None:
-            K_pm_out[_i] = _kpm.astype(np.float32)
+    # Extract the sparse K_pm pieces before DataFrame construction (list aligned with combined_df.index; None = no fit).
+    K_pm_out = [_row.pop('_K_pm_ref', None) for _row in out_rows]
     return pd.DataFrame(out_rows, index=combined_df.index), K_pm_out
 
 
@@ -5029,15 +5037,23 @@ def run_hst_crossmatch(
                 print(f"  Saved → C_vT_xmatch.npy  shape={_C_vT_arr.shape}")
                 combined_v2_df = combined_v2_df.drop(columns=_cvt_cols)
 
-            # K_pm (N, 2, n_r_total): PM sensitivity ∂(pm_i)/∂r.
+            # K_pm: PM sensitivity ∂(pm_i)/∂r, sparse CSR-like store (row_ptr, col_start, blocks (n_blocks, 2, n_r));
+            # row i of the dense (N, 2, n_r_total) array = sum over its blocks k of blocks[k] placed at col_start[k]
+            # (load_K_pm_xmatch()).  Replaces the dense K_pm_xmatch.npy (10-20; 37 GB for NGC 300).
             if _K_pm_store and _p4:
-                _n_r_tot_save = len(_p4['r_hat'])
-                _K_pm_arr = np.zeros((len(combined_v2_df), 2, _n_r_tot_save), dtype=np.float32)
+                _n_r_tot_save = len(_p4['r_hat']); _nr_save = int(_p4['n_r'])
+                _ptr = np.zeros(len(combined_v2_df) + 1, dtype=np.int64); _cs_parts = []; _blk_parts = []
                 for _i, _ridx in enumerate(combined_v2_df.index):
-                    if int(_ridx) in _K_pm_store:
-                        _K_pm_arr[_i] = _K_pm_store[int(_ridx)]
-                np.save(output_dir / 'K_pm_xmatch.npy', _K_pm_arr)
-                print(f"  Saved → K_pm_xmatch.npy  shape={_K_pm_arr.shape}")
+                    _k = _K_pm_store.get(int(_ridx))
+                    _nb = 0 if _k is None else int(len(_k[0]))
+                    if _nb:
+                        _cs_parts.append(np.asarray(_k[0], dtype=np.int32)); _blk_parts.append(np.asarray(_k[1], dtype=np.float32))
+                    _ptr[_i + 1] = _ptr[_i] + _nb
+                np.savez(output_dir / 'K_pm_xmatch.npz', row_ptr=_ptr,
+                         col_start=np.concatenate(_cs_parts) if _cs_parts else np.zeros(0, dtype=np.int32),
+                         blocks=np.concatenate(_blk_parts) if _blk_parts else np.zeros((0, 2, _nr_save), dtype=np.float32),
+                         n_r_total=np.int64(_n_r_tot_save), n_r=np.int64(_nr_save))
+                print(f"  Saved → K_pm_xmatch.npz  rows={len(combined_v2_df)} blocks={int(_ptr[-1])} n_r_total={_n_r_tot_save}")
 
             _out_v2 = output_dir / 'master_combined_v2.csv'
             if 'gaia_source_id' in combined_v2_df.columns:
