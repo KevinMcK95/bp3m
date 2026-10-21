@@ -68,15 +68,20 @@ def _readout(x, y, chip):
 
 
 class _CTEPar:
-    def __init__(self, alpha, gamma, time_order, t_install, dm_ref=4.0, sky_ref=10.0):
-        self.alphas = list(alpha) if np.ndim(alpha) else [alpha]; self.gamma, self.dm_ref, self.sky_ref = gamma, dm_ref, sky_ref
-        self.time_order, self.t_install = time_order, t_install; self.nt = 1 if time_order < 0 else time_order + 1; self.n = 2 * self.nt * len(self.alphas)
+    def __init__(self, alpha, gamma, time_order, t_install, dm_ref=4.0, sky_ref=10.0, serial=True):
+        # gamma may be a list (one coefficient set per sky exponent; GDC v7c, 2026-10-19); serial=False: parallel term only.
+        # Scalar gamma + serial=True reproduces the original column layout exactly (ml/basis_fit.CTEPar mirrors this).
+        self.alphas = list(alpha) if np.ndim(alpha) else [alpha]; self.gammas = list(gamma) if np.ndim(gamma) else [gamma]
+        self.gamma, self.dm_ref, self.sky_ref, self.serial = gamma, dm_ref, sky_ref, bool(serial)
+        self.time_order, self.t_install = time_order, t_install; self.nt = 1 if time_order < 0 else time_order + 1
+        self.n = (2 if self.serial else 1) * self.nt * len(self.alphas) * len(self.gammas)
     def rows(self, c):
         x, y, chip, t, dm = c['x'], c['y'], c['chip'], c['t'], c['dm']; n = len(x)
         sky = np.full(n, self.sky_ref) if c.get('lsky') is None else 10 ** np.nan_to_num(c['lsky'], nan=1.0)
-        sk = (np.clip(sky, 0.1, None) / self.sky_ref) ** (-self.gamma); dmc = np.clip(dm, -3, 8) - self.dm_ref
+        skr = np.clip(sky, 0.1, None) / self.sky_ref; dmc = np.clip(dm, -3, 8) - self.dm_ref
         tf = [np.clip((t * 10.0 + 2016.0 - self.t_install) / 10.0, 0, None)] if self.time_order < 0 else [t ** i for i in range(self.nt)]
-        return sp.csr_matrix(np.column_stack([sg * d * 10 ** (0.4 * al * dmc) * sk * f for d, sg in _readout(x, y, chip) for al in self.alphas for f in tf]))
+        dirs = _readout(x, y, chip) if self.serial else _readout(x, y, chip)[:1]
+        return sp.csr_matrix(np.column_stack([sg * d * 10 ** (0.4 * al * dmc) * skr ** (-gm) * f for d, sg in dirs for al in self.alphas for gm in self.gammas for f in tf]))
 
 
 class _Phase:
@@ -115,7 +120,7 @@ class _Model:
             for c in (1, 4): self.blocks.append((name, c, off, s)); off += s.n
         self.timelin = _TimeLin(spec['spans'], spec['knot_yr'], spec.get('fit_ranges')); self.tl_off = off; off += self.timelin.n
         self.extras = []
-        if spec.get('cte'): a_, g_, to_ = (list(spec['cte']) + [2])[:3]; self.extras.append(_CTEPar(a_, g_, to_, INSTALL.get(spec.get('key'))))
+        if spec.get('cte'): a_, g_, to_ = (list(spec['cte']) + [2])[:3]; self.extras.append(_CTEPar(a_, g_, to_, INSTALL.get(spec.get('key')), serial=spec.get('cte_serial', True)))
         if spec.get('phase_K'): self.extras.append(_Phase(spec['phase_K']))
         if spec.get('orbit_features'): self.extras.append(_OrbitLin(spec.get('orbit_feature_list', ORBIT_FEATURES)))
         if spec.get('era_delta'): self.extras.append(_EraDelta(spec['era_delta']['bounds'], spec['era_delta'].get('h', 512.0)))
