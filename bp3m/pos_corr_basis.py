@@ -254,7 +254,7 @@ class PosCorrBasis:
     def __init__(self, spec: str):
         """spec = 'DIR' (all basis_*.json in DIR), 'DIR:TAG', or 'DIR:TAG:noorbit' (orbit-conditioned terms left out;
         for tests of the rest of the correction while the orbit block is being validated)."""
-        spec, _, mlp_dir = str(spec).partition('+mlp:')            # 10-21 (GDC v8): 'DIR:TAG+mlp:RUN_DIR' adds the MLP residual g of ml/v8 (mlp_<DET>.{json,npz})
+        spec, _, mlp_dir = str(spec).split('#')[0].partition('+mlp:')   # 10-21 (GDC v8): 'DIR:TAG+mlp:RUN_DIR' adds the MLP residual g of ml/v8; a '#gauge=...' suffix is the gauge wrapper's
         parts = str(spec).split(':'); d = parts[0]; tag = parts[1] if len(parts) > 1 else ''; self.use_orbit = not (len(parts) > 2 and parts[2] == 'noorbit')
         self.mlp = {}
         if mlp_dir:
