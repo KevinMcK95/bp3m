@@ -3032,6 +3032,64 @@ def _recover_gaia_matches(
 
 # ── Phase 4: proper astrometry with full C_r treatment ───────────────────────
 
+def _rss_gb() -> float:
+    """resident set size of this process in GB (Linux /proc)."""
+    try:
+        with open('/proc/self/status') as fh:
+            for line in fh:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1048576.0
+    except Exception:
+        pass
+    return float('nan')
+
+
+def _mem(label: str) -> None:
+    print(f"  [mem] {label}: RSS {_rss_gb():.1f} GB", flush=True)
+
+
+class _DetLookup:
+    """(sub_name, catalog_index) -> detection fields, from column arrays (10-21).  Replaces the dict of one full row dict per
+    detection (NGC 300: 13.4M rows x ~27 fields = ~25 GB) with per-image index arrays (~100 MB).  lookup[(s, c)] returns a
+    small dict of the fields the per-source fit reads; (s, c) in lookup; lookup.row(s, c) -> positional row in det_df or -1."""
+    FIELDS = ('x_gdc', 'y_gdc', 'epoch_mjd', 'cov_xx_raw', 'cov_yy_raw', 'cov_xy_raw', 'alpha')
+
+    def __init__(self, det_df: pd.DataFrame):
+        self.cols = {k: det_df[k].to_numpy(dtype=np.float64) for k in self.FIELDS if k in det_df.columns}
+        codes, uniq = pd.factorize(det_df['sub_name'].to_numpy())
+        ci = det_df['catalog_index'].to_numpy(dtype=np.int64); order = np.argsort(codes, kind='stable')
+        bounds = np.searchsorted(codes[order], np.arange(len(uniq) + 1))
+        self.pos: dict[str, np.ndarray] = {}
+        for j, name in enumerate(uniq):
+            rows = order[bounds[j]:bounds[j + 1]]
+            if len(rows) == 0:
+                continue
+            c = ci[rows]; arr = np.full(int(c.max()) + 1, -1, dtype=np.int64); arr[c] = rows      # last row wins, as the dict did
+            self.pos[str(name)] = arr
+        self.n = int(len(ci))
+
+    def row(self, sname, cidx) -> int:
+        a = self.pos.get(sname)
+        if a is None:
+            return -1
+        c = int(cidx)
+        if c < 0 or c >= len(a):
+            return -1
+        return int(a[c])
+
+    def __contains__(self, key) -> bool:
+        return self.row(key[0], key[1]) >= 0
+
+    def __getitem__(self, key) -> dict:
+        i = self.row(key[0], key[1])
+        if i < 0:
+            raise KeyError(key)
+        return {k: v[i] for k, v in self.cols.items()}
+
+    def __len__(self) -> int:
+        return self.n
+
+
 def _parse_hst_indices_columns(combined_df: pd.DataFrame) -> dict[int, list[tuple[str, int]]]:
     """
     Parse all hst_indices_* columns in combined_df into a dict:
@@ -3040,6 +3098,8 @@ def _parse_hst_indices_columns(combined_df: pd.DataFrame) -> dict[int, list[tupl
     hst_idx_cols = [c for c in combined_df.columns if c.startswith('hst_indices_')]
     result: dict[int, list[tuple[str, int]]] = {row_i: [] for row_i in combined_df.index}
     # Column-wise (10-20): iterrows() materialises the whole frame as one object array (610k x 53 for NGC 300) and is slow.
+    # Sub-image names are interned through one dict (10-21): 13.4M tokens would otherwise be 13.4M distinct str objects (~1 GB).
+    _names: dict[str, str] = {}
     for col in hst_idx_cols:
         for row_i, val in zip(combined_df.index, combined_df[col].to_numpy(dtype=object)):
             if not val or (isinstance(val, float) and np.isnan(val)):
@@ -3051,7 +3111,7 @@ def _parse_hst_indices_columns(combined_df: pd.DataFrame) -> dict[int, list[tupl
                     continue
                 sname, cidx_str = token.rsplit(':', 1)
                 try:
-                    pairs.append((sname.strip(), int(cidx_str.strip())))
+                    sname = sname.strip(); pairs.append((_names.setdefault(sname, sname), int(cidx_str.strip())))
                 except ValueError:
                     continue
     return result
@@ -3232,11 +3292,9 @@ def _measure_astrometry_proper(
         print(f"  [phase4] det_lookup:       reused ({len(det_lookup)} entries)")
     else:
         _t = time.perf_counter()
-        det_lookup = {}
-        for row in det_df.to_dict('records'):
-            det_lookup[(str(row['sub_name']), int(row['catalog_index']))] = row
+        det_lookup = _DetLookup(det_df)
         print(f"  [phase4] det_lookup:       {time.perf_counter()-_t:.2f}s  "
-              f"({len(det_lookup)} entries)")
+              f"({len(det_lookup)} entries, index arrays)")
 
     img_idx_lookup: dict[str, int] = {name: i for i, name in enumerate(image_names)}
 
@@ -3885,6 +3943,7 @@ def _measure_astrometry_proper(
 
     elapsed_total = time.perf_counter() - _t_dispatch
     rate_total    = n_total / elapsed_total if elapsed_total > 0 else 0.0
+    _mem('phase 6 fits done (column store filled)')
     print(f"  [phase4] fit done: {elapsed_total:.1f}s total  "
           f"({rate_total:.0f} src/s avg)")
     print(f"  [phase4] total phase time: "
@@ -3907,6 +3966,7 @@ def _second_pass_match(
     mag_floor: float = 0.10,
     min_detections: int = 2,
     min_match_mas: float = 10.0,
+    det_lookup=None,
 ) -> pd.DataFrame:
     """
     Second-pass cross-match using first-pass PM estimates to propagate source
@@ -3996,9 +4056,9 @@ def _second_pass_match(
     if len(templates) == 0:
         return combined_df
 
-    # ── Build detection lookup: (sub_name, catalog_index) → row index in det_df ─
-    det_key = det_df['sub_name'].astype(str) + ':' + det_df['catalog_index'].astype(str)
-    key_to_detrow = {k: i for i, k in enumerate(det_key)}
+    # ── Detection lookup: (sub_name, catalog_index) → row index in det_df (index arrays, 10-21) ─
+    if det_lookup is None:
+        det_lookup = _DetLookup(det_df)
 
     # Parse all hst_indices / hst_indices_* columns into a per-template lookup.
     # _parse_hst_indices_columns handles both bare 'hst_indices' and per-filter
@@ -4049,8 +4109,8 @@ def _second_pass_match(
     _all_pairs = _parse_hst_indices_columns(combined_df)
     for _row_pairs in _all_pairs.values():
         for _sname, _cidx in _row_pairs:
-            _dr = key_to_detrow.get(f'{_sname}:{_cidx}')
-            if _dr is not None:
+            _dr = det_lookup.row(_sname, _cidx)
+            if _dr >= 0:
                 claimed_globally.add(_dr)
 
     # Process images in epoch order (order doesn't affect correctness here
@@ -4246,8 +4306,8 @@ def _second_pass_match(
     # Seed with existing first-pass detections
     for ti in range(len(templates)):
         for sname, cidx in hst_pairs_lookup.get(ti, []):
-            det_row = key_to_detrow.get(f'{sname}:{cidx}')
-            if det_row is not None:
+            det_row = det_lookup.row(sname, cidx)
+            if det_row >= 0:
                 tmpl_det_rows[ti].append(det_row)
 
     # Add new second-pass matches
@@ -4259,8 +4319,8 @@ def _second_pass_match(
     first_pass_keys: set[int] = set()
     for ti in range(len(templates)):
         for sname, cidx in hst_pairs_lookup.get(ti, []):
-            k = key_to_detrow.get(f'{sname}:{cidx}')
-            if k is not None:
+            k = det_lookup.row(sname, cidx)
+            if k >= 0:
                 first_pass_keys.add(k)
 
     n_new_total = sum(1 for det_row, _ in new_assignments
@@ -4269,7 +4329,7 @@ def _second_pass_match(
     # Per-template first-pass detection count (for summary comparison)
     first_pass_n = np.array([
         sum(1 for sname, cidx in hst_pairs_lookup.get(ti, [])
-            if key_to_detrow.get(f'{sname}:{cidx}') is not None)
+            if det_lookup.row(sname, cidx) >= 0)
         for ti in range(len(templates))
     ])
 
@@ -4499,6 +4559,7 @@ def run_hst_crossmatch(
     # for position propagation.  This ensures all Gaia stars from V1 are found
     # in the maximum number of images before Phase 3's min_detections cut.
     print("\nPhase 1: V1 BP3M-anchored Gaia star detection ...")
+    _mem('start of Phase 1')
     # Collect the V1 Gaia IDs so Phase 2 can skip them
     _v1_anchor_ids: set = set()
     _v1_astrom_path = _anchor_dir / 'stellar_astrometry.csv'
@@ -4513,6 +4574,7 @@ def run_hst_crossmatch(
     # For Gaia catalog stars NOT covered by Phase 1, search using Gaia catalog
     # PM.  Includes new Gaia sources and 2p stars not measured in V1 BP3M.
     print("\nPhase 2: Gaia catalog anchoring (non-V1 stars) ...")
+    _mem('start of Phase 2')
     from bp3m.astro_utils import field_typical_astrometry
     _fill2 = None
     if _v1_astrom_path.exists():
@@ -4546,6 +4608,7 @@ def run_hst_crossmatch(
 
     # ── Phase 3: within-filter matching ──────────────────────────────────────
     print("\nPhase 3: Within-filter cross-matching ...")
+    _mem('start of Phase 3')
     filter_masters = _within_filter_match(
         det_df,
         max_pm_masyr=max_pm_masyr,
@@ -4565,6 +4628,7 @@ def run_hst_crossmatch(
 
     # ── Phase 2: cross-filter matching ───────────────────────────────────────
     print("\nPhase 4: Cross-filter matching ...")
+    _mem('start of Phase 4')
     combined_df = _cross_filter_match(
         filter_masters,
         match_n_sigma=match_n_sigma,
@@ -4583,6 +4647,7 @@ def run_hst_crossmatch(
     # not labelled in Phases 1-2 (e.g. sources first seen in weak detections
     # that required the PM fit from Phase 4 to confirm their identity).
     print("\nPhase 5: Gaia recovery (post-crossmatch) ...")
+    _mem('start of Phase 5')
     # Load Gaia catalog for CMD plots (and pass to recovery)
     gaia_df: Optional[pd.DataFrame] = None
     if gaia_csv is not None and Path(gaia_csv).exists():
@@ -4623,6 +4688,7 @@ def run_hst_crossmatch(
 
     # ── Phase 4: proper astrometry with full C_r treatment ───────────────────
     print("\nPhase 6: Proper astrometry with full transformation covariance ...")
+    _mem('start of Phase 6')
     bp3m_dir = bp3m_results_dir
     astrom_df = pd.DataFrame()
     _p4: dict = {}   # stashed for Phase 5 re-use
@@ -4769,11 +4835,9 @@ def run_hst_crossmatch(
             # Pre-build the expensive lookups once; all subsequent calls reuse them
             print("  [phase4] pre-building shared lookups ...")
             _t_pre = time.perf_counter()
-            _shared_det_lookup = {}
-            for _row in det_df.to_dict('records'):
-                _shared_det_lookup[(str(_row['sub_name']), int(_row['catalog_index']))] = _row
+            _shared_det_lookup = _DetLookup(det_df)
             print(f"  [phase4]   det_lookup built: {time.perf_counter()-_t_pre:.2f}s  "
-                  f"({len(_shared_det_lookup)} entries)")
+                  f"({len(_shared_det_lookup)} entries, index arrays)"); _mem('phase 6 det_lookup built')
 
             _t_pre = time.perf_counter()
             _img_mjd_pre: dict[str, float] = {}
@@ -4958,6 +5022,7 @@ def run_hst_crossmatch(
     combined_v2_df = combined_df
     if run_second_pass:
         print("\nPhase 7: PM-guided second-pass cross-match ...")
+        _mem('start of Phase 7')
         try:
             _ra0_v2  = float(combined_df['ra0'].mean())  if 'ra0'  in combined_df.columns \
                        else float(det_df['ra'].mean())
@@ -4973,7 +5038,9 @@ def run_hst_crossmatch(
                 mag_n_sigma      = mag_n_sigma,
                 mag_floor        = mag_floor,
                 min_detections   = min_detections,
+                det_lookup       = _p4.get('det_lookup'),
             )
+            _mem('phase 7 second pass done')
 
             # ── Re-run Phase 4 proper astrometry on changed sources ───────────
             # Sources whose detection set changed have a 'pass2_hst_indices'
