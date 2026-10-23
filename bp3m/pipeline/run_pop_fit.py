@@ -428,8 +428,10 @@ def _apply_bp3m_flags(
           + ("" if has_ufa else " (no use_for_astrom.npz — used use_for_fit)"))
 
 
-def _restrict_images(names, imgs, restrict_filters, restrict_instdet):
-    """--restrict_filters / --restrict_instdet (same semantics as bp3m)."""
+def _restrict_images(names, imgs, restrict_filters, restrict_instdet, restrict_images=None):
+    """--restrict_filters / --restrict_instdet (same semantics as bp3m) / --restrict_images
+    (a text file of image base names, one per line, '#' comments; chip suffixes _hi/_lo
+    are matched on the base name).  Used for the per-exposure-set pop fits (10-23)."""
     out = list(names)
     if restrict_filters:
         keep = {f.upper() for f in restrict_filters}
@@ -438,11 +440,16 @@ def _restrict_images(names, imgs, restrict_filters, restrict_instdet):
         keep = {s.upper() for s in restrict_instdet}
         out = [n for n in out if (str(imgs[n].get('instrument', ''))
                                   + str(imgs[n].get('detector', ''))).upper() in keep]
-    if restrict_filters or restrict_instdet:
+    if restrict_images:
+        keep = {ln.strip().split('_')[0] for ln in open(restrict_images)
+                if ln.strip() and not ln.startswith('#')}
+        out = [n for n in out if n.split('_')[0] in keep]
+    if restrict_filters or restrict_instdet or restrict_images:
         print(f"  image restriction: {len(out)}/{len(names)} images kept "
-              f"(filters={restrict_filters}, instdet={restrict_instdet})")
+              f"(filters={restrict_filters}, instdet={restrict_instdet}, "
+              f"images={restrict_images})")
         if not out:
-            raise RuntimeError("no images left after --restrict_filters/--restrict_instdet")
+            raise RuntimeError("no images left after --restrict_filters/--restrict_instdet/--restrict_images")
     return out
 
 
@@ -2120,6 +2127,7 @@ def run_pop_fit(
     poly_prior_px: "float | None" = None,
     restrict_filters: "list[str] | None" = None,
     restrict_instdet: "list[str] | None" = None,
+    restrict_images: "str | None" = None,
 ) -> Path:
     """
     Run population PM fitting.
@@ -2263,8 +2271,8 @@ def run_pop_fit(
             filtered_spi = {n: d for n, d in filtered_spi.items()
                             if n in _xdf_names}
             imgs = {n: imgs[n] for n in filtered_spi}
-        if restrict_filters or restrict_instdet:
-            _keep = set(_restrict_images(sorted(filtered_spi), imgs, restrict_filters, restrict_instdet))
+        if restrict_filters or restrict_instdet or restrict_images:
+            _keep = set(_restrict_images(sorted(filtered_spi), imgs, restrict_filters, restrict_instdet, restrict_images))
             filtered_spi = {n: d for n, d in filtered_spi.items() if n in _keep}
             imgs = {n: imgs[n] for n in filtered_spi}
         star_id_to_idx, image_names, star_in_image = build_index_maps(
@@ -2306,7 +2314,7 @@ def run_pop_fit(
                 base = n[:-3] if n.endswith(('_hi', '_lo')) else n
                 v1_bases.add(base)
             image_names = [n for n in image_names if n in v1_bases]
-        image_names = _restrict_images(image_names, imgs, restrict_filters, restrict_instdet)
+        image_names = _restrict_images(image_names, imgs, restrict_filters, restrict_instdet, restrict_images)
         if not image_names:
             raise RuntimeError(
                 "No images remain after filtering to v1 image set."
@@ -3688,7 +3696,7 @@ def run_pop_fit(
             'mu_pop_prior_sigma': mu_pop_prior_sigma,
             'n_iter_mu': n_iter_mu, 'n_iter_joint': n_iter_joint,
             'hst_members_fit': bool(hst_members_fit), 'hst_all_fit': bool(hst_all_fit),
-            'poly_prior_px': poly_prior_px, 'restrict_filters': restrict_filters, 'restrict_instdet': restrict_instdet,
+            'poly_prior_px': poly_prior_px, 'restrict_filters': restrict_filters, 'restrict_instdet': restrict_instdet, 'restrict_images': restrict_images,
             'pos_err_floor_override': pos_err_floor,   # None = mirrored the v1 run's floor
             'pos_err_floor': _floor,
             'pos_corr_model': (str(pos_corr_model) if pos_corr_model else None),
@@ -4174,6 +4182,8 @@ def main(argv=None):
                         help='Keep only images taken with these HST filters (e.g. F606W)')
     parser.add_argument('--restrict_instdet', type=str, nargs='+', default=None,
                         help='Keep only these instrument+detector combos (e.g. ACSWFC WFC3UVIS)')
+    parser.add_argument('--restrict_images', type=str, default=None,
+                        help='Text file of image base names (one per line) to keep: per-exposure-set pop fits')
     parser.add_argument('--hst_all_fit', action='store_true',
                         help='master_v2: let EVERY HST-only source (member or not) '
                              'constrain the alignment in the joint phases, as the '
@@ -4341,6 +4351,7 @@ def main(argv=None):
         poly_prior_px=args.poly_prior_px,
         restrict_filters=args.restrict_filters,
         restrict_instdet=args.restrict_instdet,
+        restrict_images=args.restrict_images,
     )
 
     # Save the command only on successful completion so interrupted runs
