@@ -4921,12 +4921,32 @@ def run_hst_crossmatch(
             has_ra_xmatch = 'ra_xmatch' in combined_df.columns and combined_df['ra_xmatch'].notna().any()
             if has_ra_xmatch:
                 n_before_4b = len(combined_df)
-                # Temporarily map ra0/dec0 to ra_xmatch/dec_xmatch for position query
-                _tmp = combined_df.copy()
-                _valid_xm = _tmp['ra_xmatch'].notna() & _tmp['dec_xmatch'].notna()
-                _tmp.loc[_valid_xm, 'ra0']  = _tmp.loc[_valid_xm, 'ra_xmatch']
-                _tmp.loc[_valid_xm, 'dec0'] = _tmp.loc[_valid_xm, 'dec_xmatch']
-                combined_dedup4b = _deduplicate_merged(_tmp, pos_threshold_mas=50.0)
+                # Only the rows that take part in a close pair (ra_xmatch/dec_xmatch within
+                # 50 mas) go through the row-dict deduplicator: on NGC 300 (1.9M rows x 116
+                # columns) the full-table copy + dict rebuild died with a MemoryError at the
+                # 46 GB job cap (job 79, 2026-10-22), and the code then carried on without the
+                # Phase 4 astrometry.  The pair search is a KD-tree on the tangent plane.
+                _valid_xm = combined_df['ra_xmatch'].notna() & combined_df['dec_xmatch'].notna()
+                _xm = combined_df.loc[_valid_xm, ['ra_xmatch', 'dec_xmatch']]
+                _ra0_xm = float(_xm['ra_xmatch'].mean()); _dec0_xm = float(_xm['dec_xmatch'].mean())
+                _cosd = np.cos(np.radians(_dec0_xm))
+                _pts = np.c_[(_xm['ra_xmatch'].to_numpy() - _ra0_xm) * _cosd, _xm['dec_xmatch'].to_numpy() - _dec0_xm] * 3.6e6
+                from scipy.spatial import cKDTree as _KDT
+                _pairs = _KDT(_pts).query_pairs(50.0, output_type='ndarray') if len(_pts) > 1 else np.zeros((0, 2), int)
+                _cand = _xm.index[np.unique(_pairs.ravel())] if len(_pairs) else _xm.index[:0]
+                del _pts, _xm
+                if len(_cand) > 0:
+                    _tmp = combined_df.loc[_cand].copy()
+                    _tmp['ra0'] = _tmp['ra_xmatch']; _tmp['dec0'] = _tmp['dec_xmatch']
+                    _ded = _deduplicate_merged(_tmp, pos_threshold_mas=50.0)
+                    _dropped_4b = _tmp.index.difference(_ded.index)
+                    combined_dedup4b = combined_df.drop(index=_dropped_4b)
+                    for _col in _ded.columns:
+                        if _col in combined_dedup4b.columns:
+                            combined_dedup4b.loc[_ded.index, _col] = _ded[_col].values
+                    del _tmp, _ded
+                else:
+                    combined_dedup4b = combined_df
                 n_merged_4b = n_before_4b - len(combined_dedup4b)
                 if n_merged_4b > 0:
                     # Restore original ra0/dec0 on surviving rows (index-aligned)
@@ -5014,9 +5034,11 @@ def run_hst_crossmatch(
             print(f"  Updated master_combined.csv with Phase 4 astrometry columns")
 
     except Exception as exc:
-        print(f"  Warning: Phase 4 failed: {exc}")
+        # HARD ERROR (no fallback): a catalogue written without the Phase 4 astrometry is not a
+        # product.  NGC 300 job 79 (2026-10-22) ran 27 h of Phase 7 after a MemoryError here.
         import traceback
         traceback.print_exc()
+        raise RuntimeError(f"Phase 4 failed: {exc}") from exc
 
     # ── Phase 5: PM-guided second-pass cross-match ───────────────────────────
     combined_v2_df = combined_df
