@@ -4942,7 +4942,14 @@ def run_hst_crossmatch(
                     _dropped_4b = _tmp.index.difference(_ded.index)
                     combined_dedup4b = combined_df.drop(index=_dropped_4b)
                     for _col in _ded.columns:
-                        if _col in combined_dedup4b.columns:
+                        if _col not in combined_dedup4b.columns:
+                            continue
+                        # pandas StringDtype columns refuse non-string / NaN assignment (Fornax 10-23:
+                        # "Invalid value for dtype 'str'"): go through object dtype for those
+                        if str(combined_dedup4b[_col].dtype) in ('string', 'str') or str(_ded[_col].dtype) in ('string', 'str'):
+                            combined_dedup4b[_col] = combined_dedup4b[_col].astype(object)
+                            combined_dedup4b.loc[_ded.index, _col] = _ded[_col].astype(object).values
+                        else:
                             combined_dedup4b.loc[_ded.index, _col] = _ded[_col].values
                     del _tmp, _ded
                 else:
