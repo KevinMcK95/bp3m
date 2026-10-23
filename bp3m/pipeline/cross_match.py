@@ -486,6 +486,7 @@ def run_cross_match(
     init_resid_max: float = 5.0,
     group_pass: bool = True,
     force_group_pass: bool = False,
+    exposure_pass: bool = True,
 ) -> list[Path]:
     """
     Cross-match all PSF-fit HST catalogs in a field against Gaia.
@@ -641,6 +642,14 @@ def run_cross_match(
                 # loader admits them with zero stars and the solver link prior determines their geometry
                 from .xmatch_groups import write_jwst_sibling_prealign
                 write_jwst_sibling_prealign(folders, log=print)
+                if exposure_pass:
+                    # Step 4d (2026-10-23): exposure-level NIRCam alignment -- all SCAs of an exposure on the calibrated
+                    # focal plane (bp3m/data/nircam_sca_layout.csv), one pooled Gaia fit, written back per SCA in the
+                    # per-image schema (frames with a trusted >= 8-star solution keep it).  And XIV: 140/140 frames
+                    # solved from 14 exposure fits vs 34/140 per SCA.
+                    from .xmatch_exposure import run_exposure_pass
+                    print("\n  Step 4d: exposure-level NIRCam alignment (calibrated SCA layout, pooled Gaia fit)")
+                    run_exposure_pass(folders, _gaia(), dict(params_meta), log=print, force=force_group_pass)
             return _n_changed
         except Exception as _ge:
             import traceback

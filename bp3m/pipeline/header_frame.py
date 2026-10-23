@@ -113,7 +113,7 @@ def frame_geometry(ph, h1, cat_hdr1, telescope: str = 'HST', transformation: dic
     if telescope == 'JWST':
         tr = transformation or {}
         vaf = float(h1.get('VA_SCALE', 1.0) or 1.0)
-        pscale_deg = float(tr['pixel_scale']) * float(tr['initial_scale']) / 3600.0
+        pscale_deg = float(tr['pixel_scale']) * float(tr.get('initial_scale', 1.0)) / 3600.0   # stale pre-10-07 files lack initial_scale
         orientat = float(tr['orientat'])
         mjd = float(ph.get('EXPMID') or ph['EXPSTART'])
         try:

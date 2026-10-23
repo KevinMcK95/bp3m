@@ -1207,6 +1207,11 @@ class BP3MSolver:
             if self._link_groups:
                 n_mod = sum(g['level'] == 'module' for g in self._link_groups)
                 n_vis = sum(g['level'] == 'visit' for g in self._link_groups)
+                n_exp = sum(g['level'] == 'exposure' for g in self._link_groups)
+                if n_exp:
+                    from .jwst_links import LINK_SIGMAS as _LSE
+                    print(f"  JWST exposure link prior: {n_exp} exposure group(s); sigma_point {_LSE['exposure']['pointing_mas']:g} mas, "
+                          f"rot/scale/skew {_LSE['exposure']['rot_deg']:g} deg / {_LSE['exposure']['scale']:g} / {_LSE['exposure']['skew']:g}")
                 from .jwst_links import LINK_SIGMAS as _LS
                 sm = self._jwst_link_sigma_module_mas if self._jwst_link_sigma_module_mas is not None else _LS['module']['pointing_mas']
                 sv = self._jwst_link_sigma_visit_mas if self._jwst_link_sigma_visit_mas is not None else _LS['visit']['pointing_mas']

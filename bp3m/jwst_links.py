@@ -31,10 +31,11 @@ import re
 # jw<PPPPP><OOO><VVV>_<GGSAA>_<EEEEE>_<detector>
 _NAME_RE = re.compile(r'^jw(?P<program>\d{5})(?P<obs>\d{3})(?P<visit>\d{3})_(?P<act>\d{5})_(?P<exp>\d{5})_(?P<det>[a-z0-9]+)$')
 
-LINK_LEVELS = ('none', 'module', 'visit')
+LINK_LEVELS = ('none', 'module', 'visit', 'exposure')
 
 # prior widths of a member's deviation from its group mean
 LINK_SIGMAS = {
+    'exposure': dict(rot_deg=0.001, scale=5e-5, skew=5e-5, pointing_mas=5.0),   # 2026-10-23: the 10 SCAs of one exposure share the attitude exactly; widths = the field-to-field scatter of the calibrated layout (bp3m/data/nircam_sca_layout.csv: 1-8 mas, 0.3-1 mdeg, 20-50 ppm)
     'module': dict(rot_deg=0.001, scale=1e-4, skew=1e-4, pointing_mas=5.0),
     'visit':  dict(rot_deg=0.002, scale=2e-4, skew=2e-4, pointing_mas=25.0),
 }
@@ -78,7 +79,7 @@ def link_groups(image_names, metas=None, level: str = 'visit',
         raise ValueError(f"jwst_link must be one of {LINK_LEVELS}, got {level!r}")
     if level == 'none':
         return []
-    by_module, by_visit = {}, {}
+    by_module, by_visit, by_expo = {}, {}, {}
     for idx, name in enumerate(image_names):
         if metas is not None:
             meta = metas.get(name) or {}
@@ -89,6 +90,7 @@ def link_groups(image_names, metas=None, level: str = 'visit',
             continue
         by_module.setdefault((p['visit_id'], p['module']), []).append(idx)
         by_visit.setdefault(p['visit_id'], []).append(idx)
+        by_expo.setdefault(p['exposure'], []).append(idx)
     sig_m = dict(LINK_SIGMAS['module'])
     sig_v = dict(LINK_SIGMAS['visit'])
     if sigma_module_mas is not None:
@@ -96,10 +98,16 @@ def link_groups(image_names, metas=None, level: str = 'visit',
     if sigma_visit_mas is not None:
         sig_v['pointing_mas'] = float(sigma_visit_mas)
     out = []
+    if level == 'exposure':
+        # all NIRCam SCAs (+ parallels) of one exposure: the pooled cross-match (xmatch_exposure) already placed them on the
+        # calibrated focal plane, so their r_prior differences carry the layout; this group keeps their DEVIATIONS together
+        for ekey, members in sorted(by_expo.items()):
+            if len(members) >= 2:
+                out.append(dict(label=f"{ekey}/expo", level='exposure', members=list(members), sigmas=dict(LINK_SIGMAS['exposure'])))
     for (vid, mod), members in sorted(by_module.items()):
         if len(members) >= 2:
             out.append(dict(label=f"{vid}/{mod}", level='module', members=list(members), sigmas=sig_m))
-    if level == 'visit':
+    if level in ('visit', 'exposure'):
         for vid, members in sorted(by_visit.items()):
             # a visit with a single module is already covered by its module group
             if len(members) >= 2 and len({module_of(parse_jwst_name(image_names[i])['det']) for i in members}) >= 2:

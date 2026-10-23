@@ -66,6 +66,7 @@ exclude = ["build*", "tests*", "tests_pypass*"]
 
 [tool.setuptools.package-data]
 "bp3m.notebooks" = ["*.ipynb"]
+"bp3m.data" = ["*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

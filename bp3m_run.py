@@ -38,6 +38,7 @@ from pathlib import Path
 from multiprocessing import cpu_count
 
 import numpy as np
+import pandas as pd
 
 
 
@@ -385,7 +386,10 @@ def _parse_args():
                     help='Plate skew prior width (default 1e-4 without a correction model, 1e-5 with --pos_corr_model; pre-2026-09-30: 2e-4)')
     bp.add_argument('--prior_sigma_pointing', type=float, default=None,
                     help='Pointing offset prior width in mas (default 5000.0)')
-    bp.add_argument('--jwst_link', choices=['none', 'module', 'visit'], default='visit',
+    bp.add_argument('--no_indv_exposure_joint', action='store_true',
+                    help='Fit every JWST NIRCam SCA alone in --fit_indv_images_only (default since 2026-10-23: the SCAs of '
+                         'one exposure are fitted together, coupled by the exposure link prior and the pooled cross-match)')
+    bp.add_argument('--jwst_link', choices=['none', 'module', 'visit', 'exposure'], default='exposure',
                     help='Couple the transformation DEVIATIONS of the JWST detectors of one visit (bp3m.jwst_links): '
                          "'module' ties the SW+LW detectors of a NIRCam module across the dithers (5 mas / 3.6\" / 1e-4), "
                          "'visit' (default) adds a loose tie across modules and the NIRISS parallel (25 mas); 'none' = independent frames")
@@ -858,6 +862,99 @@ def _run_indv_one(img_name, run_kw, indv_root, extra_cfg):
         except Exception:
             pass
     return img_name, err, n_fit, n_astrom, n_det, time.time() - t0
+
+
+def _indv_units(names, field_dir, exposure_joint=True):
+    """[[image, ...], ...]: the NIRCam SCAs of one JWST exposure form one unit (fitted together with the exposure link
+    prior, 2026-10-23); every other image is a unit of its own.  Prealign-only siblings of the exposure (zero Gaia stars,
+    transformation_prealign.csv from the pooled cross-match) are added to their unit: the link prior gives them their
+    geometry.  Order: largest units first (load balance)."""
+    from bp3m.jwst_links import parse_jwst_name
+    from bp3m.data_loader_flc import find_image_dir as _fd
+    units, by_expo = [], {}
+    for n in names:
+        p = parse_jwst_name(n) if exposure_joint else None
+        if p is not None and p['det'].startswith('nrc'):
+            by_expo.setdefault(p['exposure'], []).append(n)
+        else:
+            units.append([n])
+    for ekey, mem in by_expo.items():
+        try:
+            d0 = _fd(field_dir, mem[0]).parent
+            for d in sorted(d0.glob(ekey + '_nrc*')):
+                n = d.name
+                if n not in mem and (d / 'transformation_prealign.csv').exists() and not (d / 'matched_gaia.csv').exists():
+                    mem.append(n)
+        except Exception:
+            pass
+        units.append(sorted(mem))
+    return sorted(units, key=lambda u: -len(u))
+
+
+def _run_indv_unit(names, run_kw, indv_root, cfg_map):
+    """One indv unit: a single image -> _run_indv_one; a NIRCam exposure -> one joint solve of its SCAs in
+    BP3M_indv_results/<exposure>__expo/, then the per-image products the indv consumers read (image_transformations.csv
+    row, k x k C_r block, run_config.json with the image's own matched_gaia_md5, detections / use_for_* arrays, GDC labels)
+    are written to BP3M_indv_results/<image>/ exactly as a single-image fit would.  Returns [(image, err, ...), ...]."""
+    if len(names) == 1:
+        return [_run_indv_one(names[0], run_kw, indv_root, cfg_map[names[0]])]
+    import contextlib, json, shutil, time, traceback
+    from bp3m.jwst_links import parse_jwst_name
+    t0 = time.time(); ekey = parse_jwst_name(names[0])['exposure']; joint = Path(indv_root) / f"{ekey}__expo"
+    joint.mkdir(parents=True, exist_ok=True); err = None
+    with open(joint / "processing_log.txt", "w", buffering=1) as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+        try:
+            import matplotlib; matplotlib.use("Agg", force=True)
+            from bp3m.pipeline.run_alignment import run_alignment
+            run_alignment(images=list(names), bp3m_dir=joint, extra_run_config={'exposure_joint': ekey, 'exposure_joint_images': list(names), 'indv_fit_version': INDV_FIT_VERSION},
+                          min_align_demote=0, **run_kw)
+        except Exception as exc:
+            traceback.print_exc(); err = f"{type(exc).__name__}: {exc}"
+    if err is not None:
+        return [(n, err, -1, -1, -1, time.time() - t0) for n in names]
+    out = []
+    try:
+        it = pd.read_csv(joint / 'image_transformations.csv'); cfg = json.loads((joint / 'run_config.json').read_text())
+        C = np.load(joint / 'C_r.npy'); order = list(cfg['image_names']); k = C.shape[0] // max(len(order), 1)
+        npz = {fn: dict(np.load(joint / fn)) for fn in ('detections.npz', 'use_for_fit.npz', 'use_for_astrom.npz', 'star_indices.npz') if (joint / fn).exists()}
+    except Exception as exc:
+        return [(n, f"split failed: {type(exc).__name__}: {exc}", -1, -1, -1, time.time() - t0) for n in names]
+    for n in names:
+        d = Path(indv_root) / n; d.mkdir(parents=True, exist_ok=True); t1 = time.time(); e = None; n_fit = n_astrom = n_det = -1
+        with open(d / "processing_log.txt", "w") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            try:
+                print(f"exposure-joint indv fit: {ekey} ({len(names)} SCAs); solver log in {joint.name}/processing_log.txt")
+                rows = it.index[it.image_name.astype(str) == n].tolist()
+                if not rows or n not in order:
+                    raise RuntimeError('image absent from the joint solution (dropped by the loader?)')
+                j = order.index(n); it.iloc[rows].to_csv(d / 'image_transformations.csv', index=False)
+                np.save(d / 'C_r.npy', C[j * k:(j + 1) * k, j * k:(j + 1) * k])
+                c1 = dict(cfg); c1.update(cfg_map.get(n, {})); c1['image_names'] = [n]; c1['n_images'] = 1; c1['exposure_joint'] = ekey; c1['exposure_joint_images'] = list(names)
+                if 'image_priors' in cfg and isinstance(cfg['image_priors'], dict):
+                    c1['image_priors'] = {n: cfg['image_priors'].get(n)}
+                (d / 'run_config.json').write_text(json.dumps(c1, indent=2))
+                for fn, arrs in npz.items():
+                    sub = {kk: v for kk, v in arrs.items() if kk == n or kk.startswith(n + '_')}
+                    if sub: np.savez(d / fn, **sub)
+                for fn in ('stellar_astrometry.csv',):
+                    if (joint / fn).exists(): shutil.copy2(joint / fn, d / fn)
+                try:
+                    from bp3m.pipeline.residual_export import export_gdc_labels, LABEL_FILE
+                    _n = export_gdc_labels(d, run_kw['field_name'], run_kw['output_dir'], n, pos_corr_model=run_kw.get('pos_corr_model'), pos_corr_table=run_kw.get('pos_corr_table'))
+                    print(f"  Saved: {LABEL_FILE}  ({_n} rows)")
+                except Exception:
+                    print("  WARNING: GDC label export failed"); traceback.print_exc()
+                try:
+                    with np.load(d / "use_for_fit.npz") as zf:
+                        n_fit = int(sum(int(np.sum(zf[kk] > 0)) for kk in zf.files)); n_det = int(sum(int(np.asarray(zf[kk]).size) for kk in zf.files))
+                    with np.load(d / "use_for_astrom.npz") as za:
+                        n_astrom = int(sum(int(np.sum(za[kk] > 0)) for kk in za.files))
+                except Exception:
+                    n_fit = n_astrom = n_det = 0
+            except Exception as exc:
+                traceback.print_exc(); e = f"{type(exc).__name__}: {exc}"
+        out.append((n, e, n_fit, n_astrom, n_det, time.time() - t1))
+    return out
 
 
 def main():
@@ -1591,8 +1688,16 @@ def main():
                 _catalog_file as _cat_file_ix
             if _defer_load:
                 # no matched_gaia.csv -> no Gaia stars -> the full loader would have skipped it too
+                def _pooled_prealign(_n):
+                    # zero-star NIRCam SCA placed by the exposure-level cross-match (xmatch_exposure): fitted in its exposure unit
+                    try:
+                        _pp = _find_dir_ix(output_dir / field, _n) / 'transformation_prealign.csv'
+                        return _pp.exists() and 'jwst_exposure_pooled' in _pp.read_text()
+                    except Exception:
+                        return False
                 _indv_names = [n for n in sorted(set(_bp3m_images))
-                               if (_find_dir_ix(output_dir / field, n) / 'matched_gaia.csv').exists()]
+                               if (_find_dir_ix(output_dir / field, n) / 'matched_gaia.csv').exists()
+                               or (not args.no_indv_exposure_joint and _pooled_prealign(n))]
                 _imgs_all, _spi_all = {}, {}
                 if args.restrict_filters or args.restrict_instdet:
                     from astropy.io import fits as _fits_ix
@@ -1611,6 +1716,11 @@ def main():
                     output_dir, field, pos_err_floor=_pos_err_floor_by_tel,
                     gaia_csv=gaia_csv_path, n_processes=args.n_processes)
                 _, _indv_names, _ = build_index_maps(_spi_all, _gaia_all)
+                if not args.no_indv_exposure_joint:
+                    # zero-star NIRCam SCAs placed by the exposure-level cross-match (prealign_only, xmatch_exposure) join
+                    # their exposure unit: the exposure link prior gives them their geometry
+                    _indv_names = sorted(set(_indv_names) | {n for n, m in _imgs_all.items() if m.get('prealign_only') and n.lower().startswith('jw')
+                                                             and 'nrc' in n.lower()})
 
             if _bp3m_images is not None:
                 _req = set(_bp3m_images)
@@ -1630,8 +1740,18 @@ def main():
                         _imgs_all[n].get('detector', '')).upper() in _kid
                 ]
             if args.bp3m_min_stars > 0 and not _defer_load:
+                # per exposure UNIT for NIRCam SCAs (fitted together, 2026-10-23), per frame otherwise
+                from bp3m.jwst_links import parse_jwst_name as _pjn0
+                def _ukey0(_n):
+                    _p = _pjn0(_n) if not args.no_indv_exposure_joint else None
+                    return _p['exposure'] if (_p is not None and _p['det'].startswith('nrc')) else None
+                _ustars0 = {}
+                for _n in _indv_names:
+                    _k = _ukey0(_n)
+                    if _k is not None:
+                        _ustars0[_k] = _ustars0.get(_k, 0) + len(_spi_all.get(_n, []))
                 _indv_names = [n for n in _indv_names
-                               if len(_spi_all[n]) >= args.bp3m_min_stars]
+                               if (_ustars0[_ukey0(n)] if _ukey0(n) is not None else len(_spi_all.get(n, []))) >= args.bp3m_min_stars]
 
             _indv_root = output_dir / field / (args.indv_results_name or "BP3M_indv_results")
 
@@ -1779,15 +1899,37 @@ def main():
                 _, _loaded, _ = build_index_maps(_spi_all, _gaia_all)
                 _loaded = set(_loaded)
                 _n_before = len(_indv_names)
-                _indv_names = [n for n in _indv_names if n in _loaded
-                               and (args.bp3m_min_stars <= 0 or len(_spi_all[n]) >= args.bp3m_min_stars)]
+                # --bp3m_min_stars applies to the exposure UNIT for NIRCam SCAs (2026-10-23: the SCAs of one exposure are
+                # fitted together; a 1-star SCA is constrained by its siblings), per frame otherwise
+                from bp3m.jwst_links import parse_jwst_name as _pjn
+                def _unit_key(_n):
+                    _p = _pjn(_n) if not args.no_indv_exposure_joint else None
+                    return _p['exposure'] if (_p is not None and _p['det'].startswith('nrc')) else None
+                _unit_stars = {}
+                for _n in _indv_names:
+                    _k = _unit_key(_n)
+                    if _k is not None:
+                        _unit_stars[_k] = _unit_stars.get(_k, 0) + len(_spi_all.get(_n, []))
+                _indv_names = [n for n in _indv_names if (n in _loaded or (_unit_key(n) is not None and n in _imgs_all))
+                               and (args.bp3m_min_stars <= 0
+                                    or (_unit_stars[_unit_key(n)] if _unit_key(n) is not None else len(_spi_all.get(n, []))) >= args.bp3m_min_stars)]
                 if len(_indv_names) < _n_before:
                     print(f"  {_n_before - len(_indv_names)} image(s) dropped after loading "
                           f"(no usable Gaia stars or < --bp3m_min_stars)")
 
             from datetime import datetime as _dt
+            _units = _indv_units(_indv_names, output_dir / field, exposure_joint=not args.no_indv_exposure_joint)
+            _n_units = len(_units); _n_joint = sum(1 for _u in _units if len(_u) > 1)
+            for _u in _units:
+                for _n_ in _u:
+                    if _n_ not in _cfg_map:
+                        _cfg_map[_n_] = _indv_extra_cfg(_n_)
+            _indv_names = [_n_ for _u in _units for _n_ in _u]
+            if _n_joint:
+                print(f"  Exposure-joint indv: {_n_joint} NIRCam exposure(s) fitted as one solve each "
+                      f"({sum(len(_u) for _u in _units if len(_u) > 1)} SCAs, link prior '{args.jwst_link}'); --no_indv_exposure_joint for per-SCA fits")
             _n_total = len(_indv_names)
-            _n_proc = max(1, min(args.n_processes, max(_n_total, 1)))
+            _n_proc = max(1, min(args.n_processes, max(_n_units, 1)))
             print("\n" + "─"*50)
             print(f"Individual image fitting: {_n_total} images "
                   f"({_n_proc} process{'es' if _n_proc > 1 else ''})")
@@ -1838,32 +1980,30 @@ def main():
                 # xmatch hang).  Memory is recycled by rebuilding the whole
                 # pool every _BATCH images instead.
                 _BATCH = 300
-                for _b0 in range(0, _n_total, _BATCH):
-                    _batch = _indv_names[_b0:_b0 + _BATCH]
+                for _b0 in range(0, _n_units, _BATCH):
+                    _batch = _units[_b0:_b0 + _BATCH]
                     with ProcessPoolExecutor(
                             max_workers=min(_n_proc, len(_batch)),
                             mp_context=_mp.get_context("forkserver"),
                             initializer=_indv_pool_init) as _ex:
-                        _futs = {_ex.submit(_run_indv_one, _img, _kw_for(_img),
+                        _futs = {_ex.submit(_run_indv_unit, _u, _kw_for(_u[0]),
                                             _indv_root,
-                                            _cfg_map[_img]): _img
-                                 for _img in _batch}
+                                            {_i: _cfg_map[_i] for _i in _u}): _u
+                                 for _u in _batch}
                         for _fut in as_completed(_futs):
                             try:
-                                _res = _fut.result()
+                                _ress = _fut.result()
                             except Exception as _exc:
-                                _res = (_futs[_fut],
-                                        f"{type(_exc).__name__}: {_exc}",
-                                        -1, -1, -1, 0.0)
-                            _n_done += 1
-                            if _indv_report(_res):
-                                _n_ok += 1
-                            else:
-                                _n_fail += 1
+                                _ress = [(_i, f"{type(_exc).__name__}: {_exc}", -1, -1, -1, 0.0) for _i in _futs[_fut]]
+                            for _res in _ress:
+                                _n_done += 1
+                                if _indv_report(_res):
+                                    _n_ok += 1
+                                else:
+                                    _n_fail += 1
             else:
-                for _img in _indv_names:
-                    _res = _run_indv_one(_img, _kw_for(_img), _indv_root,
-                                         _cfg_map[_img])
+                for _u in _units:
+                  for _res in _run_indv_unit(_u, _kw_for(_u[0]), _indv_root, {_i: _cfg_map[_i] for _i in _u}):
                     _n_done += 1
                     if _indv_report(_res):
                         _n_ok += 1
