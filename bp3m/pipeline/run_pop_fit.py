@@ -2110,6 +2110,8 @@ def run_pop_fit(
     members_hst_only: bool = False,
     members_5p_only: bool = False,
     keep_untrusted_members: bool = False,
+    member_bp_rp_min: "float | None" = None,
+    member_bp_rp_max: "float | None" = None,
     hst_members_fit: bool = False,
     hst_all_fit: bool = False,
     pos_corr_table: "str | None" = None,
@@ -2745,6 +2747,20 @@ def run_pop_fit(
         _n_bar = len(np.intersect1d(np.asarray(member_sidx, int), _untrusted_sidx))
         print(f"  member quality mask: {len(_untrusted_sidx)} untrusted stars (RUWE > 1.4 or excess sig > 2) "
               f"barred from membership ({_n_bar} of the initial members)")
+    # Optional colour window on membership (user 2026-10-23, NGC 300: Gaia analyses of the region suggest fitting the red
+    # stars, BP-RP > 1, separately from the full sample).  Stars outside the window, or without a Gaia colour, are barred
+    # from membership exactly like untrusted stars (seeded or not); the alignment is unaffected.
+    if member_bp_rp_min is not None or member_bp_rp_max is not None:
+        _bprp = (gaia_catalog['bp_rp'].to_numpy(float) if 'bp_rp' in gaia_catalog.columns
+                 else (gaia_catalog['bpmag'].to_numpy(float) - gaia_catalog['rpmag'].to_numpy(float)
+                       if 'bpmag' in gaia_catalog.columns and 'rpmag' in gaia_catalog.columns else np.full(solver.n_stars, np.nan)))
+        _lo = -np.inf if member_bp_rp_min is None else float(member_bp_rp_min); _hi = np.inf if member_bp_rp_max is None else float(member_bp_rp_max)
+        _out = ~(np.isfinite(_bprp) & (_bprp >= _lo) & (_bprp <= _hi))
+        _col_sidx = np.where(_out)[0]
+        _untrusted_sidx = _col_sidx if _untrusted_sidx is None else np.union1d(_untrusted_sidx, _col_sidx)
+        _n_bar_c = len(np.intersect1d(np.asarray(member_sidx, int), _col_sidx))
+        print(f"  member colour window: BP-RP in [{_lo:g}, {_hi:g}] -> {len(_col_sidx)} stars outside / without colour barred "
+              f"from membership ({_n_bar_c} of the initial members)")
 
     # A vetted QSO anchor is never a member: its secular-aberration prior REPLACES the
     # member prior (QSO anchor design).  Both at once tie mu_pop directly to the
@@ -4123,6 +4139,10 @@ def main(argv=None):
     parser.add_argument('--members_5p_only', action='store_true',
                         help='TEST: bar stars without Gaia PM solutions (2p, '
                              'HST-only) from membership')
+    parser.add_argument('--member_bp_rp_min', type=float, default=None,
+                        help='Only stars with Gaia BP-RP >= this value can be members (alignment unaffected)')
+    parser.add_argument('--member_bp_rp_max', type=float, default=None,
+                        help='Only stars with Gaia BP-RP <= this value can be members')
     parser.add_argument('--keep_untrusted_members', action='store_true',
                         help='TEST: let stars failing the solver trust rule (RUWE > 1.4, excess sig > 2) be '
                              'members; by default they are barred whatever the seed says')
@@ -4312,6 +4332,8 @@ def main(argv=None):
         members_hst_only=args.members_hst_only,
         members_5p_only=args.members_5p_only,
         keep_untrusted_members=args.keep_untrusted_members,
+        member_bp_rp_min=args.member_bp_rp_min,
+        member_bp_rp_max=args.member_bp_rp_max,
         hst_members_fit=args.hst_members_fit or args.hst_all_fit,
         hst_all_fit=args.hst_all_fit,
         pos_corr_table=args.pos_corr_table,
