@@ -385,9 +385,20 @@ def area_mag(bias_fn, tbl, h=4.0):
 
 
 def make_pos_corr(spec: str):
-    """factory used by the loaders: a basis model dir (basis_*.json) or an MLP model dir (*_shared_*.json)."""
-    d = str(spec).partition(':')[0]
-    if glob.glob(os.path.join(d, 'basis_*.json')):
-        return PosCorrBasis(spec)
-    from bp3m.pos_corr_model import PosCorrModel
-    return PosCorrModel(spec)
+    """factory used by the loaders: a basis model dir (basis_*.json) or an MLP model dir (*_shared_*.json).
+    A '#gauge=affine6|affine8[,gauge_ref=SPEC]' suffix wraps it in pos_corr_gauge.GaugeFixedPosCorr (per-image affine
+    part removed, or replaced by the reference model's)."""
+    from bp3m.pos_corr_gauge import split_spec, GaugeFixedPosCorr
+    base_spec, gauge, ref = split_spec(spec, with_ref=True)
+
+    def _load(sp):
+        d = sp.partition(':')[0]
+        if glob.glob(os.path.join(d, 'basis_*.json')):
+            return PosCorrBasis(sp)
+        from bp3m.pos_corr_model import PosCorrModel
+        return PosCorrModel(sp)
+    m = _load(base_spec)
+    if ref and ref.startswith('prior:'):                 # option C: learned per-image affine prior centres
+        from bp3m.pos_corr_prior import PriorCentreRef
+        return GaugeFixedPosCorr(m, gauge, spec=str(spec), ref=PriorCentreRef(ref[len('prior:'):])) if gauge else m
+    return GaugeFixedPosCorr(m, gauge, spec=str(spec), ref=_load(ref) if ref else None) if gauge else m
