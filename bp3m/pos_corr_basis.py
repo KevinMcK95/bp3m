@@ -337,6 +337,27 @@ class PosCorrBasis:
             fx = fx + g[:, 0]; fy = fy + g[:, 1]
         return fx, fy
 
+    def design_for(self, tbl, hdr, orbit=None):
+        """(key, filter, year, A) with A the basis design matrix of this catalogue (rows as bias()), or None when the
+        exposure has no model.  Used for the formal-covariance GDC error modes (10-24)."""
+        inst, det = str(hdr.get('INSTRUME')), str(hdr.get('DETECTOR')); key = f'{inst}/{det}'; filt = self._filter(hdr)
+        mdl = self.models.get((key, filt))
+        if mdl is None: return None
+        model, bx, by, spec = mdl; n = len(tbl)
+        x = np.asarray(tbl['x'], float); y = np.asarray(tbl['y'], float)
+        chip = np.asarray(tbl['chip_ext'], int) if 'chip_ext' in tbl.dtype.names else np.where(y >= 2048, 4, 1)
+        y_chip = np.where(chip == 4, y - (2051.0 if inst == 'WFC3' else 2048.0), y)
+        m0 = self.mag0.get(f'{key}/{filt}', np.nan); dm = np.clip(np.asarray(tbl['mag'], float) - m0, -3, 8)
+        mjd = 0.5 * (float(hdr['EXPSTART']) + float(hdr.get('EXPEND') or hdr['EXPSTART'])); year = 2000.0 + (mjd - 51544.5) / 365.25
+        t = np.full(n, (year - 2016.0) / 10.0)
+        lsky = np.log10(np.clip(np.nan_to_num(np.asarray(tbl['sky'], float), nan=1.0), 0.1, None)) if 'sky' in tbl.dtype.names else None
+        phx, phy = np.mod(x, 1.0), np.mod(y, 1.0); z = None
+        if spec.get('orbit_features') and self.use_orbit:
+            zrow, ok = self.orbit_row(hdr, orbit)
+            feats = spec.get('orbit_feature_list') or ORBIT_FEATURES; zrow = np.array([zrow[ORBIT_FEATURES.index(f)] for f in feats])
+            z = np.tile(zrow, (n, 1))
+        return key, filt, year, model.design(x, y_chip, chip, t, dm, lsky=lsky, phx=phx, phy=phy, z=z)
+
     def area_mag(self, tbl, hdr, orbit=None, h=4.0):
         """magnitude term of this correction's pixel-area change (add to calibrated mags); see area_mag()."""
         return area_mag(lambda t: self.bias(t, hdr, orbit=orbit), tbl, h=h)

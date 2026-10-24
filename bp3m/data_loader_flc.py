@@ -381,6 +381,9 @@ def _build_stars_df(img_dir: Path, img_name: str,
         # (b_k - mean_k b), so that sum_k mode_k mode_k^T is the jackknife covariance of the correction.  The solver
         # carries one N(0, 1) coefficient per mode, shared by every detection of the field (gdc_jack_modes()).
         _gm = gdc_jack_modes(tbl, img_dir, img_name)
+        _cm = gdc_cov_modes(tbl, img_dir, img_name)
+        if _cm is not None:
+            _gm = _cm if _gm is None else np.concatenate([_gm, _cm], axis=0)
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
@@ -469,10 +472,51 @@ def _build_stars_df(img_dir: Path, img_name: str,
         "use_for_fit":       ok_sat,
     })
     if _gm is not None:                                   # (K, 2, n_cat) -> per matched row, GDC px
-        for k in range(_gm.shape[0]):
-            df[f"gm_dx_{k}"] = _gm[k, 0, hst_idx]
-            df[f"gm_dy_{k}"] = _gm[k, 1, hst_idx]
+        _cols = {f"gm_dx_{k}": _gm[k, 0, hst_idx] for k in range(_gm.shape[0])}
+        _cols.update({f"gm_dy_{k}": _gm[k, 1, hst_idx] for k in range(_gm.shape[0])})
+        df = pd.concat([df, pd.DataFrame(_cols, index=df.index)], axis=1)
     return df
+
+
+def gdc_cov_modes(tbl, img_dir, img_name):
+    """(K, 2, n_cat) full-rank GDC-map error modes from the formal basis covariance, or None when $BP3M_GDC_COVMODES
+    is unset.  $BP3M_GDC_COVMODES = 'MODE_DIR|BASIS_SPEC|DET:FILT,DET:FILT,...' (ml/v7d/build_cov_modes.py output dir,
+    the production basis spec whose design the modes live in, and the ordered list of mode blocks for this field).
+    Block b holds modes_<DET>_<FILT>.npz: displacement = A W (x: W[:p], y: W[p:]), per-image affine8 projected out on
+    the catalogue footprint (as the gauge does), times k(year) (jackknife calibration).  Exposures of other filters get
+    zeros in this block; an exposure whose filter has a model but no mode block is a hard error."""
+    env = os.environ.get("BP3M_GDC_COVMODES", "")
+    if not env:
+        return None
+    mdir, spec, blocks = env.split("|"); blocks = [b for b in blocks.split(",") if b]
+    if _LDR_STATE.get("cm_env") != env:
+        from bp3m.pos_corr_basis import PosCorrBasis
+        cm = {}
+        for b in blocks:
+            det, filt = b.split(":"); zz = np.load(f"{mdir}/modes_{det}_{filt}.npz")
+            cm[(det.replace("_", "/"), filt)] = (zz["W"], int(zz["p"]), zz["k_years"], zz["k_vals"])
+        keys = [(b.split(":")[0].replace("_", "/"), b.split(":")[1]) for b in blocks]
+        _LDR_STATE.update(cm_pcb=PosCorrBasis(spec), cm=cm, cm_keys=keys,
+                          cm_off=np.cumsum([0] + [cm[k][0].shape[1] for k in keys]), cm_env=env)
+    pcb = _LDR_STATE["cm_pcb"]; hdr = pcb.read_header(img_dir / f"{img_name}_flc.fits")
+    out = np.zeros((int(_LDR_STATE["cm_off"][-1]), 2, len(tbl)))
+    d = pcb.design_for(tbl, hdr)
+    if d is None:
+        return out
+    key, filt, year, A = d
+    if (key, filt) not in _LDR_STATE["cm"]:
+        raise RuntimeError(f"gdc_cov_modes: {img_name} ({key} {filt}) has a GDC model but no mode block in $BP3M_GDC_COVMODES")
+    W, p, ky, kv = _LDR_STATE["cm"][(key, filt)]; b = _LDR_STATE["cm_keys"].index((key, filt))
+    o0, o1 = int(_LDR_STATE["cm_off"][b]), int(_LDR_STATE["cm_off"][b + 1])
+    dx = np.asarray(A @ W[:p]); dy = np.asarray(A @ W[p:])                         # (n, N) each
+    x = np.asarray(tbl["x"], float); y = np.asarray(tbl["y"], float); H2 = 4102.0 if key.startswith("WFC3") else 4096.0
+    c4 = (np.asarray(tbl["chip_ext"], int) == 4) if "chip_ext" in tbl.dtype.names else (y >= 2048)
+    M8 = np.c_[np.ones(len(x)), x / 4096.0, y / H2, c4.astype(float)]               # per-axis affine + chip step (affine8)
+    Pm = np.linalg.pinv(M8)
+    dx = dx - M8 @ (Pm @ dx); dy = dy - M8 @ (Pm @ dy)
+    k = float(np.interp(year, ky, kv))
+    out[o0:o1, 0, :] = (k * dx).T; out[o0:o1, 1, :] = (k * dy).T
+    return out
 
 
 def gdc_jack_modes(tbl, img_dir, img_name):
@@ -561,7 +605,7 @@ def _build_delve_only_stars_df(
         # member models listed in $BP3M_GDC_JACK ('spec|spec|...', gauge suffix included).  mode_k = sqrt((n-1)/n)
         # (b_k - mean_k b), so that sum_k mode_k mode_k^T is the jackknife covariance of the correction.  The solver
         # carries one N(0, 1) coefficient per mode, shared by every detection of the field (gdc_jack_modes()).
-        _gm = gdc_jack_modes(tbl, img_dir, img_name)
+        _gm = None   # DELVE-only rows carry no GDC modes; the solver refuses a mixed image (NaN modes)
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
