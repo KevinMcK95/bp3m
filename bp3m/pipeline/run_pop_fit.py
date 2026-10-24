@@ -613,20 +613,22 @@ def _joint_solve_pop(
 
         x_pred  = np.einsum('nkl,l->nk', X, r_j)
         if K_gm:
-            Gz = np.einsum('ab,nbk->nak', solver.R[img], d['GM'])          # (n, 2, K) tangent-plane px per unit z
+            Gz = np.matmul(solver.R[img], d['GM'])                          # (n, 2, K) tangent-plane px per unit z
             G_img[img] = Gz
-            x_pred = x_pred + np.einsum('nak,k->na', Gz, z_cur)
+            x_pred = x_pred + Gz @ z_cur
         x_resid = xys - x_pred
 
         JUT_Cs = np.einsum('nki,nkl->nil', JU, Cs_inv)
         K      = np.einsum('nik,nkl->nil', JUT_Cs, X)
         K_img[img] = K
-        if K_gm and not fix_r:
-            Kz = np.einsum('nik,nkl->nil', JUT_Cs[use_fit], Gz[use_fit])      # (n_fit, 5, K)
-            np.add.at(Kz_star, sidx_fit, Kz)
-            H_zz_data += np.einsum('nki,nkl,nlj->ij', Gz[use_fit], Cs_inv[use_fit], Gz[use_fit])
-            H_rz_data[cs:cs + nr] += np.einsum('nki,nkl,nlj->ij', X[use_fit], Cs_inv[use_fit], Gz[use_fit])
-            rhs_z_data += np.einsum('nki,nkl,nl->i', Gz[use_fit], Cs_inv[use_fit], x_resid[use_fit])
+        if K_gm and not fix_r:                                              # batched matmuls (K up to ~4000)
+            Gf = Gz[use_fit]; CG = np.matmul(Cs_inv[use_fit], Gf)            # (n_fit, 2, K)
+            _kz = np.matmul(JUT_Cs[use_fit], Gf)
+            if np.unique(sidx_fit).size == sidx_fit.size: Kz_star[sidx_fit] += _kz   # fast path: one detection per star
+            else: np.add.at(Kz_star, sidx_fit, _kz)
+            H_zz_data += Gf.reshape(-1, K_gm).T @ CG.reshape(-1, K_gm)
+            H_rz_data[cs:cs + nr] += X[use_fit].reshape(-1, nr).T @ CG.reshape(-1, K_gm)
+            rhs_z_data += CG.reshape(-1, K_gm).T @ x_resid[use_fit].reshape(-1)
 
         np.add.at(H_vv, sidx_any,
                   np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
@@ -694,9 +696,9 @@ def _joint_solve_pop(
     else:
         rhs[idx_mu] = rhs_mu
         if K_gm:
-            Cz = np.einsum('nij,njk->nik', C_vT, Kz_star)                   # (n_stars, 5, K)
-            Lambda[idx_z, idx_z] += H_zz_data + np.eye(K_gm) - np.einsum('nji,njk->ik', Kz_star, Cz)
-            rhs[idx_z] += rhs_z_data - z_cur + np.einsum('nji,nj->i', Kz_star, a_align)
+            Cz = np.matmul(C_vT, Kz_star)                                   # (n_stars, 5, K)
+            Lambda[idx_z, idx_z] += H_zz_data + np.eye(K_gm) - Kz_star.reshape(-1, K_gm).T @ Cz.reshape(-1, K_gm)
+            rhs[idx_z] += rhs_z_data - z_cur + Kz_star.reshape(-1, K_gm).T @ a_align.reshape(-1)
             Lambda[idx_r, idx_z] += H_rz_data; Lambda[idx_z, idx_r] += H_rz_data.T
             if n_mem > 0:                                                   # (mu, z) Schur cross-block
                 mz = -sigma_pm_inv_sq * Cz[member_sidx, 2:4, :].sum(axis=0)
@@ -724,7 +726,7 @@ def _joint_solve_pop(
             Lambda[cs:cs + nr, cs:cs + nr] -= np.einsum('nji,njk->ik', K_fit, CvT_K_fit)
             rhs[cs:cs + nr]                += np.einsum('nji,nj->i',   K_fit, a_align[sidx_fit])
             if K_gm:                                                        # (r_j, z) Schur cross-block
-                rz = np.einsum('nji,njk->ik', K_fit, Cz[sidx_fit])
+                rz = K_fit.reshape(-1, nr).T @ Cz[sidx_fit].reshape(-1, K_gm)
                 Lambda[cs:cs + nr, idx_z] -= rz; Lambda[idx_z, cs:cs + nr] -= rz.T
 
             # (r, μ) cross-block
