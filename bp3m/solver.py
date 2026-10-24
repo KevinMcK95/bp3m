@@ -1052,6 +1052,9 @@ class BP3MSolver:
                                     else None),   # (n, 2, ED_K) epoch-distortion basis
                 "ed_sigma_px"    : (self._ed_sigma_mas / meta["orig_pixel_scale"]
                                     if self._ed_enabled else None),
+                "GM"             : (np.stack([np.c_[df[f"gm_dx_{k}"].to_numpy(float), df[f"gm_dy_{k}"].to_numpy(float)]
+                                              for k in range(sum(c.startswith("gm_dx_") for c in df.columns))], axis=2)
+                                    if "gm_dx_0" in df.columns else None),   # (n, 2, K) GDC-map jackknife modes, GDC px
                 "C_hst"          : C_hst,             # (n, 2, 2) — may be inflated
                 "C_hst_orig"     : C_hst.copy(),      # (n, 2, 2) — original, never modified
                 "X_c"            : X_c,               # (n,) centered HST x (needed for poly Jacobian)

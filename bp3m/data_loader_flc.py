@@ -376,6 +376,11 @@ def _build_stars_df(img_dir: Path, img_name: str,
             if _mb is not None:
                 cat_xgdc = cat_xgdc - _mb[0]
                 cat_ygdc = cat_ygdc - _mb[1]
+        # GDC map uncertainty (10-24): per-detection jackknife modes of the correction, from the leave-one-fold-out
+        # member models listed in $BP3M_GDC_JACK ('spec|spec|...', gauge suffix included).  mode_k = sqrt((n-1)/n)
+        # (b_k - mean_k b), so that sum_k mode_k mode_k^T is the jackknife covariance of the correction.  The solver
+        # carries one N(0, 1) coefficient per mode, shared by every detection of the field (gdc_jack_modes()).
+        _gm = gdc_jack_modes(tbl, img_dir, img_name)
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)
@@ -463,7 +468,35 @@ def _build_stars_df(img_dir: Path, img_name: str,
         "use_for_alignment": ok_sat,
         "use_for_fit":       ok_sat,
     })
+    if _gm is not None:                                   # (K, 2, n_cat) -> per matched row, GDC px
+        for k in range(_gm.shape[0]):
+            df[f"gm_dx_{k}"] = _gm[k, 0, hst_idx]
+            df[f"gm_dy_{k}"] = _gm[k, 1, hst_idx]
     return df
+
+
+def gdc_jack_modes(tbl, img_dir, img_name):
+    """(K, 2, n_cat) jackknife modes of the learned GDC correction for one image, or None when $BP3M_GDC_JACK is
+    unset.  Every member must return a correction for the image's filter, or none may (filters without a model carry
+    no correction and hence no correction uncertainty); a partial set is a hard error (no silent fallback)."""
+    specs = [s for s in os.environ.get("BP3M_GDC_JACK", "").split("|") if s.strip()]
+    if not specs:
+        return None
+    if _LDR_STATE.get("gm_specs") != specs:
+        from bp3m.pos_corr_basis import make_pos_corr
+        _LDR_STATE["gm"] = [make_pos_corr(s) for s in specs]; _LDR_STATE["gm_specs"] = specs
+    ms = _LDR_STATE["gm"]
+    hdr = ms[0].read_header(img_dir / f"{img_name}_flc.fits")
+    b = [m.bias(tbl, hdr) for m in ms]
+    have = [x is not None for x in b]
+    if not any(have):
+        return np.zeros((len(ms), 2, len(tbl)))
+    if not all(have):
+        raise RuntimeError(f"gdc_jack_modes: {img_name}: only {sum(have)}/{len(ms)} jackknife members model this filter")
+    B = np.array([[np.asarray(x[0], float), np.asarray(x[1], float)] for x in b])     # (K, 2, n)
+    n = len(ms)
+    scale = float(os.environ.get("BP3M_GDC_JACK_SCALE", "1"))       # test hook: 0 must reproduce the run without modes
+    return scale * np.sqrt((n - 1) / n) * (B - B.mean(axis=0, keepdims=True))
 
 
 def _build_delve_only_stars_df(
@@ -524,6 +557,11 @@ def _build_delve_only_stars_df(
             if _mb is not None:
                 cat_xgdc = cat_xgdc - _mb[0]
                 cat_ygdc = cat_ygdc - _mb[1]
+        # GDC map uncertainty (10-24): per-detection jackknife modes of the correction, from the leave-one-fold-out
+        # member models listed in $BP3M_GDC_JACK ('spec|spec|...', gauge suffix included).  mode_k = sqrt((n-1)/n)
+        # (b_k - mean_k b), so that sum_k mode_k mode_k^T is the jackknife covariance of the correction.  The solver
+        # carries one N(0, 1) coefficient per mode, shared by every detection of the field (gdc_jack_modes()).
+        _gm = gdc_jack_modes(tbl, img_dir, img_name)
         cat_cov_xx = tbl["cov_xx_gdc"].astype(float)
         cat_cov_yy = tbl["cov_yy_gdc"].astype(float)
         cat_cov_xy = tbl["cov_xy_gdc"].astype(float)

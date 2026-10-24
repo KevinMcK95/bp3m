@@ -504,12 +504,24 @@ def _joint_solve_pop(
     sigma_pm_inv_sq  = sigma_pm ** -2
     sigma_plx_inv_sq = sigma_plx_tot ** -2
 
+    # GDC-map uncertainty (10-24): K shared jackknife-mode coefficients z ~ N(0, I) (data_loader_flc.gdc_jack_modes);
+    # detection model xys = X r_j - JU v + R_j GM z  (GM in GDC px, R_j = the image's current linear map GDC -> tangent
+    # plane).  z is solved jointly with (r, mu) and marginalised in the returned C_shared (its rows/cols are dropped);
+    # z itself and its covariance are kept on the solver (solver._gm_z, solver._gm_C) for the outputs.
+    _gm_imgs = [im for im in image_names if solver._img_data.get(im) is not None and solver._img_data[im].get('GM') is not None]
+    K_gm = solver._img_data[_gm_imgs[0]]['GM'].shape[2] if _gm_imgs else 0
+    if K_gm and len(_gm_imgs) != sum(solver._img_data.get(im) is not None for im in image_names):
+        raise RuntimeError(f'GDC jackknife modes on {len(_gm_imgs)} images only; every image needs them')
+    if K_gm and getattr(solver, '_gm_z', None) is None:
+        solver._gm_z = np.zeros(K_gm)
+    z_cur = solver._gm_z if K_gm else None
     if fix_r:
         n_shared = 2
     else:
-        n_shared = n_r + 2
+        n_shared = n_r + 2 + K_gm
         idx_r  = slice(0, n_r)
         idx_mu = slice(n_r, n_r + 2)
+        idx_z  = slice(n_r + 2, n_r + 2 + K_gm)
 
     # ── H_vv: start from Gaia prior ───────────────────────────────────────────
     H_vv = solver.C_survey_inv.copy()
@@ -562,6 +574,12 @@ def _joint_solve_pop(
     K_img       = {}
     XCs_xresid  = {}
     H_rr_block  = np.zeros((n_r, n_r))
+    G_img       = {}
+    if K_gm and not fix_r:
+        Kz_star    = np.zeros((n_stars, N_V, K_gm))     # sum over fit detections of JU^T Cs^-1 G, per star
+        H_zz_data  = np.zeros((K_gm, K_gm))
+        H_rz_data  = np.zeros((n_r, K_gm))
+        rhs_z_data = np.zeros(K_gm)
     active_glob = np.zeros(n_stars, dtype=bool)
 
     for j_idx, img in enumerate(_tqdm(image_names, desc='  pop_solve',
@@ -594,11 +612,21 @@ def _joint_solve_pop(
                 Cs_inv = Cs_inv * _z[:, None, None]
 
         x_pred  = np.einsum('nkl,l->nk', X, r_j)
+        if K_gm:
+            Gz = np.einsum('ab,nbk->nak', solver.R[img], d['GM'])          # (n, 2, K) tangent-plane px per unit z
+            G_img[img] = Gz
+            x_pred = x_pred + np.einsum('nak,k->na', Gz, z_cur)
         x_resid = xys - x_pred
 
         JUT_Cs = np.einsum('nki,nkl->nil', JU, Cs_inv)
         K      = np.einsum('nik,nkl->nil', JUT_Cs, X)
         K_img[img] = K
+        if K_gm and not fix_r:
+            Kz = np.einsum('nik,nkl->nil', JUT_Cs[use_fit], Gz[use_fit])      # (n_fit, 5, K)
+            np.add.at(Kz_star, sidx_fit, Kz)
+            H_zz_data += np.einsum('nki,nkl,nlj->ij', Gz[use_fit], Cs_inv[use_fit], Gz[use_fit])
+            H_rz_data[cs:cs + nr] += np.einsum('nki,nkl,nlj->ij', X[use_fit], Cs_inv[use_fit], Gz[use_fit])
+            rhs_z_data += np.einsum('nki,nkl,nl->i', Gz[use_fit], Cs_inv[use_fit], x_resid[use_fit])
 
         np.add.at(H_vv, sidx_any,
                   np.einsum('nik,nkj->nij', JUT_Cs[use_any], JU[use_any]))
@@ -665,6 +693,14 @@ def _joint_solve_pop(
         rhs[:] = rhs_mu
     else:
         rhs[idx_mu] = rhs_mu
+        if K_gm:
+            Cz = np.einsum('nij,njk->nik', C_vT, Kz_star)                   # (n_stars, 5, K)
+            Lambda[idx_z, idx_z] += H_zz_data + np.eye(K_gm) - np.einsum('nji,njk->ik', Kz_star, Cz)
+            rhs[idx_z] += rhs_z_data - z_cur + np.einsum('nji,nj->i', Kz_star, a_align)
+            Lambda[idx_r, idx_z] += H_rz_data; Lambda[idx_z, idx_r] += H_rz_data.T
+            if n_mem > 0:                                                   # (mu, z) Schur cross-block
+                mz = -sigma_pm_inv_sq * Cz[member_sidx, 2:4, :].sum(axis=0)
+                Lambda[idx_mu, idx_z] += mz; Lambda[idx_z, idx_mu] += mz.T
 
     # ── Per-image Schur corrections (joint solve only) ────────────────────────
     if not fix_r:
@@ -687,6 +723,9 @@ def _joint_solve_pop(
             CvT_K_fit = np.einsum('nij,njk->nik', Cv_fit, K_fit)
             Lambda[cs:cs + nr, cs:cs + nr] -= np.einsum('nji,njk->ik', K_fit, CvT_K_fit)
             rhs[cs:cs + nr]                += np.einsum('nji,nj->i',   K_fit, a_align[sidx_fit])
+            if K_gm:                                                        # (r_j, z) Schur cross-block
+                rz = np.einsum('nji,njk->ik', K_fit, Cz[sidx_fit])
+                Lambda[cs:cs + nr, idx_z] -= rz; Lambda[idx_z, cs:cs + nr] -= rz.T
 
             # (r, μ) cross-block
             if use_fmem.any():
@@ -732,6 +771,10 @@ def _joint_solve_pop(
     if fix_r:
         return r_current.copy(), mu_pop_current + delta, C_shared, C_vT, a, a_align, K_img
     else:
+        if K_gm:
+            solver._gm_z = z_cur + delta[idx_z]; solver._gm_C = C_shared[idx_z, idx_z].copy()
+            solver._gm_C_mu_z = C_shared[idx_mu, idx_z].copy()
+            C_shared = C_shared[:n_r + 2, :n_r + 2]                          # marginal over z
         return (r_current + delta[idx_r],
                 mu_pop_current + delta[idx_mu],
                 C_shared, C_vT, a, a_align, K_img)
@@ -3650,6 +3693,10 @@ def run_pop_fit(
         'mu_pop_dec_masyr':      float(mu_pop_current[1]),
         'sigma_mu_pop_ra':       float(sigma_mu_joint[0]),
         'sigma_mu_pop_dec':      float(sigma_mu_joint[1]),
+        # GDC-map jackknife modes marginalised in the joint solve (10-24; $BP3M_GDC_JACK): K, coefficient posterior
+        'gdc_jack_K':            int(len(getattr(solver, '_gm_z', None) if getattr(solver, '_gm_z', None) is not None else [])),
+        'gdc_jack_z':            [float(v) for v in getattr(solver, '_gm_z', [])] if getattr(solver, '_gm_z', None) is not None else [],
+        'gdc_jack_z_sigma':      [float(v) for v in np.sqrt(np.diag(solver._gm_C))] if getattr(solver, '_gm_C', None) is not None else [],
         # frozen-r mode: conditional/frame decomposition of sigma_mu
         # (sigma_mu_pop_* above = frame-marginalised cut posterior)
         'sigma_mu_cond_ra':      (float(np.sqrt(_C_mu_cond[0, 0]))
