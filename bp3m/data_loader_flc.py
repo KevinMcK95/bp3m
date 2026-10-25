@@ -493,13 +493,27 @@ def gdc_cov_modes(tbl, img_dir, img_name):
         from bp3m.pos_corr_basis import PosCorrBasis
         cm = {}
         for b in blocks:
-            det, filt = b.split(":"); zz = np.load(f"{mdir}/modes_{det}_{filt}.npz")
+            det, filt = b.split(":")
+            if det == "MLP":                                   # 'MLP:<DET>' = last-layer Laplace modes of that detector's MLP
+                zz = np.load(f"{mdir}/mlpmodes_{filt}.npz"); cm[("MLP", filt.replace("_", "/"))] = (zz["M"], 0, zz["k_years"], zz["k_vals"])
+                continue
+            zz = np.load(f"{mdir}/modes_{det}_{filt}.npz")
             cm[(det.replace("_", "/"), filt)] = (zz["W"], int(zz["p"]), zz["k_years"], zz["k_vals"])
-        keys = [(b.split(":")[0].replace("_", "/"), b.split(":")[1]) for b in blocks]
+        keys = [("MLP", b.split(":")[1].replace("_", "/")) if b.startswith("MLP:") else (b.split(":")[0].replace("_", "/"), b.split(":")[1]) for b in blocks]
         _LDR_STATE.update(cm_pcb=PosCorrBasis(spec), cm=cm, cm_keys=keys,
                           cm_off=np.cumsum([0] + [cm[k][0].shape[1] for k in keys]), cm_env=env)
     pcb = _LDR_STATE["cm_pcb"]; hdr = pcb.read_header(img_dir / f"{img_name}_flc.fits")
     out = np.zeros((int(_LDR_STATE["cm_off"][-1]), 2, len(tbl)))
+    x = np.asarray(tbl["x"], float); y = np.asarray(tbl["y"], float)
+    c4 = (np.asarray(tbl["chip_ext"], int) == 4) if "chip_ext" in tbl.dtype.names else (y >= 2048)
+    mf = pcb.mlp_features_for(tbl, hdr) if pcb.mlp else None
+    if mf is not None and ("MLP", mf[0]) in _LDR_STATE["cm"]:   # MLP last-layer modes: Phi (n, H) @ M (H x 2 per mode)
+        key_m, filt_m, year_m, Phi = mf; M, _, ky, kv = _LDR_STATE["cm"][("MLP", key_m)]; b = _LDR_STATE["cm_keys"].index(("MLP", key_m))
+        o0, o1 = int(_LDR_STATE["cm_off"][b]), int(_LDR_STATE["cm_off"][b + 1]); M3 = M.reshape(Phi.shape[1], 2, -1)
+        dxm = Phi @ M3[:, 0, :]; dym = Phi @ M3[:, 1, :]
+        H2m = 4102.0 if key_m.startswith("WFC3") else 4096.0; M8m = np.c_[np.ones(len(x)), x / 4096.0, y / H2m, c4.astype(float)]; Pmm = np.linalg.pinv(M8m)
+        dxm = dxm - M8m @ (Pmm @ dxm); dym = dym - M8m @ (Pmm @ dym); km = float(np.interp(year_m, ky, kv))
+        out[o0:o1, 0, :] = (km * dxm).T; out[o0:o1, 1, :] = (km * dym).T
     d = pcb.design_for(tbl, hdr)
     if d is None:
         return out
@@ -509,8 +523,7 @@ def gdc_cov_modes(tbl, img_dir, img_name):
     W, p, ky, kv = _LDR_STATE["cm"][(key, filt)]; b = _LDR_STATE["cm_keys"].index((key, filt))
     o0, o1 = int(_LDR_STATE["cm_off"][b]), int(_LDR_STATE["cm_off"][b + 1])
     dx = np.asarray(A @ W[:p]); dy = np.asarray(A @ W[p:])                         # (n, N) each
-    x = np.asarray(tbl["x"], float); y = np.asarray(tbl["y"], float); H2 = 4102.0 if key.startswith("WFC3") else 4096.0
-    c4 = (np.asarray(tbl["chip_ext"], int) == 4) if "chip_ext" in tbl.dtype.names else (y >= 2048)
+    H2 = 4102.0 if key.startswith("WFC3") else 4096.0
     M8 = np.c_[np.ones(len(x)), x / 4096.0, y / H2, c4.astype(float)]               # per-axis affine + chip step (affine8)
     Pm = np.linalg.pinv(M8)
     dx = dx - M8 @ (Pm @ dx); dy = dy - M8 @ (Pm @ dy)

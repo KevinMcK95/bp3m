@@ -337,6 +337,25 @@ class PosCorrBasis:
             fx = fx + g[:, 0]; fy = fy + g[:, 1]
         return fx, fy
 
+    def mlp_features_for(self, tbl, hdr, orbit=None):
+        """(key, filter, year, Phi) with Phi = (n, H) pinned last-hidden MLP features of this catalogue, or None when the
+        exposure has no MLP (rows as bias(); orbit features as the basis model of that filter uses them)."""
+        inst, det = str(hdr.get('INSTRUME')), str(hdr.get('DETECTOR')); key = f'{inst}/{det}'; filt = self._filter(hdr)
+        mm = self.mlp.get(key); mdl = self.models.get((key, filt))
+        if mm is None or mdl is None or filt not in mm[0]['filters']: return None
+        spec = mdl[3]; n = len(tbl)
+        x = np.asarray(tbl['x'], float); y = np.asarray(tbl['y'], float)
+        chip = np.asarray(tbl['chip_ext'], int) if 'chip_ext' in tbl.dtype.names else np.where(y >= 2048, 4, 1)
+        y_chip = np.where(chip == 4, y - (2051.0 if inst == 'WFC3' else 2048.0), y)
+        m0 = self.mag0.get(f'{key}/{filt}', np.nan); dm = np.clip(np.asarray(tbl['mag'], float) - m0, -3, 8)
+        mjd = 0.5 * (float(hdr['EXPSTART']) + float(hdr.get('EXPEND') or hdr['EXPSTART'])); year = 2000.0 + (mjd - 51544.5) / 365.25
+        lsky = np.log10(np.clip(np.nan_to_num(np.asarray(tbl['sky'], float), nan=1.0), 0.1, None)) if 'sky' in tbl.dtype.names else np.ones(n)
+        oz = np.zeros((n, len(ORBIT_FEATURES)))
+        if spec.get('orbit_features') and self.use_orbit:
+            zrow, ok = self.orbit_row(hdr, orbit); feats = spec.get('orbit_feature_list') or ORBIT_FEATURES
+            oz = np.tile(np.array([zrow[ORBIT_FEATURES.index(f)] for f in feats]), (n, 1))
+        return key, filt, year, _mlp_hidden_diff(mm, filt, x, y_chip, chip, year, dm, lsky, oz)
+
     def design_for(self, tbl, hdr, orbit=None):
         """(key, filter, year, A) with A the basis design matrix of this catalogue (rows as bias()), or None when the
         exposure has no model.  Used for the formal-covariance GDC error modes (10-24)."""
@@ -361,6 +380,22 @@ class PosCorrBasis:
     def area_mag(self, tbl, hdr, orbit=None, h=4.0):
         """magnitude term of this correction's pixel-area change (add to calibrated mags); see area_mag()."""
         return area_mag(lambda t: self.bias(t, hdr, orbit=orbit), tbl, h=h)
+
+
+def _mlp_hidden_diff(mm, filt, x, y_chip, chip, year, dm, lsky, oz):
+    """(n, H) last-hidden-layer features h(z) - h(z_anchor) of the ml/v8 MLP; g = this @ W_last exactly (the last bias cancels).
+    Same feature construction as _mlp_residual; used for the last-layer Laplace error modes (10-24)."""
+    jm, params = mm; n = len(x); phx = np.mod(x, 1.0); phy = np.mod(y_chip, 1.0)
+    Z = np.column_stack([x / 4096.0, y_chip / 2048.0, (chip == 4).astype(float), np.full(n, (year - 2016.0) / 10.0), dm / 8.0, lsky,
+                         np.sin(2 * np.pi * phx), np.cos(2 * np.pi * phx), np.sin(2 * np.pi * phy), np.cos(2 * np.pi * phy), oz]).astype(float)
+    oh = np.zeros((n, len(jm['filters']))); oh[:, jm['filters'].index(filt)] = 1.0; Z = np.c_[Z, oh]
+    Za = Z.copy()
+    for c, v in jm['anchor'].items(): Za[:, int(c)] = v
+    def hid(h):
+        for W, b in params[:-1]:
+            h = h @ W + b; h = 0.5 * h * (1 + np.tanh(np.sqrt(2 / np.pi) * (h + 0.044715 * h ** 3)))
+        return h
+    return hid(Z) - hid(Za)
 
 
 def _mlp_residual(mm, filt, x, y_chip, chip, year, dm, lsky, oz):
