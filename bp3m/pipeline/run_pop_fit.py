@@ -2099,6 +2099,26 @@ def _posthoc_sigma_int(bp3m_dir, output_pfr, mu):
     print("  Saved: sigma_int.json")
 
 
+def _sigma_int_fullcov(pm, C_ind, A, C_r, mu0=None):
+    """Intrinsic PM dispersion per axis with the alignment error as a CORRELATED term (10-25).
+
+    The post-hoc estimator treats sigma_free_i^2 = C_vT_i + C_extra_i as independent per star, but C_extra (the
+    propagated alignment / frame uncertainty) is shared between stars: it moves members together and is largely
+    absorbed by mu_pop, so counting it as per-star noise biases sigma_int LOW (injection test 10-25: 0 vs 24.7 true).
+    Model per axis: pm ~ N(mu 1, Sigma + s^2 I), Sigma = diag(C_ind) + A C_r A^T (A: (n, n_r) sensitivity of each
+    member's free PM to r), mu profiled (GLS) unless mu0 is given; profile-likelihood MLE + 68 % interval.
+    pm: (n,), C_ind: (n,), A: (n, n_r)."""
+    S = A @ C_r @ A.T; S = 0.5 * (S + S.T) + np.diag(C_ind)
+    w, V = np.linalg.eigh(S); w = np.maximum(w, 0.0); y = V.T @ pm; o = V.T @ np.ones(len(pm))
+    def nll(sig):
+        v = w + sig ** 2
+        mu = mu0 if mu0 is not None else float(np.sum(o * y / v) / np.sum(o * o / v))
+        r = y - mu * o; return 0.5 * float(np.sum(r * r / v + np.log(v))), mu
+    grid = np.linspace(0.0, 0.3, 3001); ll = np.array([nll(g)[0] for g in grid]); i = int(np.argmin(ll)); ok = ll <= ll[i] + 0.5
+    return dict(mle=float(grid[i]), lo68=float(grid[ok][0]), hi68=float(grid[ok][-1]), mu=nll(grid[i])[1],
+                frac_var_correlated=float(np.trace(A @ C_r @ A.T) / np.trace(S)))
+
+
 # Galaxy anchors (2026-10-04): master_combined_v2 rows (source_index) of confirmed background galaxies, treated exactly
 # like vetted QSO anchors -- secular-aberration PM prior + zero parallax at the QSO widths, barred from membership.
 # Set from main() (--galaxy_anchors CSV with a source_index column); positions normally come from
@@ -3499,6 +3519,29 @@ def run_pop_fit(
     )
     v_mean_free_marg, v_cov_free_sol = solver.compute_analytic_posteriors(
         r_current, C_r, v_mean_free_cond, K_img_free, C_vT_free_sol)
+    # Correlated-alignment sigma_int (10-25; see _sigma_int_fullcov): members' free-PM sensitivities to r
+    _sig_fullcov = None
+    if member_sidx is not None and len(member_sidx) >= 20:
+        try:
+            _nr = solver.N_R; _A = np.zeros((len(member_sidx), 5, _nr * solver.n_images)); _pos = {s_: k_ for k_, s_ in enumerate(member_sidx)}
+            for _j, _im in enumerate(image_names):
+                _d = solver._img_data.get(_im)
+                if _d is None or K_img_free.get(_im) is None: continue
+                _ua = _d['use_for_fit'] | _d.get('use_for_astrom', _d['use_for_fit'])
+                for _k in np.where(_ua)[0]:
+                    _q = _pos.get(int(_d['sidx'][_k]))
+                    if _q is not None: _A[_q, :, _j * _nr:(_j + 1) * _nr] += K_img_free[_im][_k][:, :_nr]
+            _A = np.einsum('nij,njk->nik', C_vT_free_sol[member_sidx], _A)
+            _sig_fullcov = {}
+            for _ax, _c in (('ra', 2), ('dec', 3)):
+                _pm = v_mean_free_cond[member_sidx, _c]; _ci = C_vT_free_sol[member_sidx, _c, _c]; _g = np.isfinite(_pm) & (_ci > 0)
+                _sig_fullcov[_ax] = _sigma_int_fullcov(_pm[_g], _ci[_g], _A[_g, _c, :], C_r)
+                _sig_fullcov[_ax]['n'] = int(_g.sum())
+                print(f"  sigma_int({_ax}) with correlated alignment error: MLE {_sig_fullcov[_ax]['mle']*1e3:.1f} "
+                      f"[68%: {_sig_fullcov[_ax]['lo68']*1e3:.1f}-{_sig_fullcov[_ax]['hi68']*1e3:.1f}] uas/yr "
+                      f"(correlated share of the error variance {_sig_fullcov[_ax]['frac_var_correlated']:.2f})")
+        except Exception as _ex:
+            print(f"  WARNING sigma_int full-covariance estimator failed: {_ex!r}"); _sig_fullcov = None
 
     # ── Save results (mirrors _save_results in run_alignment.py) ─────────────
     print("\n  Saving results...")
@@ -3783,6 +3826,8 @@ def run_pop_fit(
     print(f"  Saved: mu_pop.json, run_config.json")
     try:
         _posthoc_sigma_int(bp3m_dir, output_pfr, mu_result)
+        if _sig_fullcov is not None:
+            with open(output_pfr / 'sigma_int_fullcov.json', 'w') as _f: json.dump(_sig_fullcov, _f, indent=2)
     except Exception as _e:
         print(f"  WARNING: sigma_int post-hoc failed: {_e}")
 
