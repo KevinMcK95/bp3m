@@ -71,5 +71,10 @@ def inject(solver, image_names, r_true, member_sidx, sigma_pm, plx_pop, cfg_path
     truth = dict(cfg=cfg, mu_true=mu_true.tolist(), sigma_int=s_int, n_members=int(len(m)), K_gdc=K,
                  mu_members_sample=v_true[m, 2:4].mean(0).tolist(), sd_members_sample=v_true[m, 2:4].std(0, ddof=1).tolist(),
                  z_true_rms=float(np.sqrt(np.mean(z_true ** 2))) if K else None)
-    if cfg.get('truth_out'): json.dump(truth, open(cfg['truth_out'], 'w'), indent=1)
+    if cfg.get('truth_out'):
+        json.dump(truth, open(cfg['truth_out'], 'w'), indent=1)
+        ids = np.zeros(solver.n_stars, np.int64)
+        for gid, i in solver.star_id_to_idx.items(): ids[i] = int(gid)
+        mem = np.zeros(solver.n_stars, bool); mem[m] = True
+        np.savez(cfg['truth_out'].replace('.json', '_stars.npz'), Gaia_id=ids, v_true=v_true, member=mem, z_true=z_true if K else np.zeros(0))
     return truth
