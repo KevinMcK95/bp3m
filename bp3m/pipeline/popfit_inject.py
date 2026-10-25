@@ -17,7 +17,9 @@ import numpy as np
 
 def inject(solver, image_names, r_true, member_sidx, sigma_pm, plx_pop, cfg_path):
     from bp3m.astro_utils import build_X_matrices
-    cfg = json.load(open(cfg_path)); rng = np.random.default_rng(int(cfg['seed'])); nr = solver.N_R
+    cfg = json.load(open(cfg_path)); rng = np.random.default_rng(int(cfg.get('seed', 0))); nr = solver.N_R
+    if cfg.get('mode') == 'real_shift':
+        return _real_shift(solver, image_names, r_true, cfg, build_X_matrices)
     mu_true = np.asarray(cfg['mu_true'], float); s_int = float(cfg['sigma_int']) if cfg.get('sigma_int') is not None else float(sigma_pm)
     print(f"\n  *** SYNTHETIC INJECTION ({cfg_path}): seed {cfg['seed']}, mu_true {mu_true}, sigma_int {s_int}, "
           f"inject_gdc {cfg.get('inject_gdc', False)}, drop_modes {cfg.get('drop_modes', False)} ***")
@@ -78,3 +80,31 @@ def inject(solver, image_names, r_true, member_sidx, sigma_pm, plx_pop, cfg_path
         mem = np.zeros(solver.n_stars, bool); mem[m] = True
         np.savez(cfg['truth_out'].replace('.json', '_stars.npz'), Gaia_id=ids, v_true=v_true, member=mem, z_true=z_true if K else np.zeros(0))
     return truth
+
+
+def _real_shift(solver, image_names, r_cur, cfg, build_X_matrices):
+    """mode 'real_shift' (10-25): keep the REAL data and move every detection by a fixed map change -R GM z_fixed (GM = the
+    loaded error modes, e.g. the jackknife modes sqrt(4/5)(f_k - fbar)), i.e. switch the GDC map by a known amount without
+    re-aligning.  Linear-response counterpart of a jackknife-member re-alignment."""
+    z = np.asarray(cfg['z_fixed'], float); nr = solver.N_R; n_det = 0
+    for j, img in enumerate(image_names):
+        d = solver._img_data.get(img)
+        if d is None: continue
+        if d.get('GM') is None: raise RuntimeError('real_shift needs the error modes loaded on every image')
+        r_j = r_cur[j * nr:(j + 1) * nr]; z0 = np.zeros(len(d['sidx']))
+        def f(xc, yc):
+            X = build_X_matrices(xc, yc, z0, z0, z0, z0, poly_order=solver.poly_order)
+            if solver.fit_chip_offset: X = solver._append_chip_cols(X, d.get('chip_hi'))
+            return np.einsum('nkl,l->nk', X, r_j)
+        xc = np.asarray(d['X_c'], float).copy(); yc = np.asarray(d['Y_c'], float).copy(); T = f(xc, yc) - np.matmul(solver.R[img], d['GM']) @ z
+        for _ in range(4):
+            f0 = f(xc, yc); Jm = np.stack([f(xc + 1.0, yc) - f0, f(xc, yc + 1.0) - f0], axis=2); dl = np.linalg.solve(Jm, (T - f0)[:, :, None])[:, :, 0]; xc += dl[:, 0]; yc += dl[:, 1]
+        d['X_c'] = xc; d['Y_c'] = yc; n_det += len(xc)
+    solver._update_geometry(r_cur.copy(), solver.v_survey)
+    if cfg.get('drop_modes', True):
+        for im in image_names:
+            if solver._img_data.get(im) is not None: solver._img_data[im]['GM'] = None
+        solver._gm_z = None
+    print(f"  REAL-DATA MAP SHIFT: {n_det} detections moved by -R GM z_fixed (z {z.round(3).tolist()}); modes dropped {cfg.get('drop_modes', True)}")
+    if cfg.get('truth_out'): json.dump(dict(cfg=cfg, mode='real_shift'), open(cfg['truth_out'], 'w'), indent=1)
+    return None
