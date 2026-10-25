@@ -15,7 +15,7 @@ import json
 import numpy as np
 
 
-def inject(solver, image_names, r_true, member_sidx, sigma_pm, plx_pop, cfg_path):
+def inject(solver, image_names, r_true, member_sidx, sigma_pm, plx_pop, cfg_path, qso=None):
     from bp3m.astro_utils import build_X_matrices
     cfg = json.load(open(cfg_path)); rng = np.random.default_rng(int(cfg.get('seed', 0))); nr = solver.N_R
     if cfg.get('mode') == 'real_shift':
@@ -33,6 +33,8 @@ def inject(solver, image_names, r_true, member_sidx, sigma_pm, plx_pop, cfg_path
     no_pm = (np.abs(P[:, 2, 2]) == 0); v_true[no_pm, 2:5] = 0.0
     m = np.asarray(member_sidx, int)
     v_true[m, 2:4] = mu_true + s_int * rng.standard_normal((len(m), 2)); v_true[m, 4] = plx_pop
+    if qso is not None:                       # vetted QSO anchors: truth = the fit's anchor prior (secular-aberration PM, zero parallax)
+        v_true[qso[0], 2] = qso[1]; v_true[qso[0], 3] = qso[2]; v_true[qso[0], 4] = 0.0
     h = np.einsum('nij,nj->ni', P, v_true) + np.einsum('nij,nj->ni', U * np.sqrt(w)[:, None, :], rng.standard_normal(v_true.shape))
     solver.C_survey_inv_dot_v = h
     vp = np.einsum('nij,nj->ni', np.linalg.pinv(P), h); solver.v_prior = vp; solver.v_survey = vp.copy()
@@ -70,7 +72,7 @@ def inject(solver, image_names, r_true, member_sidx, sigma_pm, plx_pop, cfg_path
         solver._gm_z = None
     print(f"  injected {n_det} detections on {sum(solver._img_data.get(im) is not None for im in image_names)} images "
           f"(max inversion residual {max_it:.2e} px), {len(m)} members, K_gdc {K}")
-    truth = dict(cfg=cfg, mu_true=mu_true.tolist(), sigma_int=s_int, n_members=int(len(m)), K_gdc=K,
+    truth = dict(cfg=cfg, mu_true=mu_true.tolist(), sigma_int=s_int, n_members=int(len(m)), K_gdc=K, n_qso=int(len(qso[0])) if qso is not None else 0,
                  mu_members_sample=v_true[m, 2:4].mean(0).tolist(), sd_members_sample=v_true[m, 2:4].std(0, ddof=1).tolist(),
                  z_true_rms=float(np.sqrt(np.mean(z_true ** 2))) if K else None)
     if cfg.get('truth_out'):

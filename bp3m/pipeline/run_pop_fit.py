@@ -2898,7 +2898,8 @@ def run_pop_fit(
     member_sidx = _freeze_members(member_sidx)
     if os.environ.get('BP3M_POPFIT_INJECT'):      # TEST ONLY (10-25): synthetic data at a known truth (pipeline/popfit_inject.py)
         from bp3m.pipeline.popfit_inject import inject as _inject
-        _inject(solver, image_names, r_bp3m, member_sidx, sigma_pm, plx_pop, os.environ['BP3M_POPFIT_INJECT'])
+        _inject(solver, image_names, r_bp3m, member_sidx, sigma_pm, plx_pop, os.environ['BP3M_POPFIT_INJECT'],
+                qso=(_qso_sidx, _qso_pmra_mas, _qso_pmdec_mas) if _qso_sidx is not None else None)
     if members_hst_only or members_5p_only or _untrusted_sidx is not None or _phot_veto_sidx is not None:
         print(f"  Initial members after bars: {len(member_sidx)}")
 
