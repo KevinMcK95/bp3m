@@ -3537,6 +3537,10 @@ def run_pop_fit(
                 _pm = v_mean_free_cond[member_sidx, _c]; _ci = C_vT_free_sol[member_sidx, _c, _c]; _g = np.isfinite(_pm) & (_ci > 0)
                 _sig_fullcov[_ax] = _sigma_int_fullcov(_pm[_g], _ci[_g], _A[_g, _c, :], C_r)
                 _sig_fullcov[_ax]['n'] = int(_g.sum())
+                _ce = np.einsum('nk,kl,nl->n', _A[_g, _c, :], C_r, _A[_g, _c, :])                      # diag of the correlated term
+                _sig_fullcov[_ax].update(med_C_ind=float(np.median(_ci[_g])), med_C_extra_mine=float(np.median(_ce)),
+                                         med_C_extra_pipeline=float(np.median(v_cov_free_sol[member_sidx, _c, _c][_g])),
+                                         C_r_shape=list(C_r.shape), A_cols=int(_A.shape[2]))
                 print(f"  sigma_int({_ax}) with correlated alignment error: MLE {_sig_fullcov[_ax]['mle']*1e3:.1f} "
                       f"[68%: {_sig_fullcov[_ax]['lo68']*1e3:.1f}-{_sig_fullcov[_ax]['hi68']*1e3:.1f}] uas/yr "
                       f"(correlated share of the error variance {_sig_fullcov[_ax]['frac_var_correlated']:.2f})")
