@@ -471,6 +471,7 @@ def _joint_solve_pop(
     qso_sidx: "np.ndarray | None" = None,
     qso_pmra: "np.ndarray | None" = None,
     qso_pmdec: "np.ndarray | None" = None,
+    parts_out: "dict | None" = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     One Newton step for (Δr, Δμ_pop) with stellar astrometry marginalised out.
@@ -758,6 +759,10 @@ def _joint_solve_pop(
                 cs2    = j2_idx * nr
                 Lambda[cs:cs + nr, cs2:cs2 + nr] -= block
                 Lambda[cs2:cs2 + nr, cs:cs + nr] -= block.T
+
+    if parts_out is not None:                     # ingredients for _sigma_int_evidence (shared system before inversion)
+        parts_out.update(Lambda=Lambda.copy(), rhs=rhs.copy(), H_vv=H_vv, h_all=h_all, K_img=K_img, n_r=n_r, K_gm=K_gm,
+                         Kz_star=Kz_star if (K_gm and not fix_r) else None, fix_r=fix_r)
 
     # ── Solve with diagonal preconditioning ───────────────────────────────────
     d_diag    = np.sqrt(np.maximum(np.abs(np.diag(Lambda)), 1e-30))
@@ -2119,6 +2124,72 @@ def _sigma_int_fullcov(pm, C_ind, A, C_r, mu0=None):
                 frac_var_correlated=float(np.trace(A @ C_r @ A.T) / np.trace(S)))
 
 
+def _sigma_int_evidence(solver, image_names, member_sidx, mu0, sigma_pm, parts, n_iso=25, n_2d=13):
+    """Intrinsic PM dispersion (sigma_ra, sigma_dec) from the MARGINAL LIKELIHOOD of all the data (10-26).
+
+    The free-PM estimators (post-hoc, _sigma_int_fullcov) condition on r_hat, which the members' own data helped fit
+    through the population prior, so their free PMs scatter LESS than their covariance says (injection 10-26: member
+    free-PM pull sd 0.74-0.86 vs non-members 1.0-1.2) and sigma_int comes out low.  Here every star's v, the alignment r,
+    mu_pop and the GDC-mode coefficients z are integrated out exactly in the linearised model at the final state:
+        -2 log Z(s) = n_mem sum_ax mu0_ax^2/s_ax^2 - sum_m h_m' C_m h_m + sum_m log det H_m
+                      - rhs' Lam^-1 rhs + log det Lam + n_mem sum_ax log s_ax^2 + const
+    (H_m, h_m: member information incl. the prior N(mu0, s^2) on its PM; Lam, rhs: the shared (r, mu, z) Schur system).
+    Only the members' terms depend on s: Lam(s) = Lam(sigma_pm) - members' Schur terms at sigma_pm + those at s, so the
+    solver's own Lam is reproduced exactly at s = sigma_pm.  Flat prior on (s_ra, s_dec) over the grid for the marginals.
+    parts: filled by _joint_solve_pop(..., parts_out=parts) at the final state (joint mode only)."""
+    if parts.get('fix_r'):
+        return None
+    m = np.unique(np.asarray(member_sidx, int)); n_mem = len(m); nr = solver.N_R; n_r = parts['n_r']; K = parts['K_gm']
+    n_sh = n_r + 2 + K; s0 = float(sigma_pm); mu0 = np.asarray(mu0, float)
+    Hd = parts['H_vv'][m].copy(); hd = parts['h_all'][m].copy()                     # remove the prior at sigma_pm
+    Hd[:, 2, 2] -= s0 ** -2; Hd[:, 3, 3] -= s0 ** -2; hd[:, 2] -= s0 ** -2 * mu0[0]; hd[:, 3] -= s0 ** -2 * mu0[1]
+    pos = -np.ones(solver.n_stars, int); pos[m] = np.arange(n_mem)
+    B = np.zeros((n_mem, 5, n_sh)); n_dup = 0
+    for j, img in enumerate(image_names):
+        d = solver._img_data.get(img); Kj = parts['K_img'].get(img)
+        if d is None or Kj is None: continue
+        uf = d['use_for_fit']; p = pos[d['sidx'][uf]]; ok = p >= 0
+        if not ok.any(): continue
+        n_dup += int(ok.sum() - np.unique(p[ok]).size)
+        np.add.at(B[:, :, j * nr:(j + 1) * nr], p[ok], Kj[uf][ok])
+    if K and parts.get('Kz_star') is not None:
+        B[:, :, n_r + 2:] = parts['Kz_star'][m]
+
+    def members(s):
+        H = Hd.copy(); h = hd.copy(); si = np.asarray(s, float) ** -2
+        H[:, 2, 2] += si[0]; H[:, 3, 3] += si[1]; h[:, 2] += si[0] * mu0[0]; h[:, 3] += si[1] * mu0[1]
+        L = np.linalg.cholesky(H); C = np.linalg.inv(H); a = np.einsum('nij,nj->ni', C, h)
+        Bs = B.copy(); Bs[:, 2, n_r] = si[0]; Bs[:, 3, n_r + 1] = si[1]
+        W = np.linalg.solve(L, Bs).reshape(-1, n_sh)                                  # L^-1 B  ->  B' C B = W'W
+        lam = W.T @ W; rh = np.einsum('nik,ni->k', Bs, a)
+        base_L = n_mem * np.diag(si); base_r = -n_mem * si * mu0
+        quad = float(np.einsum('ni,ni->', h, a)); ldH = float(2 * np.log(np.diagonal(L, axis1=1, axis2=2)).sum())
+        return lam, rh, base_L, base_r, quad, ldH, si
+    lam0, rh0, bL0, br0, _, _, _ = members((s0, s0))
+    Lam_nm = parts['Lambda'].copy(); rhs_nm = parts['rhs'].copy()
+    Lam_nm += lam0; rhs_nm -= rh0; Lam_nm[n_r:n_r + 2, n_r:n_r + 2] -= bL0; rhs_nm[n_r:n_r + 2] -= br0
+
+    def m2logZ(s):
+        lam, rh, bL, br, quad, ldH, si = members(s)
+        Lam = Lam_nm - lam; rhs = rhs_nm + rh; Lam[n_r:n_r + 2, n_r:n_r + 2] += bL; rhs[n_r:n_r + 2] += br
+        dd = np.sqrt(np.abs(np.diag(Lam))); Ls = np.linalg.cholesky(Lam / np.outer(dd, dd))
+        y = np.linalg.solve(Ls, rhs / dd); ldL = float(2 * np.log(np.diag(Ls)).sum() + 2 * np.log(dd).sum())
+        return float(n_mem * np.sum(si * mu0 ** 2) - quad + ldH - y @ y + ldL + n_mem * np.sum(np.log(np.asarray(s, float) ** 2)))
+
+    g1 = np.linspace(0.002, max(0.15, 5 * s0), n_iso); f1 = np.array([m2logZ((g, g)) for g in g1]); s_iso = float(g1[np.argmin(f1)])
+    g2 = np.linspace(max(0.001, s_iso / 4), 3 * max(s_iso, 0.004), n_2d)
+    F = np.array([[m2logZ((a_, b_)) for b_ in g2] for a_ in g2])                    # F[i, j] = (s_ra = g2[i], s_dec = g2[j])
+    i, j = np.unravel_index(np.argmin(F), F.shape); P = np.exp(-0.5 * (F - F.min()))
+    out = dict(n_members=n_mem, n_dup_fit_detections=n_dup, sigma_pm_input=s0, grid_iso=g1.tolist(), m2logZ_iso=f1.tolist(),
+               mle_iso=s_iso, grid=g2.tolist(), m2logZ=F.tolist(), mle=[float(g2[i]), float(g2[j])])
+    for ax, marg, prof in (('ra', P.sum(1), F.min(1)), ('dec', P.sum(0), F.min(0))):
+        c = np.cumsum(marg) / marg.sum(); ok = prof <= prof.min() + 1.0
+        out[ax] = dict(profile_mle=float(g2[np.argmin(prof)]), profile_lo68=float(g2[ok][0]), profile_hi68=float(g2[ok][-1]),
+                       marg_median=float(np.interp(0.5, c, g2)), marg_lo68=float(np.interp(0.16, c, g2)), marg_hi68=float(np.interp(0.84, c, g2)),
+                       at_grid_edge=bool(ok[0] or ok[-1]))
+    return out
+
+
 # Galaxy anchors (2026-10-04): master_combined_v2 rows (source_index) of confirmed background galaxies, treated exactly
 # like vetted QSO anchors -- secular-aberration PM prior + zero parallax at the QSO widths, barred from membership.
 # Set from main() (--galaxy_anchors CSV with a source_index column); positions normally come from
@@ -2163,6 +2234,7 @@ def run_pop_fit(
     plot_residuals: bool = False,
     fit_cte: bool = False,
     fit_cte_v2: bool = False,
+    sigma_int_evidence: bool = False,
     cte_v2_n_iter: int = 5,
     cte_v2_time_order: int = 1,
     cte_v2_group: str = 'chip',
@@ -3547,6 +3619,25 @@ def run_pop_fit(
                       f"(correlated share of the error variance {_sig_fullcov[_ax]['frac_var_correlated']:.2f})")
         except Exception as _ex:
             print(f"  WARNING sigma_int full-covariance estimator failed: {_ex!r}"); _sig_fullcov = None
+    # Marginal-likelihood sigma_int (10-26; see _sigma_int_evidence): the shared system at the final state, members only
+    # re-weighted per grid point.  The extra solve's side effects on the GDC-mode state are undone.
+    _sig_ev = None
+    if sigma_int_evidence and member_sidx is not None and len(member_sidx) >= 20:
+        _parts = {}; _gm_saved = {k_: getattr(solver, k_, None) for k_ in ('_gm_z', '_gm_C', '_gm_C_mu_z')}
+        _joint_solve_pop(solver, image_names, member_sidx, mu_pop_current, sigma_pm, _plx['eff'], sigma_plx_tot,
+                         C_pop_prior_inv, mu_pop_prior, r_current, fix_r=(C_shared_joint is None), z_weights=z_weights_final,
+                         qso_sidx=_qso_sidx, qso_pmra=_qso_pmra_mas, qso_pmdec=_qso_pmdec_mas, parts_out=_parts)
+        for k_, v_ in _gm_saved.items(): setattr(solver, k_, v_)
+        _t_ev = time.time(); _sig_ev = _sigma_int_evidence(solver, image_names, member_sidx, mu_pop_current, sigma_pm, _parts)
+        del _parts
+        if _sig_ev is None:
+            print("  sigma_int evidence: skipped (frozen alignment)")
+        else:
+            print(f"  sigma_int (marginal likelihood, r/mu/z/v integrated; {time.time() - _t_ev:.0f} s): "
+                  + "  ".join(f"{a_} profile {_sig_ev[a_]['profile_mle']*1e3:.1f} [{_sig_ev[a_]['profile_lo68']*1e3:.1f}-"
+                              f"{_sig_ev[a_]['profile_hi68']*1e3:.1f}], marginal {_sig_ev[a_]['marg_median']*1e3:.1f} "
+                              f"[{_sig_ev[a_]['marg_lo68']*1e3:.1f}-{_sig_ev[a_]['marg_hi68']*1e3:.1f}]" for a_ in ('ra', 'dec'))
+                  + f" uas/yr  (isotropic MLE {_sig_ev['mle_iso']*1e3:.1f}; {_sig_ev['n_dup_fit_detections']} duplicate member fit detections)")
 
     # ── Save results (mirrors _save_results in run_alignment.py) ─────────────
     print("\n  Saving results...")
@@ -3833,6 +3924,8 @@ def run_pop_fit(
         _posthoc_sigma_int(bp3m_dir, output_pfr, mu_result)
         if _sig_fullcov is not None:
             with open(output_pfr / 'sigma_int_fullcov.json', 'w') as _f: json.dump(_sig_fullcov, _f, indent=2)
+        if _sig_ev is not None:
+            with open(output_pfr / 'sigma_int_evidence.json', 'w') as _f: json.dump(_sig_ev, _f, indent=1)
     except Exception as _e:
         print(f"  WARNING: sigma_int post-hoc failed: {_e}")
 
@@ -4190,6 +4283,9 @@ def main(argv=None):
                         help='CTE phase v2 (2026-10-06): per-detection ACS/UVIS chip CTE model (readout distance x mag x '
                              'time), fitted from members + alignment stars inside the production pop-fit solve (anchors, '
                              'z-weights, frozen/free r kept), applied before the final posterior pass. Replaces --fit_cte.')
+    parser.add_argument('--sigma_int_evidence', action='store_true',
+                        help='Also estimate sigma_int (RA, Dec) from the marginal likelihood of all the data with r, mu_pop, '
+                             'GDC modes and every star integrated out (sigma_int_evidence.json; 10-26).  Joint mode only.')
     parser.add_argument('--cte_v2_n_iter', type=int, default=5, help='CTE v2 outer iterations (default 5)')
     parser.add_argument('--cte_v2_time_order', type=int, default=1, help='CTE v2 time order: 0 constant, 1 + linear (default)')
     parser.add_argument('--cte_v2_group', choices=['chip', 'epoch', 'visit'], default='chip',
@@ -4424,6 +4520,7 @@ def main(argv=None):
         plot_residuals=args.plot_residuals,
         fit_cte=args.fit_cte,
         fit_cte_v2=args.fit_cte_v2,
+        sigma_int_evidence=args.sigma_int_evidence,
         cte_v2_n_iter=args.cte_v2_n_iter,
         cte_v2_time_order=args.cte_v2_time_order,
         cte_v2_group=args.cte_v2_group,
