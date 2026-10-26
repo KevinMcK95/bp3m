@@ -2177,21 +2177,47 @@ def _sigma_int_evidence(solver, image_names, member_sidx, mu0, sigma_pm, parts, 
         return float(n_mem * np.sum(si * mu0 ** 2) - quad + ldH - y @ y + ldL + n_mem * np.sum(np.log(np.asarray(s, float) ** 2)))
 
     g1 = np.linspace(0.002, max(0.15, 5 * s0), n_iso); f1 = np.array([m2logZ((g, g)) for g in g1]); s_iso = float(g1[np.argmin(f1)])
-    g2 = np.linspace(max(0.001, 0.5 * s_iso), 1.7 * max(s_iso, 0.004), n_2d)       # ~ +-4 sigma of the isotropic curve
-    F = np.array([[m2logZ((a_, b_)) for b_ in g2] for a_ in g2])                    # F[i, j] = (s_ra = g2[i], s_dec = g2[j])
+    # Per-axis grid ranges (10-26 b): the 2-D MLE from a log-space simplex, then each axis bracketed by its own conditional
+    # scan to Delta(-2 log Z) = 12 (the profile is never narrower than ~ this for weakly correlated axes), so strongly
+    # anisotropic data (per-set Draco: 66 vs 160 uas/yr) are not cut by a grid tied to the isotropic MLE.  Any axis whose
+    # profile is still within Delta = 4 of the minimum at an edge (other than the s_min floor) is widened and the grid redone.
+    from scipy.optimize import minimize
+    s_min = 5e-4
+    def flog(t): return m2logZ(tuple(np.maximum(np.exp(t), s_min)))
+    opt = minimize(flog, np.log([max(s_iso, 2 * s_min)] * 2), method='Nelder-Mead', options=dict(xatol=1e-3, fatol=1e-3, maxiter=400))
+    s_hat = np.maximum(np.exp(opt.x), s_min); f_hat = min(float(opt.fun), m2logZ(tuple(s_hat)))
+    rng_ = []
+    for k in range(2):
+        def cond(v): t = s_hat.copy(); t[k] = v; return m2logZ(tuple(t)) - f_hat
+        lo = s_hat[k]
+        while lo > s_min and cond(lo) < 12: lo = max(s_min, lo / 1.3 - 1e-3)
+        hi = s_hat[k] * 1.3 + 2e-3
+        while cond(hi) < 12 and hi < 5.0: hi = hi * 1.3 + 2e-3
+        rng_.append([lo, hi])
+    from scipy.interpolate import CubicSpline
+    for _it in range(4):
+        ga = np.linspace(*rng_[0], n_2d); gd = np.linspace(*rng_[1], n_2d)
+        F = np.array([[m2logZ((a_, b_)) for b_ in gd] for a_ in ga])                 # F[i, j] = (s_ra = ga[i], s_dec = gd[j])
+        widen = False
+        for k, (g, Fa) in enumerate(((ga, F), (gd, F.T))):
+            pr = Fa.min(1) - F.min()
+            if pr[0] <= 4 and g[0] > s_min: rng_[k][0] = max(s_min, g[0] - 0.5 * (g[-1] - g[0])); widen = True
+            if pr[-1] <= 4: rng_[k][1] = g[-1] + 0.5 * (g[-1] - g[0]); widen = True
+        if not widen: break
     i, j = np.unravel_index(np.argmin(F), F.shape)
     out = dict(n_members=n_mem, n_dup_fit_detections=n_dup, sigma_pm_input=s0, grid_iso=g1.tolist(), m2logZ_iso=f1.tolist(),
-               mle_iso=s_iso, grid=g2.tolist(), m2logZ=F.tolist(), mle=[float(g2[i]), float(g2[j])])
-    from scipy.interpolate import CubicSpline
-    gf = np.linspace(g2[0], g2[-1], 4001)
-    for ax, Fa in (('ra', F), ('dec', F.T)):                                         # Fa[i, :] = sigma of this axis at g2[i]
-        prof = CubicSpline(g2, Fa.min(1))(gf)                                        # profile over the other axis
-        ff = np.array([CubicSpline(g2, row)(gf) for row in Fa])                      # marginal: integrate the other axis finely
-        marg = CubicSpline(g2, np.exp(-0.5 * (ff - ff.min())).sum(1))(gf); marg = np.maximum(marg, 0)
-        c = np.cumsum(marg) / marg.sum(); ok = prof <= prof.min() + 1.0
+               mle_iso=s_iso, mle_2d=s_hat.tolist(), grid_ra=ga.tolist(), grid_dec=gd.tolist(), grid_widenings=_it, m2logZ=F.tolist(),
+               mle=[float(ga[i]), float(gd[j])], s_min=s_min)
+    for ax, g, go, Fa in (('ra', ga, gd, F), ('dec', gd, ga, F.T)):                   # Fa[i, :] = sigma of this axis at g[i]
+        gf = np.linspace(g[0], g[-1], 4001); gof = np.linspace(go[0], go[-1], 4001)
+        prof = CubicSpline(g, Fa.min(1))(gf)                                         # profile over the other axis
+        ff = np.array([CubicSpline(go, row)(gof) for row in Fa])                     # marginal: integrate the other axis finely
+        marg = CubicSpline(g, np.exp(-0.5 * (ff - ff.min())).sum(1))(gf); marg = np.maximum(marg, 0)
+        c = np.cumsum(marg) / marg.sum(); ok = prof <= prof.min() + 1.0; ok95 = prof <= prof.min() + 3.84
         out[ax] = dict(profile_mle=float(gf[np.argmin(prof)]), profile_lo68=float(gf[ok][0]), profile_hi68=float(gf[ok][-1]),
-                       marg_median=float(np.interp(0.5, c, gf)), marg_lo68=float(np.interp(0.16, c, gf)), marg_hi68=float(np.interp(0.84, c, gf)),
-                       at_grid_edge=bool(ok[0] or ok[-1]))
+                       profile_hi95=float(gf[ok95][-1]), marg_median=float(np.interp(0.5, c, gf)), marg_lo68=float(np.interp(0.16, c, gf)),
+                       marg_hi68=float(np.interp(0.84, c, gf)), marg_hi95=float(np.interp(0.95, c, gf)),
+                       at_floor=bool(ok[0] and g[0] <= s_min), at_grid_edge=bool((ok[0] and g[0] > s_min) or ok[-1]))
     return out
 
 
@@ -3642,7 +3668,8 @@ def run_pop_fit(
                   + "  ".join(f"{a_} profile {_sig_ev[a_]['profile_mle']*1e3:.1f} [{_sig_ev[a_]['profile_lo68']*1e3:.1f}-"
                               f"{_sig_ev[a_]['profile_hi68']*1e3:.1f}], marginal {_sig_ev[a_]['marg_median']*1e3:.1f} "
                               f"[{_sig_ev[a_]['marg_lo68']*1e3:.1f}-{_sig_ev[a_]['marg_hi68']*1e3:.1f}]" for a_ in ('ra', 'dec'))
-                  + f" uas/yr  (isotropic MLE {_sig_ev['mle_iso']*1e3:.1f}; {_sig_ev['n_dup_fit_detections']} duplicate member fit detections)")
+                  + f" uas/yr  (2-D MLE {_sig_ev['mle_2d'][0]*1e3:.1f}, {_sig_ev['mle_2d'][1]*1e3:.1f}; isotropic {_sig_ev['mle_iso']*1e3:.1f}; "
+                  f"{_sig_ev['grid_widenings']} grid widenings; {_sig_ev['n_dup_fit_detections']} duplicate member fit detections)")
 
     # ── Save results (mirrors _save_results in run_alignment.py) ─────────────
     print("\n  Saving results...")
