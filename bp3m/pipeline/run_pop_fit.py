@@ -428,11 +428,20 @@ def _apply_bp3m_flags(
           + ("" if has_ufa else " (no use_for_astrom.npz — used use_for_fit)"))
 
 
-def _restrict_images(names, imgs, restrict_filters, restrict_instdet, restrict_images=None):
+def _restrict_images(names, imgs, restrict_filters, restrict_instdet, restrict_images=None, exclude_images=None):
     """--restrict_filters / --restrict_instdet (same semantics as bp3m) / --restrict_images
     (a text file of image base names, one per line, '#' comments; chip suffixes _hi/_lo
-    are matched on the base name).  Used for the per-exposure-set pop fits (10-23)."""
+    are matched on the base name).  Used for the per-exposure-set pop fits (10-23).
+    exclude_images: set of base names to drop (--exclude_images).  Until 10-26 that flag reached only the master_v2
+    loader and was silently ignored on the v1 path; a name that matches no image is now a hard error."""
     out = list(names)
+    if exclude_images:
+        _ex = {str(x).split('_')[0] for x in exclude_images}
+        _miss = _ex - {n.split('_')[0] for n in out}
+        if _miss:
+            raise RuntimeError(f"--exclude_images: {len(_miss)} name(s) match no loaded image: {sorted(_miss)[:10]}")
+        out = [n for n in out if n.split('_')[0] not in _ex]
+        print(f"  exclude_images: {len(names) - len(out)} of {len(names)} images dropped ({sorted(_ex)})")
     if restrict_filters:
         keep = {f.upper() for f in restrict_filters}
         out = [n for n in out if str(imgs[n].get('filter', '')).upper() in keep]
@@ -2440,7 +2449,7 @@ def run_pop_fit(
                             if n in _xdf_names}
             imgs = {n: imgs[n] for n in filtered_spi}
         if restrict_filters or restrict_instdet or restrict_images:
-            _keep = set(_restrict_images(sorted(filtered_spi), imgs, restrict_filters, restrict_instdet, restrict_images))
+            _keep = set(_restrict_images(sorted(filtered_spi), imgs, restrict_filters, restrict_instdet, restrict_images))   # master_v2: exclusion done in the loader
             filtered_spi = {n: d for n, d in filtered_spi.items() if n in _keep}
             imgs = {n: imgs[n] for n in filtered_spi}
         star_id_to_idx, image_names, star_in_image = build_index_maps(
@@ -2482,7 +2491,7 @@ def run_pop_fit(
                 base = n[:-3] if n.endswith(('_hi', '_lo')) else n
                 v1_bases.add(base)
             image_names = [n for n in image_names if n in v1_bases]
-        image_names = _restrict_images(image_names, imgs, restrict_filters, restrict_instdet, restrict_images)
+        image_names = _restrict_images(image_names, imgs, restrict_filters, restrict_instdet, restrict_images, _EXCLUDE_IMAGES)
         if not image_names:
             raise RuntimeError(
                 "No images remain after filtering to v1 image set."
