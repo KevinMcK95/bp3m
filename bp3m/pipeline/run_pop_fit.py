@@ -2124,7 +2124,7 @@ def _sigma_int_fullcov(pm, C_ind, A, C_r, mu0=None):
                 frac_var_correlated=float(np.trace(A @ C_r @ A.T) / np.trace(S)))
 
 
-def _sigma_int_evidence(solver, image_names, member_sidx, mu0, sigma_pm, parts, n_iso=25, n_2d=13):
+def _sigma_int_evidence(solver, image_names, member_sidx, mu0, sigma_pm, parts, n_iso=40, n_2d=21):
     """Intrinsic PM dispersion (sigma_ra, sigma_dec) from the MARGINAL LIKELIHOOD of all the data (10-26).
 
     The free-PM estimators (post-hoc, _sigma_int_fullcov) condition on r_hat, which the members' own data helped fit
@@ -2177,15 +2177,20 @@ def _sigma_int_evidence(solver, image_names, member_sidx, mu0, sigma_pm, parts, 
         return float(n_mem * np.sum(si * mu0 ** 2) - quad + ldH - y @ y + ldL + n_mem * np.sum(np.log(np.asarray(s, float) ** 2)))
 
     g1 = np.linspace(0.002, max(0.15, 5 * s0), n_iso); f1 = np.array([m2logZ((g, g)) for g in g1]); s_iso = float(g1[np.argmin(f1)])
-    g2 = np.linspace(max(0.001, s_iso / 4), 3 * max(s_iso, 0.004), n_2d)
+    g2 = np.linspace(max(0.001, 0.5 * s_iso), 1.7 * max(s_iso, 0.004), n_2d)       # ~ +-4 sigma of the isotropic curve
     F = np.array([[m2logZ((a_, b_)) for b_ in g2] for a_ in g2])                    # F[i, j] = (s_ra = g2[i], s_dec = g2[j])
-    i, j = np.unravel_index(np.argmin(F), F.shape); P = np.exp(-0.5 * (F - F.min()))
+    i, j = np.unravel_index(np.argmin(F), F.shape)
     out = dict(n_members=n_mem, n_dup_fit_detections=n_dup, sigma_pm_input=s0, grid_iso=g1.tolist(), m2logZ_iso=f1.tolist(),
                mle_iso=s_iso, grid=g2.tolist(), m2logZ=F.tolist(), mle=[float(g2[i]), float(g2[j])])
-    for ax, marg, prof in (('ra', P.sum(1), F.min(1)), ('dec', P.sum(0), F.min(0))):
+    from scipy.interpolate import CubicSpline
+    gf = np.linspace(g2[0], g2[-1], 4001)
+    for ax, Fa in (('ra', F), ('dec', F.T)):                                         # Fa[i, :] = sigma of this axis at g2[i]
+        prof = CubicSpline(g2, Fa.min(1))(gf)                                        # profile over the other axis
+        ff = np.array([CubicSpline(g2, row)(gf) for row in Fa])                      # marginal: integrate the other axis finely
+        marg = CubicSpline(g2, np.exp(-0.5 * (ff - ff.min())).sum(1))(gf); marg = np.maximum(marg, 0)
         c = np.cumsum(marg) / marg.sum(); ok = prof <= prof.min() + 1.0
-        out[ax] = dict(profile_mle=float(g2[np.argmin(prof)]), profile_lo68=float(g2[ok][0]), profile_hi68=float(g2[ok][-1]),
-                       marg_median=float(np.interp(0.5, c, g2)), marg_lo68=float(np.interp(0.16, c, g2)), marg_hi68=float(np.interp(0.84, c, g2)),
+        out[ax] = dict(profile_mle=float(gf[np.argmin(prof)]), profile_lo68=float(gf[ok][0]), profile_hi68=float(gf[ok][-1]),
+                       marg_median=float(np.interp(0.5, c, gf)), marg_lo68=float(np.interp(0.16, c, gf)), marg_hi68=float(np.interp(0.84, c, gf)),
                        at_grid_edge=bool(ok[0] or ok[-1]))
     return out
 
