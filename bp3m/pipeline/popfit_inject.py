@@ -43,7 +43,8 @@ def inject(solver, image_names, r_true, member_sidx, sigma_pm, plx_pop, cfg_path
     if cfg.get('inject_gdc'):
         gm = [solver._img_data[im].get('GM') for im in image_names if solver._img_data.get(im) is not None]
         if not gm or any(g is None for g in gm): raise RuntimeError('inject_gdc needs the error modes loaded on every image ($BP3M_GDC_COVMODES)')
-        K = gm[0].shape[2]; z_true = float(cfg.get('z_scale', 1.0)) * np.random.default_rng(int(cfg['seed']) + 10 ** 6).standard_normal(K)   # own stream: arms share the star/noise draws
+        K = gm[0].shape[2]; z_true = float(cfg.get('z_scale', 1.0)) * np.random.default_rng(int(cfg['seed']) + 10 ** 6).standard_normal(K)
+        if cfg.get('z_fixed') is not None: z_true = np.asarray(cfg['z_fixed'], float)        # a fixed map change instead of a draw   # own stream: arms share the star/noise draws
     # ── detections ──
     n_det = 0; max_it = 0.0
     for j, img in enumerate(image_names):
