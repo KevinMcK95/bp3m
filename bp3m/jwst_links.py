@@ -29,7 +29,9 @@ from __future__ import annotations
 import re
 
 # jw<PPPPP><OOO><VVV>_<GGSAA>_<EEEEE>_<detector>
-_NAME_RE = re.compile(r'^jw(?P<program>\d{5})(?P<obs>\d{3})(?P<visit>\d{3})_(?P<act>\d{5})_(?P<exp>\d{5})_(?P<det>[a-z0-9]+)$')
+# 2026-10-29: the activity id <GG><S><AA> ends in base 36 (e.g. 0210b): '\d{5}' rejected those frames (182 of 9,103 in the
+# x1029b GDC table, LMC_cal / Omega Cen), which were then never linked
+_NAME_RE = re.compile(r'^jw(?P<program>\d{5})(?P<obs>\d{3})(?P<visit>\d{3})_(?P<act>[0-9a-z]{5})_(?P<exp>\d{5})_(?P<det>[a-z0-9]+)$')
 
 LINK_LEVELS = ('none', 'module', 'visit', 'exposure')
 
