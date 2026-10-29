@@ -2101,7 +2101,10 @@ class BP3MSolver:
             n_r_only  = nr * self.n_images
             diff_r    = diff[:n_r_only]
             imax      = int(np.argmax(diff))
-            if imax >= n_r_only:                    # epoch-distortion coefficient
+            if imax >= n_r_only + self.n_ed:        # Gaia field-mode coefficient z (after the epoch-D block; 10-29: was
+                max_str = (f"{diff[imax]:.3e}"     # mislabelled as epoch-D, and divided by ED_K = 0 without a GDC)
+                           f"  [Gaia field mode {imax - n_r_only - self.n_ed}]")
+            elif imax >= n_r_only:                  # epoch-distortion coefficient
                 g, k = divmod(imax - n_r_only, self.ED_K)
                 max_str = (f"{diff[imax]:.3e}"
                            f"  [epoch-D group {g} / coeff {k}]")
@@ -2120,9 +2123,12 @@ class BP3MSolver:
                     parts.append(f"{_pnames[p]}: {med:.2e} [{w68:.2e}]")
                 else:
                     parts.append(f"{_pnames[p]}: {med:.2e}")
-            if len(diff) > n_r_only:
-                parts.append(f"epoch-D: {float(np.median(diff[n_r_only:])):.2e} "
-                             f"[max {float(np.max(diff[n_r_only:])):.2e}]")
+            if self.n_ed:
+                ed = diff[n_r_only:n_r_only + self.n_ed]
+                parts.append(f"epoch-D: {float(np.median(ed)):.2e} [max {float(np.max(ed)):.2e}]")
+            if len(diff) > n_r_only + self.n_ed:
+                gz = diff[n_r_only + self.n_ed:]
+                parts.append(f"gaia-modes: {float(np.median(gz)):.2e} [max {float(np.max(gz)):.2e}]")
             return max_str, '  '.join(parts)
 
         # ── Starving-chip demotion (min_align_demote > 0) ────────────────
