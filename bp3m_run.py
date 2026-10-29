@@ -464,6 +464,12 @@ def _parse_args():
                     help='Gaia CSV(s) that replace the field\'s canonical files at every stage (a Gaia-model arm\'s corrected '
                          'copy, Gaia/corrected/*_gaiacorr_<model>.csv; never *_gaia.csv).  Recorded with md5 in run_config; '
                          'bp3m-v2 and the pop fits inherit it.  The field sidecar keeps the canonical list.')
+    bp.add_argument('--gaia_corrected', type=str, default=None,
+                    help='Build (or reuse) and use the BP3M-native corrected Gaia table of this model for every stage '
+                         '(bp3m/gaia_corrected.py, handoff 3.4): v3real2p (kernel-v3 values + covariance AS GIVEN, positions x '
+                         'geometric mean of the v3 PM/parallax inflation), v3real2p_fab (positions x Fabricius), v3real2p_mc '
+                         '(median-centred 6p conditioning), corrvals (corrected values, published errors).  Downloads a '
+                         'conditioning sample around the field once; sets --gaia_model to the matching spec unless given.')
     bp.add_argument('--qso_anchors_csv', type=str, nargs='+', default=None,
                     help='QSO anchor CSV(s) to use instead of the vetted canonical ones (a Gaia-model arm builds its own from '
                          'the corrected copy).  Hard error if missing.')
@@ -842,6 +848,12 @@ def main():
         from bp3m.astro_utils import set_gaia_uwu_mag
         set_gaia_uwu_mag(True)
         print('  Gaia uncertainties: magnitude-dependent UWU (Fabricius 2021 Fig.19/20)')
+    if getattr(args, 'gaia_corrected', None):
+        if getattr(args, 'gaia_csv_override', None):
+            raise SystemExit('--gaia_corrected and --gaia_csv_override are exclusive')
+        from bp3m.gaia_corrected import default_spec as _gc_spec
+        if getattr(args, 'gaia_model', None) is None:
+            args.gaia_model = _gc_spec(args.gaia_corrected)       # validated against the table by check_model_copies
     if getattr(args, 'gaia_model', None) is not None:
         from bp3m.gaia_model import GaiaModel, set_current
         _gm = GaiaModel.parse(args.gaia_model)
@@ -974,6 +986,18 @@ def main():
 
     from bp3m.gaia_model import override_files as _gaia_override, current as _gm_cur, set_override_files as _gm_set_files, \
         check_zp_consistency as _gm_check_zp
+    if getattr(args, 'gaia_corrected', None):
+        # BP3M-native corrected table (handoff 3.4): legacy QSO vetting (catalog matches) -> conditioning sample -> tables
+        from bp3m.gaia_corrected import legacy_anchors as _gc_anchors, ensure_field as _gc_ensure
+        _gc_copies = []
+        for _ra_i, _dec_i, _sw_i, _sh_i in args.pointings:
+            _p_i = _gaia_csv_path_for(_ra_i, _dec_i, _sw_i, _sh_i)
+            if _p_i is None:
+                raise SystemExit(f'--gaia_corrected: no Gaia CSV for pointing ({_ra_i}, {_dec_i})')
+            _a_i = _gc_anchors(output_dir, field, _ra_i, _dec_i, _sw_i, _sh_i, lib_dir=Path(args.lib_dir) if args.lib_dir else None)
+            _gc_copies.append(_gc_ensure(_p_i, _a_i, _ra_i, _dec_i, _sw_i, _sh_i, args.gaia_corrected))
+        _gm_set_files(_gc_copies)
+        print(f'  Gaia corrected tables ({args.gaia_corrected}): {[p.name for p in _gc_copies]}')
     if _gm_cur().zp == 'l21' and not _gaia_override():
         # Lindegren+21 parallax zero point (default since 2026-10-28): every stage reads the L21-corrected copy of the field's
         # Gaia CSV(s) through the override (bp3m.gaia_zp); copies are reused when their sidecar matches the source md5.

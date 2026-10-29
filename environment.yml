@@ -5,7 +5,7 @@ channels:
 dependencies:
   - python>=3.10
   - numpy
-  - scipy
+  - scipy>=1.15                 # scipy.special.sph_harm_y (bp3m/gaia_sys/qso_sys.py)
   - astropy
   - astroquery
   - matplotlib
