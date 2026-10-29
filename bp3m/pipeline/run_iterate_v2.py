@@ -198,8 +198,8 @@ def main():
         import json as _json
         _v1_cfg = _json.load(open(_v1_cfg_path))
     from bp3m.gaia_model import resolve_inherited, resolve_inherited_files
-    resolve_inherited(args.gaia_model, _v1_cfg if _v1_cfg_path.exists() else None, 'bp3m-v2', 'v1 (BP3M_results)')
     resolve_inherited_files(args.gaia_csv_override, _v1_cfg if _v1_cfg_path.exists() else None, 'bp3m-v2', 'v1 (BP3M_results)')
+    resolve_inherited(args.gaia_model, _v1_cfg if _v1_cfg_path.exists() else None, 'bp3m-v2', 'v1 (BP3M_results)')
     for _key, _default in (('poly_order', 1), ('pos_err_floor', 0.05), ('pos_corr_table', None),
                            ('fit_chip_offset', False), ('pos_corr_model', None),
                            ('n_iter', 20), ('clip_sigma', 4.5)):

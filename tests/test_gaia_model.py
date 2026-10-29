@@ -151,7 +151,7 @@ def test_model_reaches_workers(method):
     try:
         with mp.get_context(method).Pool(2) as p:
             got = p.map(_worker_spec, range(2))
-        assert got == ['cov=fab_mag;floor=none'] * 2
+        assert [GM.GaiaModel.parse(x) for x in got] == [GM.GaiaModel(cov='fab_mag', floor='none')] * 2
     finally:
         GM.set_current('')
 
@@ -164,3 +164,30 @@ def test_set_gaia_uwu_mag_alias():
     finally:
         set_gaia_uwu_mag(False)
     assert GM.current().is_default
+
+
+def test_zero_point_spec_and_legacy():
+    assert GM.GaiaModel().zp == 'l21' and 'zp=l21' in GM.GaiaModel().spec
+    old = GM.parse_recorded('cov=fab_scalar;floor=diag')           # recorded on 2026-10-28 before the zp key existed
+    assert old.zp == 'none' and old == GM.LEGACY and GM.parse_recorded(None) == GM.LEGACY
+    assert GM.GaiaModel.parse('cov=fab_mag').zp == 'l21'           # a user-given spec keeps the default zero point
+    assert GM.GaiaModel.parse('cov=fab_mag;floor=none;zp=none').zp == 'none'
+    with pytest.raises(ValueError):
+        GM.GaiaModel.parse('zp=l22')
+
+
+def test_zero_point_consistency(tmp_path):
+    raw = tmp_path / 'f_gaia_raw.csv'; cor = tmp_path / 'f_gaiacorr_l21.csv'
+    pd.DataFrame({'source_id': [1], 'parallax': [0.1]}).to_csv(raw, index=False)
+    pd.DataFrame({'source_id': [1], 'parallax': [0.12], 'parallax_orig': [0.1], 'zp_l21': [-0.02]}).to_csv(cor, index=False)
+    try:
+        GM.set_current('cov=fab_scalar;floor=diag;zp=l21'); GM.set_override_files([str(cor)]); GM.check_zp_consistency()
+        GM.set_override_files([str(raw)].copy() if False else None)
+        with pytest.raises(SystemExit):
+            GM.check_zp_consistency()                                # zp=l21 without a corrected table
+        GM.set_current('cov=fab_scalar;floor=diag;zp=none'); GM.set_override_files([str(cor)])
+        with pytest.raises(SystemExit):
+            GM.check_zp_consistency()                                # zp=none but a corrected table
+        GM.set_override_files(None); GM.check_zp_consistency()       # legacy: canonical files, no zero point
+    finally:
+        GM.set_override_files(None); GM.set_current('')

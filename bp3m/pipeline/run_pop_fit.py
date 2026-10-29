@@ -2438,7 +2438,7 @@ def run_pop_fit(
         else:
             _p = find_qso_anchors(_gaia_dir, field_name)
             # Also collect any additional parameterised files that exist
-            _all = sorted(_gaia_dir.glob(f"{field_name}_*_qso_anchors.csv"),
+            _all = sorted(_gaia_dir.glob(f"{field_name}_*_qso_anchors{__import__('bp3m.pipeline.qso_vetting', fromlist=['anchors_tag']).anchors_tag()}.csv"),
                           key=lambda p: p.stat().st_mtime)
             _anchor_paths = _all if _all else ([_p] if _p and _p.exists() else [])
 

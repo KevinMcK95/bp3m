@@ -21,6 +21,7 @@ dependencies = [
     "joblib",
     "jax",
     "jaxlib",
+    "gaiadr3-zeropoint>=0.1.0",   # Lindegren+21 Gaia DR3 parallax zero point (bp3m/gaia_zp.py; LGPLv3+, used as a library)
     "nbconvert",
     "ipykernel",
     "jupyter",

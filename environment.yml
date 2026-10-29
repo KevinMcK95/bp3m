@@ -16,4 +16,5 @@ dependencies:
   - jaxlib
   - pip
   - pip:
+    - gaiadr3-zeropoint>=0.1.0   # Lindegren+21 parallax zero point (bp3m/gaia_zp.py)
     - bp3m

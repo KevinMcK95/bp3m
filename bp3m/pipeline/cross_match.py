@@ -677,7 +677,7 @@ def run_cross_match(
         existing = [Path(f['root']) / "matched_gaia.csv" for f in folders]
         # Still run QSO vetting if the anchors file is missing
         if run_qso_vetting:
-            _anchor = Path(output_dir) / field_name / "Gaia" / f"{field_name}_qso_anchors.csv"
+            _anchor = Path(output_dir) / field_name / "Gaia" / f"{field_name}_qso_anchors{__import__('bp3m.pipeline.qso_vetting', fromlist=['anchors_tag']).anchors_tag()}.csv"
             if not _anchor.exists():
                 try:
                     from .qso_vetting import vet_qso_candidates

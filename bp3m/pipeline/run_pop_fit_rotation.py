@@ -1328,7 +1328,7 @@ def run_pop_fit_rotation(
                              else [Path(p) for p in qso_anchors_csv])
         else:
             _p = find_qso_anchors(_gaia_dir, field_name)
-            _all = sorted(_gaia_dir.glob(f"{field_name}_*_qso_anchors.csv"),
+            _all = sorted(_gaia_dir.glob(f"{field_name}_*_qso_anchors{__import__('bp3m.pipeline.qso_vetting', fromlist=['anchors_tag']).anchors_tag()}.csv"),
                           key=lambda p: p.stat().st_mtime)
             _anchor_paths = _all if _all else ([_p] if _p and _p.exists() else [])
 

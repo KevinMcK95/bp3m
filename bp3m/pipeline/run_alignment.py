@@ -993,8 +993,8 @@ def _apply_indv_init(solver, image_names, data_root, field_name):
             _fb(f'match algo v{_ver} != v{XMATCH_ALGO_VERSION}', len(subs)); continue
         # Gaia error model (2026-10-28): never warm-start from an indv fit made with another Gaia model
         # (indv run_configs from before the key existed were default-model fits)
-        from bp3m.gaia_model import GaiaModel as _GM
-        _gm_indv = _cfg.get('gaia_model') or _GM().spec
+        from bp3m.gaia_model import GaiaModel as _GM, parse_recorded as _gm_rec
+        _gm_indv = _gm_rec(_cfg.get('gaia_model')).spec
         _gm_now = getattr(getattr(solver, 'gaia_model', None), 'spec', _GM().spec)
         if _gm_indv != _gm_now:
             _fb(f'Gaia model {_gm_indv} != {_gm_now}', len(subs)); continue

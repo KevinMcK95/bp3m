@@ -972,7 +972,19 @@ def main():
     _gaia_files_json.write_text(
         _json_gaia.dumps([str(p) for p in gaia_csv_paths], indent=2))
 
-    from bp3m.gaia_model import override_files as _gaia_override
+    from bp3m.gaia_model import override_files as _gaia_override, current as _gm_cur, set_override_files as _gm_set_files, \
+        check_zp_consistency as _gm_check_zp
+    if _gm_cur().zp == 'l21' and not _gaia_override():
+        # Lindegren+21 parallax zero point (default since 2026-10-28): every stage reads the L21-corrected copy of the field's
+        # Gaia CSV(s) through the override (bp3m.gaia_zp); copies are reused when their sidecar matches the source md5.
+        from bp3m.gaia_zp import build_copy as _zp_build
+        try:
+            _copies = [_zp_build(p) for p in gaia_csv_paths]
+        except ImportError:
+            raise SystemExit("Gaia model zp=l21 (default) needs the gaiadr3-zeropoint package, a bp3m dependency: "
+                             "pip install gaiadr3-zeropoint (--gaia_model ...;zp=none reproduces legacy runs)")
+        _gm_set_files(_copies)
+    _gm_check_zp()
     if _gaia_override():
         gaia_csv_paths = [Path(p) for p in _gaia_override()]
         print(f"  Gaia catalogue: override {[p.name for p in gaia_csv_paths]} (canonical sidecar left unchanged)")
@@ -1691,7 +1703,8 @@ def main():
                     return False
                 # Gaia model / file (2026-10-28).  Caches written before these keys existed were default-model fits on
                 # the canonical file; a recorded md5 must match the file used now.
-                if _cfg.get('gaia_model', _GaiaModel().spec) != _gaia_spec:
+                from bp3m.gaia_model import parse_recorded as _gm_rec
+                if _gm_rec(_cfg.get('gaia_model')).spec != _gaia_spec:
                     return False
                 if _cfg.get('gaia_csv_md5') is not None and _cfg['gaia_csv_md5'] != _gaia_md5:
                     return False

@@ -60,10 +60,16 @@ def qso_anchors_path(
     search_width: float,
     search_height: float,
 ) -> Path:
-    """Return the canonical parameterised path for a qso_anchors CSV."""
+    """Return the canonical parameterised path for a qso_anchors CSV (suffix _zpl21 when the Gaia model applies the
+    Lindegren+21 parallax zero point: anchors vetted on corrected parallaxes are kept apart from legacy ones)."""
     return (Path(gaia_dir) /
             f"{field_name}_ra{ra:.4f}_dec{dec:+.4f}"
-            f"_w{search_width:.4f}_h{search_height:.4f}_qso_anchors.csv")
+            f"_w{search_width:.4f}_h{search_height:.4f}_qso_anchors{anchors_tag()}.csv")
+
+
+def anchors_tag() -> str:
+    from ..gaia_model import current
+    return '_zpl21' if current().zp == 'l21' else ''
 
 
 def find_qso_anchors(gaia_dir: "Path | str", field_name: str,
@@ -80,12 +86,12 @@ def find_qso_anchors(gaia_dir: "Path | str", field_name: str,
     if all(v is not None for v in [ra, dec, search_width, search_height]):
         return qso_anchors_path(gaia_dir, field_name, ra, dec,
                                 search_width, search_height)
-    matches = sorted(gaia_dir.glob(f"{field_name}_*_qso_anchors.csv"),
+    matches = sorted(gaia_dir.glob(f"{field_name}_*_qso_anchors{anchors_tag()}.csv"),
                      key=lambda p: p.stat().st_mtime)
     if matches:
         return matches[-1]
     # Legacy flat name fallback
-    legacy = gaia_dir / f"{field_name}_qso_anchors.csv"
+    legacy = gaia_dir / f"{field_name}_qso_anchors{anchors_tag()}.csv"
     return legacy if legacy.exists() else None
 
 
@@ -142,7 +148,7 @@ def vet_qso_candidates(
         out_path = qso_anchors_path(gaia_dir, field_name, ra, dec,
                                     search_width, search_height)
     else:
-        out_path = gaia_dir / f"{field_name}_qso_anchors.csv"
+        out_path = gaia_dir / f"{field_name}_qso_anchors{anchors_tag()}.csv"
 
     if not force_rerun and out_path.exists():
         print(f"[QSO vetting] Loading cached: {out_path.name}")
@@ -243,8 +249,12 @@ def _find_catalog(lib_dir: "Path | None", filename: str) -> "Path | None":
 
 def _load_gaia_astrometry(gaia_dir: Path) -> "pd.DataFrame | None":
     """Load the main Gaia CSV (non-qso/galaxy files) filtered to in_qso_candidates."""
-    paths = [p for p in sorted(gaia_dir.glob("*_G*.csv"))
-             if 'qso' not in p.name and 'galaxy' not in p.name]
+    from ..gaia_model import override_files as _gaia_override
+    if _gaia_override():           # a Gaia-model arm (e.g. the L21 zero-point copy): vet on the values every stage uses
+        paths = [Path(p) for p in _gaia_override()]
+    else:
+        paths = [p for p in sorted(gaia_dir.glob("*_G*.csv"))
+                 if 'qso' not in p.name and 'galaxy' not in p.name]
     if not paths:
         return None
     dfs = [pd.read_csv(p, dtype={'source_id': 'int64'}) for p in paths]

@@ -48,8 +48,9 @@ def set_gaia_uwu_mag(flag: bool) -> None:
     this module with the default, so past --gaia_uwu_mag runs were scalar at indv and magnitude-dependent at v1)."""
     global GAIA_UWU_MAG
     GAIA_UWU_MAG = bool(flag)
-    from .gaia_model import current, set_current, GaiaModel
-    set_current(GaiaModel(cov='fab_mag' if flag else 'fab_scalar', floor=current().floor))
+    import dataclasses
+    from .gaia_model import current, set_current
+    set_current(dataclasses.replace(current(), cov='fab_mag' if flag else 'fab_scalar'))
 
 
 # ── Magnitude-dependent Gaia unit-weight uncertainties ──────────────────────────

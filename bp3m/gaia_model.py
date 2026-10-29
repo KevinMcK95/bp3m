@@ -23,7 +23,8 @@ import numpy as np
 from .astro_utils import GAIA_SYS_DICT
 
 ENV = 'BP3M_GAIA_MODEL'
-_CHOICES = {'cov': ('fab_scalar', 'fab_mag', 'as_given'), 'floor': ('diag', 'none', 'modes'), 'modes': None}   # modes: a path
+_CHOICES = {'cov': ('fab_scalar', 'fab_mag', 'as_given'), 'floor': ('diag', 'none', 'modes'), 'modes': None,   # modes: a path
+            'zp': ('l21', 'none')}
 CANONICAL = (0, 1, 2, 3, 4)          # axis positions of (ra*, dec, pmra, pmdec, parallax) in the solver's 5x5 order
 
 
@@ -32,6 +33,7 @@ class GaiaModel:
     cov: str = 'fab_scalar'
     floor: str = 'diag'
     modes: str = 'none'          # field-mode npz (handoff 3.2) or 'none'
+    zp: str = 'l21'              # parallax zero point: Lindegren+21 (default since 2026-10-28, user) or none (legacy runs)
 
     @classmethod
     def parse(cls, spec: "str | GaiaModel | None") -> "GaiaModel":
@@ -62,11 +64,24 @@ class GaiaModel:
 
     @property
     def spec(self) -> str:
-        return f"cov={self.cov};floor={self.floor}" + (f";modes={self.modes}" if self.modes != 'none' else '')
+        return f"cov={self.cov};floor={self.floor};zp={self.zp}" + (f";modes={self.modes}" if self.modes != 'none' else '')
 
     @property
     def is_default(self) -> bool:
         return self == GaiaModel()
+
+
+# Runs recorded before the zp key existed (or with no gaia_model at all) used published parallaxes
+LEGACY = GaiaModel(zp='none')
+
+
+def parse_recorded(rec) -> GaiaModel:
+    """A model READ BACK from a run_config: nothing recorded, or a spec recorded before the zp key existed (2026-10-28),
+    means the run used published parallaxes (zp=none).  User-given specs go through GaiaModel.parse (default zp=l21)."""
+    if not rec:
+        return LEGACY
+    s = str(rec)
+    return GaiaModel.parse(s if 'zp=' in s else s + ';zp=none')
 
 
 def current() -> GaiaModel:
@@ -142,6 +157,21 @@ def resolve_inherited_files(cli_files, upstream_cfg: "dict | None", stage: str, 
     return out
 
 
+def check_zp_consistency():
+    """zp=l21 requires the Gaia table(s) in use to be L21-corrected copies; zp=none forbids them (no zero-point applied twice
+    or silently missing)."""
+    from .gaia_zp import is_corrected
+    m = current(); ov = override_files() or []
+    if m.zp == 'l21':
+        bad = [p for p in ov if not is_corrected(p)]
+        if not ov or bad:
+            raise SystemExit(f"Gaia model zp=l21 but the Gaia table(s) in use are not L21-corrected copies: {bad or 'no override set'}")
+    else:
+        bad = [p for p in ov if is_corrected(p)]
+        if bad:
+            raise SystemExit(f"Gaia model zp=none but the override file(s) carry an L21-corrected parallax: {bad}")
+
+
 def resolve_inherited(cli_spec, upstream_cfg: "dict | None", stage: str, upstream: str) -> GaiaModel:
     """The model for a downstream stage (v2, pop-fits): the CLI value if given, else the one recorded in the upstream
     run_config.json.  A CLI value that differs from a recorded upstream model is a hard error (a Gaia-model change is an
@@ -149,7 +179,7 @@ def resolve_inherited(cli_spec, upstream_cfg: "dict | None", stage: str, upstrea
     (2026-10-28) and used the default unless run with --gaia_uwu_mag, which was not recorded either -> default + a warning.
     Sets the process-wide model (call before any worker pool exists) and returns it."""
     rec = (upstream_cfg or {}).get('gaia_model')
-    up = GaiaModel.parse(rec) if rec else None
+    up = parse_recorded(rec) if upstream_cfg is not None else None
     if cli_spec is not None:
         m = GaiaModel.parse(cli_spec)
         if up is not None and m != up:
@@ -157,12 +187,13 @@ def resolve_inherited(cli_spec, upstream_cfg: "dict | None", stage: str, upstrea
                              f"a Gaia-model change needs its own alignment (indv -> v1 -> v2)")
     elif up is not None:
         m = up
+        if not rec:
+            print(f"  {stage}: {upstream} run_config.json records no gaia_model (pre-2026-10-28 run) -> the legacy model "
+                  f"{m.spec} it was run with (a --gaia_uwu_mag upstream run would not have been recorded)")
     else:
-        m = GaiaModel()
-        if upstream_cfg is not None:
-            print(f"  {stage}: {upstream} run_config.json records no gaia_model (pre-2026-10-28 run) -> default "
-                  f"{m.spec} (a --gaia_uwu_mag upstream run would not have been recorded)")
+        m = current()                       # no upstream alignment at all
     set_current(m)
+    check_zp_consistency()                  # call resolve_inherited_files BEFORE this (override files must be set)
     if not m.is_default:
         print(f"  {stage}: Gaia model {m.spec}")
     return m
