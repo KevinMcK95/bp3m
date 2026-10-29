@@ -470,6 +470,10 @@ def _parse_args():
                          'geometric mean of the v3 PM/parallax inflation), v3real2p_fab (positions x Fabricius), v3real2p_mc '
                          '(median-centred 6p conditioning), corrvals (corrected values, published errors).  Downloads a '
                          'conditioning sample around the field once; sets --gaia_model to the matching spec unless given.')
+    bp.add_argument('--gaia_field_modes', action='store_true',
+                    help='With --gaia_corrected v3real2p*: build (or reuse) the kernel-v3 Gaia field-mode file for the field '
+                         '(bp3m/gaia_modes.py; QSO-conditioned, BP3M anchors excluded) and fit its K shared coefficients '
+                         '(spec floor=modes;modes=<npz>, the per-star VB21 floor off).  Later stages inherit it.')
     bp.add_argument('--qso_anchors_csv', type=str, nargs='+', default=None,
                     help='QSO anchor CSV(s) to use instead of the vetted canonical ones (a Gaia-model arm builds its own from '
                          'the corrected copy).  Hard error if missing.')
@@ -854,6 +858,8 @@ def main():
         from bp3m.gaia_corrected import default_spec as _gc_spec
         if getattr(args, 'gaia_model', None) is None:
             args.gaia_model = _gc_spec(args.gaia_corrected)       # validated against the table by check_model_copies
+    if getattr(args, 'gaia_field_modes', False) and not str(getattr(args, 'gaia_corrected', '') or '').startswith('v3real2p'):
+        raise SystemExit('--gaia_field_modes needs --gaia_corrected v3real2p* (the modes are conditioned in the v3 convention)')
     if getattr(args, 'gaia_model', None) is not None:
         from bp3m.gaia_model import GaiaModel, set_current
         _gm = GaiaModel.parse(args.gaia_model)
@@ -998,6 +1004,19 @@ def main():
             _gc_copies.append(_gc_ensure(_p_i, _a_i, _ra_i, _dec_i, _sw_i, _sh_i, args.gaia_corrected))
         _gm_set_files(_gc_copies)
         print(f'  Gaia corrected tables ({args.gaia_corrected}): {[p.name for p in _gc_copies]}')
+        if getattr(args, 'gaia_field_modes', False):
+            import math as _math
+            from bp3m.gaia_modes import ensure_modes as _gc_modes
+            from bp3m.gaia_model import GaiaModel as _GMod, set_current as _gm_setc
+            _ras = [p[0] for p in args.pointings]; _des = [p[1] for p in args.pointings]
+            _cen = (float(np.mean(_ras)), float(np.mean(_des)))
+            _hd = max(0.5 * _math.hypot(p[2], p[3]) + _math.hypot((p[0] - _cen[0]) * np.cos(np.radians(_cen[1])), p[1] - _cen[1])
+                      for p in args.pointings)
+            _modes = _gc_modes([_gaia_csv_path_for(*p) for p in args.pointings], _gc_copies, _cen, _hd, args.gaia_corrected,
+                               lib_dir=args.lib_dir)
+            _m0 = _gm_cur()
+            _gm_setc(_GMod(cov=_m0.cov, floor='modes', modes=str(Path(_modes).resolve()), zp=_m0.zp))   # absolute: later stages may run elsewhere
+            print(f'  Gaia field modes: {_modes.name} -> model {_gm_cur().spec}')
     if _gm_cur().zp == 'l21' and not _gaia_override():
         # Lindegren+21 parallax zero point (default since 2026-10-28): every stage reads the L21-corrected copy of the field's
         # Gaia CSV(s) through the override (bp3m.gaia_zp); copies are reused when their sidecar matches the source md5.

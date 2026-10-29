@@ -112,7 +112,7 @@ def build_gp_v3(cal, center, extent_deg, star_ra, star_dec, star_G, star_sol, q_
     (the v3 noise model with n10 = 0 is applied here).  Returns dict(mode='v3', m_Z, L_Z, W3 (N, 3, 3nz) incl. the
     sources' amplitudes, Wc (3, 3nz) at the centre for G = 19 5p, fitc (N, 3, 3), q_loo_mean, q_loo_var_s, ...).
     """
-    from gp_sys import inducing_points
+    from .qso_prep import inducing_points    # VENDOR NOTE: pop_fit imports gp_sys.inducing_points (vendored verbatim there)
     zra, zde = inducing_points(center[0], center[1], extent_deg, n_rings=n_rings)
     uZ = _unit(zra, zde); nz = len(zra)
     uq = _unit(q_ra, q_dec)
