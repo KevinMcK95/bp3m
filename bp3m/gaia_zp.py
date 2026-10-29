@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 TAG = 'l21'
+BUILD_VERSION = 2       # 2026-10-29: inputs clipped strictly inside the ranges + same-type median fill (v1 left clamped sources uncorrected)
 G_RANGE = (6.0, 21.0); NU_RANGE = (1.1, 1.9); PC_RANGE = (1.24, 1.72)
 
 
@@ -48,12 +49,29 @@ def compute_zp(df: pd.DataFrame):
     pc = df['pseudocolour'].to_numpy(float); bet = df['ecl_lat'].to_numpy(float)
     has = np.isfinite(df['parallax'].to_numpy(float)) & np.isfinite(g) & np.isin(aps, (31, 95)) & np.isfinite(bet)
     six = aps == 95
-    gc = np.clip(g, *G_RANGE); nuc = np.clip(nu, *NU_RANGE); pcc = np.clip(pc, *PC_RANGE)
-    extrap = has & ((gc != g) | (~six & (nuc != nu)) | (six & (pcc != pc)))
+    # 2026-10-29: clip strictly INSIDE the ranges (pop_fit production, the kernel-v3 calibration inputs): the package returns
+    # NaN for a value exactly on a boundary, so the edge clamp of 10-28 left every clamped source uncorrected (14-15 %)
+    eps = 1e-4
+    clip = lambda x, r: np.clip(x, r[0] + eps, r[1] - eps)
+    gc = clip(g, G_RANGE); nuc = clip(nu, NU_RANGE); pcc = clip(pc, PC_RANGE)
+    extrap = has & ((g < G_RANGE[0]) | (g > G_RANGE[1]) | (~six & ((nu < NU_RANGE[0]) | (nu > NU_RANGE[1])))
+                    | (six & ((pc < PC_RANGE[0]) | (pc > PC_RANGE[1]))))
+    ok = has & np.where(six, np.isfinite(pcc), np.isfinite(nuc))
     zp = np.full(n, np.nan)
-    if has.any():
-        zp[has] = zpt.get_zpt(gc[has], np.where(six, np.nan, nuc)[has], np.where(six, pcc, np.nan)[has], bet[has],
-                              aps[has].astype(int), _warnings=False)
+    if ok.any():
+        zp[ok] = zpt.get_zpt(gc[ok], np.where(six, np.nan, nuc)[ok], np.where(six, pcc, np.nan)[ok], bet[ok],
+                             aps[ok].astype(int), _warnings=False)
+    # any remaining NaN on a source with a parallax (no colour input / undefined): the median zero point of its solution
+    # type, as pop_fit production (data.apply_parallax_zeropoint); counted in the sidecar (n_median_filled)
+    fill = has & ~np.isfinite(zp)
+    for st in (31, 95):
+        good = np.isfinite(zp) & (aps == st)
+        m = fill & (aps == st)
+        if m.any():
+            if not good.any():
+                raise ValueError(f'L21: {int(m.sum())} sources (solution type {st}) without a zero point and no same-type median')
+            zp[m] = np.median(zp[good])
+    compute_zp.n_median_filled = int(fill.sum())
     return zp, extrap
 
 
@@ -62,7 +80,7 @@ def build_copy(src, force: bool = False) -> Path:
     src = Path(src); out = copy_path(src); side = Path(str(out) + '.json'); m = _md5(src)
     if out.exists() and side.exists() and not force:
         meta = json.loads(side.read_text())
-        if meta.get('source_md5') == m and meta.get('zp') == TAG:
+        if meta.get('source_md5') == m and meta.get('zp') == TAG and meta.get('build_version') == BUILD_VERSION:
             return out
     df = pd.read_csv(src, dtype={'source_id': np.int64})
     if 'zp_l21' in df.columns or 'parallax_orig' in df.columns:
@@ -80,9 +98,9 @@ def build_copy(src, force: bool = False) -> Path:
         pv = version('gaiadr3_zeropoint')
     except Exception:
         pv = 'unknown'
-    side.write_text(json.dumps({'zp': TAG, 'source': str(src), 'source_md5': m, 'copy_md5': _md5(out),
+    side.write_text(json.dumps({'zp': TAG, 'build_version': BUILD_VERSION, 'source': str(src), 'source_md5': m, 'copy_md5': _md5(out),
                                 'package': f'gaiadr3_zeropoint {pv}', 'clamp': {'G': G_RANGE, 'nu_eff': NU_RANGE, 'pseudocolour': PC_RANGE},
-                                'n_rows': int(len(df)), 'n_corrected': int(np.isfinite(zp).sum()), 'n_extrapolated': int(extrap.sum()),
+                                'n_rows': int(len(df)), 'n_corrected': int(np.isfinite(zp).sum()), 'n_extrapolated': int(extrap.sum()), 'n_median_filled': compute_zp.n_median_filled,
                                 'zp_median_mas': float(np.nanmedian(zp)) if np.isfinite(zp).any() else None,
                                 'created': datetime.datetime.now().isoformat(timespec='seconds')}, indent=1))
     return out

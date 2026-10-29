@@ -364,8 +364,9 @@ def check_model_copies():
             # 'published' (corrvals, arm A'): corrected values with the published errors, inflated by bp3m as usual
             raise SystemExit(f"{Path(p).name}: covariance '{meta['covariance']}' is the model's own; use cov=as_given and "
                              f"floor=none|modes (got {m.spec}) or the Fabricius factors / VB21 floor are applied twice")
-        if mc in V3_CALIBRATION:
-            cal, sha = V3_CALIBRATION[mc]
+        base = next((k for k in V3_CALIBRATION if mc == k or mc.startswith(k + '_')), None)   # v3real2p_mc, _posgm, ...
+        if base is not None:
+            cal, sha = V3_CALIBRATION[base]
             if meta.get('calibration') != cal or meta.get('sha256_calibration') != sha:
                 raise SystemExit(f"{Path(p).name}: calibration {meta.get('calibration')} / {meta.get('sha256_calibration')} "
                                  f"is not the production {cal} / {sha}")

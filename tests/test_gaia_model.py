@@ -271,6 +271,20 @@ def test_model_copy_rejects_stale_or_wrong_calibration(tmp_path, kw):
         GM.set_override_files(None); GM.set_current('')
 
 
+def test_derived_v3_model_needs_production_calibration(tmp_path):
+    """Models derived from v3real2p (v3real2p_mc, v3real2p_posgm, ...) are held to the same production-kernel check."""
+    import json
+    src, cp, an = _model_copy(tmp_path, calib=('gaia_dr3_kernel_v3.json', 'x' * 64))
+    side = cp.parent / (cp.name + '.json'); m = json.loads(side.read_text()); m['model'] = 'v3real2p_posgm'
+    side.write_text(json.dumps(m))
+    try:
+        GM.set_override_files([str(cp)]); GM.set_current('cov=as_given;floor=none;zp=l21')
+        with pytest.raises(SystemExit):
+            GM.check_zp_consistency()
+    finally:
+        GM.set_override_files(None); GM.set_current('')
+
+
 def test_l21_rows_must_agree(tmp_path):
     from bp3m.gaia_zp import is_corrected
     src, cp, an = _model_copy(tmp_path)
@@ -290,3 +304,15 @@ def test_mode_anchor_exclusion(tmp_path):
     fm.check_anchors([12, 13])
     with pytest.raises(SystemExit):
         fm.check_anchors([12, 14])
+
+
+def test_l21_clamped_sources_are_corrected():
+    """2026-10-29 bug: inputs clamped exactly to the calibration edge gave NaN zero points (the package returns NaN on a
+    boundary), so 14-15 % of sources kept the published parallax.  Out-of-range inputs must get a finite, flagged zp."""
+    from bp3m.gaia_zp import compute_zp
+    d = pd.DataFrame({'parallax': [0.1, 0.1, 0.1, 0.1], 'gmag': [20.5, 21.8, 19.0, 20.0],
+                      'nu_eff_used_in_astrometry': [1.5, 1.5, np.nan, 2.3], 'pseudocolour': [np.nan, np.nan, 1.80, np.nan],
+                      'ecl_lat': [10.0, 10.0, 10.0, 10.0], 'astrometric_params_solved': [31, 31, 95, 31]})
+    zp, ex = compute_zp(d)
+    assert np.isfinite(zp).all(), zp
+    assert ex.tolist() == [False, True, True, True]
