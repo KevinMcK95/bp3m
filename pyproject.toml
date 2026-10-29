@@ -67,7 +67,7 @@ exclude = ["build*", "tests*", "tests_pypass*"]
 
 [tool.setuptools.package-data]
 "bp3m.notebooks" = ["*.ipynb"]
-"bp3m" = ["data/*.json", "data/gaia_sys/*.json", "data/gaia_sys/*.npz"]   # vendored Gaia model inputs (gaia_corrected; sha256-checked)
+"bp3m" = ["data/gaia_sys/*.json", "data/gaia_sys/*.npz"]   # vendored Gaia model inputs (gaia_corrected; sha256-checked)
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
