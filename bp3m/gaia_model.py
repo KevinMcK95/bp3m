@@ -170,6 +170,7 @@ def check_zp_consistency():
         bad = [p for p in ov if is_corrected(p)]
         if bad:
             raise SystemExit(f"Gaia model zp=none but the override file(s) carry an L21-corrected parallax: {bad}")
+    check_model_copies()
 
 
 def resolve_inherited(cli_spec, upstream_cfg: "dict | None", stage: str, upstream: str) -> GaiaModel:
@@ -309,3 +310,139 @@ def field_modes(model=None) -> "FieldModes | None":
     if m.modes not in _MODES_CACHE:
         _MODES_CACHE[m.modes] = FieldModes(m.modes)
     return _MODES_CACHE[m.modes]
+
+
+# ── Model copies built by the pop_fit side (handoff 3.1 / 3.2a, 2026-10-29) ──────────────────────────────────────────────
+# A model copy (Gaia/corrected/<stem>_gaiacorr_<model>.csv) carries a sidecar with 'model', 'corrections' (+
+# 'corrections_qso_rows'), 'covariance' when *_error / *_corr already encode the model covariance, the source CSV and its
+# sha256, and the calibration file and its sha256.  Its QSO anchors are the sibling Gaia/corrected/*_qso_anchors_<model>.csv
+# whose sidecar names the same source CSV.
+V3_CALIBRATION = {'v3real2p': ('gaia_dr3_kernel_v3_real2p.json',
+                               '30a5aa238a52c8f8e9e30716bc4229dd9c21c1013042b85b13fe233c0dd8b302')}   # production kernel (pop_fit 10-29)
+
+
+def _sidecar(path) -> dict:
+    import json
+    from pathlib import Path
+    s = Path(str(path) + '.json')
+    return json.loads(s.read_text()) if s.exists() else {}
+
+
+def _sha256(path) -> str:
+    import hashlib
+    from pathlib import Path
+    h = hashlib.sha256()
+    with open(Path(path), 'rb') as f:
+        for b in iter(lambda: f.read(1 << 22), b''):
+            h.update(b)
+    return h.hexdigest()
+
+
+def model_copy() -> "str | None":
+    """The model name of the override copies when they are pop_fit model copies (all the same model), else None."""
+    ov = override_files() or []
+    names = {_sidecar(p).get('model') for p in ov}
+    if not ov or names == {None}:
+        return None
+    if len(names) != 1:
+        raise SystemExit(f"Gaia override files mix models / plain copies: {sorted(map(str, names))} ({ov})")
+    return names.pop()
+
+
+def check_model_copies():
+    """Hard errors for a model copy used with an inconsistent spec or stale inputs: the copy's covariance is the model's
+    (cov must be as_given and the per-star VB21 floor off, else it would be inflated twice); the calibration must be the
+    production file (sha256); the copy must have been built from the field's current canonical CSV (sha256)."""
+    from pathlib import Path
+    mc = model_copy()
+    if mc is None:
+        return
+    m = current()
+    for p in override_files():
+        meta = _sidecar(p)
+        if meta.get('covariance') not in (None, 'published') and (m.cov != 'as_given' or m.floor == 'diag'):
+            # 'published' (corrvals, arm A'): corrected values with the published errors, inflated by bp3m as usual
+            raise SystemExit(f"{Path(p).name}: covariance '{meta['covariance']}' is the model's own; use cov=as_given and "
+                             f"floor=none|modes (got {m.spec}) or the Fabricius factors / VB21 floor are applied twice")
+        if mc in V3_CALIBRATION:
+            cal, sha = V3_CALIBRATION[mc]
+            if meta.get('calibration') != cal or meta.get('sha256_calibration') != sha:
+                raise SystemExit(f"{Path(p).name}: calibration {meta.get('calibration')} / {meta.get('sha256_calibration')} "
+                                 f"is not the production {cal} / {sha}")
+        src = Path(p).resolve().parent.parent / str(meta.get('source_csv', ''))
+        if not meta.get('source_csv') or not src.exists():
+            raise SystemExit(f"{Path(p).name}: source CSV {meta.get('source_csv')} not found next to Gaia/corrected/")
+        if _sha256(src) != meta.get('sha256_source_csv'):
+            raise SystemExit(f"{Path(p).name}: built from a different version of {src.name} (sha256); rebuild the copy")
+
+
+def model_anchor_files() -> "list | None":
+    """The QSO anchor files that belong to the model copies in use (one per copy, same model and source CSV), or None when
+    the override is not a model copy.  A copy without its anchors file is a hard error (no fallback to canonical anchors)."""
+    from pathlib import Path
+    mc = model_copy()
+    if mc is None:
+        return None
+    out = []
+    for p in override_files():
+        meta = _sidecar(p); d = Path(p).resolve().parent
+        hits = [a for a in sorted(d.glob(f'*_qso_anchors_{mc}.csv'))
+                if _sidecar(a).get('source_csv') == meta.get('source_csv')
+                and _sidecar(a).get('sha256_source_csv') == meta.get('sha256_source_csv')]
+        if len(hits) != 1:
+            raise SystemExit(f"{Path(p).name}: expected one *_qso_anchors_{mc}.csv for {meta.get('source_csv')}, found {hits}")
+        out.append(hits[0])
+    return out
+
+
+def check_anchor_files(paths):
+    """Explicit anchor files with a model copy must be exactly that copy's anchor files; every file must exist."""
+    from pathlib import Path
+    paths = [Path(p) for p in ([paths] if isinstance(paths, (str, Path)) else (paths or []))]
+    miss = [str(p) for p in paths if not p.exists()]
+    if miss:
+        raise SystemExit(f"QSO anchor file(s) missing: {miss}")
+    want = model_anchor_files()
+    if want is not None and sorted(p.resolve() for p in paths) != sorted(p.resolve() for p in want):
+        raise SystemExit(f"QSO anchors {[p.name for p in paths]} are not the model copy's own {[p.name for p in want]}")
+
+
+def anchor_domain_ids() -> "set | None":
+    """source_ids inside the calibration domain (column v3_domain of the model copies), or None when the copies have no such
+    column.  Anchors outside it have an extrapolated noise model and are not injected (user 2026-10-29)."""
+    import pandas as pd
+    if model_copy() is None:
+        return None
+    ids = set()
+    for p in override_files():
+        cols = pd.read_csv(p, nrows=0).columns
+        if 'v3_domain' not in cols:
+            return None
+        d = pd.read_csv(p, usecols=['source_id', 'v3_domain'], dtype={'source_id': 'int64'})
+        ids |= set(d.source_id[d.v3_domain.astype(bool)].astype(int))
+    return ids
+
+
+def apply_anchor_domain(df, what: str):
+    """Keep the anchors inside the calibration domain (see anchor_domain_ids); print the cut."""
+    dom = anchor_domain_ids()
+    if dom is None:
+        return df
+    keep = df['source_id'].astype('int64').isin(dom)
+    print(f"    v3_domain cut ({what}): {int(keep.sum())} of {len(df)} anchors inside the calibration domain")
+    return df[keep]
+
+
+def write_anchors_used(out_dir, ids, stage: str, anchor_paths=None):
+    """Record the QSO source_ids injected as anchors (handoff C5: the field-mode conditioning must exclude every one), and
+    check them against the field-mode file when modes are on."""
+    import pandas as pd
+    from pathlib import Path
+    ids = [int(i) for i in ids]
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    src = ';'.join(str(Path(p).name) for p in (anchor_paths or []))
+    pd.DataFrame({'source_id': pd.Series(ids, dtype='int64'), 'stage': stage, 'anchors_file': src}).to_csv(
+        Path(out_dir) / 'qso_anchors_used.csv', index=False)
+    fm = field_modes()
+    if fm is not None:
+        fm.check_anchors(ids)

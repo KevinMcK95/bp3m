@@ -1001,7 +1001,10 @@ def main():
     from bp3m.pipeline.qso_vetting import qso_anchors_path as _qap
     _qso_anchors_csvs: list[Path] = []
     _any_qso_new = False
-    for _ra_i, _dec_i, _sw_i, _sh_i in args.pointings:
+    from bp3m.gaia_model import model_copy as _gm_model_copy, model_anchor_files as _gm_model_anchors, \
+        check_anchor_files as _gm_check_anchors
+    _gm_mc = _gm_model_copy()        # pop_fit model copy: its own anchors file is used, never a canonical re-vetting
+    for _ra_i, _dec_i, _sw_i, _sh_i in ([] if _gm_mc else args.pointings):
         _qso_csv_i = _qap(_gaia_dir, field, _ra_i, _dec_i, _sw_i, _sh_i)
         if not args.no_qso_anchors and not _qso_csv_i.exists():
             if not _any_qso_new:
@@ -1038,6 +1041,12 @@ def main():
         _qso_anchors_csv = [Path(p) for p in args.qso_anchors_csv]
         _qso_anchors_csv = _qso_anchors_csv[0] if len(_qso_anchors_csv) == 1 else _qso_anchors_csv
         print(f'  QSO anchors: explicit {args.qso_anchors_csv}')
+    if _gm_mc and not args.no_qso_anchors:
+        if getattr(args, 'qso_anchors_csv', None):
+            _gm_check_anchors(args.qso_anchors_csv)
+        _qa = _gm_model_anchors()
+        _qso_anchors_csv = _qa[0] if len(_qa) == 1 else _qa
+        print(f'  QSO anchors: model copy {_gm_mc} -> {[p.name for p in _qa]}')
     # Helper: True when the qso anchors value is non-empty (Path or non-empty list)
     def _qso_exists(v):
         if v is None:

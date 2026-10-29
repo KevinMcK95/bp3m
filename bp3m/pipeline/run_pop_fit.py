@@ -2423,6 +2423,7 @@ def run_pop_fit(
     _qso_pmra_mas  = None
     _qso_pmdec_mas = None
     _n_qso_anchors = 0
+    _qso_used_ids, _qso_used_paths = [], []
 
     if use_qso_anchors:
         # Resolve which anchor CSV(s) to load.
@@ -2430,11 +2431,16 @@ def run_pop_fit(
         # When None, fall back to globbing the Gaia dir (supports multiple
         # search-parameter sets whose files are concatenated + deduped).
         from .qso_vetting import find_qso_anchors
+        from bp3m.gaia_model import model_anchor_files as _gm_model_anchors, check_anchor_files as _gm_check_anchors, \
+            apply_anchor_domain as _gm_anchor_domain
         _gaia_dir = data_root / field_name / 'Gaia'
+        if qso_anchors_csv is None and _gm_model_anchors() is not None:
+            qso_anchors_csv = _gm_model_anchors()      # the model copy's own anchors (never the canonical vetting)
         if qso_anchors_csv is not None:
             _anchor_paths = ([Path(qso_anchors_csv)]
                              if not isinstance(qso_anchors_csv, list)
                              else [Path(p) for p in qso_anchors_csv])
+            _gm_check_anchors(_anchor_paths)      # explicit files must exist (and be the model copy's own): no silent drop
         else:
             _p = find_qso_anchors(_gaia_dir, field_name)
             # Also collect any additional parameterised files that exist
@@ -2445,6 +2451,7 @@ def run_pop_fit(
         _anchor_paths = [p for p in _anchor_paths if p.exists()]
 
         if _anchor_paths:
+            _qso_used_paths = list(_anchor_paths)
             try:
                 _qdfs = [pd.read_csv(p, dtype={'source_id': 'int64'})
                          for p in _anchor_paths]
@@ -2452,7 +2459,7 @@ def run_pop_fit(
                         .drop_duplicates(subset=['source_id'])
                         .reset_index(drop=True)
                         if len(_qdfs) > 1 else _qdfs[0])
-                _qdf_anchors = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+                _qdf_anchors = _gm_anchor_domain(_qdf[_qdf['is_qso_anchor'].fillna(False)], 'pop-fit')
 
                 _nq_total = len(_qdf)
                 _nq_5p    = int(_qdf['has_5p_solution'].sum())
@@ -2472,6 +2479,7 @@ def run_pop_fit(
                 for _, _row in _qdf_anchors.iterrows():
                     _sidx = star_id_to_idx.get(int(_row['source_id']))
                     if _sidx is not None:
+                        _qso_used_ids.append(int(_row['source_id']))
                         _qso_idx_list.append(_sidx)
                         _qso_pmra_list.append(float(_row['pmra_aberr_uas']) * 1e-3)
                         _qso_pmdec_list.append(float(_row['pmdec_aberr_uas']) * 1e-3)
@@ -2480,11 +2488,14 @@ def run_pop_fit(
                     _qso_pmra_mas  = np.array(_qso_pmra_list, dtype=float)
                     _qso_pmdec_mas = np.array(_qso_pmdec_list, dtype=float)
                     _n_qso_anchors = len(_qso_sidx)
+                from bp3m.gaia_model import field_modes as _gm_fm
+                if _gm_fm() is not None:
+                    _gm_fm().check_anchors(_qso_used_ids)      # fail before solving: anchors must be outside the conditioning set
                 print(f"    In HST field (in solver):     {_n_qso_anchors}  "
                       + ("← tight σ_κ prior applied" if _n_qso_anchors > 0
                          else "(none in HST FOV — prior not applied)"))
-            except Exception as _qexc:
-                print(f"  WARNING: could not load QSO anchors — {_qexc}")
+            except Exception as _qexc:      # 2026-10-29: a broken anchors file is a hard error (was a warning + no anchors)
+                raise SystemExit(f"could not load QSO anchors {[str(p) for p in _anchor_paths]}: {_qexc}")
         else:
             print("  QSO anchor file not found; re-run from Phase 1 to generate it")
     else:
@@ -3756,7 +3767,9 @@ def run_pop_fit(
     with open(output_pfr / 'mu_pop.json', 'w') as _f:
         json.dump(mu_result, _f, indent=2)
 
-    # 7. run_config.json
+    # 7. run_config.json (+ qso_anchors_used.csv, handoff C5)
+    from bp3m.gaia_model import write_anchors_used as _gm_anchors_used
+    _gm_anchors_used(output_pfr, _qso_used_ids, 'pop-fit' + ('-v2' if data_source == 'master_v2' else ''), _qso_used_paths)
     from bp3m.solver import _SIGMA_ROT_DEG, _SIGMA_SCALE, _SIGMA_SKEW, _SIGMA_POINTING
     with open(output_pfr / 'run_config.json', 'w') as _f:
         json.dump({

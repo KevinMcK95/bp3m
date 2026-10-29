@@ -89,13 +89,17 @@ def build_copy(src, force: bool = False) -> Path:
 
 
 def is_corrected(path) -> bool:
-    """True if a Gaia CSV is an L21-corrected copy (sidecar or columns)."""
+    """True if a Gaia CSV carries the L21-corrected parallax: this module's copy (sidecar zp = l21), a model copy whose
+    sidecar lists 'l21_zp' in its corrections (pop_fit v3real2p / corrvals, 2026-10-29), or the zp_l21 column."""
     side = Path(str(path) + '.json')
     if side.exists():
-        try:
-            return json.loads(side.read_text()).get('zp') == TAG
-        except Exception:
-            pass
+        meta = json.loads(side.read_text())
+        if 'corrections' in meta:
+            if ('l21_zp' in meta['corrections']) != ('l21_zp' in meta.get('corrections_qso_rows', meta['corrections'])):
+                raise SystemExit(f'{path}: L21 applied to star rows but not QSO rows (or the reverse): {meta["corrections"]} / '
+                                 f'{meta.get("corrections_qso_rows")}')
+            return 'l21_zp' in meta['corrections']
+        return meta.get('zp') == TAG
     cols = pd.read_csv(path, nrows=0).columns
     return 'zp_l21' in cols
 

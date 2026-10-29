@@ -191,3 +191,102 @@ def test_zero_point_consistency(tmp_path):
         GM.set_override_files(None); GM.check_zp_consistency()       # legacy: canonical files, no zero point
     finally:
         GM.set_override_files(None); GM.set_current('')
+
+
+def _model_copy(tmp_path, cov='v3_noise_cov', corrections=('l21_zp', '6p_pseudocolour', 'qso_sys', 'v3_star_zp'),
+                calib=None, stale=False):
+    """A field dir with a canonical Gaia CSV, a pop_fit-style model copy + sidecar, and its anchors file + sidecar."""
+    import json
+    g = tmp_path / 'Gaia'; c = g / 'corrected'; c.mkdir(parents=True)
+    src = g / 'F_ra1_gaia.csv'
+    pd.DataFrame({'source_id': [10, 11, 12, 13], 'parallax': [0.1, 0.2, 0.3, 0.0]}).to_csv(src, index=False)
+    cp = c / 'F_ra1_gaia_gaiacorr_v3real2p.csv'
+    pd.DataFrame({'source_id': [10, 11, 12, 13], 'parallax': [0.12, 0.22, 0.32, 0.02],
+                  'v3_domain': [True, True, False, True]}).to_csv(cp, index=False)
+    sha = GM._sha256(src) if not stale else '0' * 64
+    cal = calib or GM.V3_CALIBRATION['v3real2p']
+    meta = {'source_csv': src.name, 'sha256_source_csv': sha, 'calibration': cal[0], 'sha256_calibration': cal[1],
+            'corrections': list(corrections), 'corrections_qso_rows': ['l21_zp', 'qso_sys'] if 'l21_zp' in corrections else ['qso_sys'],
+            'model': 'v3real2p'}
+    if cov:
+        meta['covariance'] = cov
+    (c / (cp.name + '.json')).write_text(json.dumps(meta))
+    an = c / 'F_ra1_qso_anchors_v3real2p.csv'
+    pd.DataFrame({'source_id': [12, 13], 'is_qso_anchor': [True, True]}).to_csv(an, index=False)
+    (c / (an.name + '.json')).write_text(json.dumps({**meta, 'source_anchors': 'F_ra1_qso_anchors.csv'}))
+    return src, cp, an
+
+
+def test_model_copy_checks(tmp_path):
+    """2026-10-29: pop_fit model copies (v3real2p) -- L21 recognised from the corrections list (never applied twice), the
+    model covariance forces cov=as_given + no VB21 floor, production calibration and current source CSV enforced."""
+    from bp3m.gaia_zp import is_corrected
+    src, cp, an = _model_copy(tmp_path)
+    try:
+        assert is_corrected(cp)
+        GM.set_override_files([str(cp)])
+        assert GM.model_copy() == 'v3real2p'
+        GM.set_current('cov=as_given;floor=none;zp=l21'); GM.check_zp_consistency()       # the consistent spec passes
+        GM.set_current('cov=fab_scalar;floor=diag;zp=l21')
+        with pytest.raises(SystemExit):
+            GM.check_zp_consistency()                                # Fabricius / VB21 would be applied twice
+        GM.set_current('cov=as_given;floor=none;zp=none')
+        with pytest.raises(SystemExit):
+            GM.check_zp_consistency()                                # zp=none but the copy carries L21
+        assert [p.name for p in GM.model_anchor_files()] == [an.name]
+        GM.check_anchor_files([an])
+        with pytest.raises(SystemExit):
+            GM.check_anchor_files([tmp_path / 'missing.csv'])        # explicit missing file: hard error, no silent drop
+        other = tmp_path / 'other_qso_anchors.csv'; pd.DataFrame({'source_id': [12]}).to_csv(other, index=False)
+        with pytest.raises(SystemExit):
+            GM.check_anchor_files([other])                           # not the model copy's own anchors
+        GM.set_current('cov=as_given;floor=none;zp=l21')
+        d = pd.DataFrame({'source_id': [12, 13], 'is_qso_anchor': [True, True]})
+        assert GM.apply_anchor_domain(d, 'test').source_id.tolist() == [13]               # 12 is outside v3_domain
+        GM.write_anchors_used(tmp_path / 'out', [13], 'alignment', [an])
+        u = pd.read_csv(tmp_path / 'out' / 'qso_anchors_used.csv')
+        assert u.source_id.tolist() == [13] and u.anchors_file.iloc[0] == an.name
+    finally:
+        GM.set_override_files(None); GM.set_current('')
+
+
+def test_corrvals_published_covariance(tmp_path):
+    """corrvals copies (arm A', handoff 3.1): corrected values with the PUBLISHED covariance -> bp3m's inflation applies;
+    the default cov=fab_scalar;floor=diag must be accepted (only a model covariance forces as_given)."""
+    src, cp, an = _model_copy(tmp_path, cov='published')
+    try:
+        GM.set_override_files([str(cp)]); GM.set_current('cov=fab_scalar;floor=diag;zp=l21'); GM.check_zp_consistency()
+    finally:
+        GM.set_override_files(None); GM.set_current('')
+
+
+@pytest.mark.parametrize('kw', [dict(stale=True), dict(calib=('gaia_dr3_kernel_v3.json', 'x' * 64))])
+def test_model_copy_rejects_stale_or_wrong_calibration(tmp_path, kw):
+    src, cp, an = _model_copy(tmp_path, **kw)
+    try:
+        GM.set_override_files([str(cp)]); GM.set_current('cov=as_given;floor=none;zp=l21')
+        with pytest.raises(SystemExit):
+            GM.check_zp_consistency()
+    finally:
+        GM.set_override_files(None); GM.set_current('')
+
+
+def test_l21_rows_must_agree(tmp_path):
+    from bp3m.gaia_zp import is_corrected
+    src, cp, an = _model_copy(tmp_path)
+    import json
+    side = cp.parent / (cp.name + '.json'); m = json.loads(side.read_text()); m['corrections_qso_rows'] = ['qso_sys']
+    side.write_text(json.dumps(m))
+    with pytest.raises(SystemExit):
+        is_corrected(cp)                                             # L21 on star rows only: inconsistent copy
+
+
+def test_mode_anchor_exclusion(tmp_path):
+    """Anchors outside the mode file's qso_excluded are a hard error (no double counting, handoff C5)."""
+    p = tmp_path / 'm.npz'
+    np.savez(p, source_id=np.array([1, 2], np.int64), M=np.zeros((2, 3)), W=np.zeros((2, 3, 3)), R=np.zeros((2, 3, 3)),
+             qso_excluded=np.array([12, 13], np.int64), model=np.array('v3real2p'))
+    fm = GM.FieldModes(p)
+    fm.check_anchors([12, 13])
+    with pytest.raises(SystemExit):
+        fm.check_anchors([12, 14])

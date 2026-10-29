@@ -607,7 +607,8 @@ def run_alignment(  # noqa: C901
                 if isinstance(qso_anchors_csv, list)
                 else [Path(qso_anchors_csv)]
             )
-            _anchor_paths = [p for p in _anchor_paths if p.exists()]
+            from bp3m.gaia_model import check_anchor_files as _gm_check_anchors
+            _gm_check_anchors(_anchor_paths)      # explicit files must exist (and be the model copy's own): no silent drop
         else:
             from .qso_vetting import find_qso_anchors
             _p = find_qso_anchors(Path(output_dir) / field_name / 'Gaia', field_name)
@@ -621,6 +622,8 @@ def run_alignment(  # noqa: C901
                     else _qdf_parts[0])
             _n_gaia_candidates = len(_qdf)
             _qdf_ok  = _qdf[_qdf['is_qso_anchor'].fillna(False)]
+            from bp3m.gaia_model import apply_anchor_domain as _gm_anchor_domain
+            _qdf_ok  = _gm_anchor_domain(_qdf_ok, 'alignment')
             _n_anchors = len(_qdf_ok)
 
             # Breakdown: quaia / milliquas / crf
@@ -669,6 +672,8 @@ def run_alignment(  # noqa: C901
                 _n_injected += 1
                 _injected_qso_ids.append(int(_qrow['source_id']))
 
+            from bp3m.gaia_model import write_anchors_used as _gm_anchors_used
+            _gm_anchors_used(output_bp3m, _injected_qso_ids, 'alignment', _anchor_paths)
             if _n_injected > 0:
                 print(f"    Injected into alignment:       {_n_injected}  "
                       f"(σ_κ = 0.35 µas/yr, σ_plx = 1 µas)")
