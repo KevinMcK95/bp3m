@@ -474,6 +474,8 @@ def _parse_args():
                     help='With --gaia_corrected v3real2p*: build (or reuse) the kernel-v3 Gaia field-mode file for the field '
                          '(bp3m/gaia_modes.py; QSO-conditioned, BP3M anchors excluded) and fit its K shared coefficients '
                          '(spec floor=modes;modes=<npz>, the per-star VB21 floor off).  Later stages inherit it.')
+    bp.add_argument('--gaia_modes_pad_arcsec', type=float, default=20.0,
+                    help='Padding around the image footprints for the Gaia sources that get field modes (default 20 arcsec)')
     bp.add_argument('--qso_anchors_csv', type=str, nargs='+', default=None,
                     help='QSO anchor CSV(s) to use instead of the vetted canonical ones (a Gaia-model arm builds its own from '
                          'the corrected copy).  Hard error if missing.')
@@ -1004,19 +1006,6 @@ def main():
             _gc_copies.append(_gc_ensure(_p_i, _a_i, _ra_i, _dec_i, _sw_i, _sh_i, args.gaia_corrected))
         _gm_set_files(_gc_copies)
         print(f'  Gaia corrected tables ({args.gaia_corrected}): {[p.name for p in _gc_copies]}')
-        if getattr(args, 'gaia_field_modes', False):
-            import math as _math
-            from bp3m.gaia_modes import ensure_modes as _gc_modes
-            from bp3m.gaia_model import GaiaModel as _GMod, set_current as _gm_setc
-            _ras = [p[0] for p in args.pointings]; _des = [p[1] for p in args.pointings]
-            _cen = (float(np.mean(_ras)), float(np.mean(_des)))
-            _hd = max(0.5 * _math.hypot(p[2], p[3]) + _math.hypot((p[0] - _cen[0]) * np.cos(np.radians(_cen[1])), p[1] - _cen[1])
-                      for p in args.pointings)
-            _modes = _gc_modes([_gaia_csv_path_for(*p) for p in args.pointings], _gc_copies, _cen, _hd, args.gaia_corrected,
-                               lib_dir=args.lib_dir)
-            _m0 = _gm_cur()
-            _gm_setc(_GMod(cov=_m0.cov, floor='modes', modes=str(Path(_modes).resolve()), zp=_m0.zp))   # absolute: later stages may run elsewhere
-            print(f'  Gaia field modes: {_modes.name} -> model {_gm_cur().spec}')
     if _gm_cur().zp == 'l21' and not _gaia_override():
         # Lindegren+21 parallax zero point (default since 2026-10-28): every stage reads the L21-corrected copy of the field's
         # Gaia CSV(s) through the override (bp3m.gaia_zp); copies are reused when their sidecar matches the source md5.
@@ -1323,6 +1312,31 @@ def main():
         else:
             print("  WARNING: --restrict_instdet specified but could not determine "
                   "instrument for any obsid — skipping filter for steps 3/4.")
+
+    # ── Step 2b: Gaia field modes (--gaia_field_modes; needs the images for their footprints) ──────────────
+    if getattr(args, 'gaia_field_modes', False):
+        # 10-29 (user): modes only for the Gaia sources inside the working images (+ padding), not the whole Gaia box: every
+        # star the solver can see (saturated / unmatched ones too), small files, ~20 s per field, cached and reused
+        import glob as _glob
+        from bp3m.gaia_modes import ensure_modes as _gc_modes
+        from bp3m.gaia_model import GaiaModel as _GMod, set_current as _gm_setc
+        _imgs = []
+        for _tel, _pat in (('HST', '_fl[ct].fits'), ('JWST', '_cal.fits')):
+            for _d in sorted(_glob.glob(str(output_dir / field / _tel / 'mastDownload' / _tel / '*'))):
+                _n = Path(_d).name
+                if _restrict is not None and _n not in set(_restrict):
+                    continue
+                _f = sorted(_glob.glob(f'{_d}/{_n}{_pat}'))
+                if _f:
+                    _imgs.append(_f[0])
+        if not _imgs:
+            raise SystemExit('--gaia_field_modes: no working images found for their footprints')
+        _cen = (float(np.mean([p[0] for p in args.pointings])), float(np.mean([p[1] for p in args.pointings])))
+        _modes = _gc_modes([_gaia_csv_path_for(*p) for p in args.pointings], _gc_copies, _cen, None, args.gaia_corrected,
+                           lib_dir=args.lib_dir, image_files=_imgs, pad_arcsec=args.gaia_modes_pad_arcsec)
+        _m0 = _gm_cur()
+        _gm_setc(_GMod(cov=_m0.cov, floor='modes', modes=str(Path(_modes).resolve()), zp=_m0.zp))   # absolute: later stages may run elsewhere
+        print(f'  Gaia field modes ({len(_imgs)} images): {Path(_modes).name} -> model {_gm_cur().spec}')
 
     # ── Step 3: PSF fitting ───────────────────────────────────────────────────
     if not args.skip_psf:

@@ -49,3 +49,12 @@ def test_build_modes_synthetic(tmp_path):
     recon = np.einsum('nik,njk->nij', z['W'], z['W']) + z['R']
     assert np.allclose(recon, full, rtol=1e-6, atol=1e-12)
     assert np.allclose(z['M'], g['W3'] @ g['m_Z'], rtol=1e-10, atol=1e-14)
+
+
+def test_in_footprints_padding():
+    """Inside a square footprint, within the padding outside it, and beyond the padding."""
+    P = np.array([[10.0, 0.0], [10.01, 0.0], [10.01, 0.01], [10.0, 0.01]])
+    ra = np.array([10.005, 10.0105, 10.0130, 9.9990, 10.005])
+    de = np.array([0.005, 0.005, 0.005, 0.005, 0.0118])          # last: 6.5" above the top edge
+    keep = GMo.in_footprints(ra, de, [P], pad_arcsec=5.0)          # 5" = 0.00139 deg
+    assert keep.tolist() == [True, True, False, True, False]

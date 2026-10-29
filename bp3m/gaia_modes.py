@@ -29,7 +29,7 @@ QSO_QUERY_COLS = ('g.source_id, g.ra, g.dec, g.pmra, g.pmdec, g.pmra_error, g.pm
                   'g.parallax_error, g.parallax_pmra_corr, g.parallax_pmdec_corr, g.phot_g_mean_mag, g.phot_g_mean_flux, '
                   'g.phot_g_mean_flux_error, g.phot_bp_mean_mag, g.phot_rp_mean_mag, g.ruwe, g.nu_eff_used_in_astrometry, '
                   'g.pseudocolour, g.ecl_lat, g.astrometric_params_solved')
-MODES_VERSION = 1
+MODES_VERSION = 2       # 2: sources inside the image footprints + padding (10-29)
 
 
 def qso_sample_path(gaia_dir, stem):
@@ -94,8 +94,53 @@ def prepare_qsos(qso_csv, milliquas_path, exclude_ids, center):
     return q.ra.to_numpy(float), q.dec.to_numpy(float), resid, S, q.gmag.to_numpy(float), sol, excluded_in_sample, stats
 
 
+def image_footprints(image_files):
+    """Sky polygons (deg) of every science extension of the given HST (_fl?) / JWST (_cal) images, from the header WCS.  Used
+    ONLY to select which Gaia sources get a field term (the padding absorbs WCS pointing errors); never for positions."""
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    import warnings
+    polys = []
+    drop = ('CPDIS', 'DP1', 'DP2', 'D2IM', 'CPERR', 'NPOLEXT', 'D2IMEXT', 'D2IMERR', 'WCSDVARR')
+    for f in image_files:
+        with fits.open(f, memmap=True, lazy_load_hdus=True) as h:
+            for e in h:                                  # headers only: the lookup-table distortions (read from the data) are
+                hd = e.header                            # irrelevant for a selection footprint and cost a minute per field
+                if hd.get('EXTNAME', '') == 'SCI' and hd.get('NAXIS', 0) == 2:
+                    hc = hd.copy()
+                    for k in [k for k in hc.keys() if k.startswith(drop)]:
+                        del hc[k]
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore')
+                        polys.append(WCS(hc).calc_footprint(axes=(hd['NAXIS1'], hd['NAXIS2'])))
+    if not polys:
+        raise SystemExit('field modes: no science-extension footprints in the image list')
+    return polys
+
+
+def in_footprints(ra, dec, polys, pad_arcsec):
+    """True for sources inside any footprint polygon or within pad_arcsec of its edges (tangent plane per polygon)."""
+    ra = np.asarray(ra, float); dec = np.asarray(dec, float); keep = np.zeros(len(ra), bool); pad = pad_arcsec / 3600.0
+    for P in polys:
+        c0, d0 = np.mean(P[:, 0]), np.mean(P[:, 1]); cd = np.cos(np.radians(d0))
+        px = ((P[:, 0] - c0 + 180) % 360 - 180) * cd; py = P[:, 1] - d0
+        x = ((ra - c0 + 180) % 360 - 180) * cd; y = dec - d0
+        near = (np.abs(x) < np.ptp(px) + pad + 0.05) & (np.abs(y) < np.ptp(py) + pad + 0.05) & ~keep
+        if not near.any():
+            continue
+        xs, ys = x[near], y[near]; inside = np.zeros(len(xs), bool); dmin = np.full(len(xs), np.inf)
+        for k in range(len(px)):
+            x1, y1, x2, y2 = px[k], py[k], px[(k + 1) % len(px)], py[(k + 1) % len(px)]
+            cr = ((y1 > ys) != (y2 > ys)) & (xs < (x2 - x1) * (ys - y1) / (y2 - y1 + 1e-300) + x1)
+            inside ^= cr
+            t = np.clip(((xs - x1) * (x2 - x1) + (ys - y1) * (y2 - y1)) / max((x2 - x1) ** 2 + (y2 - y1) ** 2, 1e-300), 0, 1)
+            dmin = np.minimum(dmin, np.hypot(xs - (x1 + t * (x2 - x1)), ys - (y1 + t * (y2 - y1))))
+        keep[np.where(near)[0][inside | (dmin <= pad)]] = True
+    return keep
+
+
 def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_diag_deg, out_npz, model='v3real2p',
-                chunk=4000, verbose=True) -> Path:
+                chunk=4000, verbose=True, footprints=None, pad_arcsec=None) -> Path:
     """Field-mode npz for the Gaia sources (with a PM) of the field table(s)."""
     check_inputs()
     cal = GV3.load(str(KERNEL))
@@ -103,6 +148,16 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
                                                                         'astrometric_params_solved']) for f in field_csvs])
     G = G.drop_duplicates('source_id').reset_index(drop=True)
     G = G[G.pmra.notna() & G.astrometric_params_solved.isin([31, 95])].reset_index(drop=True)
+    n_table = len(G)
+    if footprints is not None:
+        # 10-29 (user): only Gaia sources inside the images (+ padding), not the whole Gaia box: every star the solver can see
+        # (incl. saturated / unmatched ones), lightweight files; the inducing grid follows the selected sources
+        G = G[in_footprints(G.ra.values, G.dec.values, footprints, pad_arcsec)].reset_index(drop=True)
+        if len(G) == 0:
+            raise SystemExit('field modes: no Gaia source inside the image footprints')
+        cd = np.cos(np.radians(G.dec.mean()))
+        center = np.array([G.ra.mean() + ((G.ra - G.ra.mean() + 180) % 360 - 180).mean(), G.dec.mean()])   # wrap-safe mean
+        half_diag_deg = float(np.max(np.hypot(((G.ra - center[0] + 180) % 360 - 180) * cd, G.dec - center[1]))) + 0.01
     anc_ids = set()
     for a in anchors_csvs:
         anc_ids |= set(pd.read_csv(a, usecols=['source_id'], dtype={'source_id': 'int64'}).source_id.astype(int))
@@ -119,7 +174,7 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
         g = GV3.build_gp_v3(cal, center, extent, ra[sl], dec[sl], Gm[sl], sol[sl], q_ra, q_dec, q_res, q_S, q_G, q_sol,
                             n_rings=n_rings, max_qso=MAX_QSO)
         if gp0 is None:
-            gp0 = g
+            gp0 = g; g_first = g
         elif not (np.allclose(g['m_Z'], gp0['m_Z'], rtol=1e-10, atol=1e-14) and np.allclose(g['L_Z'], gp0['L_Z'], rtol=1e-10, atol=1e-14)):
             raise SystemExit('field modes: the QSO conditioning differs between chunks')
         A = (g['W3'] @ gp0['L_Z']).reshape(-1, gp0['L_Z'].shape[1])
@@ -131,8 +186,8 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
     W = np.zeros((N, 3, K)); R = fitc.copy()
     for s in range(0, N, chunk):
         sl = slice(s, min(N, s + chunk))
-        g = GV3.build_gp_v3(cal, center, extent, ra[sl], dec[sl], Gm[sl], sol[sl], q_ra, q_dec, q_res, q_S, q_G, q_sol,
-                            n_rings=n_rings, max_qso=MAX_QSO)
+        g = g_first if N <= chunk else GV3.build_gp_v3(cal, center, extent, ra[sl], dec[sl], Gm[sl], sol[sl], q_ra, q_dec, q_res,
+                                                       q_S, q_G, q_sol, n_rings=n_rings, max_qso=MAX_QSO)   # one chunk: reuse pass 1
         A3 = g['W3'] @ gp0['L_Z']                                       # (n, 3, 3nz)
         Wf = A3 @ V                                                      # all modes
         W[sl] = Wf[:, :, :K]
@@ -141,7 +196,8 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
     qso_excluded = np.array(sorted(anc_ids | (set(exc_in_sample))), dtype=np.int64)
     meta = dict(model=model, modes_version=MODES_VERSION, calibration=KERNEL.name, sha256_calibration=SHA256[KERNEL.name],
                 center=list(map(float, center)), extent_deg=extent, n_rings=n_rings, n_inducing=int(gp0['n_z']), K=K,
-                trace_fraction=float(np.cumsum(w)[K - 1] / w.sum()), n_sources=N, qso=qst, n_qso_used=int(gp0['n_qso']),
+                trace_fraction=float(np.cumsum(w)[K - 1] / w.sum()), n_sources=N, n_table_sources=n_table,
+                footprint_pad_arcsec=pad_arcsec, n_footprints=None if footprints is None else len(footprints), qso=qst, n_qso_used=int(gp0['n_qso']),
                 post_mean_center=[float(x) for x in gp0['post_mean_center']], post_sd_center=[float(x) for x in gp0['post_sd_center']],
                 field_csvs=[Path(f).name for f in field_csvs], sha256_field_csvs=[_sha(f) for f in field_csvs],
                 anchors=[Path(a).name for a in anchors_csvs], qso_sample=Path(qso_csv).name, sha256_qso_sample=_sha(qso_csv),
@@ -158,7 +214,8 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
     return out_npz
 
 
-def ensure_modes(field_csvs, model_copies, centre, half_diag_deg, model, lib_dir=None, gaia_tap_server=None) -> Path:
+def ensure_modes(field_csvs, model_copies, centre, half_diag_deg, model, lib_dir=None, gaia_tap_server=None, image_files=None,
+                 pad_arcsec=20.0) -> Path:
     """The field-mode npz for this field and model (built or reused: inputs sha256, code, MODES_VERSION must match), next to
     the model copies in Gaia/corrected_bp3m/.  Anchors = the model copies' own anchors files (all their ids are excluded)."""
     from .gaia_model import _sidecar
@@ -174,12 +231,19 @@ def ensure_modes(field_csvs, model_copies, centre, half_diag_deg, model, lib_dir
         anc += hits
     mq = find_qso_catalogs(Path(lib_dir) if lib_dir else None).get('milliquas')
     qp = download_qso_sample(gdir, stem, float(centre[0]), float(centre[1]), gaia_tap_server)
+    polys = image_footprints(image_files) if image_files else None
+    import hashlib
+    fp_key = (hashlib.sha256(np.round(np.concatenate([p.ravel() for p in polys]), 7).tobytes()).hexdigest()[:16] if polys else 'full-table')
     out = model_copies[0].parent / f'{stem}_gaia_field_modes_{model}.npz'
     side = Path(str(out) + '.json')
     if out.exists() and side.exists():
         m = json.loads(side.read_text())
-        if (m.get('modes_version') == MODES_VERSION and m.get('sha256_field_csvs') == [_sha(f) for f in field_csvs]
+        if (m.get('modes_version') == MODES_VERSION and m.get('footprint_key') == fp_key and m.get('footprint_pad_arcsec') == (pad_arcsec if polys else None) and m.get('sha256_field_csvs') == [_sha(f) for f in field_csvs]
                 and m.get('sha256_qso_sample') == _sha(qp) and m.get('anchors') == [a.name for a in anc]
                 and m.get('code') == {p.name: _sha(p) for p in (Path(__file__), Path(GV3.__file__), Path(QP.__file__))}):
             return out
-    return build_modes(field_csvs, anc, qp, mq, np.asarray(centre, float), half_diag_deg, out, model=model)
+    o = build_modes(field_csvs, anc, qp, mq, np.asarray(centre, float), half_diag_deg, out, model=model, footprints=polys,
+                    pad_arcsec=pad_arcsec if polys else None)
+    meta = json.loads(Path(str(o) + '.json').read_text()); meta['footprint_key'] = fp_key
+    Path(str(o) + '.json').write_text(json.dumps(meta, indent=1))
+    return o
