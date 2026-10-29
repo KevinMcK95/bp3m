@@ -1526,6 +1526,7 @@ def run_alignment_v2(
             "pos_err_floor":     pos_err_floor,
             "pos_corr_table":    (str(pos_corr_table) if pos_corr_table else None),
             "pos_corr_model":    (str(pos_corr_model) if pos_corr_model else None),
+            **__import__("bp3m.gaia_model", fromlist=["provenance"]).provenance(),
             "min_stars_split_ccd": min_stars_split_ccd,
             "hst_align":         bool(hst_align),
             "visit_prealigned":  sorted(_pre_sig),

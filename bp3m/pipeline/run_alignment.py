@@ -727,6 +727,8 @@ def run_alignment(  # noqa: C901
         run_config={
             **(extra_run_config or {}),
             'use_indv_outputs': use_indv_outputs,
+            'gaia_model': getattr(getattr(solver, 'gaia_model', None), 'spec', None),
+            **{k: v for k, v in __import__('bp3m.gaia_model', fromlist=['provenance']).provenance().items() if k != 'gaia_model'},
             'pos_corr_table': (str(pos_corr_table) if pos_corr_table else None),
             'pos_corr_model': (str(pos_corr_model) if pos_corr_model else None),
             'epoch_dist_prior': (str(epoch_dist_prior)
@@ -989,6 +991,13 @@ def _apply_indv_init(solver, image_names, data_root, field_name):
             _ver = None
         if _ver != XMATCH_ALGO_VERSION:
             _fb(f'match algo v{_ver} != v{XMATCH_ALGO_VERSION}', len(subs)); continue
+        # Gaia error model (2026-10-28): never warm-start from an indv fit made with another Gaia model
+        # (indv run_configs from before the key existed were default-model fits)
+        from bp3m.gaia_model import GaiaModel as _GM
+        _gm_indv = _cfg.get('gaia_model') or _GM().spec
+        _gm_now = getattr(getattr(solver, 'gaia_model', None), 'spec', _GM().spec)
+        if _gm_indv != _gm_now:
+            _fb(f'Gaia model {_gm_indv} != {_gm_now}', len(subs)); continue
 
         it = _pd.read_csv(d_indv / 'image_transformations.csv').set_index('image_name')
         try:
@@ -1231,6 +1240,24 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
     np.save(output_dir / "v_cov_marginalised.npy", v_cov)
     np.save(output_dir / "C_vT.npy", C_vT)
     _n_r_only = solver.N_R * solver.n_images
+    # Gaia field modes (plan P4): the z block sits after the image (+ epoch-D) blocks; save its posterior separately and
+    # keep C_r.npy / the epoch-D files in their legacy layout (marginalised over z)
+    _n_gz = getattr(solver, 'n_gz', 0)
+    if _n_gz and C_r is not None and C_r.shape[0] == _n_r_only + getattr(solver, 'n_ed', 0) + _n_gz:
+        _zo = C_r.shape[0] - _n_gz
+        _zc = C_r[_zo:, _zo:]; _zm = np.asarray(r_hat)[_zo:_zo + _n_gz]
+        np.save(output_dir / "C_gaia_modes.npy", _zc)
+        np.save(output_dir / "C_r_gaia_modes_cross.npy", C_r[:_zo, _zo:])
+        import json as _json_gz
+        _fm = solver.gaia_modes
+        (output_dir / "gaia_field_modes.json").write_text(_json_gz.dumps({
+            'K': int(_n_gz), 'z_mean': _zm.tolist(), 'z_sd': np.sqrt(np.clip(np.diag(_zc), 0, None)).tolist(),
+            'modes_file': _fm.path, 'modes_md5': _fm.md5, 'modes_meta': _fm.meta,
+            'n_sources_coupled': int(len(solver.gaia_gz_rows)),
+            'note': 'z ~ N(0, I) prior per coefficient; posterior from this alignment (never chained into a later stage)'},
+            indent=1))
+        print(f"  Gaia field modes: z = {np.round(_zm, 3).tolist()}  sd = {np.round(np.sqrt(np.diag(_zc)), 3).tolist()}")
+        C_r = C_r[:_zo, :_zo]
     if getattr(solver, 'n_ed', 0):
         # C_r.npy keeps its legacy shape/meaning: the per-image r-block
         # MARGINAL covariance (marginalised over the epoch-D coefficients).

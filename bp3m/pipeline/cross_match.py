@@ -624,6 +624,10 @@ def run_cross_match(
             if action == 'skip':
                 skipped.append(name)
                 continue
+            # BP3M_REQUIRE_CACHED=1 (2026-10-28): never silently rewrite an existing match during a re-alignment
+            if os.environ.get('BP3M_REQUIRE_CACHED') == '1' and (root / 'matched_gaia.csv').exists():
+                raise RuntimeError(f"BP3M_REQUIRE_CACHED: {name} would be re-matched ({reason}) -- refusing to rewrite "
+                                   f"matched_gaia.csv")
 
         # Skip images without photometric calibration — their mag column is all
         # NaN so they cannot contribute to magnitude-based cross-matching.

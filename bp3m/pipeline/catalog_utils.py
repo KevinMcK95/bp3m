@@ -149,24 +149,12 @@ def build_gaia_cov(df):
 
     C = sigmas[:, :, None] * corr * sigmas[:, None, :]
 
-    # Inflation (matches bp3m/solver.py): mult_* are SIGMA multipliers, so the
-    # covariance is scaled by their SQUARE.
+    # Gaia error model (multipliers + floor) from the shared implementation (bp3m.gaia_model), as the solver.
+    from ..gaia_model import inflate
     gaia_6p = np.isfinite(df['pseudocolour'].values)
     gaia_5p = np.isfinite(df['pmra'].values) & ~gaia_6p
-    gaia_2p = ~gaia_5p & ~gaia_6p
-
-    C[gaia_6p] *= GAIA_SYS['mult_6p'] ** 2
-    C[gaia_5p] *= GAIA_SYS['mult_5p'] ** 2
-    C[gaia_2p] *= GAIA_SYS['mult_2p'] ** 2
-
-    # Systematic floor on PM and parallax
-    floor = np.diag(np.array([0, 0,
-                               GAIA_SYS['pm_sys_err'],
-                               GAIA_SYS['pm_sys_err'],
-                               GAIA_SYS['parallax_sys_err']])**2)
-    C += floor
-
-    return C
+    gmag = df['gmag'].to_numpy(float) if 'gmag' in df.columns else None
+    return inflate(C, gaia_6p, gaia_5p, gmag=gmag)
 
 
 def cov2_geom_sigma(C):

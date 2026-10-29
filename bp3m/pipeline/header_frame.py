@@ -57,17 +57,14 @@ def gaia_pos_cov_mas2(sa, dt_yr, f_ra, f_dec):
         U[:, 0, 0] = 1; U[:, 0, 2] = f_ra; U[:, 0, 3] = dt_yr
         U[:, 1, 1] = 1; U[:, 1, 2] = f_dec; U[:, 1, 4] = dt_yr
         return np.einsum('nij,njk,nlk->nil', U, C, U)
-    from bp3m.astro_utils import GAIA_SYS_DICT as _GS
+    # Gaia error model (multipliers + floor) from the shared implementation (bp3m.gaia_model), as the solver.
+    from bp3m.gaia_model import inflate
     pc = sa['pseudocolour'].to_numpy(float) if 'pseudocolour' in sa.columns else np.full(n, np.nan)
     has_pm = np.isfinite(e['pmra_error']) & (e['pmra_error'] > 0)
     is_6p = np.isfinite(pc) & has_pm
     is_5p = has_pm & ~is_6p
-    mult = np.where(is_6p, _GS['mult_6p'], np.where(is_5p, _GS['mult_5p'], _GS['mult_2p']))
-    C *= (mult ** 2)[:, None, None]
-    # column order here is [ra, dec, parallax, pmra, pmdec]
-    C[:, 2, 2] += _GS['parallax_sys_err'] ** 2
-    C[:, 3, 3] += _GS['pm_sys_err'] ** 2
-    C[:, 4, 4] += _GS['pm_sys_err'] ** 2
+    gmag = sa['gmag'].to_numpy(float) if 'gmag' in sa.columns else None
+    inflate(C, is_6p, is_5p, gmag=gmag, idx=(0, 1, 3, 4, 2))      # column order here is [ra, dec, parallax, pmra, pmdec]
 
     U = np.zeros((n, 2, 5))
     U[:, 0, 0] = 1; U[:, 0, 2] = f_ra; U[:, 0, 3] = dt_yr

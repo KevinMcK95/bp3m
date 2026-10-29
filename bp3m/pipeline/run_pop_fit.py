@@ -471,6 +471,7 @@ def _joint_solve_pop(
     qso_sidx: "np.ndarray | None" = None,
     qso_pmra: "np.ndarray | None" = None,
     qso_pmdec: "np.ndarray | None" = None,
+    update_z: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     One Newton step for (Δr, Δμ_pop) with stellar astrometry marginalised out.
@@ -504,12 +505,18 @@ def _joint_solve_pop(
     sigma_pm_inv_sq  = sigma_pm ** -2
     sigma_plx_inv_sq = sigma_plx_tot ** -2
 
+    # Gaia field modes (plan P4): K shared N(0, 1) coefficients z after (r, mu), solved in BOTH phases (they shift every
+    # Gaia PM, so mu_pop is marginalised over them); star-level coupling K_z = -C^-1 W (solver.gaia_Kz)
+    n_gz  = getattr(solver, 'n_gz', 0)
+    z_cur = solver.gaia_z if n_gz else None
     if fix_r:
-        n_shared = 2
+        n_shared = 2 + n_gz
+        idx_mu = slice(0, 2)
     else:
-        n_shared = n_r + 2
+        n_shared = n_r + 2 + n_gz
         idx_r  = slice(0, n_r)
         idx_mu = slice(n_r, n_r + 2)
+    idx_z = slice(n_shared - n_gz, n_shared)
 
     # ── H_vv: start from Gaia prior ───────────────────────────────────────────
     H_vv = solver.C_survey_inv.copy()
@@ -538,6 +545,8 @@ def _joint_solve_pop(
     # still never constrain r directly (K/XCsX are fit-masked); they only
     # sharpen the star posteriors that the shared solve conditions on.
     h_all = solver.C_survey_inv_dot_v.copy()
+    if n_gz:          # Gaia term at the current field-mode coefficients: C^-1 (v_s - M - W z)
+        h_all += np.einsum('nik,k->ni', solver.gaia_Kz, z_cur)
 
     # Population prior RHS for member stars
     h_all[member_sidx, 2] += sigma_pm_inv_sq * mu_pop_current[0]
@@ -649,22 +658,28 @@ def _joint_solve_pop(
             if img in XCs_xresid:
                 rhs[cs:cs + nr] += XCs_xresid[img].sum(axis=0)
     else:
-        Lambda[:] = H_mu
+        Lambda[idx_mu, idx_mu] = H_mu
 
     # ── Schur correction for μ block ──────────────────────────────────────────
     if n_mem > 0:
         Cv_m = C_vT[member_sidx]
         mu_mu_schur = sigma_pm_inv_sq ** 2 * Cv_m[:, 2:4, 2:4].sum(axis=0)
-        if fix_r:
-            Lambda -= mu_mu_schur
-        else:
-            Lambda[idx_mu, idx_mu] -= mu_mu_schur
+        Lambda[idx_mu, idx_mu] -= mu_mu_schur
         rhs_mu += sigma_pm_inv_sq * a[member_sidx, 2:4].sum(axis=0)
 
     if fix_r:
-        rhs[:] = rhs_mu
+        rhs[idx_mu] = rhs_mu
     else:
         rhs[idx_mu] = rhs_mu
+    if n_gz:
+        _gr = solver.gaia_gz_rows; _Kz = solver.gaia_Kz[_gr]
+        Cz = np.zeros((n_stars, N_V, n_gz)); Cz[_gr] = np.matmul(C_vT[_gr], _Kz)            # C_vT K_z per coupled source
+        Lambda[idx_z, idx_z] += solver.gaia_WCW + np.eye(n_gz) - _Kz.reshape(-1, n_gz).T @ Cz[_gr].reshape(-1, n_gz)
+        rhs[idx_z] += (solver.gaia_bz - solver.gaia_WCW @ z_cur - z_cur
+                       + _Kz.reshape(-1, n_gz).T @ a_align[_gr].reshape(-1))
+        if n_mem > 0:                                                            # (mu, z) Schur cross-block
+            mz = -sigma_pm_inv_sq * Cz[member_sidx, 2:4, :].sum(axis=0)
+            Lambda[idx_mu, idx_z] += mz; Lambda[idx_z, idx_mu] += mz.T
 
     # ── Per-image Schur corrections (joint solve only) ────────────────────────
     if not fix_r:
@@ -687,6 +702,9 @@ def _joint_solve_pop(
             CvT_K_fit = np.einsum('nij,njk->nik', Cv_fit, K_fit)
             Lambda[cs:cs + nr, cs:cs + nr] -= np.einsum('nji,njk->ik', K_fit, CvT_K_fit)
             rhs[cs:cs + nr]                += np.einsum('nji,nj->i',   K_fit, a_align[sidx_fit])
+            if n_gz:                                                        # (r_j, z) Schur cross-block
+                rz = K_fit.reshape(-1, nr).T @ Cz[sidx_fit].reshape(-1, n_gz)
+                Lambda[cs:cs + nr, idx_z] -= rz; Lambda[idx_z, cs:cs + nr] -= rz.T
 
             # (r, μ) cross-block
             if use_fmem.any():
@@ -728,6 +746,13 @@ def _joint_solve_pop(
         C_sc = np.linalg.pinv(Lambda_sc)
     C_shared = d_inv[:, None] * C_sc * d_inv[None, :]
     delta    = C_shared @ rhs
+    if n_gz:          # z update (kept on the solver); C_shared keeps its legacy layout, marginalised over z
+        solver._gaia_last = {'C': C_shared.copy(), 'fix_r': fix_r, 'z': z_cur + delta[idx_z]}
+        if update_z:  # diagnostic solves (conditional mu, member-free posteriors) never move z
+            solver.gaia_z = z_cur + delta[idx_z]
+            solver.gaia_z_cov = C_shared[idx_z, idx_z].copy()
+        _keep = n_shared - n_gz
+        C_shared = C_shared[:_keep, :_keep]; delta = delta[:_keep]
 
     if fix_r:
         return r_current.copy(), mu_pop_current + delta, C_shared, C_vT, a, a_align, K_img
@@ -2128,6 +2153,8 @@ def run_pop_fit(
     restrict_filters: "list[str] | None" = None,
     restrict_instdet: "list[str] | None" = None,
     restrict_images: "str | None" = None,
+    gaia_model: "str | None" = None,
+    gaia_csv_override: "list | None" = None,
 ) -> Path:
     """
     Run population PM fitting.
@@ -2166,6 +2193,11 @@ def run_pop_fit(
         )
     with open(_cfg_path) as _f:
         v1_cfg = json.load(_f)
+    # Gaia error model: the alignment's (recorded in its run_config), set before any worker pool exists
+    from bp3m.gaia_model import resolve_inherited, resolve_inherited_files
+    resolve_inherited_files(gaia_csv_override, v1_cfg, 'bp3m-pop-fit', bp3m_dir.name)
+    resolve_inherited(gaia_model, v1_cfg, 'bp3m-pop-fit' + ('-v2' if data_source == 'master_v2' else ''),
+                      f"{'v2' if data_source == 'master_v2' else 'v1'} ({bp3m_dir.name})")
 
     v1_image_names      = v1_cfg.get('image_names', [])
     v1_split_ccd        = bool(v1_cfg.get('split_ccd', True))
@@ -2954,7 +2986,7 @@ def run_pop_fit(
 
     # ── Convenience wrapper: inject QSO anchor args into every _joint_solve call
     def _solve(member_sidx_arg, mu_pop_arg, r_arg,
-               fix_r_arg=False, z_weights_arg=None):
+               fix_r_arg=False, z_weights_arg=None, update_z_arg=True):
         return _joint_solve_pop(
             solver, image_names,
             member_sidx_arg, mu_pop_arg,
@@ -2964,6 +2996,7 @@ def run_pop_fit(
             qso_sidx=_qso_sidx,
             qso_pmra=_qso_pmra_mas,
             qso_pmdec=_qso_pmdec_mas,
+            update_z=update_z_arg,
         )
 
     # ── Phase 1: μ-only solve (r fixed at v1 values) ──────────────────────────
@@ -3327,6 +3360,9 @@ def run_pop_fit(
     # ── CTE phase v2 (2026-10-06): per-detection chip/camera CTE model, fitted inside the production solve ──
     # Runs BEFORE the final posterior pass so mu_pop.json, stellar astrometry and the analytic posteriors are all
     # CTE-corrected; membership and z-weights stay frozen.  See bp3m/pipeline/cte_popfit_v2.py.
+    if fit_cte_v2 and getattr(solver, 'n_gz', 0):
+        raise NotImplementedError('--fit_cte_v2 runs its own joint solve without the Gaia field-mode block (plan P4); '
+                                  'not combinable with modes= yet')
     if fit_cte_v2:
         from .cte_popfit_v2 import run_cte_v2
         _mu_nocte = mu_pop_current.copy()
@@ -3349,8 +3385,9 @@ def run_pop_fit(
     # ── Final posterior pass at convergence ───────────────────────────────────
     print("\n  Final posterior pass...")
     _, _, C_shared_final, C_vT_final, v_mean, _, K_img_final = _solve(
-        member_sidx, mu_pop_current, r_current, z_weights_arg=z_weights_final,
+        member_sidx, mu_pop_current, r_current, z_weights_arg=z_weights_final, update_z_arg=False,
     )
+    _gaia_final = getattr(solver, '_gaia_last', None)
 
     # ── Analytic marginalised posteriors (joint r + μ_pop propagation) ──────────
     print("\n  Computing analytic marginalised posteriors...")
@@ -3397,7 +3434,7 @@ def run_pop_fit(
     if C_shared_joint is None:
         _, _, _C_mu_cond, _, _, _, _ = _solve(
             member_sidx, mu_pop_current, r_current, fix_r_arg=True,
-            z_weights_arg=z_weights_final)
+            z_weights_arg=z_weights_final, update_z_arg=False)
         _B_mu = (sigma_pm ** -2) * (
             _C_mu_cond @ CvT_K[member_sidx][:, 2:4, :].sum(axis=0))
         _C_r_align = None
@@ -3441,16 +3478,44 @@ def run_pop_fit(
     C_extra_cross = (np.einsum('nik,kl,njl->nij', CvT_K, C_r_mu,   B_all) +
                      np.einsum('nik,kl,njl->nij', B_all,  C_r_mu.T, CvT_K))
     v_cov      = v_cov_r + C_extra_cross + C_extra_mu
+
+    # Gaia field modes (plan P4): each star's sensitivity to z, A_z = C_vT K_z, with the joint (r, mu, z) covariance of the
+    # final pass: + A_z C_zz A_z^T + (A_r C_rz A_z^T + B C_muz A_z^T + transposes)
+    _gz_terms = None
+    if getattr(solver, 'n_gz', 0) and _gaia_final is not None and not _gaia_final['fix_r']:
+        _Cf = _gaia_final['C']; _nz = solver.n_gz; _iz = slice(_Cf.shape[0] - _nz, _Cf.shape[0])
+        assert _Cf.shape[0] == n_r + 2 + _nz, _Cf.shape
+        _C_zz = _Cf[_iz, _iz]; _C_rz = _Cf[:n_r, _iz]; _C_mz = _Cf[n_r:n_r + 2, _iz]
+
+        def _gz_terms(_CvT, _K_img, _B):
+            _A_z = np.einsum('nij,njk->nik', _CvT, solver.gaia_Kz)
+            _Ka = np.zeros((solver.n_stars, 5, n_r_tot))
+            for _j2, _img2 in enumerate(solver.image_names):
+                if _K_img.get(_img2) is None:
+                    continue
+                _d2 = solver._img_data[_img2]; _u2 = _d2['use_for_fit'] | _d2.get('use_for_astrom', _d2['use_for_fit'])
+                if _u2.any():
+                    np.add.at(_Ka[:, :, _j2 * nr:_j2 * nr + nr], _d2['sidx'][_u2], _K_img[_img2][_u2])
+            _A_r = np.einsum('nij,njk->nik', _CvT, _Ka)
+            _X = np.einsum('nik,kl,njl->nij', _A_r, _C_rz, _A_z)
+            if _B is not None:
+                _X = _X + np.einsum('nik,kl,njl->nij', _B, _C_mz, _A_z)
+            return np.einsum('nik,kl,njl->nij', _A_z, _C_zz, _A_z) + _X + np.swapaxes(_X, 1, 2)
+        v_cov = v_cov + _gz_terms(C_vT_final, K_img_final, B_all)
+        print(f"  Gaia field modes: z = {np.round(_gaia_final['z'], 3).tolist()}  "
+              f"sd = {np.round(np.sqrt(np.diag(_C_zz)), 3).tolist()} (included in mu_pop and per-star covariances)")
     v_cov_full = v_cov + C_vT_final   # full marginal covariance per star
 
     # ── Diffuse-prior stellar posteriors (no population prior for any star) ──────
     print("\n  Computing diffuse-prior (free) stellar posteriors...")
     _, _, _, C_vT_free_sol, v_mean_free_cond, _, K_img_free = _solve(
         np.array([], dtype=int),   # no members → no population prior
-        mu_pop_current, r_current, fix_r_arg=True,
+        mu_pop_current, r_current, fix_r_arg=True, update_z_arg=False,
     )
     v_mean_free_marg, v_cov_free_sol = solver.compute_analytic_posteriors(
         r_current, C_r, v_mean_free_cond, K_img_free, C_vT_free_sol)
+    if _gz_terms is not None:           # Gaia field modes: the free posteriors' sensitivity to z (and its r cross terms)
+        v_cov_free_sol = v_cov_free_sol + _gz_terms(C_vT_free_sol, K_img_free, None)
 
     # ── Save results (mirrors _save_results in run_alignment.py) ─────────────
     print("\n  Saving results...")
@@ -3681,6 +3746,13 @@ def run_pop_fit(
         'mu_pop_prior_dec':      float(mu_pop_prior[1]),
         'mu_pop_prior_sigma':    float(mu_pop_prior_sigma),
     }
+    if getattr(solver, 'n_gz', 0) and _gaia_final is not None:
+        _Cz_f = _gaia_final['C'][-solver.n_gz:, -solver.n_gz:]
+        mu_result['gaia_field_modes'] = {
+            'K': int(solver.n_gz), 'z_mean': [float(v) for v in solver.gaia_z],
+            'z_sd': [float(v) for v in np.sqrt(np.clip(np.diag(_Cz_f), 0, None))],
+            'modes_file': solver.gaia_modes.path, 'modes_md5': solver.gaia_modes.md5, 'modes_meta': solver.gaia_modes.meta,
+            'note': 'sigma_mu_pop and the per-star covariances are marginalised over z; prior N(0, I)'}
     with open(output_pfr / 'mu_pop.json', 'w') as _f:
         json.dump(mu_result, _f, indent=2)
 
@@ -3699,6 +3771,7 @@ def run_pop_fit(
             'poly_prior_px': poly_prior_px, 'restrict_filters': restrict_filters, 'restrict_instdet': restrict_instdet, 'restrict_images': restrict_images,
             'pos_err_floor_override': pos_err_floor,   # None = mirrored the v1 run's floor
             'pos_err_floor': _floor,
+            **__import__('bp3m.gaia_model', fromlist=['provenance']).provenance(),
             'pos_corr_model': (str(pos_corr_model) if pos_corr_model else None),
             'pos_corr_table': (str(pos_corr_table) if pos_corr_table else None),
             'member_sigma_clip': member_sigma_clip,
@@ -4178,6 +4251,11 @@ def main(argv=None):
                         help='Gaussian prior on the degree>=2 transformation terms: allowed '
                              'displacement (px) at the detector edge per term (e.g. 0.3). '
                              'Needed for --poly_order 3, which is otherwise unconstrained.')
+    parser.add_argument('--gaia_csv_override', type=str, nargs='+', default=None,
+                        help='Gaia CSV override; default: the one recorded by the alignment (a different value is a hard error)')
+    parser.add_argument('--gaia_model', type=str, default=None,
+                        help='Gaia error / systematics model (bp3m/gaia_model.py); default: the one recorded by the '
+                             'alignment this pop fit runs on.  A different value is a hard error.')
     parser.add_argument('--restrict_filters', type=str, nargs='+', default=None,
                         help='Keep only images taken with these HST filters (e.g. F606W)')
     parser.add_argument('--restrict_instdet', type=str, nargs='+', default=None,
@@ -4352,6 +4430,8 @@ def main(argv=None):
         restrict_filters=args.restrict_filters,
         restrict_instdet=args.restrict_instdet,
         restrict_images=args.restrict_images,
+        gaia_model=args.gaia_model,
+        gaia_csv_override=args.gaia_csv_override,
     )
 
     # Save the command only on successful completion so interrupted runs

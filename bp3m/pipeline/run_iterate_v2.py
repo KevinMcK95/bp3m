@@ -158,6 +158,11 @@ def main():
                              'BP3M_v2_results back in step with its master catalog.')
     parser.add_argument('--gaia_csv', default=None,
                         help='Gaia catalog CSV for Gaia recovery (auto-detected if not given)')
+    parser.add_argument('--gaia_csv_override', nargs='+', default=None,
+                        help='Gaia CSV override; default: the one recorded by the v1 alignment (a different value is a hard error)')
+    parser.add_argument('--gaia_model', default=None,
+                        help='Gaia error / systematics model (bp3m/gaia_model.py); default: the one recorded by the v1 '
+                             'alignment (BP3M_results/run_config.json).  A different value is a hard error.')
     parser.add_argument('--no_save_detections', action='store_true',
                         help='Skip saving per-filter detection catalogs')
     parser.add_argument('--phase4_outlier_sigma', type=float, default=3.5,
@@ -192,6 +197,9 @@ def main():
     if _v1_cfg_path.exists():
         import json as _json
         _v1_cfg = _json.load(open(_v1_cfg_path))
+    from bp3m.gaia_model import resolve_inherited, resolve_inherited_files
+    resolve_inherited(args.gaia_model, _v1_cfg if _v1_cfg_path.exists() else None, 'bp3m-v2', 'v1 (BP3M_results)')
+    resolve_inherited_files(args.gaia_csv_override, _v1_cfg if _v1_cfg_path.exists() else None, 'bp3m-v2', 'v1 (BP3M_results)')
     for _key, _default in (('poly_order', 1), ('pos_err_floor', 0.05), ('pos_corr_table', None),
                            ('fit_chip_offset', False), ('pos_corr_model', None),
                            ('n_iter', 20), ('clip_sigma', 4.5)):

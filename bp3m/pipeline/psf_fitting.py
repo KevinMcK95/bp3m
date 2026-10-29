@@ -1825,6 +1825,14 @@ def run_psf_fitting(
 
     if skipped:
         print(f"  {len(skipped)} image(s) already fitted with matching params — skipping.")
+    # BP3M_REQUIRE_CACHED=1 (2026-10-28): a re-alignment of an existing field must not silently re-extract its catalogues
+    # (the indices of every downstream product would change); any would-be refit / reclassification is a hard error.
+    import os as _os_rc
+    if _os_rc.environ.get('BP3M_REQUIRE_CACHED') == '1' and (work or needs_reclassify):
+        raise RuntimeError(f"BP3M_REQUIRE_CACHED: {len(work)} image(s) would be (re)fitted and {len(needs_reclassify)} "
+                           f"reclassified -- refusing to rewrite cached catalogues "
+                           f"(first: {[getattr(p, 'name', str(p)) for p in work][:8]} {needs_reclassify[:8]}); "
+                           f"pass the field's production PSF flags (e.g. --fmin_thresh)")
     if needs_reclassify:
         print(f"  {len(needs_reclassify)} cached image(s) have a different conc_limit "
               f"— triggering reclassification.")

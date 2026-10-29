@@ -227,14 +227,9 @@ class AlignmentSolver:
 
         # ── Apply GAIA_SYS_DICT inflation (identical to bp3m lines 325-330) ──
         # mult_* are SIGMA multipliers — inflate the covariance by their square.
-        C[self.gaia_6p] *= GAIA_SYS_DICT['mult_6p'] ** 2
-        C[self.gaia_5p] *= GAIA_SYS_DICT['mult_5p'] ** 2
-        C[self.gaia_2p] *= GAIA_SYS_DICT['mult_2p']
-        sys_diag = np.array([0, 0,
-                              GAIA_SYS_DICT['pm_sys_err'],
-                              GAIA_SYS_DICT['pm_sys_err'],
-                              GAIA_SYS_DICT['parallax_sys_err']])**2
-        C += np.diag(sys_diag)[None, :, :]  # broadcast over n_stars
+        # Gaia error model (multipliers + floor) from the shared bp3m implementation (bp3m.gaia_model).
+        from bp3m.gaia_model import inflate
+        inflate(C, self.gaia_6p, self.gaia_5p, gmag=self.gaia_g)
 
         self.C_survey = C
         self.v_prior  = self.v_survey

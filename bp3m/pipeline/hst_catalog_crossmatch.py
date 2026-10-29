@@ -3194,18 +3194,10 @@ def _build_gaia_cov5(row: pd.Series) -> tuple:
 
     C = np.outer(sigmas, sigmas) * corr
 
-    # Apply BP3M inflation (same as solver.py / gaia_cross_match):
-    # mult_* are SIGMA multipliers, so the covariance gets their square.
-    if is_6p:
-        C *= GAIA_SYS_DICT['mult_6p'] ** 2
-    elif is_5p:
-        C *= GAIA_SYS_DICT['mult_5p'] ** 2
-    # 2p: multiply by 1.0 (no change)
-
-    # Add systematic floors (in variance) for PM and parallax
-    C[2, 2] += GAIA_SYS_DICT['pm_sys_err'] ** 2
-    C[3, 3] += GAIA_SYS_DICT['pm_sys_err'] ** 2
-    C[4, 4] += GAIA_SYS_DICT['parallax_sys_err'] ** 2
+    # Gaia error model (multipliers + floor) from the shared implementation (bp3m.gaia_model), as the solver.
+    from ..gaia_model import inflate
+    _g = float(row.get('gmag', np.nan)) if 'gmag' in row else np.nan
+    inflate(C[None], [is_6p], [is_5p], gmag=[_g])
 
     return C, is_full_astrometry
 
@@ -6025,16 +6017,9 @@ def _plot_gaia_comparison(combined_df: pd.DataFrame, gaia_df: pd.DataFrame,
     has_pseudocolour = np.isfinite(_lookup('pseudocolour')) \
                        if 'pseudocolour' in gdf.columns else np.zeros(len(combined_df), bool)
     has_pm_g = np.isfinite(sig_pmra_g_raw) & (sig_pmra_g_raw > 0)
-    mult = np.where(has_pseudocolour, GAIA_SYS_DICT['mult_6p'],
-           np.where(has_pm_g,         GAIA_SYS_DICT['mult_5p'],
-                                      GAIA_SYS_DICT['mult_2p']))
-    _pm_sys2 = GAIA_SYS_DICT['pm_sys_err'] ** 2
-    sig_pmra_g  = np.where(has_pm_g,
-                            np.sqrt(mult**2 * sig_pmra_g_raw**2  + _pm_sys2),
-                            sig_pmra_g_raw)
-    sig_pmdec_g = np.where(has_pm_g,
-                            np.sqrt(mult**2 * sig_pmdec_g_raw**2 + _pm_sys2),
-                            sig_pmdec_g_raw)
+    # Gaia error model from the shared implementation (bp3m.gaia_model), as the solver.
+    from ..gaia_model import inflate_pm_sigma
+    sig_pmra_g, sig_pmdec_g = inflate_pm_sigma(sig_pmra_g_raw, sig_pmdec_g_raw, has_pseudocolour, has_pm_g, gmag=gmag_g)
 
     # Gaia geometric mean PM uncertainty (inflated, matching BP3M)
     sig_pm_g_geom = np.where(

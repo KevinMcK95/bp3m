@@ -388,15 +388,12 @@ def _astrometric_cut(
     C[:, 0, 2] = C[:, 2, 0] = corr_rp * pmra_e * plx_e
     C[:, 1, 2] = C[:, 2, 1] = corr_dp * pdec_e * plx_e
 
-    # Scale by the BP3M mult factor (1.05 for 5p, 1.22 for 6p). These are SIGMA
-    # multipliers, so a covariance is scaled by their SQUARE.
-    mult = np.where(is_6p[has_5p].values, _MULT['6p'], _MULT['5p'])
-    C = C * (mult ** 2)[:, None, None]
-
-    # Add systematic noise floor in quadrature to diagonal
-    C[:, 0, 0] += _PM_SYS  ** 2
-    C[:, 1, 1] += _PM_SYS  ** 2
-    C[:, 2, 2] += _PLX_SYS ** 2
+    # Gaia error model (multipliers + floor) from the shared implementation (bp3m.gaia_model), as the solver.
+    from ..gaia_model import inflate
+    _six = is_6p[has_5p].values
+    _g = merged_5p['phot_g_mean_mag'].to_numpy(float) if 'phot_g_mean_mag' in merged_5p.columns else (
+         merged_5p['gmag'].to_numpy(float) if 'gmag' in merged_5p.columns else None)
+    inflate(C, _six, ~_six, gmag=_g, idx=(None, None, 0, 1, 2))
 
     # Mahalanobis distance
     delta = np.column_stack([

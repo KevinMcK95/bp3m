@@ -113,6 +113,15 @@ def resolve_gaia_csvs(field_path):
     fields, and can mix stale queries into the catalog). Falls back to the
     glob when the sidecar is missing, empty, or stale.
     """
+    # A Gaia-model arm's override files (bp3m.gaia_model.set_override_files) replace the canonical ones at every level;
+    # never mixed with the glob.  (2026-10-28)
+    from .gaia_model import override_files as _gaia_override
+    _ov = _gaia_override()
+    if _ov:
+        missing = [p for p in _ov if not Path(p).exists()]
+        if missing:
+            raise FileNotFoundError(f"Gaia override file(s) missing: {missing}")
+        return [Path(p) for p in _ov], False
     field_path = Path(field_path)
     gaia_dir = field_path / "Gaia"
     sidecar = gaia_dir / f"{field_path.name}_gaia_files.json"

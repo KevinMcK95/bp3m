@@ -566,27 +566,25 @@ class BP3MSolver:
         # C_survey = diag(sigma) @ corr @ diag(sigma)
         self.C_survey = sigmas[:, :, None] * corr_mat * sigmas[:, None, :]
 
-        #account for systematics in Gaia data
-        #amount to inflate uncertainties by
-        #might want to change to function of magnitude in the future
-        # mult_* are SIGMA multipliers (literature error underestimates), so the
-        # covariance is inflated by their square — same as gaia_cross_match.
-        from .astro_utils import GAIA_UWU_MAG as _UWU_MAG
-        if _UWU_MAG:
-            # Magnitude-dependent unit-weight uncertainties (Fabricius et al. 2021, Fig. 19 for
-            # parallax and Fig. 20 for proper motion). These are SIGMA multipliers and differ
-            # between the parallax row/column and the rest, so the covariance is scaled by the
-            # OUTER PRODUCT of the per-parameter vector rather than by one factor squared.
-            from .astro_utils import gaia_cov_scale_vector
-            _f = gaia_cov_scale_vector(self.gaia_g, self.gaia_6p, self.gaia_5p)
-            self.C_survey *= _f[:, :, None] * _f[:, None, :]
-        else:
-            self.C_survey[self.gaia_6p] *= GAIA_SYS_DICT['mult_6p'] ** 2
-            self.C_survey[self.gaia_5p] *= GAIA_SYS_DICT['mult_5p'] ** 2
-            self.C_survey[self.gaia_2p] *= GAIA_SYS_DICT['mult_2p']
-        self.C_survey += np.diag(np.array([0,0,
-                            GAIA_SYS_DICT['pm_sys_err'],GAIA_SYS_DICT['pm_sys_err'],
-                            GAIA_SYS_DICT['parallax_sys_err']])**2)
+        # Gaia error model (multipliers + floor) from the one shared implementation (bp3m.gaia_model; default =
+        # Fabricius scalar sigma multipliers by solution type + VB21 diagonal floors, as before 2026-10-28).
+        from .gaia_model import inflate as _gaia_inflate, current as _gaia_current
+        self.gaia_model = _gaia_current()
+        _gaia_inflate(self.C_survey, self.gaia_6p, self.gaia_5p, gmag=self.gaia_g, model=self.gaia_model)
+        # Gaia field modes (bp3m.gaia_model.FieldModes; plan GAIA_SYSTEMATICS_BP3M_PLAN.md 3.1-3.2): the mean shift M and the
+        # independent remainder R act per source here; the loadings W couple every Gaia source to n_gz shared N(0, 1)
+        # coefficients z that join the shared vector after the image / epoch-D blocks (see _solve_one_pass).
+        from .gaia_model import field_modes as _field_modes
+        self.gaia_modes = _field_modes(self.gaia_model)
+        self.n_gz = 0
+        _gz_W = None
+        if self.gaia_modes is not None:
+            _gids = (g['Gaia_id'].fillna(0).to_numpy().astype(np.int64) if 'Gaia_id' in g.columns
+                     else g['source_id'].fillna(0).to_numpy().astype(np.int64))
+            _gz_M, _gz_W, _gz_R = self.gaia_modes.align(_gids, np.asarray(self.full_gaia_astrometry, bool))
+            self.v_survey[:, 2:5] -= _gz_M
+            self.C_survey[:, 2:5, 2:5] += _gz_R
+            self.n_gz = self.gaia_modes.K
 
         # Flag stars with full Gaia astrometry
         self.has_full_astro = (
@@ -602,6 +600,17 @@ class BP3MSolver:
         self.C_survey_inv[~self.full_gaia_astrometry,:2,:2] = np.linalg.inv(self.C_survey[~self.full_gaia_astrometry,:2,:2])
 
         self.C_survey_inv_dot_v = np.einsum('nij,nj->ni',self.C_survey_inv,self.v_survey)
+        if self.n_gz:
+            # Gaia-only quantities (before DELVE adds its own precision): K_z = -C^-1 W~ (n, 5, K; W~ = W with zero
+            # position rows), the same sign convention as the per-detection K blocks: v_i(z) = a_i + C_vT_i K_z,i (z - z0).
+            self.gaia_Kz = -np.einsum('nij,njk->nik', self.C_survey_inv[:, :, 2:5], _gz_W)
+            self.gaia_WCW = -np.einsum('nji,njk->ik', _gz_W, self.gaia_Kz[:, 2:5, :])         # sum_i W^T C^-1 W  (K, K)
+            self.gaia_bz = -np.einsum('nik,ni->k', self.gaia_Kz, self.v_survey)                # sum_i W^T C^-1 (v_s - M)
+            self.gaia_gz_rows = np.where(np.abs(self.gaia_Kz).sum(axis=(1, 2)) > 0)[0]
+            if getattr(self, 'gaia_z', None) is None or len(self.gaia_z) != self.n_gz:
+                self.gaia_z = np.zeros(self.n_gz)
+            print(f"  Gaia field modes: K = {self.n_gz} shared coefficients, {len(self.gaia_gz_rows)} sources coupled "
+                  f"({self.gaia_modes.path})")
 
         # ── Add DELVE PM/parallax precision ───────────────────────────────────
         # For stars with DELVE PM errors in gaia_catalog, add the full DELVE
@@ -1476,10 +1485,17 @@ class BP3MSolver:
         """
         nr = self.N_R
         n_r = nr * self.n_images
-        n_s = n_r + self.n_ed          # shared dim: per-image r blocks + epoch-D
+        n_gz = getattr(self, 'n_gz', 0)
+        n_s = n_r + self.n_ed + n_gz   # shared dim: per-image r blocks + epoch-D + Gaia field modes
         if self.n_ed and r_current.size == n_r:
             # legacy-length input: append zero epoch-distortion coefficients
             r_current = np.concatenate([r_current, np.zeros(self.n_ed)])
+        if n_gz and r_current.size == n_r + self.n_ed:
+            # input without the Gaia-mode block: append the current Gaia-mode coefficients
+            r_current = np.concatenate([r_current, self.gaia_z])
+        gz_off = n_r + self.n_ed
+        gz_cols = np.arange(gz_off, gz_off + n_gz)
+        z_cur = r_current[gz_off:gz_off + n_gz] if n_gz else None
 
         def _cols_of(j_idx, img):
             base = np.arange(j_idx * nr, j_idx * nr + nr)
@@ -1501,6 +1517,8 @@ class BP3MSolver:
         _vg_h  = getattr(self, '_C_VG_h_per_star', None)
         h_base = (self.C_survey_inv_dot_v + _vg_h
                   if _vg_h is not None else self.C_survey_inv_dot_v)
+        if n_gz:   # Gaia term at the current field-mode coefficients: C^-1 (v_s - M - W z) = C^-1 (v_s - M) + K_z z
+            h_base = h_base + np.einsum('nik,k->ni', self.gaia_Kz, z_cur)
         h_align = h_base.copy()
         h_all   = h_base.copy()
         # H_vv_align: the star precision the ALIGNMENT sees (prior + alignment detections only).
@@ -1619,6 +1637,10 @@ class BP3MSolver:
                 H_rr[np.arange(off, off + self.ED_K),
                      np.arange(off, off + self.ED_K)] += prec
 
+        # ── Gaia field modes: data (sum_i W^T C^-1 W) + N(0, I) prior on z ───
+        if n_gz:
+            H_rr[np.ix_(gz_cols, gz_cols)] += self.gaia_WCW + np.eye(n_gz)
+
         # ── Hi/lo chip coupling prior: off-diagonal blocks in H_rr ───────────
         for hi_idx, lo_idx in self._chip_pairs:
             C_cp = self._chip_pair_couplings[(hi_idx, lo_idx)]
@@ -1678,6 +1700,16 @@ class BP3MSolver:
                     mu = 0.0
                 off = n_r + g * self.ED_K
                 rhs[off:off + self.ED_K] += (mu - r_current[off:off + self.ED_K]) * prec
+
+        # Gaia field modes: rhs = sum_i W^T C^-1 (v_s - M - W z) - z (prior), plus the star-level Schur coupling, which
+        # rides with the per-image observations (one 'observation' per coupled Gaia source, columns = the z block)
+        if n_gz:
+            if _pair_major:
+                raise NotImplementedError('Gaia field modes need the star-major Schur path (unset BP3M_SCHUR_PAIR_MAJOR)')
+            rhs[gz_cols] += self.gaia_bz - self.gaia_WCW @ z_cur - z_cur
+            _gr = self.gaia_gz_rows
+            rhs[gz_cols] += np.einsum('nji,nj->i', self.gaia_Kz[_gr], a_align[_gr])
+            _schur_obs.append((_gr, self.gaia_Kz[_gr], gz_cols))
 
         for j_idx, img in enumerate(self.image_names):
             r_prior_j      = self._img_data[img]["r_prior"]
@@ -1820,6 +1852,8 @@ class BP3MSolver:
             except (linalg.LinAlgError, ValueError):
                 delta_r = d_inv * (np.linalg.pinv(Cr_inv_sc) @ rhs_sc)
         r_hat   = r_current + delta_r
+        if n_gz:
+            self.gaia_z = r_hat[gz_off:gz_off + n_gz].copy()
 
         # for j_idx, img in enumerate(self.image_names):
         #     meta = self.images[img]
@@ -2050,6 +2084,8 @@ class BP3MSolver:
                                  for img in self.image_names])
         if self.n_ed:
             r_hat = np.concatenate([r_hat, np.zeros(self.n_ed)])
+        if getattr(self, 'n_gz', 0):
+            r_hat = np.concatenate([r_hat, self.gaia_z])      # Gaia field-mode coefficients (start at the prior mean, 0)
         self._update_R(r_hat)
         nr  = self.N_R
         C_r = None
@@ -3541,7 +3577,8 @@ class BP3MSolver:
         """
         nr      = self.N_R
         n_r_tot = nr * self.n_images
-        n_s_tot = n_r_tot + self.n_ed
+        n_gz    = getattr(self, 'n_gz', 0)
+        n_s_tot = n_r_tot + self.n_ed + n_gz
         n_stars = self.n_stars
 
         # Build K_all[i, :, cols(j)] = Σ_{detections of star i in img j} K_{ij}
@@ -3569,6 +3606,11 @@ class BP3MSolver:
                 _tmp = np.zeros((n_stars, 5, self.ED_K))
                 np.add.at(_tmp, sidx, K[:, :, nr:])
                 K_all[:, :, ec[0]:ec[0] + self.ED_K] += _tmp
+
+        if n_gz and C_r.shape[0] == n_s_tot:      # Gaia field modes: each Gaia source's coupling to z
+            K_all[:, :, n_r_tot + self.n_ed:] += self.gaia_Kz
+        elif C_r.shape[0] != n_s_tot:
+            K_all = K_all[:, :, :C_r.shape[0]]
 
         # C_extra[i] = (C_vT[i] @ K_all[i]) @ C_r @ (C_vT[i] @ K_all[i]).T
         CvT_K   = np.einsum('nij,njk->nik', C_vT, K_all)           # (n_stars, 5, n_r_tot)

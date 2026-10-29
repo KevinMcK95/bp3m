@@ -456,6 +456,17 @@ def _parse_args():
                          '2021 Fig.19/20) instead of the scalar 1.05/1.22; parallax and '
                          'position/PM take different curves, so the covariance scales by the outer '
                          'product of the per-parameter sigma multipliers')
+    bp.add_argument('--gaia_model', type=str, default=None,
+                    help='Gaia error / systematics model for every stage (bp3m/gaia_model.py), e.g. "cov=fab_mag;floor=diag". '
+                         'cov: fab_scalar (default) | fab_mag | as_given; floor: diag (default) | none | modes. Set before any '
+                         'worker pool exists, so indv workers inherit it; recorded in run_config.json.')
+    bp.add_argument('--gaia_csv_override', type=str, nargs='+', default=None,
+                    help='Gaia CSV(s) that replace the field\'s canonical files at every stage (a Gaia-model arm\'s corrected '
+                         'copy, Gaia/corrected/*_gaiacorr_<model>.csv; never *_gaia.csv).  Recorded with md5 in run_config; '
+                         'bp3m-v2 and the pop fits inherit it.  The field sidecar keeps the canonical list.')
+    bp.add_argument('--qso_anchors_csv', type=str, nargs='+', default=None,
+                    help='QSO anchor CSV(s) to use instead of the vetted canonical ones (a Gaia-model arm builds its own from '
+                         'the corrected copy).  Hard error if missing.')
     bp.add_argument('--bp3m_results_suffix', type=str, default=None,
                     help='Write the joint-fit outputs to '
                          'BP3M_results_<suffix> instead of BP3M_results '
@@ -831,6 +842,17 @@ def main():
         from bp3m.astro_utils import set_gaia_uwu_mag
         set_gaia_uwu_mag(True)
         print('  Gaia uncertainties: magnitude-dependent UWU (Fabricius 2021 Fig.19/20)')
+    if getattr(args, 'gaia_model', None) is not None:
+        from bp3m.gaia_model import GaiaModel, set_current
+        _gm = GaiaModel.parse(args.gaia_model)
+        if getattr(args, 'gaia_uwu_mag', False) and _gm.cov != 'fab_mag':
+            raise SystemExit(f'--gaia_uwu_mag contradicts --gaia_model {args.gaia_model!r}')
+        set_current(_gm)
+    from bp3m.gaia_model import current as _gaia_current, set_override_files as _gaia_set_files
+    if not _gaia_current().is_default:
+        print(f'  Gaia model: {_gaia_current().spec}')
+    if getattr(args, 'gaia_csv_override', None):
+        print(f'  Gaia CSV override: {_gaia_set_files(args.gaia_csv_override)}')
 
     # Wire --n_processes to thread limits.
     # In parallel image mode (default): workers set their own limits; the main
@@ -950,6 +972,11 @@ def main():
     _gaia_files_json.write_text(
         _json_gaia.dumps([str(p) for p in gaia_csv_paths], indent=2))
 
+    from bp3m.gaia_model import override_files as _gaia_override
+    if _gaia_override():
+        gaia_csv_paths = [Path(p) for p in _gaia_override()]
+        print(f"  Gaia catalogue: override {[p.name for p in gaia_csv_paths]} (canonical sidecar left unchanged)")
+
     # For alignment etc., pass explicit list (avoids stale-file glob)
     # Single-pointing: pass the one path; multi-pointing: pass the list.
     gaia_csv_path: Path | list | None = (
@@ -992,6 +1019,13 @@ def main():
         else _qso_anchors_csvs if _qso_anchors_csvs
         else None
     )
+    if getattr(args, 'qso_anchors_csv', None):
+        _missing_q = [p for p in args.qso_anchors_csv if not Path(p).exists()]
+        if _missing_q:
+            raise SystemExit(f'--qso_anchors_csv: missing {_missing_q}')
+        _qso_anchors_csv = [Path(p) for p in args.qso_anchors_csv]
+        _qso_anchors_csv = _qso_anchors_csv[0] if len(_qso_anchors_csv) == 1 else _qso_anchors_csv
+        print(f'  QSO anchors: explicit {args.qso_anchors_csv}')
     # Helper: True when the qso anchors value is non-empty (Path or non-empty list)
     def _qso_exists(v):
         if v is None:
@@ -1534,6 +1568,14 @@ def main():
 
             _indv_root = output_dir / field / (args.indv_results_name or "BP3M_indv_results")
 
+            # Gaia provenance for the indv cache (2026-10-28): the Gaia file(s) actually used (md5) and the Gaia model
+            import hashlib as _hlg
+            _gaia_md5 = ','.join(_hlg.md5(Path(_p).read_bytes()).hexdigest()
+                                 for _p in (gaia_csv_path if isinstance(gaia_csv_path, (list, tuple)) else [gaia_csv_path])
+                                 if _p is not None and Path(_p).exists()) or None
+            from bp3m.gaia_model import current as _gaia_current, GaiaModel as _GaiaModel
+            _gaia_spec = _gaia_current().spec
+
             def _indv_extra_cfg(_img_name):
                 """Record exact match provenance in each indv run_config so
                 --use_indv_outputs can verify the joint fit sees the same
@@ -1541,7 +1583,7 @@ def main():
                 import hashlib as _hl
                 _m = (output_dir / field / 'HST' / 'mastDownload' / 'HST'
                       / _img_name / 'matched_gaia.csv')
-                _cfg = {'indv_fit_version': INDV_FIT_VERSION}
+                _cfg = {'indv_fit_version': INDV_FIT_VERSION, 'gaia_csv_md5': _gaia_md5}
                 if _m.exists():
                     _cfg['matched_gaia_md5'] = _hl.md5(_m.read_bytes()).hexdigest()
                     _cfg['matched_gaia_mtime'] = _m.stat().st_mtime
@@ -1646,6 +1688,12 @@ def main():
                     if _cfg['gdc_id'] != _cfg_map[_img].get('gdc_id'):
                         return False
                 elif 'OFFICIAL' in str(_cfg_map[_img].get('gdc_file') or ''):
+                    return False
+                # Gaia model / file (2026-10-28).  Caches written before these keys existed were default-model fits on
+                # the canonical file; a recorded md5 must match the file used now.
+                if _cfg.get('gaia_model', _GaiaModel().spec) != _gaia_spec:
+                    return False
+                if _cfg.get('gaia_csv_md5') is not None and _cfg['gaia_csv_md5'] != _gaia_md5:
                     return False
                 return all(_cfg.get(_k) == _v
                            for _k, _v in _want_params.items())

@@ -43,6 +43,8 @@ class BP3MSolverSparse(BP3MSolver):
     # ── Core solver (sparse override) ─────────────────────────────────────────
 
     def _solve_one_pass(self, r_current, _return_C_r=True):
+        if getattr(self, 'n_gz', 0):
+            raise NotImplementedError('Gaia field modes are implemented in the dense solver (BP3MSolver) only; drop --sparse')
         """
         Single Schur-complement solve using sparse assembly for Cr_inv.
 
