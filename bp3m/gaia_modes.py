@@ -26,6 +26,7 @@ from .gaia_corrected import KERNEL, QSOSYS, SHA256, check_inputs, _sha, OUT_DIR
 
 QSO_RADIUS_DEG, QSO_GMAX, MAX_QSO, TRACE_FRAC = 5.0, 21.0, 1500, 0.999
 SPACING_DEG, KEEP_DEG, QSO_NEAR_DEG, MAX_QSO_TOTAL = 0.13, 0.26, 5.0, 3000   # inducing lattice / its reach; conditioning QSOs
+FOOTPRINT_MARGIN_DEG = 0.5   # footprints with no vertex within the field Gaia extent + this are dropped (stray images)
 MQ_MATCH_ARCSEC, MQ_CHUNK = 1.5, 2000   # match radius = qso_prep.crossmatch_milliquas default (prepare_qsos); MILLIQUAS positions per uploaded TAP job
 MAX_3NZ, MAX_CHUNK_BYTES = 9000, 4e8                                         # memory guards (grid size; per-chunk arrays)
 QSO_QUERY_COLS = ('g.source_id, g.ra, g.dec, g.pmra, g.pmdec, g.pmra_error, g.pmdec_error, g.pmra_pmdec_corr, g.parallax, '
@@ -252,7 +253,7 @@ def _project(cal, zra, zde, LZZ, ra, dec, G, sol):
     return Wu.reshape(N, 3, 3 * nz) * a[:, :, None], (Kxx - Q) * a[:, :, None] * a[:, None, :]
 
 
-def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_diag_deg, out_npz, model='v3real2p',
+def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_diag_deg, out_npz, model='v3real2p', footprints_dropped=0,
                 verbose=True, footprints=None, pad_arcsec=None, chunk=None) -> Path:
     """Field-mode npz for the Gaia sources (with a PM) of the field table(s), restricted to the image footprints when given."""
     import time
@@ -321,7 +322,7 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
     meta = dict(model=model, modes_version=MODES_VERSION, calibration=KERNEL.name, sha256_calibration=SHA256[KERNEL.name],
                 center=list(map(float, center)), inducing_spacing_deg=sp, inducing_keep_deg=KEEP_DEG, n_inducing=len(zra), K=K,
                 trace_fraction=float(np.cumsum(w)[K - 1] / w.sum()), n_sources=N, n_table_sources=n_table, chunk=chunk,
-                footprint_pad_arcsec=pad_arcsec, n_footprints=None if footprints is None else len(footprints), qso=qst,
+                footprint_pad_arcsec=pad_arcsec, n_footprints=None if footprints is None else len(footprints), footprints_dropped=int(footprints_dropped), qso=qst,
                 qso_near_deg=QSO_NEAR_DEG, n_qso_used=int(gp0['n_qso']),
                 post_mean_center=[float(x) for x in gp0['post_mean_center']], post_sd_center=[float(x) for x in gp0['post_sd_center']],
                 field_csvs=[Path(f).name for f in field_csvs], sha256_field_csvs=[_sha(f) for f in field_csvs],
@@ -359,6 +360,16 @@ def ensure_modes(field_csvs, model_copies, centre, half_diag_deg, model, lib_dir
         anc += hits
     mq = find_qso_catalogs(Path(lib_dir) if lib_dir else None).get('milliquas')
     polys = image_footprints(image_files, cache_path=gdir / f'{stem}_image_footprints.json') if image_files else None
+    n_drop = 0
+    if polys:      # 10-29: stray images (bad header WCS / other targets: 47 Tuc and M31 folders hold images 80-153 deg away) cannot hold
+        c0 = _unit([centre[0]], [centre[1]])[0]                     # field sources but inflated the QSO cone to the whole sky
+        near = [p for p in polys if np.degrees(np.arccos(np.clip(_unit(p[:, 0], p[:, 1]) @ c0, -1, 1))).min() <= half_diag_deg + FOOTPRINT_MARGIN_DEG]
+        n_drop = len(polys) - len(near)
+        if n_drop:
+            print(f'  field modes: {n_drop} image footprint(s) farther than the field Gaia extent + {FOOTPRINT_MARGIN_DEG} deg dropped', flush=True)
+        if not near:
+            raise SystemExit('field modes: no image footprint overlaps the field Gaia catalogue')
+        polys = near
     r_q = QSO_RADIUS_DEG                                            # QSO cone: must reach QSO_NEAR_DEG beyond every footprint
     if polys:
         V = np.concatenate(polys); c = _unit([centre[0]], [centre[1]])[0]
@@ -377,7 +388,7 @@ def ensure_modes(field_csvs, model_copies, centre, half_diag_deg, model, lib_dir
                 and m.get('sha256_qso_sample') == _sha(qp) and m.get('anchors') == [a.name for a in anc]
                 and m.get('code') == {p.name: _sha(p) for p in (Path(__file__), Path(GV3.__file__), Path(QP.__file__))}):
             return out
-    o = build_modes(field_csvs, anc, qp, mq, np.asarray(centre, float), half_diag_deg, out, model=model, footprints=polys,
+    o = build_modes(field_csvs, anc, qp, mq, np.asarray(centre, float), half_diag_deg, out, model=model, footprints=polys, footprints_dropped=n_drop,
                     pad_arcsec=pad_arcsec if polys else None)
     meta = json.loads(Path(str(o) + '.json').read_text()); meta['footprint_key'] = fp_key
     Path(str(o) + '.json').write_text(json.dumps(meta, indent=1))
