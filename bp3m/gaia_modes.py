@@ -26,7 +26,7 @@ from .gaia_corrected import KERNEL, QSOSYS, SHA256, check_inputs, _sha, OUT_DIR
 
 QSO_RADIUS_DEG, QSO_GMAX, MAX_QSO, TRACE_FRAC = 5.0, 21.0, 1500, 0.999
 SPACING_DEG, KEEP_DEG, QSO_NEAR_DEG, MAX_QSO_TOTAL = 0.13, 0.26, 5.0, 3000   # inducing lattice / its reach; conditioning QSOs
-MQ_MATCH_ARCSEC = 1.5      # = gaia_sys.qso_prep.crossmatch_milliquas default used by prepare_qsos (MILLIQUAS-first QSO download)
+MQ_MATCH_ARCSEC, MQ_CHUNK = 1.5, 2000   # match radius = qso_prep.crossmatch_milliquas default (prepare_qsos); MILLIQUAS positions per uploaded TAP job
 MAX_3NZ, MAX_CHUNK_BYTES = 9000, 4e8                                         # memory guards (grid size; per-chunk arrays)
 QSO_QUERY_COLS = ('g.source_id, g.ra, g.dec, g.pmra, g.pmdec, g.pmra_error, g.pmdec_error, g.pmra_pmdec_corr, g.parallax, '
                   'g.parallax_error, g.parallax_pmra_corr, g.parallax_pmdec_corr, g.phot_g_mean_mag, g.phot_g_mean_flux, '
@@ -39,17 +39,19 @@ def qso_sample_path(gaia_dir, stem, radius_deg=QSO_RADIUS_DEG):
     return Path(gaia_dir) / f'{stem}_qsocond_r{radius_deg:.1f}_G{QSO_GMAX:.1f}.csv'
 
 
-def download_qso_sample(gaia_dir, stem, ra, dec, gaia_tap_server=None, radius_deg=QSO_RADIUS_DEG, milliquas_path=None) -> Path:
+def download_qso_sample(gaia_dir, stem, ra, dec, gaia_tap_server=None, radius_deg=QSO_RADIUS_DEG, milliquas_path=None, qso_table=None) -> Path:
     """Gaia DR3 QSO candidates (pop_fit production cuts) within radius_deg; cached with a verified sidecar.
     With milliquas_path (10-29, mosaics): MILLIQUAS-FIRST - the MILLIQUAS objects in the cone are uploaded and only Gaia QSO candidates
     within MQ_MATCH_ARCSEC of one are returned.  prepare_qsos keeps exactly those (it cross-matches to MILLIQUAS at the same radius),
     so the conditioning sample is identical while the query no longer scans every candidate of a large cone (LMC / 47 Tuc / COSMOS
-    cones failed: the archive dropped the async result after > 1 h).  Without it: the original cone query."""
+    cones failed: the archive dropped the async result after > 1 h).  Without it: the original cone query.
+    With qso_table (bp3m.qso_allsky, 10-29; preferred): a LOCAL cone selection from the verified all-sky table built with the same
+    cuts - no archive call per field (the upload join also failed for the 31 deg LMC cone).  Identical rows to the cone query."""
     from .pipeline.download_gaia import _submit_gaia_async
-    mode = 'milliquas_upload' if milliquas_path is not None else 'cone'
+    mode = 'allsky_table' if qso_table is not None else ('milliquas_upload' if milliquas_path is not None else 'cone')
     out = qso_sample_path(gaia_dir, stem, radius_deg)
-    if mode == 'milliquas_upload':
-        out = out.with_name(out.stem + '_mq.csv')
+    if mode != 'cone':
+        out = out.with_name(out.stem + ('_tab.csv' if mode == 'allsky_table' else '_mq.csv'))
     side = Path(str(out) + '.json')
     if out.exists() and side.exists():
         m = json.loads(side.read_text())
@@ -59,7 +61,17 @@ def download_qso_sample(gaia_dir, stem, ra, dec, gaia_tap_server=None, radius_de
             f"AND g.ruwe < 1.4 AND g.ipd_gof_harmonic_amplitude < 0.2 AND g.phot_g_mean_mag < {QSO_GMAX:.2f}")
     cone = f"CONTAINS(POINT('ICRS', g.ra, g.dec), CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius_deg:.6f})) = 1"
     meta = {}
-    if mode == 'cone':
+    if mode == 'allsky_table':
+        tside = json.loads(Path(str(qso_table) + '.json').read_text())
+        if tside.get('columns') != QSO_QUERY_COLS or not tside.get('row_count_verified'):
+            raise SystemExit(f'{qso_table}: not built with the current QSO columns / unverified')
+        T = pd.read_parquet(qso_table)
+        c = _unit([ra], [dec])[0]
+        df = T[np.degrees(np.arccos(np.clip(_unit(T.ra.to_numpy(float), T.dec.to_numpy(float)) @ c, -1, 1))) < radius_deg]
+        df = df.drop(columns=['mq_match']).reset_index(drop=True); n = len(df)
+        where = f'{cone} AND {cuts} (local selection from {Path(qso_table).name})'
+        meta = dict(qso_table=Path(qso_table).name, sha256_qso_table=tside.get('sha256'))
+    elif mode == 'cone':
         where = f'{cone} AND {cuts}'
         frm = 'FROM gaiadr3.gaia_source AS g JOIN gaiadr3.qso_candidates AS q ON q.source_id = g.source_id'
         df = _submit_gaia_async(f'SELECT {QSO_QUERY_COLS} {frm} WHERE {where}', gaia_tap_server)
@@ -74,15 +86,25 @@ def download_qso_sample(gaia_dir, stem, ra, dec, gaia_tap_server=None, radius_de
             mra = h[1].data['RA'].astype(np.float64); mde = h[1].data['DEC'].astype(np.float64)
         c = _unit([ra], [dec])[0]; pad = MQ_MATCH_ARCSEC / 3600.0
         sel = np.degrees(np.arccos(np.clip(_unit(mra, mde) @ c, -1, 1))) < radius_deg + pad
-        up = Path(str(out) + '.upload.xml'); Table(dict(mq_id=np.nonzero(sel)[0].astype(np.int64), ra=mra[sel], dec=mde[sel])).write(up, format='votable', overwrite=True)
+        # chunks of MQ_CHUNK uploaded positions; the cone cut is applied client-side (10-29: a 31 deg CONTAINS cone inside the join made
+        # the LMC job fail server-side even with only 6,264 uploaded positions); each chunk's rows verified by COUNT(DISTINCT)
+        ids = np.nonzero(sel)[0]; parts, n = [], 0
         frm = (f"FROM tap_upload.mq AS u JOIN gaiadr3.gaia_source AS g ON 1 = CONTAINS(POINT('ICRS', g.ra, g.dec), "
                f"CIRCLE('ICRS', u.ra, u.dec, {MQ_MATCH_ARCSEC / 3600.0:.8f})) JOIN gaiadr3.qso_candidates AS q ON q.source_id = g.source_id")
-        where = f'{cone} AND {cuts}'
-        df = _submit_gaia_async(f'SELECT DISTINCT {QSO_QUERY_COLS} {frm} WHERE {where}', gaia_tap_server, upload_resource=str(up), upload_table_name='mq')
-        n = int(_submit_gaia_async(f'SELECT COUNT(DISTINCT g.source_id) AS n {frm} WHERE {where}', gaia_tap_server,
-                                   upload_resource=str(up), upload_table_name='mq').iloc[0, 0])
-        df.columns = [c_.lower() for c_ in df.columns]
-        meta = dict(n_milliquas_uploaded=int(sel.sum()), match_arcsec=MQ_MATCH_ARCSEC); up.unlink()
+        where = cuts
+        for k in range(0, len(ids), MQ_CHUNK):
+            ch = ids[k:k + MQ_CHUNK]; up = Path(str(out) + f'.upload{k // MQ_CHUNK}.xml')
+            Table(dict(mq_id=ch.astype(np.int64), ra=mra[ch], dec=mde[ch])).write(up, format='votable', overwrite=True)
+            d_ = _submit_gaia_async(f'SELECT DISTINCT {QSO_QUERY_COLS} {frm} WHERE {where}', gaia_tap_server, upload_resource=str(up), upload_table_name='mq')
+            n_ = int(_submit_gaia_async(f'SELECT COUNT(DISTINCT g.source_id) AS n {frm} WHERE {where}', gaia_tap_server,
+                                        upload_resource=str(up), upload_table_name='mq').iloc[0, 0])
+            if len(d_) != n_: raise SystemExit(f'QSO sample chunk {k // MQ_CHUNK}: {len(d_)} rows vs COUNT(DISTINCT) {n_}')
+            d_.columns = [c_.lower() for c_ in d_.columns]; parts.append(d_); up.unlink()
+        df = pd.concat(parts, ignore_index=True).drop_duplicates('source_id') if parts else pd.DataFrame(columns=[c_.strip().split('.')[-1] for c_ in QSO_QUERY_COLS.split(',')])
+        incone = np.degrees(np.arccos(np.clip(_unit(df.ra.to_numpy(float), df.dec.to_numpy(float)) @ c, -1, 1))) < radius_deg
+        df = df[incone].reset_index(drop=True); n = len(df)                     # per-chunk counts verified above; the cut is local
+        where = f'{cone} AND {cuts} (cone applied client-side)'
+        meta = dict(n_milliquas_uploaded=int(sel.sum()), match_arcsec=MQ_MATCH_ARCSEC, chunk=MQ_CHUNK)
     if len(df) != n or df.source_id.duplicated().any():
         raise SystemExit(f'QSO sample: {len(df)} rows vs COUNT(*) {n} (or duplicates)')
     df['source_id'] = df.source_id.astype(np.int64)
@@ -342,7 +364,9 @@ def ensure_modes(field_csvs, model_copies, centre, half_diag_deg, model, lib_dir
         V = np.concatenate(polys); c = _unit([centre[0]], [centre[1]])[0]
         far = float(np.degrees(np.arccos(np.clip(_unit(V[:, 0], V[:, 1]) @ c, -1, 1))).max())
         r_q = max(QSO_RADIUS_DEG, round(far + QSO_NEAR_DEG + 0.05, 1))
-    qp = download_qso_sample(gdir, stem, float(centre[0]), float(centre[1]), gaia_tap_server, radius_deg=r_q, milliquas_path=mq)   # MILLIQUAS-first (10-29)
+    from .qso_allsky import ensure_table
+    qp = download_qso_sample(gdir, stem, float(centre[0]), float(centre[1]), gaia_tap_server, radius_deg=r_q,
+                             qso_table=ensure_table(lib_dir, gaia_tap_server))   # local selection from the all-sky table (10-29)
     import hashlib
     fp_key = (hashlib.sha256(np.round(np.concatenate([p.ravel() for p in polys]), 7).tobytes()).hexdigest()[:16] if polys else 'full-table')
     out = model_copies[0].parent / f'{stem}_gaia_field_modes_{model}.npz'
