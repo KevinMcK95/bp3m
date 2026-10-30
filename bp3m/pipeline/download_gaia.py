@@ -248,14 +248,15 @@ def _make_gaia_client(gaia_tap_server: str | None):
 GAIA_MAXREC = 10_000_000
 
 
-def _launch_async(client, query):
-    """launch_job_async with an explicit row limit, and refuse a result that hit it."""
+def _launch_async(client, query, upload_resource=None, upload_table_name=None):
+    """launch_job_async with an explicit row limit, and refuse a result that hit it.  Optional VOTable upload (TAP_UPLOAD)."""
     from astroquery.utils.tap.core import TapPlus
     from astroquery.gaia import GaiaClass
+    up = dict(upload_resource=upload_resource, upload_table_name=upload_table_name) if upload_resource is not None else {}
     if isinstance(client, TapPlus) and not isinstance(client, GaiaClass):
-        job = client.launch_job_async(query, maxrec=GAIA_MAXREC)
+        job = client.launch_job_async(query, maxrec=GAIA_MAXREC, **up)
     else:
-        job = client.launch_job_async(query)
+        job = client.launch_job_async(query, **up)
     return job
 
 
@@ -296,10 +297,11 @@ def _cached_catalogue_suspect(df, meta_path, area=None, min_gmag=None, max_gmag=
     return None
 
 
-def _submit_gaia_async(full_q: str, gaia_tap_server: str | None = None) -> pd.DataFrame:
-    """Submit one Gaia TAP async job and return the result as a DataFrame."""
+def _submit_gaia_async(full_q: str, gaia_tap_server: str | None = None, upload_resource=None,
+                       upload_table_name=None) -> pd.DataFrame:
+    """Submit one Gaia TAP async job and return the result as a DataFrame (optionally with an uploaded VOTable)."""
     client = _make_gaia_client(gaia_tap_server)
-    job = _launch_async(client, full_q)
+    job = _launch_async(client, full_q, upload_resource, upload_table_name)
     result = job.get_results().to_pandas()
     _check_not_truncated(len(result))
     try:

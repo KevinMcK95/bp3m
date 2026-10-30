@@ -105,7 +105,7 @@ def smooth_cov(cal, u1, u2):
 
 
 def build_gp_v3(cal, center, extent_deg, star_ra, star_dec, star_G, star_sol, q_ra, q_dec, q_resid, q_S, q_G, q_sol,
-                n_rings=3, max_qso=1500, jitter=1e-12):
+                n_rings=3, max_qso=1500, jitter=1e-12, z_points=None):
     """
     QSO-conditioned smooth field at inducing points and the projection to the sources.
     q_resid (M, 3): QSO pmra − drift, pmdec − drift, plx (pop order); q_S (M, 3, 3) their raw Gaia covariances
@@ -113,7 +113,7 @@ def build_gp_v3(cal, center, extent_deg, star_ra, star_dec, star_G, star_sol, q_
     sources' amplitudes, Wc (3, 3nz) at the centre for G = 19 5p, fitc (N, 3, 3), q_loo_mean, q_loo_var_s, ...).
     """
     from .qso_prep import inducing_points    # VENDOR NOTE: pop_fit imports gp_sys.inducing_points (vendored verbatim there)
-    zra, zde = inducing_points(center[0], center[1], extent_deg, n_rings=n_rings)
+    zra, zde = inducing_points(center[0], center[1], extent_deg, n_rings=n_rings) if z_points is None else z_points   # VENDOR NOTE: z_points (bp3m: grid pruned to the image footprints, large mosaics)
     uZ = _unit(zra, zde); nz = len(zra)
     uq = _unit(q_ra, q_dec)
     if len(uq) > max_qso:                                        # nearest QSOs to the centre

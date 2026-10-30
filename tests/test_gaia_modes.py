@@ -32,7 +32,7 @@ def _setup(tmp_path, n=120, nq=160, seed=5):
 
 def test_build_modes_synthetic(tmp_path):
     fp, an, qp, mq, c, G = _setup(tmp_path)
-    out = GMo.build_modes([fp], [an], qp, mq, c, 0.42, tmp_path / 'm.npz', chunk=50, verbose=False)
+    out = GMo.build_modes([fp], [an], qp, mq, c, 0.42, tmp_path / 'm.npz', chunk=50, verbose=False)     # 3 chunks: projection path
     z = np.load(out); meta = json.loads(str(z['meta']))
     N = len(G); K = z['W'].shape[2]
     assert z['M'].shape == (N, 3) and z['R'].shape == (N, 3, 3) and z['W'].shape[:2] == (N, 3) and K == meta['K']
@@ -40,15 +40,16 @@ def test_build_modes_synthetic(tmp_path):
     assert int(G.source_id[0]) in set(z['qso_excluded'])                      # a QSO that is a field source too
     assert meta['qso']['n_excluded_in_sample'] >= 1 and meta['trace_fraction'] >= 0.999
     assert (np.linalg.eigvalsh(z['R']).min(axis=1) > -1e-12).all()            # R is a covariance
-    # W W^T + R reproduces the full projected field covariance W3 C_Z W3^T + FITC at each source
-    cal = GV3.load(str(GMo.KERNEL))
-    q = pd.read_csv(qp); ra, de, res, S, Gq, sol, exc, st = GMo.prepare_qsos(qp, mq, set(pd.read_csv(an).source_id) | set(G.source_id), c)
-    g = GV3.build_gp_v3(cal, c, max(0.3, 0.42), G.ra.values, G.dec.values, G.gmag.values, G.astrometric_params_solved.values, ra, de, res, S, Gq, sol,
-                        n_rings=meta['n_rings'], max_qso=GMo.MAX_QSO)
+    # W W^T + R reproduces the full projected field covariance W3 C_Z W3^T + FITC at each source, and M = W3 m_Z, against ONE
+    # build_gp_v3 call on all sources with the same inducing points and conditioning QSOs (chunked projection == direct)
+    cal = GV3.load(str(GMo.KERNEL)); li = GMo.build_modes.last_inputs; qra, qde, res, S, Gq, sol = li['q']
+    g = GV3.build_gp_v3(cal, li['center'], 0.3, G.ra.values, G.dec.values, G.gmag.values, G.astrometric_params_solved.values,
+                        qra, qde, res, S, Gq, sol, max_qso=len(qra) + 1, z_points=li['z_points'])
     full = np.einsum('nia,ab,njb->nij', g['W3'], g['L_Z'] @ g['L_Z'].T, g['W3']) + g['fitc']
     recon = np.einsum('nik,njk->nij', z['W'], z['W']) + z['R']
     assert np.allclose(recon, full, rtol=1e-6, atol=1e-12)
-    assert np.allclose(z['M'], g['W3'] @ g['m_Z'], rtol=1e-10, atol=1e-14)
+    assert np.allclose(z['M'], g['W3'] @ g['m_Z'], rtol=1e-9, atol=1e-14)
+    assert len(z['z_ra']) == meta['n_inducing'] and meta['chunk'] == 50
 
 
 def test_in_footprints_padding():

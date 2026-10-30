@@ -25,37 +25,69 @@ from .gaia_sys import gaia_v3 as GV3, qso_prep as QP
 from .gaia_corrected import KERNEL, QSOSYS, SHA256, check_inputs, _sha, OUT_DIR
 
 QSO_RADIUS_DEG, QSO_GMAX, MAX_QSO, TRACE_FRAC = 5.0, 21.0, 1500, 0.999
+SPACING_DEG, KEEP_DEG, QSO_NEAR_DEG, MAX_QSO_TOTAL = 0.13, 0.26, 5.0, 3000   # inducing lattice / its reach; conditioning QSOs
+MQ_MATCH_ARCSEC = 1.5      # = gaia_sys.qso_prep.crossmatch_milliquas default used by prepare_qsos (MILLIQUAS-first QSO download)
+MAX_3NZ, MAX_CHUNK_BYTES = 9000, 4e8                                         # memory guards (grid size; per-chunk arrays)
 QSO_QUERY_COLS = ('g.source_id, g.ra, g.dec, g.pmra, g.pmdec, g.pmra_error, g.pmdec_error, g.pmra_pmdec_corr, g.parallax, '
                   'g.parallax_error, g.parallax_pmra_corr, g.parallax_pmdec_corr, g.phot_g_mean_mag, g.phot_g_mean_flux, '
                   'g.phot_g_mean_flux_error, g.phot_bp_mean_mag, g.phot_rp_mean_mag, g.ruwe, g.nu_eff_used_in_astrometry, '
                   'g.pseudocolour, g.ecl_lat, g.astrometric_params_solved')
-MODES_VERSION = 2       # 2: sources inside the image footprints + padding (10-29)
+MODES_VERSION = 3       # 2: sources inside the image footprints + padding; 3: pruned grid, QSOs near the sources (10-29)
 
 
-def qso_sample_path(gaia_dir, stem):
-    return Path(gaia_dir) / f'{stem}_qsocond_r{QSO_RADIUS_DEG:.1f}_G{QSO_GMAX:.1f}.csv'
+def qso_sample_path(gaia_dir, stem, radius_deg=QSO_RADIUS_DEG):
+    return Path(gaia_dir) / f'{stem}_qsocond_r{radius_deg:.1f}_G{QSO_GMAX:.1f}.csv'
 
 
-def download_qso_sample(gaia_dir, stem, ra, dec, gaia_tap_server=None) -> Path:
-    """Gaia DR3 QSO candidates (pop_fit production cuts) within QSO_RADIUS_DEG; cached with a verified sidecar."""
+def download_qso_sample(gaia_dir, stem, ra, dec, gaia_tap_server=None, radius_deg=QSO_RADIUS_DEG, milliquas_path=None) -> Path:
+    """Gaia DR3 QSO candidates (pop_fit production cuts) within radius_deg; cached with a verified sidecar.
+    With milliquas_path (10-29, mosaics): MILLIQUAS-FIRST - the MILLIQUAS objects in the cone are uploaded and only Gaia QSO candidates
+    within MQ_MATCH_ARCSEC of one are returned.  prepare_qsos keeps exactly those (it cross-matches to MILLIQUAS at the same radius),
+    so the conditioning sample is identical while the query no longer scans every candidate of a large cone (LMC / 47 Tuc / COSMOS
+    cones failed: the archive dropped the async result after > 1 h).  Without it: the original cone query."""
     from .pipeline.download_gaia import _submit_gaia_async
-    out = qso_sample_path(gaia_dir, stem); side = Path(str(out) + '.json')
+    mode = 'milliquas_upload' if milliquas_path is not None else 'cone'
+    out = qso_sample_path(gaia_dir, stem, radius_deg)
+    if mode == 'milliquas_upload':
+        out = out.with_name(out.stem + '_mq.csv')
+    side = Path(str(out) + '.json')
     if out.exists() and side.exists():
         m = json.loads(side.read_text())
-        if m.get('sha256') == _sha(out) and m.get('row_count_verified') and m.get('columns') == QSO_QUERY_COLS:
+        if m.get('sha256') == _sha(out) and m.get('row_count_verified') and m.get('columns') == QSO_QUERY_COLS and m.get('mode', 'cone') == mode:
             return out
-    where = (f"CONTAINS(POINT('ICRS', g.ra, g.dec), CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {QSO_RADIUS_DEG:.6f})) = 1 "
-             f"AND g.astrometric_params_solved >= 31 AND g.pmra IS NOT NULL AND g.pmdec IS NOT NULL AND g.parallax IS NOT NULL "
-             f"AND g.ruwe < 1.4 AND g.ipd_gof_harmonic_amplitude < 0.2 AND g.phot_g_mean_mag < {QSO_GMAX:.2f}")
-    frm = 'FROM gaiadr3.gaia_source AS g JOIN gaiadr3.qso_candidates AS q ON q.source_id = g.source_id'
-    df = _submit_gaia_async(f'SELECT {QSO_QUERY_COLS} {frm} WHERE {where}', gaia_tap_server)
-    n = int(_submit_gaia_async(f'SELECT COUNT(*) AS n {frm} WHERE {where}', gaia_tap_server).iloc[0, 0])
-    df.columns = [c.lower() for c in df.columns]
+    cuts = (f"g.astrometric_params_solved >= 31 AND g.pmra IS NOT NULL AND g.pmdec IS NOT NULL AND g.parallax IS NOT NULL "
+            f"AND g.ruwe < 1.4 AND g.ipd_gof_harmonic_amplitude < 0.2 AND g.phot_g_mean_mag < {QSO_GMAX:.2f}")
+    cone = f"CONTAINS(POINT('ICRS', g.ra, g.dec), CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius_deg:.6f})) = 1"
+    meta = {}
+    if mode == 'cone':
+        where = f'{cone} AND {cuts}'
+        frm = 'FROM gaiadr3.gaia_source AS g JOIN gaiadr3.qso_candidates AS q ON q.source_id = g.source_id'
+        df = _submit_gaia_async(f'SELECT {QSO_QUERY_COLS} {frm} WHERE {where}', gaia_tap_server)
+        n = int(_submit_gaia_async(f'SELECT COUNT(*) AS n {frm} WHERE {where}', gaia_tap_server).iloc[0, 0])
+        df.columns = [c.lower() for c in df.columns]
+    else:
+        from astropy.io import fits
+        from astropy.table import Table
+        if not Path(milliquas_path).exists():
+            raise SystemExit(f'MILLIQUAS catalogue not found ({milliquas_path})')
+        with fits.open(milliquas_path) as h:
+            mra = h[1].data['RA'].astype(np.float64); mde = h[1].data['DEC'].astype(np.float64)
+        c = _unit([ra], [dec])[0]; pad = MQ_MATCH_ARCSEC / 3600.0
+        sel = np.degrees(np.arccos(np.clip(_unit(mra, mde) @ c, -1, 1))) < radius_deg + pad
+        up = Path(str(out) + '.upload.xml'); Table(dict(mq_id=np.nonzero(sel)[0].astype(np.int64), ra=mra[sel], dec=mde[sel])).write(up, format='votable', overwrite=True)
+        frm = (f"FROM tap_upload.mq AS u JOIN gaiadr3.gaia_source AS g ON 1 = CONTAINS(POINT('ICRS', g.ra, g.dec), "
+               f"CIRCLE('ICRS', u.ra, u.dec, {MQ_MATCH_ARCSEC / 3600.0:.8f})) JOIN gaiadr3.qso_candidates AS q ON q.source_id = g.source_id")
+        where = f'{cone} AND {cuts}'
+        df = _submit_gaia_async(f'SELECT DISTINCT {QSO_QUERY_COLS} {frm} WHERE {where}', gaia_tap_server, upload_resource=str(up), upload_table_name='mq')
+        n = int(_submit_gaia_async(f'SELECT COUNT(DISTINCT g.source_id) AS n {frm} WHERE {where}', gaia_tap_server,
+                                   upload_resource=str(up), upload_table_name='mq').iloc[0, 0])
+        df.columns = [c_.lower() for c_ in df.columns]
+        meta = dict(n_milliquas_uploaded=int(sel.sum()), match_arcsec=MQ_MATCH_ARCSEC); up.unlink()
     if len(df) != n or df.source_id.duplicated().any():
         raise SystemExit(f'QSO sample: {len(df)} rows vs COUNT(*) {n} (or duplicates)')
     df['source_id'] = df.source_id.astype(np.int64)
     tmp = Path(str(out) + '.tmp'); df.to_csv(tmp, index=False); tmp.replace(out)
-    side.write_text(json.dumps({'ra': ra, 'dec': dec, 'radius_deg': QSO_RADIUS_DEG, 'gmax': QSO_GMAX, 'where': where,
+    side.write_text(json.dumps({'ra': ra, 'dec': dec, 'radius_deg': radius_deg, 'gmax': QSO_GMAX, 'where': where, 'mode': mode, **meta,
                                 'columns': QSO_QUERY_COLS, 'n_rows': len(df), 'row_count_verified': True, 'sha256': _sha(out),
                                 'created': datetime.datetime.now().isoformat(timespec='seconds')}, indent=1))
     return out
@@ -94,15 +126,28 @@ def prepare_qsos(qso_csv, milliquas_path, exclude_ids, center):
     return q.ra.to_numpy(float), q.dec.to_numpy(float), resid, S, q.gmag.to_numpy(float), sol, excluded_in_sample, stats
 
 
-def image_footprints(image_files):
+def image_footprints(image_files, cache_path=None):
     """Sky polygons (deg) of every science extension of the given HST (_fl?) / JWST (_cal) images, from the header WCS.  Used
     ONLY to select which Gaia sources get a field term (the padding absorbs WCS pointing errors); never for positions."""
     from astropy.io import fits
     from astropy.wcs import WCS
     import warnings
-    polys = []
+    import os
+    cache = {}
+    if cache_path is not None and Path(cache_path).exists():
+        try:
+            cache = json.loads(Path(cache_path).read_text())
+        except Exception:
+            cache = {}
+    polys, new = [], 0
     drop = ('CPDIS', 'DP1', 'DP2', 'D2IM', 'CPERR', 'NPOLEXT', 'D2IMEXT', 'D2IMERR', 'WCSDVARR')
     for f in image_files:
+        st = os.stat(f); key = Path(f).name; tag = [st.st_size, int(st.st_mtime)]
+        hit = cache.get(key)
+        if hit is not None and hit.get('tag') == tag:                      # 10-29: one header read per image, ever (mosaics:
+            polys += [np.asarray(q, float) for q in hit['polys']]          # 5,000-14,000 images on a loaded RAID, ~0.35 s each)
+            continue
+        mine = []
         with fits.open(f, memmap=True, lazy_load_hdus=True) as h:
             for e in h:                                  # headers only: the lookup-table distortions (read from the data) are
                 hd = e.header                            # irrelevant for a selection footprint and cost a minute per field
@@ -112,41 +157,90 @@ def image_footprints(image_files):
                         del hc[k]
                     with warnings.catch_warnings():
                         warnings.simplefilter('ignore')
-                        polys.append(WCS(hc).calc_footprint(axes=(hd['NAXIS1'], hd['NAXIS2'])))
+                        mine.append(WCS(hc).calc_footprint(axes=(hd['NAXIS1'], hd['NAXIS2'])))
+        polys += mine; new += 1
+        cache[key] = {'tag': tag, 'polys': [q.tolist() for q in mine]}
+    if cache_path is not None and new:
+        tmp = Path(str(cache_path) + '.tmp'); tmp.write_text(json.dumps(cache)); tmp.replace(cache_path)
     if not polys:
         raise SystemExit('field modes: no science-extension footprints in the image list')
     return polys
 
 
 def in_footprints(ra, dec, polys, pad_arcsec):
-    """True for sources inside any footprint polygon or within pad_arcsec of its edges (tangent plane per polygon)."""
+    """True for sources inside any footprint polygon or within pad_arcsec of its edges (tangent plane per polygon).  Sources are
+    swept in declination so each polygon only tests its own band (47 Tuc: 8,800 polygons x 3 M Gaia rows)."""
     ra = np.asarray(ra, float); dec = np.asarray(dec, float); keep = np.zeros(len(ra), bool); pad = pad_arcsec / 3600.0
+    order = np.argsort(dec); ds = dec[order]
     for P in polys:
+        i0, i1 = np.searchsorted(ds, P[:, 1].min() - pad - 1e-6), np.searchsorted(ds, P[:, 1].max() + pad + 1e-6, 'right')
+        if i1 <= i0:
+            continue
+        idx = order[i0:i1]; idx = idx[~keep[idx]]
         c0, d0 = np.mean(P[:, 0]), np.mean(P[:, 1]); cd = np.cos(np.radians(d0))
         px = ((P[:, 0] - c0 + 180) % 360 - 180) * cd; py = P[:, 1] - d0
-        x = ((ra - c0 + 180) % 360 - 180) * cd; y = dec - d0
-        near = (np.abs(x) < np.ptp(px) + pad + 0.05) & (np.abs(y) < np.ptp(py) + pad + 0.05) & ~keep
-        if not near.any():
+        xs = ((ra[idx] - c0 + 180) % 360 - 180) * cd; ys = dec[idx] - d0
+        m = (xs > px.min() - pad - 1e-6) & (xs < px.max() + pad + 1e-6)
+        idx, xs, ys = idx[m], xs[m], ys[m]
+        if not len(idx):
             continue
-        xs, ys = x[near], y[near]; inside = np.zeros(len(xs), bool); dmin = np.full(len(xs), np.inf)
+        inside = np.zeros(len(xs), bool); dmin = np.full(len(xs), np.inf)
         for k in range(len(px)):
             x1, y1, x2, y2 = px[k], py[k], px[(k + 1) % len(px)], py[(k + 1) % len(px)]
-            cr = ((y1 > ys) != (y2 > ys)) & (xs < (x2 - x1) * (ys - y1) / (y2 - y1 + 1e-300) + x1)
-            inside ^= cr
+            inside ^= ((y1 > ys) != (y2 > ys)) & (xs < (x2 - x1) * (ys - y1) / (y2 - y1 + 1e-300) + x1)
             t = np.clip(((xs - x1) * (x2 - x1) + (ys - y1) * (y2 - y1)) / max((x2 - x1) ** 2 + (y2 - y1) ** 2, 1e-300), 0, 1)
             dmin = np.minimum(dmin, np.hypot(xs - (x1 + t * (x2 - x1)), ys - (y1 + t * (y2 - y1))))
-        keep[np.where(near)[0][inside | (dmin <= pad)]] = True
+        keep[idx[inside | (dmin <= pad)]] = True
     return keep
 
 
+def _unit(ra, dec):
+    r, d = np.radians(np.asarray(ra, float)), np.radians(np.asarray(dec, float))
+    return np.column_stack([np.cos(d) * np.cos(r), np.cos(d) * np.sin(r), np.sin(d)])
+
+
+def pruned_grid(ra, dec, center, spacing=SPACING_DEG, keep=KEEP_DEG):
+    """Hexagonal inducing lattice (spacing deg) kept only within `keep` deg of a selected source: the cost follows the covered
+    area, not the bounding box of a mosaic.  RA spacing uses each row's own cos(dec)."""
+    from scipy.spatial import cKDTree
+    c0, d0 = float(center[0]), float(center[1])
+    y = np.asarray(dec, float) - d0; x = ((np.asarray(ra, float) - c0 + 180) % 360 - 180) * np.cos(np.radians(np.asarray(dec, float)))
+    rows = np.arange(y.min() - keep, y.max() + keep + 1e-9, spacing * np.sqrt(3) / 2)
+    zr, zd = [], []
+    for j, yy in enumerate(rows):
+        xs = np.arange(x.min() - keep, x.max() + keep + 1e-9, spacing) + (spacing / 2 if j % 2 else 0.0)
+        dd = d0 + yy; zr.append(c0 + xs / max(np.cos(np.radians(dd)), 1e-3)); zd.append(np.full(len(xs), dd))
+    zr, zd = np.concatenate(zr) % 360, np.concatenate(zd)
+    ok = np.abs(zd) < 89.9
+    zr, zd = zr[ok], zd[ok]
+    dist, _ = cKDTree(_unit(ra, dec)).query(_unit(zr, zd), distance_upper_bound=2 * np.sin(np.radians(keep) / 2))
+    m = np.isfinite(dist)
+    return zr[m], zd[m]
+
+
+def _project(cal, zra, zde, LZZ, ra, dec, G, sol):
+    """W3 (n, 3, 3nz) and the FITC remainder (n, 3, 3) of build_gp_v3's projection for any stars, given its K_ZZ Cholesky (the
+    conditioning is done once; asserted equal to build_gp_v3 on the first chunk)."""
+    uZ = _unit(zra, zde); us = _unit(ra, dec); N = len(us); nz = len(uZ)
+    a = GV3.amplitude(cal, G, sol)
+    KxZ = GV3.smooth_cov(cal, us, uZ).reshape(3 * N, 3 * nz)
+    Wu = np.linalg.solve(LZZ.T, np.linalg.solve(LZZ, KxZ.T)).T
+    Kxx = np.repeat((cal['B_mid_pop'] + cal['B_large_pop'])[None], N, 0)
+    Q = np.einsum('nia,nja->nij', KxZ.reshape(N, 3, 3 * nz), Wu.reshape(N, 3, 3 * nz))
+    return Wu.reshape(N, 3, 3 * nz) * a[:, :, None], (Kxx - Q) * a[:, :, None] * a[:, None, :]
+
+
 def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_diag_deg, out_npz, model='v3real2p',
-                chunk=4000, verbose=True, footprints=None, pad_arcsec=None) -> Path:
-    """Field-mode npz for the Gaia sources (with a PM) of the field table(s)."""
+                verbose=True, footprints=None, pad_arcsec=None, chunk=None) -> Path:
+    """Field-mode npz for the Gaia sources (with a PM) of the field table(s), restricted to the image footprints when given."""
+    import time
+    from scipy.spatial import cKDTree
+    t0 = time.time()
     check_inputs()
     cal = GV3.load(str(KERNEL))
     G = pd.concat([pd.read_csv(f, dtype={'source_id': 'int64'}, usecols=['source_id', 'ra', 'dec', 'gmag', 'pmra', 'pseudocolour',
                                                                         'astrometric_params_solved']) for f in field_csvs])
-    G = G.drop_duplicates('source_id').reset_index(drop=True)
+    G = G.drop_duplicates('source_id')
     G = G[G.pmra.notna() & G.astrometric_params_solved.isin([31, 95])].reset_index(drop=True)
     n_table = len(G)
     if footprints is not None:
@@ -155,62 +249,74 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
         G = G[in_footprints(G.ra.values, G.dec.values, footprints, pad_arcsec)].reset_index(drop=True)
         if len(G) == 0:
             raise SystemExit('field modes: no Gaia source inside the image footprints')
-        cd = np.cos(np.radians(G.dec.mean()))
         center = np.array([G.ra.mean() + ((G.ra - G.ra.mean() + 180) % 360 - 180).mean(), G.dec.mean()])   # wrap-safe mean
-        half_diag_deg = float(np.max(np.hypot(((G.ra - center[0] + 180) % 360 - 180) * cd, G.dec - center[1]))) + 0.01
+    sol = G.astrometric_params_solved.to_numpy(); Gm = G.gmag.to_numpy(float)
+    ra, dec = G.ra.to_numpy(float), G.dec.to_numpy(float); N = len(G)
     anc_ids = set()
     for a in anchors_csvs:
         anc_ids |= set(pd.read_csv(a, usecols=['source_id'], dtype={'source_id': 'int64'}).source_id.astype(int))
-    field_ids = set(G.source_id.astype(int))
-    q_ra, q_dec, q_res, q_S, q_G, q_sol, exc_in_sample, qst = prepare_qsos(qso_csv, milliquas_path, anc_ids | field_ids, center)
-    extent = max(0.3, float(half_diag_deg)); n_rings = max(3, int(math.ceil(extent / 0.13)))
-    sol = G.astrometric_params_solved.to_numpy(); Gm = G.gmag.to_numpy(float)
-    ra, dec = G.ra.to_numpy(float), G.dec.to_numpy(float)
-    N = len(G)
-    # pass 1: accumulate A^T A over star chunks (A = W3 L_Z); the QSO conditioning is identical in every call
-    AtA, M, fitc, gp0 = None, np.zeros((N, 3)), np.zeros((N, 3, 3)), None
+    q_ra, q_dec, q_res, q_S, q_G, q_sol, exc_in_sample, qst = prepare_qsos(qso_csv, milliquas_path, anc_ids | set(G.source_id.astype(int)), center)
+    # conditioning QSOs: within QSO_NEAR_DEG of a selected source, the MAX_QSO_TOTAL nearest (each field patch keeps its own)
+    dq, _ = cKDTree(_unit(ra, dec)).query(_unit(q_ra, q_dec))
+    dq = np.degrees(2 * np.arcsin(np.clip(dq / 2, 0, 1)))
+    sel = np.where(dq <= QSO_NEAR_DEG)[0]; sel = sel[np.argsort(dq[sel])][:MAX_QSO_TOTAL]
+    q_ra, q_dec, q_res, q_S, q_G, q_sol = q_ra[sel], q_dec[sel], q_res[sel], q_S[sel], q_G[sel], q_sol[sel]
+    qst.update(n_near=int((dq <= QSO_NEAR_DEG).sum()), n_used=len(sel))
+    if len(sel) == 0:
+        raise SystemExit(f'field modes: no conditioning QSO within {QSO_NEAR_DEG} deg of the field')
+    sp = SPACING_DEG
+    while True:                                                     # inducing grid; spacing widened only if the grid is too big
+        zra, zde = pruned_grid(ra, dec, center, spacing=sp)
+        if 3 * len(zra) <= MAX_3NZ:
+            break
+        sp *= 1.25
+    if len(zra) < 7:
+        zra, zde = QP.inducing_points(center[0], center[1], 0.3, n_rings=3)
+    nz3 = 3 * len(zra)
+    chunk = int(chunk or max(200, min(20000, MAX_CHUNK_BYTES // (nz3 * 3 * 8 * 4))))
+    gp0 = GV3.build_gp_v3(cal, center, 0.3, ra[:chunk], dec[:chunk], Gm[:chunk], sol[:chunk], q_ra, q_dec, q_res, q_S, q_G, q_sol,
+                          max_qso=len(q_ra) + 1, z_points=(zra, zde))
+    W3c, fc = _project(cal, zra, zde, gp0['LZZ'], ra[:chunk], dec[:chunk], Gm[:chunk], sol[:chunk])
+    if not (np.allclose(W3c, gp0['W3'], rtol=1e-9, atol=1e-15) and np.allclose(fc, gp0['fitc'], rtol=1e-9, atol=1e-15)):
+        raise SystemExit('field modes: chunk projection differs from build_gp_v3')
+    t_cond = time.time() - t0
+    # pass 1: accumulate A^T A (A = W3 L_Z), M and the FITC part of R chunk by chunk (projection only; conditioning done once)
+    LZ = gp0['L_Z']; AtA = np.zeros((nz3, nz3)); M = np.zeros((N, 3)); R = np.zeros((N, 3, 3))
     for s in range(0, N, chunk):
         sl = slice(s, min(N, s + chunk))
-        g = GV3.build_gp_v3(cal, center, extent, ra[sl], dec[sl], Gm[sl], sol[sl], q_ra, q_dec, q_res, q_S, q_G, q_sol,
-                            n_rings=n_rings, max_qso=MAX_QSO)
-        if gp0 is None:
-            gp0 = g; g_first = g
-        elif not (np.allclose(g['m_Z'], gp0['m_Z'], rtol=1e-10, atol=1e-14) and np.allclose(g['L_Z'], gp0['L_Z'], rtol=1e-10, atol=1e-14)):
-            raise SystemExit('field modes: the QSO conditioning differs between chunks')
-        A = (g['W3'] @ gp0['L_Z']).reshape(-1, gp0['L_Z'].shape[1])
-        AtA = A.T @ A if AtA is None else AtA + A.T @ A
-        M[sl] = g['W3'] @ gp0['m_Z']; fitc[sl] = g['fitc']
+        W3, f = (gp0['W3'], gp0['fitc']) if s == 0 else _project(cal, zra, zde, gp0['LZZ'], ra[sl], dec[sl], Gm[sl], sol[sl])
+        A = (W3 @ LZ).reshape(-1, nz3); AtA += A.T @ A; M[sl] = W3 @ gp0['m_Z']; R[sl] = f
     w, V = np.linalg.eigh(AtA); o = np.argsort(w)[::-1]; w, V = np.clip(w[o], 0, None), V[:, o]
     K = int(np.searchsorted(np.cumsum(w) / w.sum(), TRACE_FRAC) + 1)
-    # pass 2: loadings of the K modes and the dropped modes' per-source remainder
-    W = np.zeros((N, 3, K)); R = fitc.copy()
-    for s in range(0, N, chunk):
+    W = np.zeros((N, 3, K))
+    for s in range(0, N, chunk):                                     # pass 2: the K loadings + dropped modes' per-source part
         sl = slice(s, min(N, s + chunk))
-        g = g_first if N <= chunk else GV3.build_gp_v3(cal, center, extent, ra[sl], dec[sl], Gm[sl], sol[sl], q_ra, q_dec, q_res,
-                                                       q_S, q_G, q_sol, n_rings=n_rings, max_qso=MAX_QSO)   # one chunk: reuse pass 1
-        A3 = g['W3'] @ gp0['L_Z']                                       # (n, 3, 3nz)
-        Wf = A3 @ V                                                      # all modes
-        W[sl] = Wf[:, :, :K]
-        R[sl] += np.einsum('nik,njk->nij', Wf[:, :, K:], Wf[:, :, K:])
+        W3, _ = (gp0['W3'], None) if s == 0 else _project(cal, zra, zde, gp0['LZZ'], ra[sl], dec[sl], Gm[sl], sol[sl])
+        Wf = (W3 @ LZ) @ V
+        W[sl] = Wf[:, :, :K]; R[sl] += np.einsum('nik,njk->nij', Wf[:, :, K:], Wf[:, :, K:])
     out_npz = Path(out_npz); out_npz.parent.mkdir(parents=True, exist_ok=True)
     qso_excluded = np.array(sorted(anc_ids | (set(exc_in_sample))), dtype=np.int64)
     meta = dict(model=model, modes_version=MODES_VERSION, calibration=KERNEL.name, sha256_calibration=SHA256[KERNEL.name],
-                center=list(map(float, center)), extent_deg=extent, n_rings=n_rings, n_inducing=int(gp0['n_z']), K=K,
-                trace_fraction=float(np.cumsum(w)[K - 1] / w.sum()), n_sources=N, n_table_sources=n_table,
-                footprint_pad_arcsec=pad_arcsec, n_footprints=None if footprints is None else len(footprints), qso=qst, n_qso_used=int(gp0['n_qso']),
+                center=list(map(float, center)), inducing_spacing_deg=sp, inducing_keep_deg=KEEP_DEG, n_inducing=len(zra), K=K,
+                trace_fraction=float(np.cumsum(w)[K - 1] / w.sum()), n_sources=N, n_table_sources=n_table, chunk=chunk,
+                footprint_pad_arcsec=pad_arcsec, n_footprints=None if footprints is None else len(footprints), qso=qst,
+                qso_near_deg=QSO_NEAR_DEG, n_qso_used=int(gp0['n_qso']),
                 post_mean_center=[float(x) for x in gp0['post_mean_center']], post_sd_center=[float(x) for x in gp0['post_sd_center']],
                 field_csvs=[Path(f).name for f in field_csvs], sha256_field_csvs=[_sha(f) for f in field_csvs],
                 anchors=[Path(a).name for a in anchors_csvs], qso_sample=Path(qso_csv).name, sha256_qso_sample=_sha(qso_csv),
                 milliquas_sha256=_sha(milliquas_path), code={p.name: _sha(p) for p in (Path(__file__), Path(GV3.__file__), Path(QP.__file__))},
+                seconds_conditioning=round(t_cond, 1), seconds_total=round(time.time() - t0, 1),
                 created=datetime.datetime.now().isoformat(timespec='seconds'))
+    build_modes.last_inputs = dict(center=center, z_points=(zra, zde), q=(q_ra, q_dec, q_res, q_S, q_G, q_sol))   # tests
     np.savez(out_npz, source_id=G.source_id.to_numpy(np.int64), M=M, W=W, R=R, qso_excluded=qso_excluded, model=np.array(model),
+             z_ra=zra, z_dec=zde,
              calibration=np.array(KERNEL.name), sha256_calibration=np.array(SHA256[KERNEL.name]), created=np.array(meta['created']),
              meta=np.array(json.dumps(meta)))
     Path(str(out_npz) + '.json').write_text(json.dumps(meta, indent=1))
     if verbose:
-        print(f'  field modes {out_npz.name}: N {N:,}, QSOs {qst} -> {gp0["n_qso"]} used; extent {extent:.2f} deg, {n_rings} rings, '
-              f'{gp0["n_z"]} inducing points; K = {K} modes ({meta["trace_fraction"]:.4f} of the trace); post. mean at the centre '
-              f'{np.round(1e3 * gp0["post_mean_center"], 2)} uas(/yr) +- {np.round(1e3 * gp0["post_sd_center"], 2)}')
+        print(f'  field modes {out_npz.name}: N {N:,} (of {n_table:,}); QSOs {qst}; {len(zra)} inducing points (spacing {sp:.3f} deg); '
+              f'K = {K} ({meta["trace_fraction"]:.4f} of the trace); {meta["seconds_total"]:.0f} s; centre field '
+              f'{np.round(1e3 * gp0["post_mean_center"], 2)} +- {np.round(1e3 * gp0["post_sd_center"], 2)} uas(/yr)', flush=True)
     return out_npz
 
 
@@ -230,8 +336,13 @@ def ensure_modes(field_csvs, model_copies, centre, half_diag_deg, model, lib_dir
             raise SystemExit(f'{p.name}: expected one anchors file for model {model}, found {hits}')
         anc += hits
     mq = find_qso_catalogs(Path(lib_dir) if lib_dir else None).get('milliquas')
-    qp = download_qso_sample(gdir, stem, float(centre[0]), float(centre[1]), gaia_tap_server)
-    polys = image_footprints(image_files) if image_files else None
+    polys = image_footprints(image_files, cache_path=gdir / f'{stem}_image_footprints.json') if image_files else None
+    r_q = QSO_RADIUS_DEG                                            # QSO cone: must reach QSO_NEAR_DEG beyond every footprint
+    if polys:
+        V = np.concatenate(polys); c = _unit([centre[0]], [centre[1]])[0]
+        far = float(np.degrees(np.arccos(np.clip(_unit(V[:, 0], V[:, 1]) @ c, -1, 1))).max())
+        r_q = max(QSO_RADIUS_DEG, round(far + QSO_NEAR_DEG + 0.05, 1))
+    qp = download_qso_sample(gdir, stem, float(centre[0]), float(centre[1]), gaia_tap_server, radius_deg=r_q, milliquas_path=mq)   # MILLIQUAS-first (10-29)
     import hashlib
     fp_key = (hashlib.sha256(np.round(np.concatenate([p.ravel() for p in polys]), 7).tobytes()).hexdigest()[:16] if polys else 'full-table')
     out = model_copies[0].parent / f'{stem}_gaia_field_modes_{model}.npz'
