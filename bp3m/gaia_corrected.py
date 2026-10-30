@@ -14,14 +14,17 @@ Values (rows, order, NaN pattern of every column kept): star rows = pop_fit prod
 L21, 6p conditioning of ALL FIVE parameters, quality cuts with C* = missing colour, qso_sys) + the kernel's stars' parallax offset;
 rows of the sample passing the cuts take that preparation (value_source calib_sample), other star rows the same steps without the
 cuts (extended); catalog-matched QSO rows L21 + qso_sys only (qso); 2p rows untouched (none).
-Covariance (v3real2p*): PM / parallax block = kernel-v3 noise_cov of the conditioned block (n10 = 0 for QSO rows); positions
-scaled by f: 'gm' (default, user 10-29 interim) = per-star geometric mean of the v3 inflation of (pmra, pmdec, parallax),
-f = (k_pmra k_pmdec k_plx)^(1/3), k = sigma_v3 / sigma_conditioned; 'fab' = Fabricius 1.05 (5p) / 1.22 (6p) as the reference
-build.  Full 5x5 = B C5c B^T, B = blockdiag(f I2, L_new L_c^-1): PD by construction, PM / parallax block exactly the v3 model.
+Covariance (v3real2p*): PM / parallax block = kernel-v3 noise_cov of the conditioned block (n10 = 0 for QSO rows; no extra PM
+floor: the Gaia PM systematics are the v3 terms, user 10-29); positions scaled by f: 'hst' (default, user 10-29 evening) = k_pos
+(G, 5p/6p) measured from HST multi-epoch residuals with the PM block fixed to v3 (data/gaia_sys/kpos_hst.json), plus a position
+floor c_pos (mas, per solution type) added in quadrature to the RA* and Dec variances; 'gm' (the 10-29 interim, model
+v3real2p_gm) = per-star geometric mean of the v3 inflation of (pmra, pmdec, parallax), f = (k_pmra k_pmdec k_plx)^(1/3),
+k = sigma_v3 / sigma_conditioned; 'fab' = Fabricius 1.05 (5p) / 1.22 (6p) as the reference build.  Full 5x5 = B C5c B^T
+(+ floor), B = blockdiag(f I2, L_new L_c^-1): PD by construction, PM / parallax block exactly the v3 model.
 corrvals: the same values with the published errors / correlations (arm A', inflated by bp3m as usual).
 Outputs go to Gaia/corrected_bp3m/ (never over the reference fixtures in Gaia/corrected/):
-  <stem>_gaiacorr_<model>.csv + .json, <anchor stem>_qso_anchors_<model>.csv + .json, models v3real2p (positions 'gm'),
-  v3real2p_fab, v3real2p_mc (median-centred conditioning, positions 'gm'), corrvals.
+  <stem>_gaiacorr_<model>.csv + .json, <anchor stem>_qso_anchors_<model>.csv + .json, models v3real2p (positions 'hst'),
+  v3real2p_gm (interim positions), v3real2p_fab, v3real2p_mc (median-centred conditioning, positions 'hst'), corrvals.
 Missing inputs are hard errors (no fallback)."""
 from __future__ import annotations
 import datetime, hashlib, json, math
@@ -35,15 +38,17 @@ from .gaia_sys import gaia_v3 as GV3
 DATA = Path(__file__).resolve().parent / 'data' / 'gaia_sys'
 KERNEL = DATA / 'gaia_dr3_kernel_v3_real2p.json'
 QSOSYS = DATA / 'qso_sys_model_dr3.npz'
+KPOS = DATA / 'kpos_hst.json'      # measured Gaia position scaling + floor (science_census/gaia_model_dev/kpos_1029, stage 3c)
 SHA256 = {KERNEL.name: '30a5aa238a52c8f8e9e30716bc4229dd9c21c1013042b85b13fe233c0dd8b302',
           QSOSYS.name: '5a6477c1e45c63e180feb1a896b0b3dcb6c09fab1e206475a437ed34f644c5ca'}
 MULT5, MULT6, FLOOR_PM, FLOOR_PLX, SIGMA_CUT = 1.05, 1.22, 0.026, 0.011, 3.0      # bp3m GAIA_SYS_DICT, qso_vetting
 QSO_CORR = ['l21_zp', 'qso_sys']
 STAR_CORR = ['l21_zp', '6p_pseudocolour', 'qso_sys', 'v3_star_zp']
-MODELS = {'v3real2p': ('mp', 'gm', 'v3_noise_cov'), 'v3real2p_fab': ('mp', 'fab', 'v3_noise_cov'),
-          'v3real2p_mc': ('mc', 'gm', 'v3_noise_cov'), 'corrvals': ('mp', None, 'published')}
+MODELS = {'v3real2p': ('mp', 'hst', 'v3_noise_cov'), 'v3real2p_gm': ('mp', 'gm', 'v3_noise_cov'),
+          'v3real2p_fab': ('mp', 'fab', 'v3_noise_cov'), 'v3real2p_mc': ('mc', 'hst', 'v3_noise_cov'),
+          'corrvals': ('mp', None, 'published')}
 OUT_DIR = 'corrected_bp3m'
-BUILD_VERSION = 2       # 2: C*-masked 6p rows restore the position block with the PM block
+BUILD_VERSION = 3       # 2: C*-masked 6p rows restore the position block with the PM block; 3: positions 'hst' (measured k_pos + floor)
 P5, ASTRO = P.P5, P.ASTRO
 POS_COLS = ['ra_error', 'dec_error', 'ra_dec_corr', 'ra_parallax_corr', 'ra_pmra_corr', 'ra_pmdec_corr', 'dec_parallax_corr',
             'dec_pmra_corr', 'dec_pmdec_corr']
@@ -138,7 +143,25 @@ def download_conditioning_sample(gaia_dir, stem: str, ra: float, dec: float, rad
 
 
 # -- builder -------------------------------------------------------------------------------------------------------------
-def _position_factor(kind: str, C5c, S_new, sol):
+def kpos_table() -> dict:
+    """The measured position scaling (sha256 recorded in each sidecar).  Missing file = hard error."""
+    t = json.loads(KPOS.read_text())
+    if set(t['k_pos']) != {'31', '95'} or any(len(v) != len(t['g_edges']) + 1 for v in t['k_pos'].values()):
+        raise SystemExit(f'{KPOS.name}: malformed k_pos table')
+    return t
+
+
+def _position_floor(kind: str, sol):
+    """Additive position floor (mas) per row: 'hst' only."""
+    if kind != 'hst':
+        return None
+    t = kpos_table(); return np.where(sol == 95, t['c_pos_mas']['95'], t['c_pos_mas']['31'])
+
+
+def _position_factor(kind: str, C5c, S_new, sol, gmag=None):
+    if kind == 'hst':
+        t = kpos_table(); b = np.digitize(gmag, t['g_edges'])          # G bins: < e0, [e0, e1), ..., >= e_last
+        return np.where(sol == 95, np.asarray(t['k_pos']['95'])[b], np.asarray(t['k_pos']['31'])[b])
     if kind == 'fab':
         return np.where(sol == 95, MULT6, MULT5)
     if kind == 'gm':
@@ -240,9 +263,12 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
         out['value_source'] = src; out['n10'] = n10; out['gaia_model'] = model
         fpos = None
         if covname == 'v3_noise_cov':
-            fpos = _position_factor(pos, C5c[has], S_new[has], sol[has])
+            fpos = _position_factor(pos, C5c[has], S_new[has], sol[has], Gm[has])
             B = np.zeros((has.sum(), 5, 5)); B[:, 0, 0] = B[:, 1, 1] = fpos; B[:, 2:, 2:] = L
             C5v3 = B @ C5c[has] @ np.transpose(B, (0, 2, 1))
+            cpos = _position_floor(pos, sol[has])
+            if cpos is not None:                               # measured star-common position floor (RA*, Dec), mas
+                C5v3[:, 0, 0] += cpos ** 2; C5v3[:, 1, 1] += cpos ** 2
             if not np.allclose(C5v3[:, 2:, 2:], S_new[has], rtol=1e-8, atol=1e-14):
                 raise SystemExit('v3 block not reproduced')
             if not (np.linalg.eigvalsh(C5v3).min(axis=1) > 0).all():
@@ -255,6 +281,8 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
         meta = dict(model=model, builder='bp3m.gaia_corrected', build_version=BUILD_VERSION, corrections=(
                         STAR_CORR if mode == 'mp' else ['l21_zp', '6p_pseudocolour_mc', 'qso_sys', 'v3_star_zp']),
                     corrections_qso_rows=QSO_CORR, covariance=covname, position_inflation=pos,
+                    position_table=(dict(file=KPOS.name, sha256=_sha(KPOS), **{k: v for k, v in kpos_table().items() if k != 'provenance'})
+                                    if pos == 'hst' else None),
                     position_factor_median_5p_6p=(None if fpos is None else [float(np.median(fpos[sol[has] == 31])),
                                                                               float(np.median(fpos[sol[has] == 95]))]),
                     conditioned_parameters=P5, six_p_mode={'mp': 'exact per-bin weighted-mean preserving (r3b, 10-21)',

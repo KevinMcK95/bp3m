@@ -79,6 +79,11 @@ def test_build_synthetic(tmp_path):
             k = np.cbrt((C.pmra_error / F.pmra_error) * (C.pmdec_error / F.pmdec_error) * (C.parallax_error / F.parallax_error))
             f = C.ra_error / F.ra_error
             assert np.allclose(f[five], k[five], rtol=1e-9)                  # 5p rows are unconditioned: exact
+        if meta['position_inflation'] == 'hst':
+            # 5p rows: ra_error^2 = (k_pos(G) sigma_published)^2 + c_pos^2 with the table recorded in the sidecar
+            tb = meta['position_table']; b = np.digitize(F.gmag.values, tb['g_edges'])
+            k = np.asarray(tb['k_pos']['31'])[b]; c = tb['c_pos_mas']['31']
+            assert np.allclose(C.ra_error[five] ** 2, (k[five] * F.ra_error[five]) ** 2 + c ** 2, rtol=1e-9)
         if meta['position_inflation'] == 'fab':
             assert np.allclose((C.ra_error / F.ra_error)[five], 1.05, rtol=1e-9)
         if model == 'corrvals':

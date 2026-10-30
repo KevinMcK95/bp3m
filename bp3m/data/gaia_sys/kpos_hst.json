@@ -1,0 +1,33 @@
+{
+ "version": "hst_1029b",
+ "g_edges": [
+  18.0,
+  19.0,
+  20.0
+ ],
+ "k_pos": {
+  "31": [
+   1.0976,
+   0.8263,
+   1.2552,
+   1.1209
+  ],
+  "95": [
+   2.1599,
+   1.4812,
+   1.2032,
+   1.2067
+  ]
+ },
+ "c_pos_mas": {
+  "31": 0.1247,
+  "95": 0.1636
+ },
+ "provenance": {
+  "measured": "science_census/gaia_model_dev/kpos_1029/stage3c_fixedpm.py (2026-10-29), KPOS_CPM=0.025, clean sample (nearest HST neighbour >= 1\", RUWE < 1.1)",
+  "sample": "HST GDC hold-out fold 9 (non-science fields), v7dX residuals, 32,977 clean stars; PM block fixed to kernel v3 (no free PM floor; user 10-29)",
+  "bins": "G < 18 | 18-19 | 19-20 | >= 20 (the 20-21 value beyond 21); bright bins trade off against c_pos (total variance determined, k alone not)",
+  "sensitivity": "KPOS_CPM 0 / 0.05: k_pos at G >= 19 within 0.04; c_pos 0.136 / 0.107 (5p), 0.174 / 0.136 (6p)",
+  "caveats": "crowding / RUWE dependence not modelled (calibration GCs: k_pos ~2 with a neighbour < 0.5\"); c_pos may include HST-side star-common systematics (upper limit on the Gaia share)"
+ }
+}
