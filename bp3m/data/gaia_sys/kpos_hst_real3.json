@@ -1,0 +1,35 @@
+{
+ "version": "hst_1031_real3",
+ "kernel": "real3",
+ "g_edges": [
+  18.0,
+  19.0,
+  20.0
+ ],
+ "k_pos": {
+  "31": [
+   1.0,
+   1.0,
+   1.2986,
+   1.1333
+  ],
+  "95": [
+   1.907,
+   1.552,
+   1.2889,
+   1.2266
+  ]
+ },
+ "c_pos_mas": {
+  "31": 0.0868,
+  "95": 0.0754
+ },
+ "provenance": {
+  "measured": "science_census/gaia_model_dev/kpos_real3_1031/stage3d_real3.py (2026-10-31) -> kpos_real3_results_kmin1.csv",
+  "sample": "as kpos_hst.json (HST GDC hold-out fold 9, non-science, v7dX residuals, clean: nearest HST neighbour >= 1\", RUWE < 1.1)",
+  "pm_block": "per star: kernel-v3 real3 noise_cov of the published block with the all-source n10 (bp3m.gaia_n10, server-side), entering as B = blockdiag(k_pos I2, L) as in bp3m.gaia_corrected; field-mode marginal c_v3 = 0.034 mas/yr",
+  "bins": "G < 18 | 18-19 | 19-20 | >= 20",
+  "choice": "k_pos >= 1 (KPOS_KMIN=1; 10-31, provisional): unconstrained 5p G < 18 collapsed to k_pos = 0 (bright-bin k_pos / c_pos trade-off) which would zero the position-PM correlations; pull sd unchanged (1.002 vs 1.002); 6p unaffected",
+  "sensitivity": "c_v3 0 / 0.05: k_pos at G >= 19 within 0.03; crowding term exp(kappa log1p(n10/10)) not needed (5p kappa -0.22 [-0.40, -0.12] clean, -0.11 [-0.25, 0.03] RUWE < 1.4; 6p +0.04 / +0.06, intervals include 0)"
+ }
+}
