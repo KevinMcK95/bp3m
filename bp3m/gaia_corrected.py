@@ -145,6 +145,37 @@ def sample_path(gaia_dir: Path, stem: str, radius_deg: float) -> Path:
     return Path(gaia_dir) / f'{stem}_condsample_r{radius_deg:.4f}.csv'
 
 
+SYNC_TAP = 'https://gaia.ari.uni-heidelberg.de/tap'
+SYNC_TIMEOUT_S, SYNC_MIN_DG = 600, 0.05
+
+
+def _sync_query(q: str) -> pd.DataFrame:
+    """One synchronous TAP query on Heidelberg (row limit explicit; a result at a known limit is refused).  10-31: Heidelberg's
+    async queue stopped completing even 1k-row jobs while synchronous queries answered; the rows are the same either way."""
+    import pyvo
+    from .pipeline.download_gaia import _check_not_truncated, GAIA_MAXREC
+    t = pyvo.dal.TAPService(SYNC_TAP).run_sync(q, maxrec=GAIA_MAXREC, timeout=SYNC_TIMEOUT_S).to_table()
+    for c in t.colnames:                                   # masked -> NaN (as the async CSV path gives)
+        if hasattr(t[c], 'filled') and t[c].dtype.kind == 'f':
+            t[c] = t[c].filled(np.nan)
+    df = t.to_pandas()
+    _check_not_truncated(len(df))
+    return df
+
+
+def _sync_slices(where: str, lo, hi, depth=0) -> pd.DataFrame:
+    """G slice [lo, hi) synchronously; a slice that fails (server timeout) is split in two G halves, down to SYNC_MIN_DG mag."""
+    lo_ = 3.0 if lo is None else float(lo); hi_ = 23.5 if hi is None else float(hi)      # open ends: DR3 G range
+    gw = ' AND '.join(([f'phot_g_mean_mag >= {lo}'] if lo is not None else []) + ([f'phot_g_mean_mag < {hi}'] if hi is not None else []))
+    try:
+        return _sync_query(f'SELECT {SAMPLE_QUERY_COLS} FROM gaiadr3.gaia_source WHERE {where} AND {gw}')
+    except Exception as exc:                               # noqa: BLE001 - split, then hard error
+        if hi_ - lo_ < 2 * SYNC_MIN_DG or depth > 8:
+            raise RuntimeError(f'conditioning sample: G slice [{lo}, {hi}) failed and cannot be split further: {str(exc)[:200]}')
+        mid = round(0.5 * (lo_ + hi_), 3)
+        return pd.concat([_sync_slices(where, lo, mid, depth + 1), _sync_slices(where, mid, hi, depth + 1)], ignore_index=True)
+
+
 def download_conditioning_sample(gaia_dir, stem: str, ra: float, dec: float, radius_deg: float,
                                  gaia_tap_server: str | None = None) -> Path:
     """Gaia DR3 5p/6p sources (all G) in a cone, every column the preparation needs, in G slices (each checked against the TAP
@@ -158,15 +189,19 @@ def download_conditioning_sample(gaia_dir, stem: str, ra: float, dec: float, rad
             return out
     where = (f"CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius_deg:.6f})) = 1 "
              f"AND astrometric_params_solved >= 31")
+    sync = gaia_tap_server in (None, 'sync', SYNC_TAP)        # default: synchronous Heidelberg queries (10-31, see _sync_slices)
+    run = (lambda q: _sync_query(q)) if sync else (lambda q: _submit_gaia_async(q, gaia_tap_server))
     parts, counts = [], []
     for lo, hi in G_SLICES:
         if lo == 'null':
-            gw = 'phot_g_mean_mag IS NULL'
+            d = run(f"SELECT {SAMPLE_QUERY_COLS} FROM gaiadr3.gaia_source WHERE {where} AND phot_g_mean_mag IS NULL")
+        elif sync:
+            d = _sync_slices(where, lo, hi)
         else:
             gw = ' AND '.join(([f'phot_g_mean_mag >= {lo}'] if lo is not None else []) + ([f'phot_g_mean_mag < {hi}'] if hi is not None else []))
-        d = _submit_gaia_async(f'SELECT {SAMPLE_QUERY_COLS} FROM gaiadr3.gaia_source WHERE {where} AND {gw}', gaia_tap_server)
+            d = run(f'SELECT {SAMPLE_QUERY_COLS} FROM gaiadr3.gaia_source WHERE {where} AND {gw}')
         parts.append(d); counts.append(len(d))
-    n_tot = int(_submit_gaia_async(f'SELECT COUNT(*) AS n FROM gaiadr3.gaia_source WHERE {where}', gaia_tap_server).iloc[0, 0])
+    n_tot = int(run(f'SELECT COUNT(*) AS n FROM gaiadr3.gaia_source WHERE {where}').iloc[0, 0])
     df = pd.concat(parts, ignore_index=True)
     if len(df) != n_tot or df.source_id.duplicated().any():
         raise SystemExit(f'conditioning sample: {len(df)} rows from the G slices vs COUNT(*) {n_tot} (or duplicates)')
