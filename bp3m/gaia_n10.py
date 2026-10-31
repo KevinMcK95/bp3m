@@ -24,7 +24,7 @@ MIRRORS = {'heidelberg': ('https://gaia.ari.uni-heidelberg.de/tap', 'gaiadr3.gai
            'gavo': ('https://dc.g-vo.org/tap', 'gaia.dr3lite'),
            'esa': ('https://gea.esac.esa.int/tap-server/tap', 'gaiadr3.gaia_source')}
 RADIUS_ARCSEC = 10.0
-CHUNK = 50_000
+CHUNK = 2_000          # synchronous queries only: Heidelberg's async upload joins hung on 10-31 (sync 2k-source joins take ~1 s)
 NCHECK = 500
 BOUNDARY_MAS = 1.0
 DEFINITION = ('all other gaiadr3.gaia_source entries (any astrometric solution, any G) within 10 arcsec, server-side TAP '
@@ -46,8 +46,7 @@ def _run(sid, ra, dec, mirrors, retries=2):
             try:
                 svc = pyvo.dal.TAPService(url)
                 q = QUERY.format(tab=tab, r=RADIUS_ARCSEC / 3600.0)
-                r = (svc.run_sync(q, uploads={'t': tbl}, maxrec=10_000_000, timeout=600) if len(sid) <= 2000
-                     else svc.run_async(q, uploads={'t': tbl}, maxrec=10_000_000)).to_table().to_pandas()
+                r = svc.run_sync(q, uploads={'t': tbl}, maxrec=10_000_000, timeout=600).to_table().to_pandas()
                 r_id = r.source_id.to_numpy(np.int64)
                 if not np.isin(r_id, sid).all() or len(np.unique(r_id)) != len(r_id):
                     raise RuntimeError('unknown or repeated source_ids returned')
@@ -131,7 +130,7 @@ def ensure(out_dir, stem, sid, ra, dec, ref=None, verbose=True) -> tuple[pd.Seri
             sl = slice(i, i + CHUNK)
             n, m = _run(sid[sl], ra[sl], dec[sl], list(MIRRORS))
             pd.DataFrame({'source_id': sid[sl], 'n10_all': n, 'mirror': m}).to_parquet(p)
-            if verbose:
+            if verbose and (i // CHUNK) % 25 == 0:
                 print(f'    n10_all: {min(i + CHUNK, len(sid)):,}/{len(sid):,} sources ({m}, {time.time() - t0:.0f} s)', flush=True)
     C = pd.concat([pd.read_parquet(parts / f'part_{i // CHUNK:04d}.parquet') for i in range(0, len(sid), CHUNK)], ignore_index=True)
     if len(C) != len(sid) or not (C.source_id.to_numpy(np.int64) == sid).all():
