@@ -42,7 +42,7 @@ def test_build_modes_synthetic(tmp_path):
     assert (np.linalg.eigvalsh(z['R']).min(axis=1) > -1e-12).all()            # R is a covariance
     # W W^T + R reproduces the full projected field covariance W3 C_Z W3^T + FITC at each source, and M = W3 m_Z, against ONE
     # build_gp_v3 call on all sources with the same inducing points and conditioning QSOs (chunked projection == direct)
-    cal = GV3.load(str(GMo.KERNEL)); li = GMo.build_modes.last_inputs; qra, qde, res, S, Gq, sol = li['q']
+    cal = GV3.load(str(GMo.kernel_path(GMo.kernel_name('v3real2p')))); li = GMo.build_modes.last_inputs; qra, qde, res, S, Gq, sol = li['q']
     g = GV3.build_gp_v3(cal, li['center'], 0.3, G.ra.values, G.dec.values, G.gmag.values, G.astrometric_params_solved.values,
                         qra, qde, res, S, Gq, sol, max_qso=len(qra) + 1, z_points=li['z_points'])
     full = np.einsum('nia,ab,njb->nij', g['W3'], g['L_Z'] @ g['L_Z'].T, g['W3']) + g['fitc']

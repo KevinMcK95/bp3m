@@ -55,7 +55,7 @@ def _field(tmp_path, drop_col=None):
 def test_build_synthetic(tmp_path):
     fp, ap, sp, F, S, qso = _field(tmp_path)
     w = GC.build(fp, ap, sp, verbose=False)
-    cal = GV3.load(str(GC.KERNEL))
+    cal = GV3.load(str(GC.kernel_path("real2p")))
     for model, (cp, apath) in w.items():
         C = pd.read_csv(cp); meta = json.loads(open(str(cp) + '.json').read())
         assert (C.source_id.values == F.source_id.values).all()
@@ -103,3 +103,49 @@ def test_field_rows_must_be_in_the_sample(tmp_path):
     s = pd.read_csv(sp); s = s[~s.source_id.isin(F.source_id[F.astrometric_params_solved == 31].head(3))]; s.to_csv(sp, index=False)
     with pytest.raises(SystemExit):
         GC.build(fp, ap, sp, verbose=False)
+
+
+def _n10_counts(F, seed=5):
+    """Synthetic all-source counts for every 5p/6p row with a PM (2p neighbours make them larger than local 5p/6p counts)."""
+    r = np.random.default_rng(seed)
+    f = F[F.astrometric_params_solved.isin([31, 95]) & F.pmra.notna()]
+    return pd.Series(r.integers(0, 40, len(f)), index=f.source_id.to_numpy(np.int64))
+
+
+def test_real3_uses_all_source_counts(tmp_path):
+    """handoff 7 (10-31): a kernel with n10_sources = all takes the server-side counts (QSO rows 0), never the local 5p/6p count;
+    real2p tables are unchanged by building real3 next to them."""
+    fp, ap, sp, F, S, qso = _field(tmp_path)
+    n = _n10_counts(F); nf = tmp_path / 'T_n10all.parquet'; n.rename('n10_all').reset_index().to_parquet(nf)
+    w2 = GC.build(fp, ap, sp, models=['v3real2p_fab'], verbose=False, out_dir=tmp_path / 'a')
+    w = GC.build(fp, ap, sp, models=['v3real3_fab', 'v3real2p_fab'], verbose=False, n10_all=n, n10_file=nf, out_dir=tmp_path / 'b')
+    assert pd.read_csv(w2['v3real2p_fab'][0]).equals(pd.read_csv(w['v3real2p_fab'][0]))
+    C = pd.read_csv(w['v3real3_fab'][0]); meta = json.loads(open(str(w['v3real3_fab'][0]) + '.json').read())
+    assert meta['kernel'] == 'real3' and meta['calibration'] == 'gaia_dr3_kernel_v3_real3.json' and meta['n10_counts']['file'] == nf.name
+    star = C.value_source.isin(['calib_sample', 'extended']).to_numpy()
+    assert np.array_equal(C.n10[star].to_numpy(), n.loc[C.source_id[star]].to_numpy().astype(float))
+    assert (C.n10[C.value_source == 'qso'] == 0).all()
+    # 5p star rows are unconditioned: PM / parallax block = real3 noise_cov of the PUBLISHED block with these counts
+    cal = GC.load_kernel('real3')
+    five = ((C.astrometric_params_solved == 31) & C.value_source.isin(['calib_sample', 'extended'])).to_numpy()
+    want = GV3.noise_cov(cal, P.cov(F[five], P5)[:, 2:, 2:], F.gmag.values[five], C.n10.values[five], np.full(five.sum(), 31))
+    assert np.allclose(P.cov(C[five], P5)[:, 2:, 2:], want, rtol=1e-8, atol=1e-14)
+
+
+def test_real3_needs_counts_and_its_own_kpos(tmp_path):
+    fp, ap, sp, F, S, qso = _field(tmp_path)
+    with pytest.raises(SystemExit, match='all-source n10'):
+        GC.build(fp, ap, sp, models=['v3real3_fab'], verbose=False)
+    n = _n10_counts(F); nf = tmp_path / 'T_n10all.parquet'; n.rename('n10_all').reset_index().to_parquet(nf)
+    with pytest.raises(SystemExit, match='no all-source n10 count'):
+        GC.build(fp, ap, sp, models=['v3real3_fab'], verbose=False, n10_all=n.iloc[5:], n10_file=nf)
+    if not GC.kpos_path('real3').exists():
+        with pytest.raises(SystemExit, match='k_pos table for kernel real3'):
+            GC.build(fp, ap, sp, models=['v3real3'], verbose=False, n10_all=n, n10_file=nf)
+
+
+def test_kernel_n10_convention_guard(monkeypatch):
+    """A calibration whose n10_sources disagrees with the registry is a hard error (the silent 5p/6p-count trap)."""
+    k = dict(GC.KERNELS); k['real3'] = dict(k['real3'], n10='5p6p'); monkeypatch.setattr(GC, 'KERNELS', k)
+    with pytest.raises(SystemExit, match='n10_sources'):
+        GC.load_kernel('real3')

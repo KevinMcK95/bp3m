@@ -318,7 +318,9 @@ def field_modes(model=None) -> "FieldModes | None":
 # sha256, and the calibration file and its sha256.  Its QSO anchors are the sibling Gaia/corrected/*_qso_anchors_<model>.csv
 # whose sidecar names the same source CSV.
 V3_CALIBRATION = {'v3real2p': ('gaia_dr3_kernel_v3_real2p.json',
-                               '30a5aa238a52c8f8e9e30716bc4229dd9c21c1013042b85b13fe233c0dd8b302')}   # production kernel (pop_fit 10-29)
+                               '30a5aa238a52c8f8e9e30716bc4229dd9c21c1013042b85b13fe233c0dd8b302'),   # production kernel (pop_fit 10-29)
+                  'v3real3': ('gaia_dr3_kernel_v3_real3.json',
+                              'ed7faf38cb8f3c912025cc695535e035dd98370137ba1f68cdb3c286b2dfaf33')}    # all-source n10 (user 10-31)
 
 
 def _sidecar(path) -> dict:

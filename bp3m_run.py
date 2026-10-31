@@ -466,12 +466,13 @@ def _parse_args():
                          'bp3m-v2 and the pop fits inherit it.  The field sidecar keeps the canonical list.')
     bp.add_argument('--gaia_corrected', type=str, default=None,
                     help='Build (or reuse) and use the BP3M-native corrected Gaia table of this model for every stage '
-                         '(bp3m/gaia_corrected.py, handoff 3.4): v3real2p (kernel-v3 values + covariance AS GIVEN, positions x '
-                         'geometric mean of the v3 PM/parallax inflation), v3real2p_fab (positions x Fabricius), v3real2p_mc '
-                         '(median-centred 6p conditioning), corrvals (corrected values, published errors).  Downloads a '
-                         'conditioning sample around the field once; sets --gaia_model to the matching spec unless given.')
+                         '(bp3m/gaia_corrected.py, handoff 3.4 / 7): v3real3 (kernel-v3 real3 values + covariance AS GIVEN, all-source '
+                         'n10 counted server-side, positions x measured k_pos), v3real3_fab (positions x Fabricius), v3real3_mc '
+                         '(median-centred 6p conditioning); the real2p family v3real2p / _gm / _fab / _mc and corrvals '
+                         '(corrected values, published errors) for A/B.  Downloads a conditioning sample around the field '
+                         'once; sets --gaia_model to the matching spec unless given.')
     bp.add_argument('--gaia_field_modes', action='store_true',
-                    help='With --gaia_corrected v3real2p*: build (or reuse) the kernel-v3 Gaia field-mode file for the field '
+                    help='With --gaia_corrected v3real3* / v3real2p*: build (or reuse) the kernel-v3 Gaia field-mode file for the field '
                          '(bp3m/gaia_modes.py; QSO-conditioned, BP3M anchors excluded) and fit its K shared coefficients '
                          '(spec floor=modes;modes=<npz>, the per-star VB21 floor off).  Later stages inherit it.')
     bp.add_argument('--gaia_modes_pad_arcsec', type=float, default=20.0,
@@ -860,8 +861,10 @@ def main():
         from bp3m.gaia_corrected import default_spec as _gc_spec
         if getattr(args, 'gaia_model', None) is None:
             args.gaia_model = _gc_spec(args.gaia_corrected)       # validated against the table by check_model_copies
-    if getattr(args, 'gaia_field_modes', False) and not str(getattr(args, 'gaia_corrected', '') or '').startswith('v3real2p'):
-        raise SystemExit('--gaia_field_modes needs --gaia_corrected v3real2p* (the modes are conditioned in the v3 convention)')
+    if getattr(args, 'gaia_field_modes', False):
+        from bp3m.gaia_corrected import MODELS as _gc_models
+        if _gc_models.get(getattr(args, 'gaia_corrected', None) or '', (None,) * 4)[2] != 'v3_noise_cov':
+            raise SystemExit('--gaia_field_modes needs --gaia_corrected v3real3* / v3real2p* (the modes are conditioned in the v3 convention)')
     if getattr(args, 'gaia_model', None) is not None:
         from bp3m.gaia_model import GaiaModel, set_current
         _gm = GaiaModel.parse(args.gaia_model)

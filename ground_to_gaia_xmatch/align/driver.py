@@ -334,7 +334,8 @@ def run_joint(inst, field_root: Path, label='all', force=False,
               f'({info.get("n_images", "?")} images, {info.get("n_stars", "?")} '
               f'stars) — reusing.  Use --force to redo.')
         return joint_dir
-    records, gaia_parts, used_metas = [], [], []
+    records, used_metas = [], []
+    gaia_df = None
     n_prefiltered = 0
     for meta in select_images(field_root, inst.iter_images(),
                               select_radius, select_center):
@@ -350,17 +351,26 @@ def run_joint(inst, field_root: Path, label='all', force=False,
             # Gaia table per image before de-duplication -- 229 copies of 63k
             # rows on a Reticulum_II joint.  The merge is a whole-field
             # operation, so it happens once, below.
-            gaia_parts.append(_gaia(inst, meta))
+            # Exposures may carry different Gaia catalogues; pool and
+            # de-duplicate AS WE GO (first occurrence kept, in image order --
+            # the rows of concat + drop_duplicates).  Stacking every image's
+            # copy first ran dense LSST fields out of memory (10-31: NGC 6171
+            # / NGC 6144, 83-109M rows of one 2-deg field catalogue, 60 GB).
+            g = _gaia(inst, meta)
+            if gaia_df is None:
+                gaia_df = g.drop_duplicates('gaia_source_id')
+            else:
+                new = ~g['gaia_source_id'].isin(gaia_df['gaia_source_id'])
+                if new.any():
+                    gaia_df = pd.concat([gaia_df, g[new].drop_duplicates('gaia_source_id')], ignore_index=True)
+            del g
     if n_prefiltered:
         print(f'  {n_prefiltered} image(s) skipped at cross-match time '
               f'(too few sources/Gaia) — not retried')
     if not records:
         print('No usable images — nothing to solve.')
         return None
-    # Exposures may carry different Gaia catalogues; pool and de-duplicate.
-    gaia_df = (pd.concat(gaia_parts, ignore_index=True)
-                 .drop_duplicates('gaia_source_id')
-                 .reset_index(drop=True))
+    gaia_df = gaia_df.reset_index(drop=True)
     if use_delve:
         from ..delve import merge_delve
         gaia_df = merge_delve(gaia_df, field_root, used_metas,

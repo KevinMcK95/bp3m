@@ -80,6 +80,7 @@ class LSSTInstrument:
             self.config = CONFIG
         self._sources = None
         self._meta = None
+        self._gaia = None
 
     # ── table loading (cached) ───────────────────────────────────────────────
 
@@ -146,7 +147,10 @@ class LSSTInstrument:
         Returns the FULL catalogue.  No clean_label filter: clean_label derives
         from RUWE, which 2p sources lack, so filtering here would remove every
         one of them.  Quality enters downstream as a discovery seed mask only.
+        Read once and cached (one catalogue per field; callers do not modify it).
         """
+        if self._gaia is not None:
+            return self._gaia
         from ..layout import gaia_dir
         gdir = gaia_dir(self.field_root)
         hits = sorted(gdir.glob('*_gaia.csv')) if gdir.is_dir() else []
@@ -154,7 +158,8 @@ class LSSTInstrument:
             hits = sorted(self.field_root.glob('*_gaia.csv'))
         if not hits:
             raise FileNotFoundError(f'No *_gaia.csv in {gdir} or {self.field_root}')
-        return pd.read_csv(hits[0])
+        self._gaia = pd.read_csv(hits[0])
+        return self._gaia
 
     # ── Instrument protocol ──────────────────────────────────────────────────
 

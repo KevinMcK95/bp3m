@@ -36,19 +36,29 @@ from .gaia_sys import prep as P
 from .gaia_sys import gaia_v3 as GV3
 
 DATA = Path(__file__).resolve().parent / 'data' / 'gaia_sys'
-KERNEL = DATA / 'gaia_dr3_kernel_v3_real2p.json'
 QSOSYS = DATA / 'qso_sys_model_dr3.npz'
-KPOS = DATA / 'kpos_hst.json'      # measured Gaia position scaling + floor (science_census/gaia_model_dev/kpos_1029, stage 3c)
-SHA256 = {KERNEL.name: '30a5aa238a52c8f8e9e30716bc4229dd9c21c1013042b85b13fe233c0dd8b302',
+# Kernel-v3 calibrations (pop_fit owns them; handoff 3.2a / 7).  The n10 convention is a property of the calibration: the JSON's
+# "n10_sources" must equal it (guard against feeding 5p/6p counts to an all-source calibration: handoff 7, "the trap").
+# kpos = the measured Gaia position scaling + floor fitted with THAT kernel's PM block (handoff 7 item 6).
+KERNELS = {'real2p': dict(file='gaia_dr3_kernel_v3_real2p.json', n10='5p6p', kpos='kpos_hst.json',
+                          sha256='30a5aa238a52c8f8e9e30716bc4229dd9c21c1013042b85b13fe233c0dd8b302'),
+           'real3': dict(file='gaia_dr3_kernel_v3_real3.json', n10='all', kpos='kpos_hst_real3.json',
+                         sha256='ed7faf38cb8f3c912025cc695535e035dd98370137ba1f68cdb3c286b2dfaf33')}
+SHA256 = {**{k['file']: k['sha256'] for k in KERNELS.values()},
           QSOSYS.name: '5a6477c1e45c63e180feb1a896b0b3dcb6c09fab1e206475a437ed34f644c5ca'}
 MULT5, MULT6, FLOOR_PM, FLOOR_PLX, SIGMA_CUT = 1.05, 1.22, 0.026, 0.011, 3.0      # bp3m GAIA_SYS_DICT, qso_vetting
 QSO_CORR = ['l21_zp', 'qso_sys']
 STAR_CORR = ['l21_zp', '6p_pseudocolour', 'qso_sys', 'v3_star_zp']
-MODELS = {'v3real2p': ('mp', 'hst', 'v3_noise_cov'), 'v3real2p_gm': ('mp', 'gm', 'v3_noise_cov'),
-          'v3real2p_fab': ('mp', 'fab', 'v3_noise_cov'), 'v3real2p_mc': ('mc', 'hst', 'v3_noise_cov'),
-          'corrvals': ('mp', None, 'published')}
+# model -> (6p centring mode, position inflation, covariance, kernel).  Names are never reused across kernels (handoff 7 item 4).
+MODELS = {'v3real2p': ('mp', 'hst', 'v3_noise_cov', 'real2p'), 'v3real2p_gm': ('mp', 'gm', 'v3_noise_cov', 'real2p'),
+          'v3real2p_fab': ('mp', 'fab', 'v3_noise_cov', 'real2p'), 'v3real2p_mc': ('mc', 'hst', 'v3_noise_cov', 'real2p'),
+          'corrvals': ('mp', None, 'published', 'real2p'),
+          'v3real3': ('mp', 'hst', 'v3_noise_cov', 'real3'), 'v3real3_fab': ('mp', 'fab', 'v3_noise_cov', 'real3'),
+          'v3real3_mc': ('mc', 'hst', 'v3_noise_cov', 'real3')}
 OUT_DIR = 'corrected_bp3m'
-BUILD_VERSION = 3       # 2: C*-masked 6p rows restore the position block with the PM block; 3: positions 'hst' (measured k_pos + floor)
+N10_DIR = 'n10all'      # all-source n10 counts: Gaia/corrected_bp3m/n10all/<stem>_n10all.parquet (outside every Gaia-CSV pattern)
+BUILD_VERSION = 4       # 2: C*-masked 6p rows restore the position block with the PM block; 3: positions 'hst' (measured k_pos +
+                        # floor); 4: kernel per model (real3, all-source n10)
 P5, ASTRO = P.P5, P.ASTRO
 POS_COLS = ['ra_error', 'dec_error', 'ra_dec_corr', 'ra_parallax_corr', 'ra_pmra_corr', 'ra_pmdec_corr', 'dec_parallax_corr',
             'dec_pmra_corr', 'dec_pmdec_corr']
@@ -76,9 +86,36 @@ def _sha(p) -> str:
 
 def check_inputs():
     """The vendored model inputs must be the announced versions (hard error otherwise)."""
-    for p in (KERNEL, QSOSYS):
+    for p in [DATA / k['file'] for k in KERNELS.values()] + [QSOSYS]:
         if _sha(p) != SHA256[p.name]:
             raise SystemExit(f'{p}: sha256 differs from the announced {SHA256[p.name]} (re-vendor from pop_fit)')
+
+
+def kernel_name(model: str) -> str:
+    if model not in MODELS:
+        raise SystemExit(f'Gaia model {model!r}: one of {sorted(MODELS)}')
+    return MODELS[model][3]
+
+
+def kernel_path(kernel: str) -> Path:
+    return DATA / KERNELS[kernel]['file']
+
+
+def load_kernel(kernel: str) -> dict:
+    """The calibration of one kernel, its sha256 and its n10 convention checked (hard errors)."""
+    p = kernel_path(kernel)
+    if _sha(p) != KERNELS[kernel]['sha256']:
+        raise SystemExit(f'{p}: sha256 differs from the announced {KERNELS[kernel]["sha256"]} (re-vendor from pop_fit)')
+    cal = GV3.load(str(p))
+    if cal.get('n10_sources', '5p6p') != KERNELS[kernel]['n10']:
+        raise SystemExit(f'{p.name}: n10_sources {cal.get("n10_sources", "5p6p")!r} but KERNELS says {KERNELS[kernel]["n10"]!r}')
+    return cal
+
+
+def n10_convention(kernel: str) -> str:
+    from . import gaia_n10
+    return (gaia_n10.DEFINITION if KERNELS[kernel]['n10'] == 'all'
+            else '5p/6p sources of the conditioning sample within 10 arcsec')
 
 
 # -- conditioning sample -------------------------------------------------------------------------------------------------
@@ -142,25 +179,55 @@ def download_conditioning_sample(gaia_dir, stem: str, ra: float, dec: float, rad
     return out
 
 
+def _code_hashes() -> dict:
+    return {p.name: _sha(p) for p in [Path(__file__), Path(P.__file__), Path(GV3.__file__), Path(P.__file__).parent / 'qso_sys.py',
+                                      Path(__file__).parent / 'gaia_n10.py']}
+
+
+def ensure_n10_counts(field_csv, sample_csv, verbose=True):
+    """All-source n10 for every 5p/6p row with a PM of one field Gaia CSV (bp3m.gaia_n10; cached in Gaia/corrected_bp3m/n10all/).
+    Lower-bound report against the conditioning sample's own 5p/6p neighbours (every such row is in the sample)."""
+    from . import gaia_n10
+    field_csv = Path(field_csv)
+    G = pd.read_csv(field_csv, usecols=['source_id', 'ra', 'dec', 'pmra', 'astrometric_params_solved'], dtype={'source_id': 'int64'})
+    G = G[G.astrometric_params_solved.isin([31, 95]) & G.pmra.notna()]
+    S = pd.read_csv(sample_csv, usecols=['source_id', 'ra', 'dec', 'astrometric_params_solved'], dtype={'source_id': 'int64'})
+    S = S[S.astrometric_params_solved.isin([31, 95])]
+    self_in = G.source_id.isin(S.source_id).to_numpy()
+    return gaia_n10.ensure(field_csv.parent / OUT_DIR / N10_DIR, field_csv.name[:-4], G.source_id.to_numpy(np.int64),
+                           G.ra.to_numpy(float), G.dec.to_numpy(float), ref=(S.ra.to_numpy(float), S.dec.to_numpy(float), self_in),
+                           verbose=verbose)
+
+
 # -- builder -------------------------------------------------------------------------------------------------------------
-def kpos_table() -> dict:
-    """The measured position scaling (sha256 recorded in each sidecar).  Missing file = hard error."""
-    t = json.loads(KPOS.read_text())
+def kpos_path(kernel: str = 'real2p') -> Path:
+    return DATA / KERNELS[kernel]['kpos']
+
+
+def kpos_table(kernel: str = 'real2p') -> dict:
+    """The measured position scaling of one kernel (sha256 recorded in each sidecar).  Missing file = hard error: the k_pos fit
+    is kernel specific (PM block fixed to that kernel; handoff 7 item 6), never borrowed from another kernel."""
+    p = kpos_path(kernel)
+    if not p.exists():
+        raise SystemExit(f'{p.name}: the k_pos table for kernel {kernel} has not been measured yet (handoff 7 item 6)')
+    t = json.loads(p.read_text())
     if set(t['k_pos']) != {'31', '95'} or any(len(v) != len(t['g_edges']) + 1 for v in t['k_pos'].values()):
-        raise SystemExit(f'{KPOS.name}: malformed k_pos table')
+        raise SystemExit(f'{p.name}: malformed k_pos table')
+    if t.get('kernel', 'real2p') != kernel:
+        raise SystemExit(f'{p.name}: fitted with kernel {t.get("kernel", "real2p")}, not {kernel}')
     return t
 
 
-def _position_floor(kind: str, sol):
+def _position_floor(kind: str, sol, kernel: str = 'real2p'):
     """Additive position floor (mas) per row: 'hst' only."""
     if kind != 'hst':
         return None
-    t = kpos_table(); return np.where(sol == 95, t['c_pos_mas']['95'], t['c_pos_mas']['31'])
+    t = kpos_table(kernel); return np.where(sol == 95, t['c_pos_mas']['95'], t['c_pos_mas']['31'])
 
 
-def _position_factor(kind: str, C5c, S_new, sol, gmag=None):
+def _position_factor(kind: str, C5c, S_new, sol, gmag=None, kernel: str = 'real2p'):
     if kind == 'hst':
-        t = kpos_table(); b = np.digitize(gmag, t['g_edges'])          # G bins: < e0, [e0, e1), ..., >= e_last
+        t = kpos_table(kernel); b = np.digitize(gmag, t['g_edges'])          # G bins: < e0, [e0, e1), ..., >= e_last
         return np.where(sol == 95, np.asarray(t['k_pos']['95'])[b], np.asarray(t['k_pos']['31'])[b])
     if kind == 'fab':
         return np.where(sol == 95, MULT6, MULT5)
@@ -171,13 +238,17 @@ def _position_factor(kind: str, C5c, S_new, sol, gmag=None):
 
 
 def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_meta: dict | None = None,
-          verbose: bool = True) -> dict:
-    """Build the corrected tables for one field Gaia CSV.  Returns {model: (copy path, anchors path)}."""
+          verbose: bool = True, n10_all: pd.Series | None = None, n10_file=None) -> dict:
+    """Build the corrected tables for one field Gaia CSV.  Returns {model: (copy path, anchors path)}.
+    models default: the real2p family (the models that need no all-source counts).  A model whose kernel counts all sources
+    (real3) needs n10_all = the all-source counts by source_id for every non-QSO 5p/6p row (bp3m.gaia_n10; missing = hard error)
+    and n10_file = the counts file (provenance)."""
     check_inputs()
     field_csv, anchors_csv, sample_csv = Path(field_csv), Path(anchors_csv), Path(sample_csv)
     out_dir = Path(out_dir) if out_dir else field_csv.parent / OUT_DIR
-    models = models or list(MODELS)
-    cal = GV3.load(str(KERNEL))
+    models = models or [m for m in MODELS if MODELS[m][3] == 'real2p']
+    kernels = sorted({kernel_name(m) for m in models})
+    cals = {k: load_kernel(k) for k in kernels}
     G0 = pd.read_csv(field_csv, dtype={'source_id': 'int64'}, low_memory=False)
     if not (G0.source_id.is_unique and (G0.source_id % 128 == 0).all()):
         raise SystemExit(f'{field_csv.name}: source_id integrity')
@@ -228,48 +299,64 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
         raise SystemExit(f'{field_csv.name}: rows missing from the uncut pass')
     src = np.where(is_q, 'qso', np.where(in_a, 'calib_sample', np.where(in_b, 'extended', 'none')))
     Gm = G0.gmag.to_numpy(float)
-    zp = np.zeros(len(G0)); star = has & ~is_q; zp[star] = GV3.zp_star(cal, Gm[star])
-    n10 = np.zeros(len(G0))
-    n10[has] = GV3.count_n10(G0.ra.to_numpy(float)[has], G0.dec.to_numpy(float)[has], base.ra.to_numpy(float),
-                             base.dec.to_numpy(float), cal['n10_radius_arcsec'])
-    n10[is_q] = 0.0
-    X, C5c = {}, None
+    star = has & ~is_q
+    X0, C5c = {}, None
     for mode in modes:
         Xm = np.full((len(G0), 5), np.nan); Cm = np.full((len(G0), 5, 5), np.nan)
         for m, T in ((in_a, vals[mode][0]), (in_b, vals[mode][1]), (is_q, Q)):
             t = T.loc[sid[m]]
             Xm[m] = t[P5].to_numpy(float); Cm[m] = P.cov(t, P5)
-        Xm[:, 4] -= zp
-        X[mode] = Xm
+        X0[mode] = Xm
         if C5c is None:
             C5c = Cm
         elif not np.allclose(Cm[has], C5c[has], rtol=1e-10, atol=1e-15):
             raise SystemExit(f'{field_csv.name}: conditioned covariance depends on the centring mode')
-    S_new = np.full((len(G0), 3, 3), np.nan)
-    S_new[has] = GV3.noise_cov(cal, C5c[has, 2:, 2:], Gm[has], n10[has], sol[has])
-    L = np.linalg.cholesky(S_new[has]) @ np.linalg.inv(np.linalg.cholesky(C5c[has, 2:, 2:]))
+    # per kernel: stars' parallax offset, n10 in the kernel's convention, noise covariance
+    X, n10, S_new, L = {}, {}, {}, {}
+    for k in kernels:
+        cal = cals[k]
+        zp = np.zeros(len(G0)); zp[star] = GV3.zp_star(cal, Gm[star])
+        for mode in modes:
+            X[mode, k] = X0[mode].copy(); X[mode, k][:, 4] -= zp
+        n = np.zeros(len(G0))
+        if KERNELS[k]['n10'] == 'all':
+            if n10_all is None or n10_file is None:
+                raise SystemExit(f'{field_csv.name}: kernel {k} needs the all-source n10 counts (bp3m.gaia_n10)')
+            miss = ~np.isin(sid[star], n10_all.index.to_numpy(np.int64))
+            if miss.any():
+                raise SystemExit(f'{field_csv.name}: {int(miss.sum())} 5p/6p star rows have no all-source n10 count')
+            n[star] = n10_all.loc[sid[star]].to_numpy(float)
+        else:
+            n[has] = GV3.count_n10(G0.ra.to_numpy(float)[has], G0.dec.to_numpy(float)[has], base.ra.to_numpy(float),
+                                   base.dec.to_numpy(float), cal['n10_radius_arcsec'])
+        n[is_q] = 0.0
+        n10[k] = n
+        S = np.full((len(G0), 3, 3), np.nan)
+        S[has] = GV3.noise_cov(cal, C5c[has, 2:, 2:], Gm[has], n[has], sol[has]); S_new[k] = S
+        L[k] = np.linalg.cholesky(S[has]) @ np.linalg.inv(np.linalg.cholesky(C5c[has, 2:, 2:]))
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = field_csv.name[:-4]
-    code = {p.name: _sha(p) for p in [Path(__file__), Path(P.__file__), Path(GV3.__file__), Path(P.__file__).parent / 'qso_sys.py']}
+    code = _code_hashes()
     created = datetime.datetime.now().isoformat(timespec='seconds')
     written = {}
     for model in models:
-        mode, pos, covname = MODELS[model]
+        mode, pos, covname, kern = MODELS[model]
+        Xk, Sk, Lk, kfile = X[mode, kern], S_new[kern], L[kern], kernel_path(kern)
         out = G0.copy()
         for j, c in enumerate(P5):
             out[f'{c}_orig'] = G0[c]
-            out[c] = out[c].astype('float64'); out.loc[has, c] = X[mode][has, j]
+            out[c] = out[c].astype('float64'); out.loc[has, c] = Xk[has, j]
         out['v3_domain'] = np.isin(sid, list(dom_ids)) & has
-        out['value_source'] = src; out['n10'] = n10; out['gaia_model'] = model
+        out['value_source'] = src; out['n10'] = n10[kern]; out['gaia_model'] = model
         fpos = None
         if covname == 'v3_noise_cov':
-            fpos = _position_factor(pos, C5c[has], S_new[has], sol[has], Gm[has])
-            B = np.zeros((has.sum(), 5, 5)); B[:, 0, 0] = B[:, 1, 1] = fpos; B[:, 2:, 2:] = L
+            fpos = _position_factor(pos, C5c[has], Sk[has], sol[has], Gm[has], kern)
+            B = np.zeros((has.sum(), 5, 5)); B[:, 0, 0] = B[:, 1, 1] = fpos; B[:, 2:, 2:] = Lk
             C5v3 = B @ C5c[has] @ np.transpose(B, (0, 2, 1))
-            cpos = _position_floor(pos, sol[has])
+            cpos = _position_floor(pos, sol[has], kern)
             if cpos is not None:                               # measured star-common position floor (RA*, Dec), mas
                 C5v3[:, 0, 0] += cpos ** 2; C5v3[:, 1, 1] += cpos ** 2
-            if not np.allclose(C5v3[:, 2:, 2:], S_new[has], rtol=1e-8, atol=1e-14):
+            if not np.allclose(C5v3[:, 2:, 2:], Sk[has], rtol=1e-8, atol=1e-14):
                 raise SystemExit('v3 block not reproduced')
             if not (np.linalg.eigvalsh(C5v3).min(axis=1) > 0).all():
                 raise SystemExit(f'{field_csv.name}: non-PD covariance')
@@ -281,16 +368,17 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
         meta = dict(model=model, builder='bp3m.gaia_corrected', build_version=BUILD_VERSION, corrections=(
                         STAR_CORR if mode == 'mp' else ['l21_zp', '6p_pseudocolour_mc', 'qso_sys', 'v3_star_zp']),
                     corrections_qso_rows=QSO_CORR, covariance=covname, position_inflation=pos,
-                    position_table=(dict(file=KPOS.name, sha256=_sha(KPOS), **{k: v for k, v in kpos_table().items() if k != 'provenance'})
+                    position_table=(dict(file=kpos_path(kern).name, sha256=_sha(kpos_path(kern)), **{k: v for k, v in kpos_table(kern).items() if k != 'provenance'})
                                     if pos == 'hst' else None),
                     position_factor_median_5p_6p=(None if fpos is None else [float(np.median(fpos[sol[has] == 31])),
                                                                               float(np.median(fpos[sol[has] == 95]))]),
                     conditioned_parameters=P5, six_p_mode={'mp': 'exact per-bin weighted-mean preserving (r3b, 10-21)',
                                                            'mc': 'median-centred (the 10-16 kernel-calibration inputs)'}[mode],
-                    six_p_stats=stats[mode], n10_convention='5p/6p sources of the conditioning sample within 10 arcsec',
+                    six_p_stats=stats[mode], kernel=kern, n10_convention=n10_convention(kern),
+                    n10_counts=(None if KERNELS[kern]['n10'] != 'all' else dict(file=Path(n10_file).name, sha256=_sha(n10_file))),
                     source_csv=field_csv.name, sha256_source_csv=_sha(field_csv),
                     conditioning_sample=sample_csv.name, sha256_conditioning_sample=_sha(sample_csv), conditioning_sample_meta=sample_meta,
-                    calibration=KERNEL.name, sha256_calibration=SHA256[KERNEL.name], qso_sys=QSOSYS.name,
+                    calibration=kfile.name, sha256_calibration=SHA256[kfile.name], qso_sys=QSOSYS.name,
                     sha256_qso_sys=SHA256[QSOSYS.name], code=code, qso_rows='catalog_match in ' + anchors_csv.name,
                     counts={s_: int((src == s_).sum()) for s_ in ('calib_sample', 'extended', 'qso', 'none')},
                     n_v3_domain=int(out.v3_domain.sum()), created=created)
@@ -298,12 +386,12 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
         # anchors: astrometric test on this model's values and covariance
         a = A.copy(); m = a.source_id.isin(sid[has]).to_numpy()
         r = pd.Series(np.arange(len(G0)), index=sid).loc[a.source_id[m]].to_numpy()
-        Cq = (S_new[r] if covname == 'v3_noise_cov' else
+        Cq = (Sk[r] if covname == 'v3_noise_cov' else
               P.cov(G0.iloc[r], ASTRO) * np.where(sol[r] == 95, MULT6, MULT5)[:, None, None]**2
               + np.diag([FLOOR_PM**2, FLOOR_PM**2, FLOOR_PLX**2]))
         from .pipeline.secular_aberration import secular_aberration_pm
         ab = np.column_stack(secular_aberration_pm(G0.ra.to_numpy(float)[r], G0.dec.to_numpy(float)[r])) / 1e3
-        d = X[mode][r, 2:] - np.column_stack([ab, np.zeros(len(r))])
+        d = Xk[r, 2:] - np.column_stack([ab, np.zeros(len(r))])
         mah = np.sqrt(np.einsum('ni,nij,nj->n', d, np.linalg.inv(Cq), d))
         a['has_5p_solution'] = m
         a['chi2_astrometric'] = np.nan; a.loc[m, 'chi2_astrometric'] = mah
@@ -315,8 +403,8 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
             model=model, builder='bp3m.gaia_corrected', corrections=QSO_CORR,
             covariance=covname + (' (n10 = 0)' if covname != 'published' else ' x Fabricius + VB21 floor'),
             source_anchors=anchors_csv.name, sha256_source_anchors=_sha(anchors_csv), dropped_not_in_gaia_csv=dropped_ids,
-            sigma_cut=SIGMA_CUT, source_csv=field_csv.name, sha256_source_csv=_sha(field_csv), calibration=KERNEL.name,
-            sha256_calibration=SHA256[KERNEL.name], code=code, created=created), indent=1))
+            sigma_cut=SIGMA_CUT, source_csv=field_csv.name, sha256_source_csv=_sha(field_csv), calibration=kfile.name,
+            sha256_calibration=SHA256[kfile.name], code=code, created=created), indent=1))
         written[model] = (p, pa)
         if verbose:
             print(f'  {model}: anchors {int(A.is_qso_anchor.sum())} -> {int(a.is_qso_anchor.sum())}; rows {meta["counts"]}; '
@@ -328,8 +416,7 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
 def default_spec(model: str) -> str:
     """Gaia-model spec that consumes a table: v3 covariances AS GIVEN without the VB21 floor (field modes add floor=modes);
     corrvals keeps bp3m's Fabricius + VB21 inflation (arm A').  All carry L21 (the table has it; never applied twice)."""
-    if model not in MODELS:
-        raise SystemExit(f'--gaia_corrected {model!r}: one of {sorted(MODELS)}')
+    kernel_name(model)
     return 'cov=fab_scalar;floor=diag;zp=l21' if MODELS[model][2] == 'published' else 'cov=as_given;floor=none;zp=l21'
 
 
@@ -366,14 +453,17 @@ def ensure_field(field_csv, anchors_csv, ra: float, dec: float, width: float, he
     sp = download_conditioning_sample(gdir, stem, ra, dec, r, gaia_tap_server)
     out = gdir / OUT_DIR / f'{field_csv.name[:-4]}_gaiacorr_{model}.csv'
     side = Path(str(out) + '.json')
-    code = {p.name: _sha(p) for p in [Path(__file__), Path(P.__file__), Path(GV3.__file__), Path(P.__file__).parent / 'qso_sys.py']}
+    code = _code_hashes()
+    n10, n10_file = (ensure_n10_counts(field_csv, sp) if KERNELS[kernel_name(model)]['n10'] == 'all' else (None, None))
     if out.exists() and side.exists():
         m = json.loads(side.read_text())
         if (m.get('build_version') == BUILD_VERSION and m.get('sha256_source_csv') == _sha(field_csv)
                 and m.get('sha256_conditioning_sample') == _sha(sp) and m.get('code') == code
+                and (m.get('n10_counts') or {}).get('sha256') == (None if n10_file is None else _sha(n10_file))
                 and json.loads(Path(str(gdir / OUT_DIR / f'{anchors_csv.name[:-4]}_{model}.csv') + '.json').read_text()).get(
                     'sha256_source_anchors') == _sha(anchors_csv)):
             return out
     meta = json.loads(Path(str(sp) + '.json').read_text())
-    w = build(field_csv, anchors_csv, sp, sample_meta={k: meta[k] for k in ('ra', 'dec', 'radius_deg', 'n_rows')})
+    w = build(field_csv, anchors_csv, sp, models=[model], sample_meta={k: meta[k] for k in ('ra', 'dec', 'radius_deg', 'n_rows')},
+              n10_all=n10, n10_file=n10_file)
     return w[model][0]

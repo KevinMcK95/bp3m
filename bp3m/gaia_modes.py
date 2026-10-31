@@ -1,4 +1,4 @@
-"""BP3M-native Gaia field-mode files (handoff GAIA_SYSTEMATICS_BP3M_HANDOFF.md 3.2 / 3.2a / 3.4): the kernel-v3 (real2p)
+"""BP3M-native Gaia field-mode files (handoff GAIA_SYSTEMATICS_BP3M_HANDOFF.md 3.2 / 3.2a / 3.4 / 7): the kernel-v3 (the model's kernel)
 smooth field term f ~ GP(0, B_mid / (1 + theta/theta_mid) + B_large exp(-theta/theta_large)) with per-source amplitudes
 a(G, 5p/6p), conditioned on the target's QSOs, projected to every Gaia source of the field:
     v_meas,i = v_true,i + M_i + W_i z + e_i,   z ~ N(0, I_K),   e_i ~ N(0, C_star,i + R_i)     (pmra, pmdec, parallax)
@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .gaia_sys import gaia_v3 as GV3, qso_prep as QP
-from .gaia_corrected import KERNEL, QSOSYS, SHA256, check_inputs, _sha, OUT_DIR
+from .gaia_corrected import QSOSYS, SHA256, check_inputs, _sha, OUT_DIR, kernel_name, kernel_path, load_kernel
 
 QSO_RADIUS_DEG, QSO_GMAX, MAX_QSO, TRACE_FRAC = 5.0, 21.0, 1500, 0.999
 SPACING_DEG, KEEP_DEG, QSO_NEAR_DEG, MAX_QSO_TOTAL = 0.13, 0.26, 5.0, 3000   # inducing lattice / its reach; conditioning QSOs
@@ -260,7 +260,7 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
     from scipy.spatial import cKDTree
     t0 = time.time()
     check_inputs()
-    cal = GV3.load(str(KERNEL))
+    kfile = kernel_path(kernel_name(model)); cal = load_kernel(kernel_name(model))      # the model's own kernel (handoff 7 item 5)
     G = pd.concat([pd.read_csv(f, dtype={'source_id': 'int64'}, usecols=['source_id', 'ra', 'dec', 'gmag', 'pmra', 'pseudocolour',
                                                                         'astrometric_params_solved']) for f in field_csvs])
     G = G.drop_duplicates('source_id')
@@ -319,7 +319,7 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
         W[sl] = Wf[:, :, :K]; R[sl] += np.einsum('nik,njk->nij', Wf[:, :, K:], Wf[:, :, K:])
     out_npz = Path(out_npz); out_npz.parent.mkdir(parents=True, exist_ok=True)
     qso_excluded = np.array(sorted(anc_ids | (set(exc_in_sample))), dtype=np.int64)
-    meta = dict(model=model, modes_version=MODES_VERSION, calibration=KERNEL.name, sha256_calibration=SHA256[KERNEL.name],
+    meta = dict(model=model, modes_version=MODES_VERSION, calibration=kfile.name, sha256_calibration=SHA256[kfile.name],
                 center=list(map(float, center)), inducing_spacing_deg=sp, inducing_keep_deg=KEEP_DEG, n_inducing=len(zra), K=K,
                 trace_fraction=float(np.cumsum(w)[K - 1] / w.sum()), n_sources=N, n_table_sources=n_table, chunk=chunk,
                 footprint_pad_arcsec=pad_arcsec, n_footprints=None if footprints is None else len(footprints), footprints_dropped=int(footprints_dropped), qso=qst,
@@ -333,7 +333,7 @@ def build_modes(field_csvs, anchors_csvs, qso_csv, milliquas_path, center, half_
     build_modes.last_inputs = dict(center=center, z_points=(zra, zde), q=(q_ra, q_dec, q_res, q_S, q_G, q_sol))   # tests
     np.savez(out_npz, source_id=G.source_id.to_numpy(np.int64), M=M, W=W, R=R, qso_excluded=qso_excluded, model=np.array(model),
              z_ra=zra, z_dec=zde,
-             calibration=np.array(KERNEL.name), sha256_calibration=np.array(SHA256[KERNEL.name]), created=np.array(meta['created']),
+             calibration=np.array(kfile.name), sha256_calibration=np.array(SHA256[kfile.name]), created=np.array(meta['created']),
              meta=np.array(json.dumps(meta)))
     Path(str(out_npz) + '.json').write_text(json.dumps(meta, indent=1))
     if verbose:
