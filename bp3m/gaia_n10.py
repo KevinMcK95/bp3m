@@ -46,7 +46,10 @@ def _run(sid, ra, dec, mirrors, retries=2):
             try:
                 svc = pyvo.dal.TAPService(url)
                 q = QUERY.format(tab=tab, r=RADIUS_ARCSEC / 3600.0)
-                r = svc.run_sync(q, uploads={'t': tbl}, maxrec=10_000_000, timeout=600).to_table().to_pandas()
+                res = svc.run_sync(q, uploads={'t': tbl}, maxrec=10_000_000, timeout=600)
+                if res.query_status != 'OK':          # truncated: absent sources would silently read as 0 neighbours
+                    raise RuntimeError(f'result status {res.query_status}')
+                r = res.to_table().to_pandas()
                 r_id = r.source_id.to_numpy(np.int64)
                 if not np.isin(r_id, sid).all() or len(np.unique(r_id)) != len(r_id):
                     raise RuntimeError('unknown or repeated source_ids returned')

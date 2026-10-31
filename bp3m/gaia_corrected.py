@@ -150,17 +150,18 @@ SYNC_TIMEOUT_S, SYNC_MIN_DG = 600, 0.05
 
 
 def _sync_query(q: str) -> pd.DataFrame:
-    """One synchronous TAP query on Heidelberg (row limit explicit; a result at a known limit is refused).  10-31: Heidelberg's
+    """One synchronous TAP query on Heidelberg (row limit explicit; a result the server flags as truncated is refused).  10-31: Heidelberg's
     async queue stopped completing even 1k-row jobs while synchronous queries answered; the rows are the same either way."""
     import pyvo
-    from .pipeline.download_gaia import _check_not_truncated, GAIA_MAXREC
-    t = pyvo.dal.TAPService(SYNC_TAP).run_sync(q, maxrec=GAIA_MAXREC, timeout=SYNC_TIMEOUT_S).to_table()
+    from .pipeline.download_gaia import GAIA_MAXREC
+    res = pyvo.dal.TAPService(SYNC_TAP).run_sync(q, maxrec=GAIA_MAXREC, timeout=SYNC_TIMEOUT_S)
+    if res.query_status != 'OK':          # the server's own overflow flag (exact; the magic-number guard refused a true 2,000-row
+        raise RuntimeError(f'sync TAP result status {res.query_status} (truncated) for: {q[:160]}')    # slice in 47 Tuc, 10-31)
+    t = res.to_table()
     for c in t.colnames:                                   # masked -> NaN (as the async CSV path gives)
         if hasattr(t[c], 'filled') and t[c].dtype.kind == 'f':
             t[c] = t[c].filled(np.nan)
-    df = t.to_pandas()
-    _check_not_truncated(len(df))
-    return df
+    return t.to_pandas()
 
 
 def _sync_slices(where: str, lo, hi, depth=0) -> pd.DataFrame:
