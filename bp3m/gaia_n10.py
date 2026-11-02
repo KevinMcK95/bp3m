@@ -26,6 +26,7 @@ MIRRORS = {'heidelberg': ('https://gaia.ari.uni-heidelberg.de/tap', 'gaiadr3.gai
 RADIUS_ARCSEC = 10.0
 CHUNK = 2_000          # synchronous queries only: Heidelberg's async upload joins hung on 10-31 (sync 2k-source joins take ~1 s)
 NCHECK = 500
+CHECK_CHUNK = 100      # cross-check sources per synchronous job
 BOUNDARY_MAS = 1.0
 DEFINITION = ('all other gaiadr3.gaia_source entries (any astrometric solution, any G) within 10 arcsec, server-side TAP '
               'upload-join count (bp3m.gaia_n10); QSO rows n10 = 0')
@@ -140,10 +141,15 @@ def ensure(out_dir, stem, sid, ra, dec, ref=None, verbose=True) -> tuple[pd.Seri
         raise SystemExit(f'gaia_n10 {stem}: counts incomplete or out of order ({len(C)} vs {len(sid)}); delete {parts}')
     # cross-mirror check on a subsample, on mirrors that did not produce those counts
     rng = np.random.default_rng(int(sid[0] % 2**32)); k = np.sort(rng.choice(len(sid), min(NCHECK, len(sid)), replace=False))
-    others = [m for m in MIRRORS if m not in set(C.mirror.iloc[k])]
-    if not others:
-        raise SystemExit(f'gaia_n10 {stem}: no independent mirror left for the cross-check')
-    n_chk, m_chk = _run(sid[k], ra[k], dec[k], others)
+    # 11-02: each subsample source is recounted on a mirror that did not produce ITS count (grouped by producing mirror), in
+    # chunks of CHECK_CHUNK: one 500-source job on the only mirror left (ESA, when Heidelberg and GAVO both produced counts) timed out
+    # in a dense LMC field.  Same counts, same exact-agreement test.
+    prod = C.mirror.iloc[k].to_numpy(); n_chk = np.zeros(len(k), np.int64); used = []
+    for pm in sorted(set(prod)):
+        g = np.where(prod == pm)[0]; others = [m for m in MIRRORS if m != pm]
+        for i in range(0, len(g), CHECK_CHUNK):
+            j = g[i:i + CHECK_CHUNK]; n_chk[j], m_ = _run(sid[k][j], ra[k][j], dec[k][j], others); used.append(m_)
+    m_chk = '+'.join(sorted(set(used)))
     n0 = C.n10_all.to_numpy(np.int64)
     diff = np.where(n_chk != n0[k])[0]
     for j in diff:
