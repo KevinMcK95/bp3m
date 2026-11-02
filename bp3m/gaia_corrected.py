@@ -319,40 +319,49 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
     for c in ('pmra', 'parallax', 'ra'):
         if not np.allclose(chk[c], chk[c + '_s'], rtol=0, atol=1e-6 if c != 'ra' else 1e-9, equal_nan=True):
             raise SystemExit(f'{field_csv.name}: {c} differs between the field CSV and the conditioning sample (different release?)')
-    # 11-02 memory: the sample is only read below (no copy), freed once base exists, and each full-sample pass keeps only the
-    # field's rows (the only rows ever read from it).  Same operations in the same order as before: outputs unchanged
-    # (Sagittarius_dSph's 13.1 M-row sample needed 56 GB with the copies).
-    U = S0
-    six_u = U.astrometric_params_solved == 95
+    six_u = S0.astrometric_params_solved == 95
     for c in ['pseudocolour_error'] + [f'{p}_pseudocolour_corr' for p in P5] + POS_COLS:
-        bad = six_u & U[c].isna() & U.pseudocolour.notna()
+        bad = six_u & S0[c].isna() & S0.pseudocolour.notna()
         if bad.any():
             raise SystemExit(f'conditioning sample: {int(bad.sum())} 6p rows lack {c}')
-    base = U[U.astrometric_params_solved.isin([31, 95])].reset_index(drop=True)
-    del S0, U, six_u
-    # each pass below is a pure function of its input frame (every prep step copies first), so the order of the passes is free:
-    # the uncut passes and Q run on base first, base is freed once cut0 exists, cut0 once the last cut pass has conditioned it
-    # (Sagittarius_dSph peaked at 34.5 GB with base, cut0 and the cut pass's copies alive together)
-    vals, stats = {}, {}
-    modes = sorted({MODELS[m][0] for m in models})
+    del six_u
+    # 11-02 memory (Sagittarius_dSph: 13.1 M sample rows, 7.1 M field rows; 56 GB, then 34.5 GB, with the full frames alive
+    # together).  Every prep step is a pure function of its input frame (each copies first), so: the full-sample passes keep
+    # only the field's rows (the only rows ever read from them); L21 (mode independent) runs once per pass; the sample frame
+    # is freed as soon as the pass input exists and READ AGAIN for the cut pass, the field frame is freed during the passes
+    # and read again after them (same files, same parser: identical frames).  Outputs unchanged.
     fsid = G0.source_id.to_numpy(np.int64)
     keep = lambda T: T[T.index.isin(fsid)]
+    base = lambda S: S[S.astrometric_params_solved.isin([31, 95])].reset_index(drop=True)
+    vals, stats = {}, {}
+    modes = sorted({MODELS[m][0] for m in models})
+    del G0, f56, miss, chk
+    B0 = base(S0); del S0
+    Q = B0[B0.source_id.isin(qso_ids)].reset_index(drop=True)
+    Q = P.qsosys(P.l21(Q, 'QSOs'), str(QSOSYS)).set_index('source_id')
+    base_ra, base_dec = B0.ra.to_numpy(float), B0.dec.to_numpy(float)   # for the 5p/6p-neighbour n10 convention only
+    T = P.l21(B0, 'sample'); del B0
     for mode in modes:
-        b, stats[mode] = P.cond5(P.l21(base, 'sample'), mode, 'sample (no cuts)')
+        b, stats[mode] = P.cond5(T, mode, 'sample (no cuts)')
         vals[mode] = keep(P.qsosys(b, str(QSOSYS)).set_index('source_id'))
         del b
-    Q = base[base.source_id.isin(qso_ids)].reset_index(drop=True)
-    Q = P.qsosys(P.l21(Q, 'QSOs'), str(QSOSYS)).set_index('source_id')
-    base_ra, base_dec = base.ra.to_numpy(float), base.dec.to_numpy(float)   # for the 5p/6p-neighbour n10 convention only
-    cut0 = P._drop_no_g(base[base.ruwe < P.RUWE_MAX].reset_index(drop=True))
-    del base
-    dom_ids = set(P.apply_quality_cuts(cut0.copy()).source_id)          # calibration cuts -> v3_domain
+    del T
+    B0 = base(_read_big_csv(sample_csv))
+    cut0 = P._drop_no_g(B0[B0.ruwe < P.RUWE_MAX].reset_index(drop=True)); del B0
+    dom_ids = set(P.apply_quality_cuts(cut0).source_id)          # calibration cuts -> v3_domain (apply_quality_cuts copies first)
+    T = P.l21(cut0, 'sample'); del cut0
     for k, mode in enumerate(modes):
-        a, sa = P.cond5(P.l21(cut0, 'sample'), mode, 'sample (cuts)')
+        a, sa = P.cond5(T, mode, 'sample (cuts)')
         if k == len(modes) - 1:
-            del cut0
-        a = keep(P.qsosys(P.restore_positions(P.apply_quality_cuts(a)), str(QSOSYS)).set_index('source_id'))
+            del T
+        a = P.apply_quality_cuts(a)
+        a = P.restore_positions(a)
+        a = keep(P.qsosys(a, str(QSOSYS)).set_index('source_id'))
         vals[mode], stats[mode] = (a, vals[mode]), dict(calib_sample=sa, extended=stats[mode])
+        del a
+    G0 = _read_big_csv(field_csv)
+    if not (G0.source_id.to_numpy(np.int64) == fsid).all():
+        raise SystemExit(f'{field_csv.name}: changed while the table was built')
     # -- per field row
     sid = G0.source_id.to_numpy(np.int64); sol = G0.astrometric_params_solved.to_numpy()
     has = np.isin(sol, [31, 95]) & G0.pmra.notna().to_numpy()
