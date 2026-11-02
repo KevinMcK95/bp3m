@@ -306,25 +306,34 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
     for c in ('pmra', 'parallax', 'ra'):
         if not np.allclose(chk[c], chk[c + '_s'], rtol=0, atol=1e-6 if c != 'ra' else 1e-9, equal_nan=True):
             raise SystemExit(f'{field_csv.name}: {c} differs between the field CSV and the conditioning sample (different release?)')
-    U = S0.copy()
+    # 11-02 memory: the sample is only read below (no copy), freed once base exists, and each full-sample pass keeps only the
+    # field's rows (the only rows ever read from it).  Same operations in the same order as before: outputs unchanged
+    # (Sagittarius_dSph's 13.1 M-row sample needed 56 GB with the copies).
+    U = S0
     six_u = U.astrometric_params_solved == 95
     for c in ['pseudocolour_error'] + [f'{p}_pseudocolour_corr' for p in P5] + POS_COLS:
         bad = six_u & U[c].isna() & U.pseudocolour.notna()
         if bad.any():
             raise SystemExit(f'conditioning sample: {int(bad.sum())} 6p rows lack {c}')
     base = U[U.astrometric_params_solved.isin([31, 95])].reset_index(drop=True)
+    del S0, U, six_u
     cut0 = P._drop_no_g(base[base.ruwe < P.RUWE_MAX].reset_index(drop=True))
     dom_ids = set(P.apply_quality_cuts(cut0.copy()).source_id)          # calibration cuts -> v3_domain
     vals, stats = {}, {}
     modes = sorted({MODELS[m][0] for m in models})
+    fsid = G0.source_id.to_numpy(np.int64)
+    keep = lambda T: T[T.index.isin(fsid)]
     for mode in modes:
         a, sa = P.cond5(P.l21(cut0, 'sample'), mode, 'sample (cuts)')
-        a = P.qsosys(P.restore_positions(P.apply_quality_cuts(a)), str(QSOSYS)).set_index('source_id')
+        a = keep(P.qsosys(P.restore_positions(P.apply_quality_cuts(a)), str(QSOSYS)).set_index('source_id'))
         b, sb = P.cond5(P.l21(base, 'sample'), mode, 'sample (no cuts)')
-        b = P.qsosys(b, str(QSOSYS)).set_index('source_id')
+        b = keep(P.qsosys(b, str(QSOSYS)).set_index('source_id'))
         vals[mode], stats[mode] = (a, b), dict(calib_sample=sa, extended=sb)
+    del cut0
     Q = base[base.source_id.isin(qso_ids)].reset_index(drop=True)
     Q = P.qsosys(P.l21(Q, 'QSOs'), str(QSOSYS)).set_index('source_id')
+    base_ra, base_dec = base.ra.to_numpy(float), base.dec.to_numpy(float)   # for the 5p/6p-neighbour n10 convention only
+    del base
     # -- per field row
     sid = G0.source_id.to_numpy(np.int64); sol = G0.astrometric_params_solved.to_numpy()
     has = np.isin(sol, [31, 95]) & G0.pmra.notna().to_numpy()
@@ -363,8 +372,8 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
                 raise SystemExit(f'{field_csv.name}: {int(miss.sum())} 5p/6p star rows have no all-source n10 count')
             n[star] = n10_all.loc[sid[star]].to_numpy(float)
         else:
-            n[has] = GV3.count_n10(G0.ra.to_numpy(float)[has], G0.dec.to_numpy(float)[has], base.ra.to_numpy(float),
-                                   base.dec.to_numpy(float), cal['n10_radius_arcsec'])
+            n[has] = GV3.count_n10(G0.ra.to_numpy(float)[has], G0.dec.to_numpy(float)[has], base_ra,
+                                   base_dec, cal['n10_radius_arcsec'])
         n[is_q] = 0.0
         n10[k] = n
         S = np.full((len(G0), 3, 3), np.nan)
