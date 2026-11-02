@@ -123,8 +123,10 @@ def vet_qso_candidates(
         When not provided (backward-compatibility), the legacy flat name
         ``{field}_qso_anchors.csv`` is used instead.
     lib_dir
-        BP3M library directory (from bp3m-setup).  If None or catalogs are
-        missing, catalog matching is skipped (only gaia_crf_source passes).
+        BP3M library directory (from bp3m-setup); None = lib_dir of
+        $BP3M_HOME/config.toml.  Quaia and MILLIQUAS must both be there
+        (FileNotFoundError otherwise; 11-02: vetting without them silently
+        dropped the catalog match to CRF3 only).
     search_radius_arcsec
         MILLIQUAS positional match radius.  Sources flagged as having Gaia
         EDR3 positions ('G' in MILLIQUAS COMMENT) use half this radius.
@@ -138,7 +140,10 @@ def vet_qso_candidates(
     -------
     DataFrame or None
         The vetted QSO anchor catalog with is_qso_anchor column, or None if
-        qso_candidates CSV is missing.
+        the qso_candidates CSV has no rows.  A missing candidates CSV for the
+        box (or, without box parameters, not exactly one candidates CSV) is a
+        FileNotFoundError: never another box's candidates (11-02: the old
+        most-recent-file fallback saved foreign anchors under the box's name).
     """
     output_dir = Path(output_dir)
     gaia_dir   = output_dir / field_name / "Gaia"
@@ -154,23 +159,22 @@ def vet_qso_candidates(
         print(f"[QSO vetting] Loading cached: {out_path.name}")
         return pd.read_csv(out_path, dtype={'source_id': 'int64'})
 
+    lib_dir = _resolve_lib_dir(lib_dir)
+
     # ── Load qso_candidates CSV ───────────────────────────────────────────────
     if _have_coords:
         _cand_name = (f"{field_name}_ra{ra:.4f}_dec{dec:+.4f}"
                       f"_w{search_width:.4f}_h{search_height:.4f}_qso_candidates.csv")
         _cand_path = gaia_dir / _cand_name
         if not _cand_path.exists():
-            # fallback: most recently modified candidates file
-            _cands = sorted(gaia_dir.glob("*_qso_candidates.csv"),
-                            key=lambda p: p.stat().st_mtime)
-            _cand_path = _cands[-1] if _cands else None
+            raise FileNotFoundError(f"[QSO vetting] no qso_candidates for this box: {_cand_path} "
+                                    f"(download it; another box's candidates are never used)")
     else:
         _cands = sorted(gaia_dir.glob("*_qso_candidates.csv"))
-        _cand_path = _cands[0] if _cands else None
-
-    if _cand_path is None or not _cand_path.exists():
-        print("[QSO vetting] No qso_candidates CSV found — skipping.")
-        return None
+        if len(_cands) != 1:
+            raise FileNotFoundError(f"[QSO vetting] {len(_cands)} qso_candidates CSVs in {gaia_dir}: without the box "
+                                    f"parameters exactly one is required")
+        _cand_path = _cands[0]
     qso_df = pd.read_csv(_cand_path, dtype={'source_id': 'int64'})
     print(f"\n[QSO vetting] Starting with {len(qso_df)} Gaia qso_candidates")
     if len(qso_df) == 0:
@@ -183,28 +187,13 @@ def vet_qso_candidates(
     gaia_astro = _load_gaia_astrometry(gaia_dir)
 
     # ── Quaia cross-match ─────────────────────────────────────────────────────
-    quaia_path = _find_catalog(lib_dir, 'quaia_G20.5.fits')
-    if quaia_path is not None:
-        qso_df = _match_quaia(qso_df, quaia_path)
-    else:
-        print("  Quaia catalog not found — skipping Quaia cross-match")
-        qso_df['quaia_match'] = False
-        qso_df['quaia_z']     = np.nan
+    qso_df = _match_quaia(qso_df, lib_dir / 'qso_catalogs' / 'quaia_G20.5.fits')
 
     n_quaia = qso_df['quaia_match'].sum()
     print(f"  After Quaia match (by source_id):       {n_quaia} / {len(qso_df)}")
 
     # ── MILLIQUAS cross-match ─────────────────────────────────────────────────
-    mq_path = _find_catalog(lib_dir, 'milliquas.fits')
-    if mq_path is not None:
-        qso_df = _match_milliquas(qso_df, mq_path, search_radius_arcsec)
-    else:
-        print("  MILLIQUAS catalog not found — skipping MILLIQUAS cross-match")
-        qso_df['milliquas_match']      = False
-        qso_df['milliquas_sep_arcsec'] = np.nan
-        qso_df['milliquas_z']          = np.nan
-        qso_df['milliquas_type']       = ''
-        qso_df['milliquas_gaia_pos']   = False
+    qso_df = _match_milliquas(qso_df, lib_dir / 'qso_catalogs' / 'milliquas.fits', search_radius_arcsec)
 
     n_mq = qso_df['milliquas_match'].sum()
     print(f"  After MILLIQUAS match (RA/Dec ≤{search_radius_arcsec:.1f}\"): "
@@ -240,11 +229,21 @@ def vet_qso_candidates(
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _find_catalog(lib_dir: "Path | None", filename: str) -> "Path | None":
+def _resolve_lib_dir(lib_dir: "Path | str | None") -> Path:
+    """lib_dir, else the lib_dir of $BP3M_HOME/config.toml; Quaia and MILLIQUAS must both be in its qso_catalogs/."""
     if lib_dir is None:
-        return None
-    p = Path(lib_dir) / "qso_catalogs" / filename
-    return p if p.exists() else None
+        import re
+        from ..setup import _bp3m_home
+        cfg = _bp3m_home() / "config.toml"
+        m = re.search(r'^lib_dir\s*=\s*["\']([^"\']+)["\']', cfg.read_text(), re.MULTILINE) if cfg.exists() else None
+        if m is None:
+            raise FileNotFoundError(f"[QSO vetting] no lib_dir given and none in {cfg}: Quaia / MILLIQUAS required")
+        lib_dir = m.group(1)
+    lib_dir = Path(lib_dir)
+    missing = [f for f in ('quaia_G20.5.fits', 'milliquas.fits') if not (lib_dir / 'qso_catalogs' / f).exists()]
+    if missing:
+        raise FileNotFoundError(f"[QSO vetting] {', '.join(missing)} missing from {lib_dir / 'qso_catalogs'}")
+    return lib_dir
 
 
 def _load_gaia_astrometry(gaia_dir: Path) -> "pd.DataFrame | None":
