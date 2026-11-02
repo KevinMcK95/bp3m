@@ -330,23 +330,29 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
             raise SystemExit(f'conditioning sample: {int(bad.sum())} 6p rows lack {c}')
     base = U[U.astrometric_params_solved.isin([31, 95])].reset_index(drop=True)
     del S0, U, six_u
-    cut0 = P._drop_no_g(base[base.ruwe < P.RUWE_MAX].reset_index(drop=True))
-    dom_ids = set(P.apply_quality_cuts(cut0.copy()).source_id)          # calibration cuts -> v3_domain
+    # each pass below is a pure function of its input frame (every prep step copies first), so the order of the passes is free:
+    # the uncut passes and Q run on base first, base is freed once cut0 exists, cut0 once the last cut pass has conditioned it
+    # (Sagittarius_dSph peaked at 34.5 GB with base, cut0 and the cut pass's copies alive together)
     vals, stats = {}, {}
     modes = sorted({MODELS[m][0] for m in models})
     fsid = G0.source_id.to_numpy(np.int64)
     keep = lambda T: T[T.index.isin(fsid)]
     for mode in modes:
-        a, sa = P.cond5(P.l21(cut0, 'sample'), mode, 'sample (cuts)')
-        a = keep(P.qsosys(P.restore_positions(P.apply_quality_cuts(a)), str(QSOSYS)).set_index('source_id'))
-        b, sb = P.cond5(P.l21(base, 'sample'), mode, 'sample (no cuts)')
-        b = keep(P.qsosys(b, str(QSOSYS)).set_index('source_id'))
-        vals[mode], stats[mode] = (a, b), dict(calib_sample=sa, extended=sb)
-    del cut0
+        b, stats[mode] = P.cond5(P.l21(base, 'sample'), mode, 'sample (no cuts)')
+        vals[mode] = keep(P.qsosys(b, str(QSOSYS)).set_index('source_id'))
+        del b
     Q = base[base.source_id.isin(qso_ids)].reset_index(drop=True)
     Q = P.qsosys(P.l21(Q, 'QSOs'), str(QSOSYS)).set_index('source_id')
     base_ra, base_dec = base.ra.to_numpy(float), base.dec.to_numpy(float)   # for the 5p/6p-neighbour n10 convention only
+    cut0 = P._drop_no_g(base[base.ruwe < P.RUWE_MAX].reset_index(drop=True))
     del base
+    dom_ids = set(P.apply_quality_cuts(cut0.copy()).source_id)          # calibration cuts -> v3_domain
+    for k, mode in enumerate(modes):
+        a, sa = P.cond5(P.l21(cut0, 'sample'), mode, 'sample (cuts)')
+        if k == len(modes) - 1:
+            del cut0
+        a = keep(P.qsosys(P.restore_positions(P.apply_quality_cuts(a)), str(QSOSYS)).set_index('source_id'))
+        vals[mode], stats[mode] = (a, vals[mode]), dict(calib_sample=sa, extended=stats[mode])
     # -- per field row
     sid = G0.source_id.to_numpy(np.int64); sol = G0.astrometric_params_solved.to_numpy()
     has = np.isin(sol, [31, 95]) & G0.pmra.notna().to_numpy()
