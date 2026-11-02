@@ -84,6 +84,19 @@ def _sha(p) -> str:
     return h.hexdigest()
 
 
+READ_CHUNK = 1_000_000      # rows per read_csv chunk (one whole-file low_memory=False read of Sagittarius_dSph's 8.2 GB sample + 4.1 GB
+                            # field CSV peaks near 3x the file size; chunked: the frame + one chunk + the concat)
+
+
+def _read_big_csv(p) -> pd.DataFrame:
+    """read_csv(p, dtype={'source_id': 'int64'}) in READ_CHUNK-row chunks: same parser and values; a column whose dtype differs
+    between chunks is unified by the concat exactly as a whole-column inference would (int + float -> float, any str -> object)."""
+    parts = list(pd.read_csv(p, dtype={'source_id': 'int64'}, chunksize=READ_CHUNK, low_memory=False))
+    D = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+    del parts
+    return D
+
+
 def check_inputs():
     """The vendored model inputs must be the announced versions (hard error otherwise)."""
     for p in [DATA / k['file'] for k in KERNELS.values()] + [QSOSYS]:
@@ -285,10 +298,10 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
     models = models or [m for m in MODELS if MODELS[m][3] == 'real2p']
     kernels = sorted({kernel_name(m) for m in models})
     cals = {k: load_kernel(k) for k in kernels}
-    G0 = pd.read_csv(field_csv, dtype={'source_id': 'int64'}, low_memory=False)
+    G0 = _read_big_csv(field_csv)
     if not (G0.source_id.is_unique and (G0.source_id % 128 == 0).all()):
         raise SystemExit(f'{field_csv.name}: source_id integrity')
-    S0 = pd.read_csv(sample_csv, dtype={'source_id': 'int64'}, low_memory=False)
+    S0 = _read_big_csv(sample_csv)
     A = pd.read_csv(anchors_csv, dtype={'source_id': 'int64'}, low_memory=False)
     out_csv = ~A.source_id.isin(G0.source_id)
     if (out_csv & (A.catalog_match.astype(bool) | A.is_qso_anchor.astype(bool))).any():
