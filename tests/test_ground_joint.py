@@ -235,3 +235,17 @@ def test_extensions_off_identical():
     n = len(P['y'])
     b = J.JointProblem(**P, re_grp=np.full((n, 2), -1, np.int64), re_lam=np.zeros((n, 2, 2))); tb, pb = b.solve(tol=1e-12)
     assert np.allclose(ta, tb, atol=1e-12) and np.allclose(pa, pb, atol=1e-12)
+
+
+def test_random_effects_nesting_checked():
+    P, star = _ext_problem()
+    ex = P['fb'] - int((P['block_kind'] == 0).sum()); ex = np.where(ex < 1000, ex, 0)
+    g = P['re_grp'].copy(); on = g[:, 1] >= 0
+    g[on, 1] = star[on] * 100 + 50 + (ex[on] + 1) // 4          # seasons shifted by one exposure: night pairs straddle them
+    P['re_grp'] = g
+    try:
+        J.JointProblem(**P)
+    except ValueError as e:
+        assert 'not nested' in str(e)
+    else:
+        raise AssertionError('non-nested random effects accepted')

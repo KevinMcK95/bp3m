@@ -557,6 +557,34 @@ def _local_groups(ptr, grp):
     return out
 
 
+def _check_nesting(grp):
+    """The nested Woodbury needs every group of level l to lie inside ONE group of each higher level m > l (where it has one):
+    raises otherwise (e.g. a night straddling a season boundary)."""
+    L = grp.shape[1]
+    for l in range(L):
+        for m in range(l + 1, L):
+            ok = (grp[:, l] >= 0) & (grp[:, m] >= 0)
+            if not ok.any():
+                continue
+            pairs = np.unique(np.c_[grp[ok, l], grp[ok, m]], axis=0)
+            if len(np.unique(pairs[:, 0])) != len(pairs):
+                raise ValueError(f'random effects: a level-{l} group spans several level-{m} groups (not nested)')
+            # and a level-l group may not be partly inside / partly outside its level-m group
+            hasm = pd_bincount_any(grp[:, l], grp[:, m] >= 0)
+            if hasm is not None and hasm:
+                raise ValueError(f'random effects: a level-{l} group has detections with and without a level-{m} group')
+
+
+def pd_bincount_any(g, flag):
+    """True if some group id in g (>= 0) has both flag True and flag False rows."""
+    ok = g >= 0
+    if not ok.any():
+        return None
+    u, inv = np.unique(g[ok], return_inverse=True)
+    t = np.bincount(inv.ravel(), flag[ok].astype(float), minlength=len(u)); c = np.bincount(inv.ravel(), minlength=len(u))
+    return bool(((t > 0) & (t < c)).any())
+
+
 class JointProblem:
     """Arrays (n detections sorted by star; ns stars; nphi frame parameters in nb blocks):
       ptr (ns+1) int64; A (n, 2, p); y (n, 2); C (n, 3) = (cxx, cyy, cxy) measurement covariance (the independent part when
@@ -594,6 +622,7 @@ class JointProblem:
                 raise ValueError('re_lam must be (n, L, 2)')
             star = np.repeat(np.arange(ns), np.diff(self.ptr))
             self.reon = np.bincount(star, (self.rg >= 0).any(1).astype(float), minlength=ns) > 0
+            _check_nesting(self.re_gid)
         # coupled measurements
         self.cp = coupling
         self.cidx = np.full(ns, -1, np.int64)
