@@ -62,6 +62,12 @@ BUILD_VERSION = 4       # 2: C*-masked 6p rows restore the position block with t
 P5, ASTRO = P.P5, P.ASTRO
 POS_COLS = ['ra_error', 'dec_error', 'ra_dec_corr', 'ra_parallax_corr', 'ra_pmra_corr', 'ra_pmdec_corr', 'dec_parallax_corr',
             'dec_pmra_corr', 'dec_pmdec_corr']
+# the 5x5 (values, errors, correlations in either name order): all the covariance assembly reads from a pass
+COV_COLS = set(P5) | {f'{p}_error' for p in P5} | {f'{a}_{b}_corr' for a in P5 for b in P5 if a != b}
+# every column L21 (compute_zp) and cond5 read: the sample-dependent steps run on the sample narrowed to these
+COND_COLS = (COV_COLS | set(P._COND_6P_COLS) | set(P._COND_POS_COLS) | {f'{p}_pseudocolour_corr' for p in P5}
+             | {'source_id', 'astrometric_params_solved', 'gmag', 'bp_rp', 'bp_rp_error', 'nu_eff_used_in_astrometry',
+                'pseudocolour', 'pseudocolour_error', 'ecl_lat'})
 # every column the preparation reads (pop_fit's download + positions and their pseudocolour correlations)
 SAMPLE_QUERY_COLS = (
     'source_id, ra, dec, ra_error, dec_error, ra_dec_corr, ra_parallax_corr, ra_pmra_corr, ra_pmdec_corr, dec_parallax_corr, '
@@ -325,40 +331,52 @@ def build(field_csv, anchors_csv, sample_csv, out_dir=None, models=None, sample_
         if bad.any():
             raise SystemExit(f'conditioning sample: {int(bad.sum())} 6p rows lack {c}')
     del six_u
-    # 11-02 memory (Sagittarius_dSph: 13.1 M sample rows, 7.1 M field rows; 56 GB, then 34.5 GB, with the full frames alive
-    # together).  Every prep step is a pure function of its input frame (each copies first), so: the full-sample passes keep
-    # only the field's rows (the only rows ever read from them); L21 (mode independent) runs once per pass; the sample frame
-    # is freed as soon as the pass input exists and READ AGAIN for the cut pass, the field frame is freed during the passes
-    # and read again after them (same files, same parser: identical frames).  Outputs unchanged.
+    # 11-02 memory (Sagittarius_dSph: 13.1 M sample rows, 7.1 M field rows; 56 GB, then 34.5 and 31.5 GB with the full-width
+    # sample frames alive together).  The only sample-dependent steps are L21 + cond5 (per-bin centring); they read the
+    # COND_COLS columns only and run on the full sample narrowed to those columns.  Every later step (quality cuts,
+    # restore_positions, qso_sys) and the v3 domain are row-wise, so they run on the field's rows only (the only rows ever read
+    # from the passes), widened back with the untouched columns.  L21 (mode independent) runs once per pass; the passes keep
+    # only the columns the covariance assembly reads; the field frame is freed during the passes and read again after them
+    # (same file, same parser: identical frame).  Outputs unchanged.
     fsid = G0.source_id.to_numpy(np.int64)
-    keep = lambda T: T[T.index.isin(fsid)]
-    base = lambda S: S[S.astrometric_params_solved.isin([31, 95])].reset_index(drop=True)
     vals, stats = {}, {}
     modes = sorted({MODELS[m][0] for m in models})
     del G0, f56, miss, chk
-    B0 = base(S0); del S0
+    B0 = S0[S0.astrometric_params_solved.isin([31, 95])].reset_index(drop=True); del S0
     Q = B0[B0.source_id.isin(qso_ids)].reset_index(drop=True)
     Q = P.qsosys(P.l21(Q, 'QSOs'), str(QSOSYS)).set_index('source_id')
     base_ra, base_dec = B0.ra.to_numpy(float), B0.dec.to_numpy(float)   # for the 5p/6p-neighbour n10 convention only
-    T = P.l21(B0, 'sample'); del B0
+    Bx = B0[B0.source_id.isin(fsid)].reset_index(drop=True)               # field rows, every column
+    cut = (B0.ruwe < P.RUWE_MAX).to_numpy()
+    Bn = B0[[c for c in B0.columns if c in COND_COLS]]; del B0
+
+    def widen(D, X):
+        """Field rows of a narrow full-sample pass D + the columns of X (the same rows, same order) it does not have."""
+        D = D[D.source_id.isin(fsid)].reset_index(drop=True)
+        if not np.array_equal(D.source_id.to_numpy(), X.source_id.to_numpy()):
+            raise SystemExit(f'{field_csv.name}: pass rows out of order')
+        return pd.concat([D, X[X.columns.difference(D.columns, sort=False)]], axis=1)
+
+    slim = lambda T: T[[c for c in T.columns if c in COV_COLS]]
+    T = P.l21(Bn, 'sample')
     for mode in modes:
         b, stats[mode] = P.cond5(T, mode, 'sample (no cuts)')
-        vals[mode] = keep(P.qsosys(b, str(QSOSYS)).set_index('source_id'))
+        vals[mode] = slim(P.qsosys(widen(b, Bx), str(QSOSYS)).set_index('source_id'))
         del b
     del T
-    B0 = base(_read_big_csv(sample_csv))
-    cut0 = P._drop_no_g(B0[B0.ruwe < P.RUWE_MAX].reset_index(drop=True)); del B0
-    dom_ids = set(P.apply_quality_cuts(cut0).source_id)          # calibration cuts -> v3_domain (apply_quality_cuts copies first)
+    cut0 = P._drop_no_g(Bn[cut].reset_index(drop=True)); del Bn
+    Cx = P._drop_no_g(Bx[Bx.ruwe < P.RUWE_MAX].reset_index(drop=True)); del Bx
+    dom_ids = set(P.apply_quality_cuts(Cx).source_id)          # calibration cuts -> v3_domain (field rows; row-wise)
     T = P.l21(cut0, 'sample'); del cut0
     for k, mode in enumerate(modes):
         a, sa = P.cond5(T, mode, 'sample (cuts)')
         if k == len(modes) - 1:
             del T
-        a = P.apply_quality_cuts(a)
-        a = P.restore_positions(a)
-        a = keep(P.qsosys(a, str(QSOSYS)).set_index('source_id'))
+        a = P.restore_positions(P.apply_quality_cuts(widen(a, Cx)))
+        a = slim(P.qsosys(a, str(QSOSYS)).set_index('source_id'))
         vals[mode], stats[mode] = (a, vals[mode]), dict(calib_sample=sa, extended=stats[mode])
         del a
+    del Cx
     G0 = _read_big_csv(field_csv)
     if not (G0.source_id.to_numpy(np.int64) == fsid).all():
         raise SystemExit(f'{field_csv.name}: changed while the table was built')
