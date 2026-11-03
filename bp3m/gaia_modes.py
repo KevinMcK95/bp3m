@@ -361,6 +361,8 @@ def ensure_modes(field_csvs, model_copies, centre, half_diag_deg, model, lib_dir
     mq = find_qso_catalogs(Path(lib_dir) if lib_dir else None).get('milliquas')
     polys = image_footprints(image_files, cache_path=gdir / f'{stem}_image_footprints.json') if image_files else None
     n_drop = 0
+    if polys and half_diag_deg is None:
+        raise ValueError('ensure_modes: half_diag_deg (field Gaia extent, deg) is required when image footprints are given')
     if polys:      # 10-29: stray images (bad header WCS / other targets: 47 Tuc and M31 folders hold images 80-153 deg away) cannot hold
         c0 = _unit([centre[0]], [centre[1]])[0]                     # field sources but inflated the QSO cone to the whole sky
         near = [p for p in polys if np.degrees(np.arccos(np.clip(_unit(p[:, 0], p[:, 1]) @ c0, -1, 1))).min() <= half_diag_deg + FOOTPRINT_MARGIN_DEG]

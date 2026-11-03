@@ -1335,7 +1335,13 @@ def main():
         if not _imgs:
             raise SystemExit('--gaia_field_modes: no working images found for their footprints')
         _cen = (float(np.mean([p[0] for p in args.pointings])), float(np.mean([p[1] for p in args.pointings])))
-        _modes = _gc_modes([_gaia_csv_path_for(*p) for p in args.pointings], _gc_copies, _cen, None, args.gaia_corrected,
+        # 11-02: the field Gaia extent (half-diagonal about _cen, deg) that ensure_modes needs to drop stray footprints (b0ad81f);
+        # None here made every --gaia_field_modes run with images fail (TypeError).  Max over pointings of centre offset + box half-diagonal.
+        from astropy.coordinates import SkyCoord as _SC
+        import astropy.units as _u
+        _c0 = _SC(_cen[0] * _u.deg, _cen[1] * _u.deg)
+        _hd = max(float(_c0.separation(_SC(p[0] * _u.deg, p[1] * _u.deg)).deg) + 0.5 * float(np.hypot(p[2], p[3])) for p in args.pointings)
+        _modes = _gc_modes([_gaia_csv_path_for(*p) for p in args.pointings], _gc_copies, _cen, _hd, args.gaia_corrected,
                            lib_dir=args.lib_dir, image_files=_imgs, pad_arcsec=args.gaia_modes_pad_arcsec)
         _m0 = _gm_cur()
         _gm_setc(_GMod(cov=_m0.cov, floor='modes', modes=str(Path(_modes).resolve()), zp=_m0.zp))   # absolute: later stages may run elsewhere
