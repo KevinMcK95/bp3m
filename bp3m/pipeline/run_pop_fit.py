@@ -2125,8 +2125,11 @@ def run_pop_fit(
     fit_cte_v2: bool = False,
     cte_v2_n_iter: int = 5,
     cte_v2_time_order: int = 1,
-    cte_v2_group: str = 'chip',
+    cte_v2_group: str = 'filter',
     cte_v2_sigma_gamma: float = 0.03,
+    cte_v2_method: str = 'newton',
+    cte_v2_sigma_filter: float = 0.015,
+    cte_v2_diag: bool = False,
     cte_mag_poly_order: int = 3,
     cte_spatial_order: int = 2,
     cte_time_poly_order: int = 0,
@@ -3371,25 +3374,35 @@ def run_pop_fit(
     # ── CTE phase v2 (2026-10-06): per-detection chip/camera CTE model, fitted inside the production solve ──
     # Runs BEFORE the final posterior pass so mu_pop.json, stellar astrometry and the analytic posteriors are all
     # CTE-corrected; membership and z-weights stay frozen.  See bp3m/pipeline/cte_popfit_v2.py.
-    if fit_cte_v2 and getattr(solver, 'n_gz', 0):
-        raise NotImplementedError('--fit_cte_v2 runs its own joint solve without the Gaia field-mode block (plan P4); '
-                                  'not combinable with modes= yet')
+    _cte_C_mu = None
+    _cte_summary = None
+    if fit_cte_v2 and cte_v2_method == 'fixed_point' and getattr(solver, 'n_gz', 0):
+        raise NotImplementedError('--cte_v2_method fixed_point does not handle the Gaia field-mode block; use the default '
+                                  'newton method')
     if fit_cte_v2:
         from .cte_popfit_v2 import run_cte_v2
         _mu_nocte = mu_pop_current.copy()
         _frozen = C_shared_joint is None
-        _, _, _, _CvT_cte, _a_cte, _, _ = _solve(member_sidx, mu_pop_current, r_current, fix_r_arg=_frozen,
-                                                 z_weights_arg=z_weights_final)
+        _CvT_cte = _a_cte = None
+        if cte_v2_method == 'fixed_point':          # legacy loop: conditioned start state (it never moves z)
+            _, _, _, _CvT_cte, _a_cte, _, _ = _solve(member_sidx, mu_pop_current, r_current, fix_r_arg=_frozen,
+                                                     z_weights_arg=z_weights_final)
         r_current, mu_pop_current, _C_cte, _, _, _cte_info = run_cte_v2(
             solver, image_names, filtered_spi, star_id_to_idx,
-            lambda m, mu, r, fx, z: _solve(m, mu, r, fix_r_arg=fx, z_weights_arg=z),
+            lambda m, mu, r, fx, z, uz=True: _solve(m, mu, r, fix_r_arg=fx, z_weights_arg=z, update_z_arg=uz),
             member_sidx, mu_pop_current, r_current, _a_cte, C_vT=_CvT_cte,
             anchor_sidx=_qso_sidx, sigma_pm=sigma_pm, sigma_plx_tot=sigma_plx_tot, C_pop_prior_inv=C_pop_prior_inv, fix_r=_frozen, z_weights=z_weights_final,
-            n_iter=cte_v2_n_iter, time_order=cte_v2_time_order, output_dir=output_pfr, group_by=cte_v2_group, sigma_gamma=cte_v2_sigma_gamma)
+            n_iter=cte_v2_n_iter, time_order=cte_v2_time_order, output_dir=output_pfr, group_by=cte_v2_group, sigma_gamma=cte_v2_sigma_gamma,
+            method=cte_v2_method, sigma_filter=cte_v2_sigma_filter, diag=cte_v2_diag)
         if not _cte_info.get('skipped'):
             if not _frozen and _C_cte is not None:
                 C_shared_joint = _C_cte
                 sigma_mu_joint = np.sqrt(np.diag(C_shared_joint[n_r:, n_r:]))
+            if _cte_info.get('C_mu_cte') is not None:
+                _cte_C_mu = np.asarray(_cte_info['C_mu_cte'], float)
+            _cte_summary = {k: _cte_info.get(k) for k in (
+                'method', 'groups', 'group_by', 'time_order', 'sigma_gamma_prior_px', 'sigma_filter_prior_px', 'frozen_r',
+                'n_gaia_modes', 'mu_nocte', 'mu_cte', 'sigma_mu_cte', 'n_solves')}
             print(f"  CTE v2: mu_pop ({_mu_nocte[0]:+.4f}, {_mu_nocte[1]:+.4f}) -> "
                   f"({mu_pop_current[0]:+.4f}, {mu_pop_current[1]:+.4f}) mas/yr")
 
@@ -3686,6 +3699,15 @@ def run_pop_fit(
     # 6. mu_pop.json
     _C_mu = (C_shared_final[n_r:, n_r:] if _C_mu_total is None
              else _C_mu_total)           # (2, 2) μ_pop posterior covariance
+    _sigma_mu_nocte_unc = None
+    if _cte_C_mu is not None:
+        # CTE v2 (newton): the CTE coefficients are part of the same linear-Gaussian model; the marginal mu_pop
+        # covariance is the gamma-conditional one + S C_gamma S^T (S = d mu / d gamma measured by the production solve).
+        _sigma_mu_nocte_unc = np.array(sigma_mu_joint, float).copy()
+        _C_mu = _C_mu + _cte_C_mu
+        sigma_mu_joint = np.sqrt(np.asarray(sigma_mu_joint, float) ** 2 + np.clip(np.diag(_cte_C_mu), 0, None))
+        print(f"  CTE v2: sigma_mu_pop ({_sigma_mu_nocte_unc[0]:.4f}, {_sigma_mu_nocte_unc[1]:.4f}) -> "
+              f"({sigma_mu_joint[0]:.4f}, {sigma_mu_joint[1]:.4f}) mas/yr with the CTE-coefficient uncertainty")
     _corr_mu = (float(_C_mu[0, 1] / (sigma_mu_joint[0] * sigma_mu_joint[1]))
                 if (sigma_mu_joint[0] > 0 and sigma_mu_joint[1] > 0) else 0.0)
 
@@ -3757,6 +3779,10 @@ def run_pop_fit(
         'mu_pop_prior_dec':      float(mu_pop_prior[1]),
         'mu_pop_prior_sigma':    float(mu_pop_prior_sigma),
     }
+    if _cte_summary is not None:
+        mu_result['cte_v2'] = dict(_cte_summary, sigma_mu_pop_gamma_conditional=(
+            None if _sigma_mu_nocte_unc is None else [float(v) for v in _sigma_mu_nocte_unc]),
+            note='sigma_mu_pop_* include the CTE-coefficient uncertainty (S C_gamma S^T); details in cte_v2.json')
     if getattr(solver, 'n_gz', 0) and _gaia_final is not None:
         _Cz_f = _gaia_final['C'][-solver.n_gz:, -solver.n_gz:]
         mu_result['gaia_field_modes'] = {
@@ -4176,9 +4202,20 @@ def main(argv=None):
                              'z-weights, frozen/free r kept), applied before the final posterior pass. Replaces --fit_cte.')
     parser.add_argument('--cte_v2_n_iter', type=int, default=5, help='CTE v2 outer iterations (default 5)')
     parser.add_argument('--cte_v2_time_order', type=int, default=1, help='CTE v2 time order: 0 constant, 1 + linear (default)')
-    parser.add_argument('--cte_v2_group', choices=['chip', 'epoch', 'visit'], default='chip',
-                        help="CTE v2 gamma blocks: one per camera chip (default), per chip x epoch (half-year), or per chip x visit; "
-                             "epoch/visit blocks are shared by all sibling images (use --cte_v2_time_order 0 with them)")
+    parser.add_argument('--cte_v2_group', choices=['filter', 'chip', 'epoch', 'visit'], default='filter',
+                        help="CTE v2 gamma blocks: per camera chip x filter (default since 11-03; hierarchical prior: shared chip "
+                             "block sigma_gamma + per-filter deviation sigma_filter), one per camera chip (the 10-06..11-02 "
+                             "default), per chip x epoch (half-year), or per chip x visit; epoch/visit blocks are shared by all "
+                             "sibling images (use --cte_v2_time_order 0 with them)")
+    parser.add_argument('--cte_v2_method', choices=['newton', 'fixed_point'], default='newton',
+                        help='CTE v2 solver: exact linear-response Newton solve with the production pop-fit solve (default '
+                             'since 11-03; works with --gaia_field_modes; propagates the CTE uncertainty into mu_pop) or the '
+                             'legacy outer fixed-point loop (unstable on Sculptor; kept to reproduce old runs)')
+    parser.add_argument('--cte_v2_sigma_filter', type=float, default=0.015,
+                        help='CTE v2 group_by=filter: prior sigma [px] of each filter\'s deviation from its camera-chip block')
+    parser.add_argument('--cte_v2_diag', action='store_true',
+                        help='CTE v2 newton: also measure the information with the alignment fixed and the legacy '
+                             'fixed-point map (diagnostics; ~2x the solves)')
     parser.add_argument('--cte_v2_sigma_gamma', type=float, default=0.03,
                         help='CTE v2 Gaussian prior sigma per coefficient [px] (default 0.03; ACS 2025 residuals reach ~0.1 px)')
     parser.add_argument('--cte_mag_poly_order', type=int, default=3,
@@ -4417,6 +4454,9 @@ def main(argv=None):
         cte_v2_time_order=args.cte_v2_time_order,
         cte_v2_group=args.cte_v2_group,
         cte_v2_sigma_gamma=args.cte_v2_sigma_gamma,
+        cte_v2_method=args.cte_v2_method,
+        cte_v2_sigma_filter=args.cte_v2_sigma_filter,
+        cte_v2_diag=args.cte_v2_diag,
         cte_mag_poly_order=args.cte_mag_poly_order,
         cte_spatial_order=args.cte_spatial_order,
         cte_time_poly_order=args.cte_time_poly_order,
